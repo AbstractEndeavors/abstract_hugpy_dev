@@ -75,6 +75,7 @@ def snapshot() -> list:
             ft = e["first_token_at"]
             out.append({
                 "request_id": e["request_id"],
+                "model_key": e["model_key"],
                 "model": e["model"],
                 "kind": e["kind"],
                 "state": e["state"],
