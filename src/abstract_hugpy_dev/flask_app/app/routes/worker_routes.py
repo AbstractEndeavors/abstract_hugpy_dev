@@ -28,7 +28,7 @@ from pydantic import BaseModel, Field
 from flask import request, jsonify, abort, send_file, Response
 
 from .imports import *
-from ....managers.serve.overrides import get_override, set_override, available_gguf_files
+from ....managers.serve.overrides import get_override, set_override, available_gguf_files, all_overrides
 # Serving/slot drivers: imported at module scope (the route handlers below call
 # these by bare name). They are not on the functions star re-export chain.
 from ....managers.serve.serve import (
@@ -722,9 +722,66 @@ def _apply_serving(model_key):
     return {"applied": True, "commands": plan.describe()}
 
 
+def _parse_systemd_ts(s):
+    """systemd ActiveEnterTimestamp ('Sat 2026-06-27 08:00:00 UTC') -> epoch secs."""
+    import time, calendar
+    s = (s or "").strip()
+    if not s or s.lower().startswith("n/a"):
+        return None
+    try:
+        p = s.split()                       # [wday, date, time, tz]
+        st = time.strptime(p[1] + " " + p[2], "%Y-%m-%d %H:%M:%S")
+        return int(calendar.timegm(st))     # the timestamps here are UTC
+    except Exception:
+        return None
+
+
+def _unit_live_state(model_key):
+    """Live systemd-unit state for an explicitly-pinned model: is its always-on
+    unit actually running, its cgroup RAM, and since when. Read-only `systemctl
+    show` (no root). {active:None} if the unit/spec can't be resolved."""
+    import subprocess
+    try:
+        unit = serve_spec_for(model_key).unit_name + ".service"
+    except Exception:
+        return {"active": None}
+    try:
+        out = subprocess.run(
+            ["systemctl", "show", unit,
+             "--property=ActiveState,SubState,MemoryCurrent,ActiveEnterTimestamp"],
+            capture_output=True, text=True, timeout=3)
+        kv = {}
+        for line in (out.stdout or "").splitlines():
+            k, _, v = line.partition("=")
+            kv[k] = v
+    except Exception as exc:
+        return {"unit": unit, "active": None, "error": str(exc)}
+    state = kv.get("ActiveState", "") or ""
+    mem = kv.get("MemoryCurrent", "")
+    return {
+        "unit": unit,
+        "state": state,                                  # active|inactive|failed|…
+        "sub_state": kv.get("SubState", "") or "",
+        "active": state == "active",
+        "rss_bytes": int(mem) if mem.isdigit() and int(mem) < (1 << 63) else None,
+        "since": _parse_systemd_ts(kv.get("ActiveEnterTimestamp", "")),
+    }
+
+
 @worker_bp.route("/llm/serving", methods=["GET"])
 def serving_list():
-    return jsonify(serving_overview())
+    # Attach the EXPLICIT override overlay per row so the console can tell a
+    # deliberate pin (operator set serve_mode in serve_overrides.json) from the
+    # registry/env default (DEFAULT_SERVE_MODE=systemd makes every model look
+    # "systemd" otherwise). For pinned rows, also attach live unit state so the
+    # console can show whether the always-on unit is actually running + its RAM.
+    rows = serving_overview()
+    ov = all_overrides()
+    for r in rows:
+        r["override"] = ov.get(r.get("key"), {})
+        if (r.get("override") or {}).get("serve_mode") == "systemd":
+            r["unit"] = _unit_live_state(r.get("key"))
+    return jsonify(rows)
 
 
 def _gguf_choices(model_key):

@@ -522,4 +522,14 @@ def refresh_registry(run_discovery=True):
         refresh_task_registries()
     except Exception as exc:
         logger.warning("refresh_registry: task registry refresh failed (%s)", exc)
+    # Self-heal serve overrides orphaned by collision-qualification of keys
+    # (bare `name` -> `owner~name`). Runs at discovery so a re-walk re-homes them.
+    try:
+        from ....managers.serve.overrides import migrate_overrides
+        moved = migrate_overrides(fresh_dict)
+        if moved:
+            logger.info("refresh_registry: migrated %d orphaned serve override(s): %s",
+                        len(moved), moved)
+    except Exception as exc:
+        logger.warning("refresh_registry: serve-override migration skipped (%s)", exc)
     return MODEL_REGISTRY

@@ -14,8 +14,11 @@ systemd unit, the swap config, and the HTTP runner endpoint all reflect it.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
+
+logger = logging.getLogger(__name__)
 
 try:
     from ...imports.src.constants.constants import PROJECTS_HOME
@@ -130,9 +133,63 @@ def set_override(model_key: str, fields: dict) -> dict:
             data[model_key] = current
         else:
             data.pop(model_key, None)
-        os.makedirs(os.path.dirname(_OVERRIDES_PATH) or ".", exist_ok=True)
-        tmp = _OVERRIDES_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, indent=2, sort_keys=True)
-        os.replace(tmp, _OVERRIDES_PATH)
+        _save(data)
         return current
+
+
+def _save(data: dict) -> None:
+    os.makedirs(os.path.dirname(_OVERRIDES_PATH) or ".", exist_ok=True)
+    tmp = _OVERRIDES_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2, sort_keys=True)
+    os.replace(tmp, _OVERRIDES_PATH)
+
+
+def _bare_key(k: str) -> str:
+    """Model name without the 'owner~' collision qualifier."""
+    return k.split("~", 1)[1] if "~" in k else k
+
+
+def migrate_overrides(registry) -> dict:
+    """Heal overrides orphaned when a model key got collision-qualified
+    (``name`` -> ``owner~name``). For each override key absent from the registry,
+    re-key it to the qualified key sharing its bare suffix. If several owners
+    match (a real collision), disambiguate by the override's ``gguf_file`` vs each
+    variant's ``filename``; skip + log when still ambiguous so a human picks the
+    owner. Idempotent; never clobbers an existing override on the target.
+
+    ``registry``: ``{model_key: cfg-dict-or-ModelConfig}``. Returns ``{old: new}``.
+    """
+    moved: dict = {}
+    with _LOCK:
+        ov = _load()
+        if not ov:
+            return moved
+        keys = list(registry)
+
+        def _fname(k):
+            cfg = registry.get(k)
+            fn = cfg.get("filename") if isinstance(cfg, dict) else getattr(cfg, "filename", None)
+            return os.path.basename(str(fn or ""))
+
+        for okey in list(ov):
+            if okey in registry:
+                continue                                   # still a valid key
+            cands = [k for k in keys if _bare_key(k) == okey]
+            if not cands:
+                continue                                   # model gone — leave override
+            target = cands[0] if len(cands) == 1 else None
+            if target is None:                             # multi-owner: use gguf_file hint
+                gf = os.path.basename(str((ov[okey] or {}).get("gguf_file") or ""))
+                matched = [k for k in cands if gf and _fname(k) == gf]
+                target = matched[0] if len(matched) == 1 else None
+            if target and target not in ov:
+                ov[target] = ov.pop(okey)
+                moved[okey] = target
+                logger.info("serve override migrated: %r -> %r", okey, target)
+            elif not target:
+                logger.warning("serve override %r orphaned + ambiguous across %s; "
+                               "re-key manually", okey, cands)
+        if moved:
+            _save(ov)
+    return moved
