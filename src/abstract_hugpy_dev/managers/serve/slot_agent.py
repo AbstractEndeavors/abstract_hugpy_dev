@@ -158,6 +158,15 @@ def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None):
     if not path or not os.path.isfile(path):
         raise FileNotFoundError(f"{model_key}: no GGUF on disk (resolved {path!r})")
 
+    # Serve from the SSD hot-cache when this model is warmed there (NVMe-fast);
+    # otherwise this kicks a background HDD->SSD warm and returns the HDD path for
+    # this (cold) load, so the next load is fast. Never blocks.
+    try:
+        from . import model_cache
+        path = model_cache.use(path)
+    except Exception as exc:
+        logger.warning("model_cache unavailable (%s); loading from %s", exc, path)
+
     # Autofit from the VRAM free RIGHT NOW, so later slots take what's left.
     auto = autofit_gpu_layers(path)
     ngl = n_gpu_layers if n_gpu_layers is not None else auto
