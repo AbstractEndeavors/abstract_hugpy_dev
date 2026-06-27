@@ -16,3 +16,10 @@ node_modules/
 .env.*
 !.env.example
 !.env.sample
+
+logs/
+*.pyc
+*.pyo
+*.whl
+*.tar.gz
+*.asc
