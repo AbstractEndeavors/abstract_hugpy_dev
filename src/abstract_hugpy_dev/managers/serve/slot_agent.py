@@ -71,15 +71,48 @@ def _allowed_cpus():
         return None
 
 
+def _total_gguf_bytes(path):
+    """Total on-disk size of a gguf, summing ALL shards when ``path`` is one shard
+    of a split model (``…-00001-of-00004.gguf``). The resolver only ever hands us
+    the FIRST shard, so a naive getsize under-counts a multi-shard model ~3-4x."""
+    try:
+        if not path or not os.path.isfile(path):
+            return None
+        import re
+        import glob
+        base = os.path.basename(path)
+        m = re.search(r"-\d{5}-of-(\d{5})\.gguf$", base)
+        if m:
+            patt = f"{base[:m.start()]}-*-of-{m.group(1)}.gguf"
+            shards = [s for s in glob.glob(os.path.join(os.path.dirname(path), patt))
+                      if os.path.isfile(s)]
+            if shards:
+                return sum(os.path.getsize(s) for s in shards)
+        return os.path.getsize(path)
+    except Exception:
+        return None
+
+
+def _mem_available_bytes():
+    """This node's reclaim-inclusive free RAM (MemAvailable)."""
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except Exception:
+        pass
+    return None
+
+
 def _model_expected_bytes(model_key):
-    """Rough 'total RAM required' for a model = its GGUF file size on disk.
-    Used as the denominator for a load-progress %. Approximate (mmap/repack mean
-    resident RAM lands a bit under the file size), but good enough for a bar."""
+    """Rough 'total RAM required' for a model ~= its full GGUF size on disk (ALL
+    shards summed). Denominator for the load-progress % AND the CPU preflight in
+    _build_cmd. Approximate (mmap/repack land resident RAM a bit under file size)."""
     try:
         from .serve import _model_file_for, get_model_config
         cfg = get_model_config(model_key)
-        path = _model_file_for(model_key, cfg)
-        return os.path.getsize(path) if path and os.path.isfile(path) else None
+        return _total_gguf_bytes(_model_file_for(model_key, cfg))
     except Exception:
         return None
 
@@ -126,10 +159,24 @@ def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None):
         raise FileNotFoundError(f"{model_key}: no GGUF on disk (resolved {path!r})")
 
     # Autofit from the VRAM free RIGHT NOW, so later slots take what's left.
-    ngl = n_gpu_layers if n_gpu_layers is not None else autofit_gpu_layers(path)
+    auto = autofit_gpu_layers(path)
+    ngl = n_gpu_layers if n_gpu_layers is not None else auto
     ctx = int(ctx) if ctx else _ctx_for(cfg, model_key)
     threads = int(threads) if threads else DEFAULT_LLAMA_THREADS
     cpus = str(cpus).strip() if cpus not in (None, "") else None
+
+    # Preflight: when nothing can offload to GPU (auto<=0 — e.g. no GPU on this
+    # node) the weights are CPU-RAM-resident, so a model bigger than free RAM will
+    # OOM mid-load. Sum ALL shards (the resolved path is only shard 1) and fail
+    # fast with a clear message instead of letting RSS climb into an OOM 500.
+    if auto <= 0:
+        need = _total_gguf_bytes(path)
+        avail = _mem_available_bytes()
+        if need and avail and need > avail * 0.95:
+            raise RuntimeError(
+                f"{model_key}: needs ~{need / 1e9:.1f} GB RAM (all shards) but only "
+                f"{avail / 1e9:.1f} GB available and no GPU offload on this node — "
+                f"free RAM (recycle the API worker) or pick a smaller quant")
 
     argv = [
         LLAMA_SERVER_BIN, "-m", path,
