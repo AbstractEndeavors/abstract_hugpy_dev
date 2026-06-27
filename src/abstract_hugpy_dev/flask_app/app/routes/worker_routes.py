@@ -832,19 +832,29 @@ def serving_set(model_key):
 # GET  /api/llm/slots/install        one-time install steps (dry run; sudo to do)
 # ──────────────────────────────────────────────────────────────────────────
 def _sys_resources():
-    """System RAM + core count the slot pool draws from (read from this VM)."""
+    """System RAM (with the used / reclaimable-cache / free split) + cores, read
+    from this VM. `free` semantics: buff/cache = Buffers+Cached+SReclaimable (all
+    reclaimable on demand, already counted in `available`); used = total-free-cache."""
     import os as _os
     mem = {}
     try:
         with open("/proc/meminfo") as fh:
             for line in fh:
                 k, _, v = line.partition(":")
-                if k in ("MemTotal", "MemAvailable"):
+                if k in ("MemTotal", "MemAvailable", "MemFree",
+                         "Buffers", "Cached", "SReclaimable"):
                     mem[k] = int(v.split()[0]) * 1024
     except Exception:
         pass
-    return {"total_bytes": mem.get("MemTotal"),
+    total = mem.get("MemTotal")
+    free = mem.get("MemFree")
+    cache = (mem.get("Buffers") or 0) + (mem.get("Cached") or 0) + (mem.get("SReclaimable") or 0)
+    used = (total - free - cache) if (total is not None and free is not None) else None
+    return {"total_bytes": total,
             "available_bytes": mem.get("MemAvailable"),
+            "free_bytes": free,
+            "cache_bytes": cache or None,
+            "used_bytes": used,
             "cpu_count": _os.cpu_count()}
 
 
@@ -854,6 +864,24 @@ def slots_overview():
         return jsonify({"enabled": False, "slots": [], "resources": _sys_resources()})
     return jsonify({"enabled": True, "slots": SlotPool().overview(),
                     "resources": _sys_resources()})
+
+
+@worker_bp.route("/llm/free-worker", methods=["POST"])
+def free_worker():
+    """Recycle the API gunicorn worker to release its accumulated in-process RAM
+    (anon memory — e.g. in-process embed/media models, registry caches). Sends a
+    graceful SIGHUP to the gunicorn master: a fresh worker spawns and the old one
+    drains in-flight requests then exits — no root, no dropped service. Slot
+    agents are separate processes and are unaffected. (Reclaimable page cache is
+    NOT this — the kernel frees that on demand; drop_caches isn't needed.)"""
+    import os, signal
+    ppid = os.getppid()
+    try:
+        os.kill(ppid, signal.SIGHUP)
+        return jsonify({"ok": True, "signaled_pid": ppid,
+                        "note": "API worker recycling — reconnect in a few seconds"})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
 
 
 @worker_bp.route("/llm/slots/load", methods=["POST"])
