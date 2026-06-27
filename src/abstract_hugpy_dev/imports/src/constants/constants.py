@@ -119,7 +119,9 @@ HUGPY_MARKER= get_env_value("HUGPY_MARKER") or "hugpy.json"
 LLAMA_HOST= get_env_value("LLAMA_HOST") or "http://127.0.0.1"
 VISION_HOST= get_env_value("VISION_HOST") or "http://127.0.0.1"
 
-EXCLUDE_DIR_NAMES = make_list(get_env_value("EXCLUDE_DIR_NAMES") or ".cache,.git,.locks,snapshots,blobs,refs,1_Pooling,2_Normalize,onnx")
+# `legacy` is the operator's data-hoarding store — kept on disk but never
+# walked, indexed, or counted by any metric/appendage in these systems.
+EXCLUDE_DIR_NAMES = make_list(get_env_value("EXCLUDE_DIR_NAMES") or ".cache,.git,.locks,snapshots,blobs,refs,1_Pooling,2_Normalize,onnx,legacy")
 EXCLUDE_DIR_NAMES = frozenset(EXCLUDE_DIR_NAMES)
 
 EXCLUDE_DIR_PREFIXES = make_list(get_env_value("EXCLUDE_DIR_PREFIXES") or "models--")

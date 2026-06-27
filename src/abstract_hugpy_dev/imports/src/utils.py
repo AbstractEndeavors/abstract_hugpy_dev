@@ -1,7 +1,9 @@
 from .init_imports import *
 logger = get_logFile(__name__)
 
-def get_glob(path,ext):
+def get_glob(path,ext,recursive=False):
+    if recursive:
+        return sorted(glob.glob(os.path.join(path, "**", ext), recursive=True))
     return sorted(glob.glob(os.path.join(path, ext)))
 def exists(obj):
     try:
@@ -219,11 +221,14 @@ def get_host(name):
 # Filesystem inspection
 # ---------------------------------------------------------------------------
 def get_guffs_in_dir(directory: str) -> List[str]:
-    return [
-        join_path(directory, item)
-        for item in get_dirlist(directory)
-        if item.endswith(".gguf") or item.endswith(".GGUF")
-    ]
+    """Every .gguf under a model dir, INCLUDING a split-gguf shard subdir
+    (e.g. ``<model>/Qwen3-Coder-Next-Q4_K_M/*-00001-of-00004.gguf``). Recursive
+    because shard downloads nest one level down; a model dir is a leaf
+    (discovery never descends past one) so this never strays into another model."""
+    return sorted(set(
+        get_glob(directory, "*.gguf", recursive=True)
+        + get_glob(directory, "*.GGUF", recursive=True)
+    ))
 
 
 # Multimodal projector (mmproj) detection. A vision GGUF (e.g.

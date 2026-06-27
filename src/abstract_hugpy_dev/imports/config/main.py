@@ -1,5 +1,7 @@
 from .imports import *
 from .models import *
+import logging
+logger = logging.getLogger(__name__)
 
 
 
@@ -28,13 +30,42 @@ def list_models():
     return list(MODEL_REGISTRY.keys())
 
 
-def get_model_config(model_key: str=None,dict_return=False,return_dict=False,key: str=None) -> ModelConfig or dict:
+def _resolve_model_key(model_key, registry, prefer=None):
+    """Map a possibly-bare model_key to a concrete registry key.
+
+    Keys are bare basenames unless an owner collision forced an
+    ``<owner>/<name>`` qualifier (see discover_models). Resolution order:
+      1. exact key — covers unique bare keys AND fully-qualified keys;
+      2. a single qualified key whose bare suffix matches;
+      3. ambiguous bare key -> prefer a variant already allocated to a
+         slot/worker (``prefer``), else the first qualified key in sorted order.
+    Returns the resolved key, or None when nothing matches."""
+    if model_key in registry:
+        return model_key
+    candidates = sorted(k for k in registry if k.rsplit("/", 1)[-1] == model_key)
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    for p in (prefer or []):                       # slot/worker allocation wins
+        if p in candidates:
+            return p
+        for c in candidates:                       # prefer may itself be bare
+            if c.rsplit("/", 1)[-1] == p:
+                return c
+    logger.info("ambiguous model_key %r -> %s (candidates: %s)",
+                model_key, candidates[0], candidates)
+    return candidates[0]                            # stable first-in-list
+
+
+def get_model_config(model_key: str=None,dict_return=False,return_dict=False,key: str=None,prefer=None) -> ModelConfig or dict:
     model_key = model_key or key
     model_registry = get_model_registry(dict_return=dict_return,return_dict=return_dict)
-   
-    if model_key not in model_registry:
+
+    resolved = _resolve_model_key(model_key, model_registry, prefer=prefer)
+    if resolved is None:
         raise KeyError(f"Unknown model: {model_key}")
-    return model_registry[model_key]
+    return model_registry[resolved]
 
 
 def list_model_options():
@@ -70,7 +101,11 @@ def get_gguf_file(path: str, cfg: ModelConfig, prefer: Optional[str] = None) -> 
     # The multimodal projector (mmproj-*.gguf) is NOT the model — exclude it so a
     # vision GGUF dir resolves to the language model, not the CLIP projector.
     from ..src.utils import is_mmproj_file
-    ggufs = [g for g in get_glob(path, "*.gguf") if not is_mmproj_file(g)]
+    # Recursive: split-gguf models nest their shards in a subdir; the shallow
+    # glob missed them and resolved to None (the "filename fiasco").
+    ggufs = [g for g in (get_glob(path, "*.gguf", recursive=True)
+                         + get_glob(path, "*.GGUF", recursive=True))
+             if not is_mmproj_file(g)]
     if not ggufs:
         return None
 
@@ -78,7 +113,7 @@ def get_gguf_file(path: str, cfg: ModelConfig, prefer: Optional[str] = None) -> 
     #    per-request user choice; cfg.filename is the config-level default. Each
     #    matches by exact basename OR by substring (so "Q4_K_M" selects the right
     #    quant without naming the whole file).
-    for want in (prefer, cfg.filename):
+    for want in (prefer, getattr(cfg, "filename", None)):
         if not want or is_mmproj_file(want):
             continue
         base = os.path.basename(want).lower()

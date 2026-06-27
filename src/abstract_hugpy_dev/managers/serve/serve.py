@@ -251,7 +251,7 @@ class ServeSpec:
 
 def serve_spec_for(model_key=None, *, cfg=None) -> ServeSpec:
     cfg = cfg if cfg is not None else get_model_config(model_key)
-    model_key = model_key or cfg.model_key or cfg.name
+    model_key = cfg.model_key or model_key or cfg.name   # canonical registry key wins
     extra = _effective_extra(model_key, cfg)   # cfg.extra + persisted UI override
     mode = _resolve_mode(cfg, extra)
 
@@ -597,14 +597,28 @@ def serve_endpoint(model_key) -> Optional[str]:
     the model on the GPU, and only when every slot is busy do we fall back to
     the swap proxy (the configured overflow). Non-llama models stay in-process.
     """
-    spec = serve_spec_for(model_key)
+    # Resolve a possibly-bare/ambiguous key to its canonical registry key,
+    # preferring a variant already loaded in a slot so we reuse it instead of
+    # loading a second copy. Everything downstream uses the canonical key.
+    pool = None
+    prefer = None
+    try:
+        from .slots import SlotPool, slots_enabled
+        if slots_enabled():
+            pool = SlotPool()
+            prefer = [s.get("model_key") for s in pool.statuses() if s.get("model_key")]
+    except Exception as exc:  # never let slot scheduling break serving
+        logger.warning("slot status lookup failed for %s: %s", model_key, exc)
+
+    cfg = get_model_config(model_key, prefer=prefer)
+    model_key = cfg.model_key                       # canonical from here on
+    spec = serve_spec_for(model_key, cfg=cfg)
     if spec.mode is ServeMode.OFF:
         return None
 
     try:
-        from .slots import SlotPool, slots_enabled
-        if slots_enabled():
-            endpoint = SlotPool().endpoint_for(model_key)
+        if pool is not None:
+            endpoint = pool.endpoint_for(model_key)
             if endpoint:
                 return endpoint
             logger.info("all slots busy; routing %s via swap proxy", model_key)

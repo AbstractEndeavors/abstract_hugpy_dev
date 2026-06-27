@@ -284,31 +284,61 @@ def discover_model(save_json: bool = True, verbose: bool = True, use_hub: bool =
 
 def discover_models(save_json: bool = True, verbose: bool = True, use_hub: bool = True):
     """Walk the model tree and enrich each dir. Records the real on-disk
-    location — discovery already walked it; don't throw it away."""
-    discovered = {}
+    location — discovery already walked it; don't throw it away.
+
+    Model keys are the bare directory basename (e.g. ``Qwen2.5-3B-Instruct-GGUF``)
+    UNLESS two different owners ship a repo of the same name — e.g. both
+    ``unsloth/Qwen3-Coder-Next-GGUF`` and ``Qwen/Qwen3-Coder-Next-GGUF``. Only
+    the *colliding* names are qualified with their one-dir-up owner
+    (``<owner>/<name>``) so each physical copy survives as its own registry row;
+    unique names stay bare so the common case needs no owner prefix. Without
+    this, two distinct models with the same basename collapse onto one key and
+    one silently overwrites the other — taking its dir/filename/size with it
+    (the "confused local map": only one shows, with the wrong gguf size)."""
     chain = build_resolver_chain(use_hub=use_hub)
 
+    rows = []
     for directory in get_model_dirs():
         file_parts = get_file_parts(directory)
         name = file_parts.get("basename")
         parent_dirname = file_parts.get("parent_dirname")
+        owner = os.path.basename(os.path.dirname(directory))    # the one dir up
 
         hub_id = clean_hub_id(directory, directory[len(parent_dirname) + 1:])
         meta, meta_sources = enrich(directory, hub_id, chain)
 
         row = meta.to_dict()
+        row["name"] = name                                     # display name stays bare
         row["dir"] = directory                                  # absolute, ground truth
         try:
             row["folder"] = os.path.relpath(directory, MODELS_HOME)   # MODELS_HOME-relative
         except ValueError:
             row["folder"] = directory
-        guffs = get_guffs_in_dir(directory)                     # capture gguf filename now
-        if guffs:
-            row["filename"] = extract_gguf_filename(guffs, directory)
+        # Resolve the model file via the ONE canonical, shard-aware finder
+        # (recursive; prefers the 00001-of shard, excludes the mmproj projector)
+        # so split-gguf models nested in a subdir get a real, loadable filename.
+        from ..config.main import get_gguf_file
+        gguf = get_gguf_file(directory, None)
+        if gguf:
+            row["filename"] = os.path.relpath(gguf, directory)
 
-        discovered[name] = row
+        rows.append((name, owner, row))
         if verbose:
             print(f"[enrich] {hub_id}: {meta_sources}")
+
+    # qualify-on-collision: bare name when unique, else "<owner>/<name>"
+    name_counts = {}
+    for name, _owner, _row in rows:
+        name_counts[name] = name_counts.get(name, 0) + 1
+    discovered = {}
+    for name, owner, row in rows:
+        key = name if name_counts[name] == 1 else f"{owner}/{name}"
+        if key in discovered:        # same owner+name twice (rare) — keep both, distinct
+            suffix = 2
+            while f"{key}#{suffix}" in discovered:
+                suffix += 1
+            key = f"{key}#{suffix}"
+        discovered[key] = row
 
     if save_json:
         safe_dump_to_file(data=discovered, file_path=MODELS_DISCOVERY_PATH)
