@@ -326,18 +326,22 @@ def discover_models(save_json: bool = True, verbose: bool = True, use_hub: bool 
         if verbose:
             print(f"[enrich] {hub_id}: {meta_sources}")
 
-    # qualify-on-collision: bare name when unique, else "<owner>/<name>"
+    # qualify-on-collision: bare name when unique, else "<owner>~<name>".
+    # The delimiter is `~` (URL-unreserved, not %-encoded, systemd-unit safe) NOT
+    # `/` — a slash in a model_key falls through every `<model_key>`-in-path route
+    # to the SPA catch-all (returns index.html -> the UI's "JSON.parse: unexpected
+    # character at line 1 column 1").
     name_counts = {}
     for name, _owner, _row in rows:
         name_counts[name] = name_counts.get(name, 0) + 1
     discovered = {}
     for name, owner, row in rows:
-        key = name if name_counts[name] == 1 else f"{owner}/{name}"
+        key = name if name_counts[name] == 1 else f"{owner}~{name}"
         if key in discovered:        # same owner+name twice (rare) — keep both, distinct
             suffix = 2
-            while f"{key}#{suffix}" in discovered:
+            while f"{key}~{suffix}" in discovered:
                 suffix += 1
-            key = f"{key}#{suffix}"
+            key = f"{key}~{suffix}"
         discovered[key] = row
 
     if save_json:

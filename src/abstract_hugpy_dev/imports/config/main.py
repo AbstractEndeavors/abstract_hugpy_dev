@@ -34,7 +34,7 @@ def _resolve_model_key(model_key, registry, prefer=None):
     """Map a possibly-bare model_key to a concrete registry key.
 
     Keys are bare basenames unless an owner collision forced an
-    ``<owner>/<name>`` qualifier (see discover_models). Resolution order:
+    ``<owner>~<name>`` qualifier (see discover_models). Resolution order:
       1. exact key — covers unique bare keys AND fully-qualified keys;
       2. a single qualified key whose bare suffix matches;
       3. ambiguous bare key -> prefer a variant already allocated to a
@@ -42,7 +42,9 @@ def _resolve_model_key(model_key, registry, prefer=None):
     Returns the resolved key, or None when nothing matches."""
     if model_key in registry:
         return model_key
-    candidates = sorted(k for k in registry if k.rsplit("/", 1)[-1] == model_key)
+    def _bare(k):  # name without the "owner~" qualifier
+        return k.split("~", 1)[1] if "~" in k else k
+    candidates = sorted(k for k in registry if _bare(k) == model_key)
     if not candidates:
         return None
     if len(candidates) == 1:
@@ -51,7 +53,7 @@ def _resolve_model_key(model_key, registry, prefer=None):
         if p in candidates:
             return p
         for c in candidates:                       # prefer may itself be bare
-            if c.rsplit("/", 1)[-1] == p:
+            if _bare(c) == _bare(p):
                 return c
     logger.info("ambiguous model_key %r -> %s (candidates: %s)",
                 model_key, candidates[0], candidates)
