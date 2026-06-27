@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 
 logger = logging.getLogger("abstract_hugpy_dev.slots")
 
@@ -74,25 +75,49 @@ class SlotPool:
             out.append(status)
         return out
 
-    def endpoint_for(self, model_key: str, *, load_timeout: float = 900.0) -> str | None:
+    def endpoint_for(self, model_key: str, *, load_timeout: float = 900.0,
+                     opts: dict | None = None) -> str | None:
         """Resolve (and if needed load) the slot serving ``model_key``.
 
+        ``opts`` is an optional per-load compute dict (n_gpu_layers, ctx,
+        threads, cpus, gpu) applied when the model is loaded into a free slot.
         Returns the slot's inference endpoint, or None when every slot is busy
         with a different model (caller should fall back to swap).
         """
         statuses = self.statuses()
 
-        # 1. already serving it
+        # 1. already serving OR currently loading it — reuse, never load a 2nd
+        #    copy. A slot mid-load has model_key set but healthy=False; if we
+        #    returned that endpoint immediately the caller would proxy to a child
+        #    that isn't up yet and get a 503. So WAIT for the loading slot to go
+        #    healthy (coalescing concurrent requests onto the one load), just like
+        #    loading into a fresh slot blocks. A down slot reports model_key=None.
         for s in statuses:
-            if s.get("model_key") == model_key and s.get("healthy"):
-                return s.get("endpoint") or s["_control"]
+            if s.get("model_key") != model_key:
+                continue
+            ep = s.get("endpoint") or s["_control"]
+            if s.get("healthy"):
+                return ep
+            deadline = time.time() + load_timeout
+            while time.time() < deadline:
+                time.sleep(2.0)
+                try:
+                    st = _get(s["_control"] + "/status")
+                except Exception:
+                    break                       # slot went away — reload below
+                if st.get("healthy"):
+                    return st.get("endpoint") or ep
+                if not st.get("model_key"):
+                    break                       # load aborted/failed — reload below
+            break                               # not ready in time — fall through
 
         # 2. an idle slot (reachable, nothing loaded)
         for s in statuses:
             if "error" in s:
                 continue
             if not s.get("model_key"):
-                resp = _post(s["_control"] + "/load", {"model_key": model_key}, load_timeout)
+                body = {"model_key": model_key, **(opts or {})}
+                resp = _post(s["_control"] + "/load", body, load_timeout)
                 if isinstance(resp, dict) and resp.get("error"):
                     raise RuntimeError(f"slot load failed: {resp['error']}")
                 return resp.get("endpoint") or s["_control"]

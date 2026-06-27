@@ -56,8 +56,64 @@ MAIN_GPU = os.environ.get("MAIN_GPU")
 HEALTH_TIMEOUT = float(os.environ.get("SLOT_HEALTH_TIMEOUT", "180"))
 
 
-def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None):
-    """argv for the child llama-server + the resolved (ngl, ctx) actually used."""
+def _allowed_cpus():
+    """Cores this slot's cgroup is confined to via systemd AllowedCPUs (kernel-
+    enforced, un-escapable), or None when unconfined. Read-only; no root needed."""
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["systemctl", "show", f"abstract-hugpy-slot@{SLOT_ID}.service",
+             "-p", "AllowedCPUs", "--value"],
+            capture_output=True, text=True, timeout=2)
+        v = (out.stdout or "").strip()
+        return v or None
+    except Exception:
+        return None
+
+
+def _model_expected_bytes(model_key):
+    """Rough 'total RAM required' for a model = its GGUF file size on disk.
+    Used as the denominator for a load-progress %. Approximate (mmap/repack mean
+    resident RAM lands a bit under the file size), but good enough for a bar."""
+    try:
+        from .serve import _model_file_for, get_model_config
+        cfg = get_model_config(model_key)
+        path = _model_file_for(model_key, cfg)
+        return os.path.getsize(path) if path and os.path.isfile(path) else None
+    except Exception:
+        return None
+
+
+def _proc_rss_bytes(pid):
+    """Resident RAM (bytes) of a pid — the slot's llama-server child footprint."""
+    try:
+        with open(f"/proc/{pid}/status") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+    except Exception:
+        return None
+    return None
+
+
+def _cpus_to_hexmask(cpus: str) -> str:
+    """Turn a cpu spec like "0-3" or "0,2,4" into llama.cpp's hex --cpu-mask."""
+    bits = 0
+    for part in str(cpus).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            for c in range(int(lo), int(hi) + 1):
+                bits |= 1 << c
+        else:
+            bits |= 1 << int(part)
+    return format(bits, "x") if bits else ""
+
+
+def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None):
+    """argv for the child llama-server + the resolved (ngl, ctx, threads, cpus)."""
     from .serve import (
         _model_file_for, _ctx_for, get_model_config,
         LLAMA_SERVER_BIN, DEFAULT_LLAMA_THREADS,
@@ -73,12 +129,20 @@ def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None):
     ngl = n_gpu_layers if n_gpu_layers is not None else autofit_gpu_layers(path)
     ctx = int(ctx) if ctx else _ctx_for(cfg, model_key)
     threads = int(threads) if threads else DEFAULT_LLAMA_THREADS
+    cpus = str(cpus).strip() if cpus not in (None, "") else None
 
     argv = [
         LLAMA_SERVER_BIN, "-m", path,
         "--host", "127.0.0.1", "--port", str(SLOT_CHILD_PORT),
         "--n-gpu-layers", str(ngl), "-c", str(ctx), "-t", str(threads),
     ]
+    if cpus:
+        # Soft pin via llama.cpp's own affinity (taskset is escaped by llama.cpp's
+        # per-thread sched_setaffinity). For HARD, kernel-enforced dedication use
+        # hugpy-slot-cpus -> cgroup AllowedCPUs. "0-3" / "0,2,4" -> hex mask.
+        mask = _cpus_to_hexmask(cpus)
+        if mask:
+            argv += ["--cpu-mask", mask, "--cpu-strict", "1"]
     # Vision GGUF: load the multimodal projector so /v1/chat/completions accepts
     # image_url content. No-op for text models (no projector beside the model).
     from ...imports.src.utils import find_mmproj
@@ -86,7 +150,7 @@ def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None):
     if mmproj:
         argv += ["--mmproj", mmproj]
         logger.info("slot %s: vision model — loading projector %s", SLOT_ID, mmproj)
-    return argv, ngl, ctx
+    return argv, ngl, ctx, threads, cpus
 
 
 class Slot:
@@ -97,6 +161,10 @@ class Slot:
         self.proc = None
         self.ngl = None
         self.ctx = None
+        self.threads = None
+        self.cpus = None
+        self.gpu = None
+        self.expected_bytes = None
         self.loaded_at = 0.0
         self.last_used = 0.0
         self.lock = threading.Lock()
@@ -126,26 +194,38 @@ class Slot:
             "healthy": self.healthy(),
             "n_gpu_layers": self.ngl,
             "ctx": self.ctx,
+            "threads": self.threads,
+            "cpus": self.cpus,
+            "gpu": self.gpu,
+            "allowed_cpus": _allowed_cpus(),   # kernel-enforced dedicated cores
             "loaded_at": self.loaded_at,
             "last_used": self.last_used,
             "free_vram_bytes": free_vram_bytes(),
+            "rss_bytes": _proc_rss_bytes(self.proc.pid) if self._child_alive() else 0,
+            "expected_bytes": self.expected_bytes,
         }
 
     # -- lifecycle ---------------------------------------------------------
-    def load(self, model_key, n_gpu_layers=None, ctx=None, threads=None) -> dict:
+    def load(self, model_key, n_gpu_layers=None, ctx=None, threads=None,
+             cpus=None, gpu=None) -> dict:
         with self.lock:
             if self.model_key == model_key and self.healthy():
                 self.last_used = time.time()
                 return self.status()
 
             self._kill()
-            argv, self.ngl, self.ctx = _build_cmd(model_key, n_gpu_layers, ctx, threads)
-            logger.info("slot %s loading %s (ngl=%s ctx=%s): %s",
-                        SLOT_ID, model_key, self.ngl, self.ctx, " ".join(argv))
+            argv, self.ngl, self.ctx, self.threads, self.cpus = _build_cmd(
+                model_key, n_gpu_layers, ctx, threads, cpus)
+            # per-load GPU pin overrides the slot's MAIN_GPU default
+            self.gpu = gpu if gpu not in (None, "") else MAIN_GPU
+            self.expected_bytes = _model_expected_bytes(model_key)
+            logger.info("slot %s loading %s (ngl=%s ctx=%s threads=%s cpus=%s gpu=%s): %s",
+                        SLOT_ID, model_key, self.ngl, self.ctx, self.threads,
+                        self.cpus, self.gpu, " ".join(argv))
 
             env = dict(os.environ)
-            if MAIN_GPU is not None:
-                env["CUDA_VISIBLE_DEVICES"] = str(MAIN_GPU)
+            if self.gpu is not None:
+                env["CUDA_VISIBLE_DEVICES"] = str(self.gpu)
             self.proc = subprocess.Popen(argv, env=env)
             self.model_key = model_key
             self.loaded_at = self.last_used = time.time()
@@ -170,9 +250,14 @@ class Slot:
         return False
 
     def unload(self) -> dict:
+        # Interrupt any in-progress load first: killing the child makes a blocking
+        # _wait_healthy bail and release the lock, so /unload returns promptly
+        # instead of waiting out the load's (up to 180s) health timeout.
+        self._kill()
         with self.lock:
             self._kill()
             self.model_key = self.ngl = self.ctx = None
+            self.threads = self.cpus = self.gpu = self.expected_bytes = None
             return self.status()
 
     def _kill(self):
@@ -209,7 +294,8 @@ def build_app():
             return jsonify({"error": "missing model_key"}), 400
         try:
             return jsonify(slot.load(body["model_key"], body.get("n_gpu_layers"),
-                                     body.get("ctx"), body.get("threads")))
+                                     body.get("ctx"), body.get("threads"),
+                                     body.get("cpus"), body.get("gpu")))
         except Exception as exc:  # noqa: BLE001
             return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
 

@@ -774,11 +774,29 @@ def serving_set(model_key):
 # POST /api/llm/slots/unload         {"control": "http://...:8101"}  free a slot
 # GET  /api/llm/slots/install        one-time install steps (dry run; sudo to do)
 # ──────────────────────────────────────────────────────────────────────────
+def _sys_resources():
+    """System RAM + core count the slot pool draws from (read from this VM)."""
+    import os as _os
+    mem = {}
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                k, _, v = line.partition(":")
+                if k in ("MemTotal", "MemAvailable"):
+                    mem[k] = int(v.split()[0]) * 1024
+    except Exception:
+        pass
+    return {"total_bytes": mem.get("MemTotal"),
+            "available_bytes": mem.get("MemAvailable"),
+            "cpu_count": _os.cpu_count()}
+
+
 @worker_bp.route("/llm/slots", methods=["GET"])
 def slots_overview():
     if not slots_enabled():
-        return jsonify({"enabled": False, "slots": []})
-    return jsonify({"enabled": True, "slots": SlotPool().overview()})
+        return jsonify({"enabled": False, "slots": [], "resources": _sys_resources()})
+    return jsonify({"enabled": True, "slots": SlotPool().overview(),
+                    "resources": _sys_resources()})
 
 
 @worker_bp.route("/llm/slots/load", methods=["POST"])
@@ -786,7 +804,10 @@ def slots_load():
     body = request.get_json(silent=True) or {}
     if not body.get("model_key"):
         return jsonify({"error": "missing model_key"}), 400
-    endpoint = SlotPool().endpoint_for(body["model_key"])
+    # optional per-load compute knobs (blank/omitted = autofit/default)
+    opts = {k: body[k] for k in ("n_gpu_layers", "ctx", "threads", "cpus", "gpu")
+            if body.get(k) not in (None, "")}
+    endpoint = SlotPool().endpoint_for(body["model_key"], opts=opts)
     if endpoint is None:
         return jsonify({"loaded": False, "reason": "all slots busy",
                         "slots": SlotPool().overview()}), 409
@@ -800,7 +821,11 @@ def slots_unload():
     control = body.get("control")
     if not control:
         return jsonify({"error": "missing control url"}), 400
-    return jsonify(SlotPool().unload(control))
+    try:
+        return jsonify(SlotPool().unload(control))
+    except Exception as exc:  # slot unreachable / mid-load timeout — don't 500 the UI
+        return jsonify({"unloaded": False,
+                        "error": f"{type(exc).__name__}: {exc}"}), 502
 
 
 @worker_bp.route("/llm/slots/install", methods=["GET"])
