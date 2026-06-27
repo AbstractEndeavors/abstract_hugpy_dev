@@ -1,0 +1,137 @@
+# hugpy — self-hosted LLM console.
+# Successor packaging for abstract_hugpy / abstract_hugpy_dev (renamed to match
+# the product + hugpy.ai). Source-available license to start; may ease later.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "abstract_hugpy_dev"
+version = "0.1.56"
+description = "Self-hosted LLM console: model registry & downloads, streaming chat, OpenAI-compatible /v1 API with on-site keys, GPU worker fleet with cross-machine RPC sharding"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "putkoff" }]
+license = { file = "LICENSE" }
+classifiers = ["License :: Other/Proprietary License"]
+keywords = ["llm", "llama.cpp", "transformers", "self-hosted", "openai-compatible"]
+
+# Base = the minimum to install, import, and serve the console/API on ANY
+# platform — including a phone (Termux/aarch64) or a coordinator-only box. It is
+# deliberately free of native/compiled heavyweights: the GGUF engine
+# (llama-cpp-python), local vision (opencv/onnxruntime), the OCR stack
+# (abstract_ocr → paddle…) and web-scraping (abstract_webtools →
+# selenium/playwright) all live in extras below, and the code lazily imports them
+# only when the feature is used. `pip install abstract_hugpy_dev` therefore stays
+# small and wheels-only; `pip install abstract_hugpy_dev[engine]` (or [all]) adds
+# the heavy bits on platforms that can build them.
+dependencies = [
+    "flask",
+    # gunicorn is POSIX-only; on Windows we serve via waitress (see below). The
+    # CLI already falls back to the Flask dev server if neither is present.
+    "gunicorn; platform_system != 'Windows'",
+    "waitress; platform_system == 'Windows'",
+    # pydantic intentionally NOT in base: on the phone it's absent and the built-in
+    # pure-Python shim (_compat_pydantic.ensure_pydantic, called first in __init__)
+    # provides BaseModel/Field/ConfigDict/validators with no validation. Install the
+    # real thing on a server with: pip install abstract_hugpy_dev[validate]
+    "httpx",
+    "aiohttp",
+    "requests",
+    "abstract_essentials",   # de-vendored stdlib-only core (was imports/src/standalone_utils.py)
+    "platformdirs",          # per-OS data/config/cache/engine dirs
+    "huggingface_hub>=0.26,<0.30",   # phone: <0.30 avoids hf-xet (Rust dep, no android wheel); >=0.26 keeps RepoFile
+    "beautifulsoup4",        # base import chain (imports/init_imports) does `import bs4`
+    "PyPDF2",                # pure-python
+    "pdfplumber",            # pure-python (pdfminer.six)
+    # abstract_security / abstract_utilities were dropped — their used surface is
+    # vendored, stdlib-only, in hugpy/imports/src/standalone_utils.py. The
+    # remaining abstract_* below are the slimmed, phone-clean ones.
+    "abstract_apis",
+    "abstract_flask",
+]
+
+[project.optional-dependencies]
+# Real pydantic + validation, for platforms where pydantic-core installs (servers,
+# desktop). Omit on the phone — the shim covers import + construction there.
+validate = ["pydantic>=2"]
+
+# Native/compiled base deps with NO Android wheel on Termux's index (psutil,
+# pyyaml, numpy, pillow, bcrypt). Carved out of base so `pip install` stays
+# wheels-only and completes on a phone. All are imported lazily, so the console
+# /API run without them; install on Termux via:  pkg install python-numpy
+# python-pillow  &&  pip install 'abstract_hugpy_dev[native]'
+native = [
+    "psutil",
+    "pyyaml",
+    "numpy<2.4",
+    "pillow",
+    "bcrypt",
+]
+
+# In-process GGUF engine. Compiles via cmake; prebuilt wheels exist for desktop
+# Linux/macOS/Windows but NOT for Android/Termux — so it's an extra, kept out of
+# the base so a phone / coordinator-only install stays wheels-only. For a
+# CUDA-accelerated build, reinstall with:
+#   CMAKE_ARGS="-DGGML_CUDA=on" pip install --force-reinstall --no-cache-dir llama-cpp-python
+engine = ["llama-cpp-python"]
+llama = ["abstract_hugpy_dev[engine]"]   # back-compat alias for the old [llama] extra
+# Local vision: phone-brick object detector + image rendering (lazy-imported).
+vision = ["opencv-python-headless", "onnxruntime"]
+# OCR stack — heavy (paddlepaddle/paddleocr have no aarch64 wheels). Desktop/server
+# only. pytest is here because abstract_ocr imports it at module level.
+ocr = ["abstract_ocr", "pytest"]
+# Web extraction / scraping (selenium, playwright, opencv via abstract_webtools).
+web = ["abstract_webtools"]
+transformers = ["torch", "transformers", "accelerate", "sentencepiece"]  # sentencepiece: T5/flan tokenizers
+gpu = ["pynvml"]             # optional richer GPU probing (falls back to nvidia-smi)
+embed = ["sentence-transformers"]
+finetune = ["peft"]
+# Media-intelligence amenities (the /ml/* tools) — each its own opt-in so the
+# base / phone install stays lean. (vision rides [engine]+mmproj; embeddings &
+# similarity ride [embed]; summarize rides [transformers].)
+keywords = ["keybert"]            # keyword-extraction
+audio = ["openai-whisper"]        # automatic-speech-recognition (transcribe)
+imagegen = ["diffusers", "accelerate"]   # text-to-image
+# Deterministic ingest amenities (no model): /ml/extract reads PDF/DOCX/text,
+# /ml/fetch reads readable text from a URL. PDF rides base PyPDF2/pdfplumber;
+# requests is base — only python-docx + beautifulsoup4 are extra.
+extract = ["python-docx", "beautifulsoup4", "brotli", "zstandard"]  # brotli/zstandard: decode br/zstd-encoded pages (/ml/fetch) — else garbage text
+# Umbrella: the full server-side media toolset in one opt-in.
+media = ["abstract_hugpy_dev[keywords,audio,imagegen,extract,vision,embed,transformers]"]
+# Discord UI arm (`hugpy bot`): drives a hugpy central over HTTP. discord.py is
+# POSIX/Windows-portable; python-dotenv loads the bot's .env (token/settings).
+bot = ["discord.py", "python-dotenv"]
+# Central/coordinator (the box that runs the flask app + console). Beyond the
+# feature extras it must carry the runtime deps that transitive abstract_security
+# / abstract_database IMPORT at module load but do not declare themselves — until
+# those upstream packages declare their own deps, list them here so a server
+# install is reproducible (no manual pip afterwards).
+server = [
+    "abstract_hugpy_dev[engine,bot,gpu]",
+    "abstract_pandas", "geopandas", "pandas", "openpyxl",
+    "pexpect", "tiktoken", "ezodf", "pytesseract", "pdf2image",
+]
+# Everything (the full desktop/server install). Self-reference must use the real
+# distribution name, not the legacy "hugpy".
+all = ["abstract_hugpy_dev[server,vision,ocr,web,transformers,embed,finetune,keywords,audio,imagegen,extract]"]
+
+[project.urls]
+Homepage = "https://hugpy.ai"
+
+[project.scripts]
+hugpy = "abstract_hugpy_dev.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["abstract_hugpy_dev*"]
+
+# The built web console rides inside the wheel so `pip install hugpy` is the
+# whole product. Refresh before release: npm run build in ui/, then
+# cp -r ui/dist api/api/hugpy/console_dist
+[tool.setuptools.package-data]
+# console_dist = the built web UI (binary bundle). The *.sh glob ships the
+# phone-brick bootstrap + worker-deploy installers inside the wheel (they were
+# previously lost: MANIFEST.in/setup.py globbed the wrong package name).
+abstract_hugpy_dev = ["console_dist/**/*", "**/*.sh"]

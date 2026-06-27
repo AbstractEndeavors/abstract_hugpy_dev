@@ -1,0 +1,347 @@
+# hugpy — run your own models, your own way
+
+[![PyPI](https://img.shields.io/pypi/v/abstract_hugpy_dev.svg)](https://pypi.org/project/abstract_hugpy_dev/)
+[![Python](https://img.shields.io/pypi/pyversions/abstract_hugpy_dev.svg)](https://pypi.org/project/abstract_hugpy_dev/)
+
+**A self-hosted LLM console and OpenAI-compatible API in a single process.**
+Model registry & downloads, streaming chat, an OpenAI-compatible `/v1` surface
+with on-site API keys, and a GPU worker fleet with cross-machine RPC sharding —
+all served by one command, with no nginx and no Node required.
+
+> `abstract_hugpy_dev` is the **development** distribution of hugpy. The import
+> package is `abstract_hugpy_dev`; the command is `hugpy`. (The production
+> distribution is published separately as `hugpy`.)
+
+```bash
+pip install abstract_hugpy_dev
+hugpy serve            # console at http://localhost:7002/ , API at /api/v1
+```
+
+That's the whole product: the built web console rides inside the wheel, so the
+one process gives you a browser UI **and** a programmable API.
+
+---
+
+## Table of contents
+
+- [Why hugpy](#why-hugpy)
+- [Install](#install)
+- [Quickstart](#quickstart)
+- [OpenAI-compatible API](#openai-compatible-api)
+- [Command-line interface](#command-line-interface)
+- [GPU worker fleet & sharding](#gpu-worker-fleet--sharding)
+- [Discord bot](#discord-bot)
+- [Configuration](#configuration)
+- [Storage & paths](#storage--paths)
+- [Authentication](#authentication)
+- [Platform notes](#platform-notes)
+- [Links & license](#links--license)
+
+---
+
+## Why hugpy
+
+Most "run a model" tools stop at load-and-infer. hugpy is the operational layer
+around self-hosting:
+
+- **One process, whole product.** `hugpy serve` runs the API, the web console,
+  model downloads, chat, and the OpenAI `/v1` surface. No reverse proxy, no
+  separate frontend build.
+- **OpenAI-compatible.** Point any OpenAI SDK at your box — `base_url` + an
+  `hp_…` key and you're done.
+- **Bring your own GPUs.** Join any machine to a central as a worker
+  (`hugpy worker`), or lend its GPU to a **cross-machine shard pool** so models
+  larger than one card can run across several boxes over RPC.
+- **Phone-to-server install.** The base install is small and wheels-only (it
+  runs on Termux/aarch64 as a coordinator); the heavy engine, vision, OCR, and
+  scraping stacks are opt-in extras that the code lazy-imports only when used.
+
+---
+
+## Install
+
+```bash
+pip install abstract_hugpy_dev            # base: console + API, wheels-only
+```
+
+The base package deliberately omits native/compiled heavyweights so it installs
+anywhere (including phones and coordinator-only boxes). Add capabilities with
+extras:
+
+| Extra | Adds | Use it for |
+|-------|------|------------|
+| `engine` | `llama-cpp-python` | In-process **GGUF** inference (`[llama]` is an alias) |
+| `transformers` | `torch`, `transformers`, `accelerate` | Transformers/PyTorch backends |
+| `vision` | `opencv-python-headless`, `onnxruntime` | Local image/object detection |
+| `ocr` | `abstract_ocr`, `pytest` | OCR stack (desktop/server only) |
+| `web` | `abstract_webtools` | Web extraction / scraping |
+| `embed` | `sentence-transformers` | Embeddings |
+| `finetune` | `peft` | Fine-tuning helpers |
+| `gpu` | `pynvml` | Richer GPU probing (else falls back to `nvidia-smi`) |
+| `bot` | `discord.py`, `python-dotenv` | The Discord bot arm |
+| `server` | engine + bot + gpu + data/runtime deps | A central/coordinator box |
+| `all` | server + vision + ocr + web + transformers + embed + finetune | Full desktop/server install |
+
+```bash
+pip install "abstract_hugpy_dev[engine]"          # local GGUF inference
+pip install "abstract_hugpy_dev[server]"          # a coordinator that hosts the console + fleet
+pip install "abstract_hugpy_dev[all]"             # everything
+```
+
+**CUDA-accelerated engine** (rebuild `llama-cpp-python` against CUDA):
+
+```bash
+CMAKE_ARGS="-DGGML_CUDA=on" pip install --force-reinstall --no-cache-dir llama-cpp-python
+```
+
+Requires **Python ≥ 3.10**.
+
+---
+
+## Quickstart
+
+```bash
+# 1. start the console + API (single-operator, no login wall by default)
+hugpy serve --host 0.0.0.0 --port 7002
+
+# 2. open the console
+#    → http://localhost:7002/
+
+# 3. (optional) provision the native llama.cpp binaries for the serve drivers
+hugpy install-engine            # add --cuda for a CUDA build
+```
+
+Download a model and chat from the console, or drive it over the API below.
+
+---
+
+## OpenAI-compatible API
+
+`hugpy serve` exposes an OpenAI-compatible surface at both `/v1` and `/api/v1`.
+
+### Python (OpenAI SDK)
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:7002/v1",   # or https://your-hugpy/api/v1
+    api_key="hp_your_key_here",            # mint keys in the console
+)
+
+resp = client.chat.completions.create(
+    model="your-model-key",
+    messages=[{"role": "user", "content": "Say hello in one line."}],
+    stream=True,
+)
+for chunk in resp:
+    print(chunk.choices[0].delta.content or "", end="")
+```
+
+### curl
+
+```bash
+# list models
+curl http://localhost:7002/v1/models -H "Authorization: Bearer hp_your_key_here"
+
+# chat completion (streaming)
+curl http://localhost:7002/v1/chat/completions \
+  -H "Authorization: Bearer hp_your_key_here" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"your-model-key","messages":[{"role":"user","content":"hello"}],"stream":true}'
+```
+
+**API keys.** Keys (`hp_…`) are minted and revoked in the console (or via the
+same-origin `/keys` endpoints). A `require_key` flag decides whether `/v1` calls
+must present `Authorization: Bearer hp_…`. The `/v1` surface is public/
+programmatic; the console's own routes (model management, jobs, workers) live on
+the same origin and are governed by the site's auth mode, not `/v1` keys.
+
+Other notable endpoints served by the same process include `/health`,
+`/v1/models`, `/v1/chat/completions`, model management (`/models`, `/llm/*`),
+background jobs (`/jobs`), the worker fleet (`/llm/workers/*`), and the Discord
+bridge (`/discord/*`). Every path is reachable both bare (`/health`) and
+`/api`-prefixed (`/api/health`).
+
+---
+
+## Command-line interface
+
+The package installs a single `hugpy` entry point:
+
+```
+hugpy serve           run the console + API in one process
+hugpy worker          join this machine to a central as a GPU worker
+hugpy bot             run the Discord bot (drives a central over HTTP)
+hugpy keeper          terminal "keeper" REPL — a model keeps this machine/LXD instance
+hugpy install-engine  download or build the native llama.cpp binaries
+```
+
+### `hugpy serve`
+
+```bash
+hugpy serve [--host 0.0.0.0] [--port 7002] [--threads 8]
+            [--auth open|external] [--origins a.com,b.com] [--debug]
+```
+
+Serves via gunicorn on POSIX, waitress on Windows, and falls back to the Flask
+dev server if neither is installed.
+
+### `hugpy install-engine`
+
+```bash
+hugpy install-engine [--cuda] [--build-from-source] [--tag <release>] [--jobs N] [--force]
+```
+
+Fetches a prebuilt `llama-server` / `rpc-server` (or builds from source with
+`--build-from-source`, which needs git + cmake).
+
+---
+
+## GPU worker fleet & sharding
+
+Turn any GPU box into capacity for a central instance:
+
+```bash
+# on the GPU machine
+hugpy worker --central https://your-hugpy/        # join as a worker
+```
+
+For models larger than a single card, hugpy can split a GGUF model **across
+machines** over llama.cpp RPC: the central's allocator coordinates a pool of
+`rpc-server` backends. This is opt-in (`HUGPY_SHARD_MODELS`) and configured with
+`HUGPY_RPC_SERVERS` / `HUGPY_TENSOR_SPLIT` (see [Configuration](#configuration)).
+All flags after `worker` are passed straight to the worker agent's own parser
+(`hugpy worker --help`).
+
+### Admission, dedicated pools & self-update
+
+- **Admission.** A newly-joined worker is `pending` and serves nothing until an
+  operator **Admits** it in the console. Set `HUGPY_WORKER_ENROLL_REQUIRED=1` to
+  also require a one-time enrollment token (`WORKER_ENROLL_TOKEN`).
+- **Dedicated pools.** Reserve a worker for one app by starting it with
+  `WORKER_POOL=<name>`: it then serves *only* requests tagged for that pool, and
+  general traffic never lands on it. Tag requests by minting an API key bound to
+  the pool, or with an explicit per-request `pool`; a pool request with no
+  matching worker falls back to local rather than the shared fleet. Pooled
+  workers eagerly pre-warm their assigned models (`WORKER_PRELOAD`).
+- **Self-update.** Workers converge to the central's target version via
+  `pip install -U` + re-exec — from PyPI by default, or from central's bundled
+  PEP-503 index (`--pkg-index <central>/api/llm/pip/simple`) for egress-less
+  boxes. A single publish rolls the fleet.
+- **Even a phone can help.** The `phone_brick` arm runs ONNX object detection
+  across cheap Android phones, and a phone can join the shard pool as a
+  `role=rpc` llama.cpp backend (`PHONE_BRICK_RPC=1`) — lending its RAM as
+  pseudo-VRAM to models too big for one card.
+
+---
+
+## Discord bot
+
+The bot arm drives a hugpy central over HTTP — it can point at this machine or a
+remote central.
+
+```bash
+pip install "abstract_hugpy_dev[bot]"
+hugpy bot --central http://127.0.0.1:7002 --env /path/to/.env
+```
+
+The `.env` supplies `DISCORD_TOKEN` and bot settings (or set `HUGPY_BOT_ENV`).
+Restrict slash-command sync to one guild with `--guild <id>`.
+
+---
+
+## Configuration
+
+hugpy is configured by environment variables. The most useful:
+
+| Variable | Purpose |
+|----------|---------|
+| `DEFAULT_ROOT` | Root directory for model weights, manifests, and data |
+| `HUGPY_AUTH_MODE` | `open` (default, no login wall) or `external` (front a real auth service) |
+| `HUGPY_AUTO_DOWNLOAD` | Auto-fetch missing models on demand |
+| `HUGPY_BASE_URL` | Central base URL used by `hugpy bot` / clients |
+| `HUGPY_DATA_DIR` / `HUGPY_CONFIG_DIR` / `HUGPY_CACHE_DIR` | Per-OS data/config/cache overrides |
+| `HUGPY_ENGINE_DIR` / `HUGPY_ENGINE_TAG` | Native engine location / llama.cpp release tag |
+| `HUGPY_N_GPU` / `HUGPY_N_GPU_LAYERS` / `HUGPY_MAIN_GPU` | GPU offload controls |
+| `HUGPY_TENSOR_SPLIT` | Per-GPU split for multi-GPU / sharded serving |
+| `HUGPY_SHARD_MODELS` | Enable cross-machine GGUF sharding |
+| `HUGPY_RPC_SERVERS` / `HUGPY_SHARD_PORT_BASE` | RPC backend pool for sharding |
+| `WORKER_POOL` / `WORKER_PRELOAD` | Reserve a worker for a dedicated pool; eager-warm its models |
+| `HUGPY_WORKER_ENROLL_REQUIRED` / `WORKER_PKG_INDEX` | Require enrollment tokens; worker self-update index |
+| `PHONE_BRICK_RPC` | Let a phone join the shard pool as a `role=rpc` backend |
+| `HUGPY_SSE_HEARTBEAT_SECS` / `HUGPY_MAX_CONTINUATIONS` | SSE keepalive; unbounded-continuation clamp |
+| `HUGPY_MAX_UPLOAD_MB` | Max upload size for `/uploads` (default 100) |
+| `HUGPY_PER_PASS_MAX_TOKENS` | Cap tokens per generation pass |
+| `HUGPY_UI_DIST` | Override the path to the built web console |
+
+CLI flags take precedence over the corresponding environment variables (e.g.
+`hugpy serve --auth external` sets `HUGPY_AUTH_MODE`).
+
+---
+
+## Storage & paths
+
+Large artifacts (weights, snapshots, caches) live under `DEFAULT_ROOT` (or the
+per-OS data dir resolved via `platformdirs`). Point `DEFAULT_ROOT` at a big,
+shared volume for server installs rather than your home directory. The built web
+console ships inside the wheel (`console_dist/`), so no separate asset hosting is
+needed.
+
+---
+
+## Authentication
+
+- **`open`** (default): single-operator instance, no login wall. The `/v1`
+  API-key system still gates programmatic access.
+- **`external`**: the console authenticates against a separate auth service.
+  hugpy includes a same-origin auth proxy so the session cookie stays
+  first-party (works in Safari/Firefox, which block third-party cookies). Toggle
+  with `HUGPY_AUTH_PROXY`; point it at the upstream with `HUGPY_AUTH_BASE`.
+
+---
+
+## Platform notes
+
+- **Base install is wheels-only** and runs on Linux, macOS, Windows, and
+  Termux/aarch64 (as a coordinator). Heavy stacks are extras.
+- **Windows**: served via `waitress` (gunicorn is POSIX-only). The CLI falls
+  back to the Flask dev server if neither is present.
+- **Android/Termux**: the GGUF engine, OCR (paddle), and some vision wheels are
+  not available; install those extras only on desktop/server. See below.
+
+### Mobile / Termux (Android)
+
+`abstract_hugpy_dev` installs and imports on Termux as a coordinator/worker. The
+one historical blocker was `pydantic_core` (pydantic v2's Rust core), which has
+no Termux wheel. The package now ships a **pure-Python pydantic fallback**: if
+`pydantic_core` can't be imported, a lightweight shim is used automatically so
+`import abstract_hugpy_dev` succeeds with no Rust toolchain. The shim covers
+model construction and serialization but **does not validate types** — fine for
+running a phone as a coordinator/worker.
+
+```bash
+pkg install python                       # Termux
+pip install abstract_hugpy_dev
+python -c "import abstract_hugpy_dev; print('ok')"
+```
+
+If you want **full pydantic validation** on the phone (or hit a dependency that
+truly needs the real `pydantic_core`), install a Rust toolchain so pip can build
+it from source:
+
+```bash
+pkg install rust binutils
+export CARGO_BUILD_JOBS=1                 # avoid OOM on low-RAM devices
+pip install --no-cache-dir pydantic
+```
+
+---
+
+## Links & license
+
+- **Homepage:** https://hugpy.ai
+- **Source:** https://github.com/AbstractEndeavors/abstract_hugpy_dev
+
+**License:** Source-Available (see `LICENSE`). Copyright © 2026 putkoff
+(hugpy.ai). All rights reserved.

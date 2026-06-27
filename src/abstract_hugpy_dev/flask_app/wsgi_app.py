@@ -1,0 +1,200 @@
+import os
+
+from flask import send_from_directory
+
+from .app import *
+from .app import routes as routes
+from .app.routes.worker_routes import worker_bp
+from .app.routes.phone_brick_routes import phone_brick_bp
+from .app.routes.discord_routes import discord_bp
+
+
+class ApiPrefixMiddleware:
+    """Strip a leading /api from the request path, exactly like the public
+    nginx does. With it, the app standalone (no proxy in front) accepts both
+    the bare paths gunicorn has always served (/health, /v1/...) and the
+    /api-prefixed paths every client uses (/api/health, /api/v1/...). This is
+    what lets one process serve UI + API with no nginx at all."""
+
+    def __init__(self, wsgi_app):
+        self.wsgi_app = wsgi_app
+
+    def __call__(self, environ, start_response):
+        path = environ.get("PATH_INFO", "")
+        if path == "/api" or path.startswith("/api/"):
+            environ["PATH_INFO"] = path[len("/api"):] or "/"
+        return self.wsgi_app(environ, start_response)
+
+
+def _ui_dist_dir() -> str | None:
+    """Where the built UI lives, if anywhere.
+
+    HUGPY_UI_DIST (env or .env) wins; otherwise look for a sibling ui/dist
+    next to the api tree (the repo layout: <root>/api/api + <root>/ui/dist).
+    Returns None when there is no build — API-only mode, nothing changes."""
+    explicit = os.environ.get("HUGPY_UI_DIST")
+    if not explicit:
+        try:
+            from abstract_hugpy_dev.imports.src.standalone_utils import get_env_value
+            explicit = get_env_value("HUGPY_UI_DIST")
+        except Exception:
+            explicit = None
+    candidates = [explicit] if explicit else []
+    here = os.path.dirname(os.path.abspath(__file__))   # <pkg>/flask_app
+    # Packaged console: hugpy/console_dist ships inside the wheel, so a bare
+    # `pip install hugpy && hugpy serve` includes the UI.
+    candidates.append(os.path.join(os.path.dirname(here), "console_dist"))
+    # Dev checkout layout: <tree>/{api/<pkg>/flask_app, ui/dist}. From `here`
+    # (<pkg>/flask_app) the tree root is three parents up: flask_app -> <pkg> ->
+    # api -> <tree>.
+    tree_root = os.path.abspath(os.path.join(here, "..", "..", ".."))
+    candidates.append(os.path.join(tree_root, "ui", "dist"))
+    for cand in candidates:
+        if cand and os.path.isfile(os.path.join(cand, "index.html")):
+            return cand
+    return None
+
+
+def _mount_ui(app, dist_dir: str) -> None:
+    """Serve the built SPA: real files from dist, everything else (deep links
+    like /login) falls back to index.html. API rules are explicit routes, so
+    Werkzeug always prefers them over this converter catch-all."""
+
+    @app.route("/", defaults={"asset": ""})
+    @app.route("/<path:asset>")
+    def _hugpy_ui(asset):
+        target = os.path.join(dist_dir, asset)
+        if asset and os.path.isfile(target):
+            return send_from_directory(dist_dir, asset)
+        # The media-intelligence arm is a separate SPA shipped at media/ inside
+        # the same dist (console_dist/media/*). Its assets are real files (served
+        # above); its deep links (/media, /media/foo) must fall back to the arm's
+        # OWN index.html, not the console SPA's — mirrors the webpack devServer
+        # historyApiFallback rewrite that keeps the dev path working.
+        if (asset == "media" or asset.startswith("media/")) and os.path.isfile(
+            os.path.join(dist_dir, "media", "index.html")
+        ):
+            return send_from_directory(os.path.join(dist_dir, "media"), "index.html")
+        return send_from_directory(dist_dir, "index.html")
+
+
+def get_hugpy_flask(name=None,allowed_origins=None,debug=False):
+    name = name or "hugpy_flask"
+    # Tighten CORS for the public deployment: an explicit allowlist beats the
+    # reflect-any default on a credentialed API. Comma-separated origins in
+    # HUGPY_ALLOWED_ORIGINS; unset keeps prior behavior (same-origin UI calls
+    # don't use CORS, so this only constrains cross-origin browser callers).
+    if allowed_origins is None:
+        _ao = (os.environ.get("HUGPY_ALLOWED_ORIGINS") or "").strip()
+        if _ao:
+            allowed_origins = [o.strip() for o in _ao.split(",") if o.strip()]
+    app = get_Flask_app(
+        name=name,
+        routes=routes,
+        allowed_origins=allowed_origins,
+        debug=debug
+    )
+    # Bound request bodies so /uploads (and any POST) can't be an unbounded
+    # memory/disk DoS. Generous default (100 MB); override via HUGPY_MAX_UPLOAD_MB.
+    try:
+        _mb = float(os.environ.get("HUGPY_MAX_UPLOAD_MB", "100"))
+        app.config["MAX_CONTENT_LENGTH"] = int(_mb * 1024 * 1024)
+    except (TypeError, ValueError):
+        pass
+    # Dual-mount the worker/model routes under /api as well.
+    #
+    # gunicorn serves these at /llm/... and /models; the /api prefix the worker
+    # uses exists ONLY because the public nginx (hugpy.ai) strips it. A worker
+    # that reaches central directly — e.g. over WireGuard at http://<wg-ip>:7002,
+    # bypassing nginx — would 404 on its /api/llm/... calls. Registering the
+    # blueprint again under /api makes /api/llm/workers/* and /api/llm/models/*
+    # resolve on gunicorn itself, so the direct (proxy-less) route works
+    # identically to the nginx route. The original /llm/... mount is untouched.
+    try:
+        app.register_blueprint(worker_bp, url_prefix="/api", name="worker_bp_api")
+    except (ValueError, AssertionError):
+        # Idempotent: already mounted on this app instance.
+        pass
+
+    # Same /api dual-mount for the phone-brick pool: phones register, heartbeat,
+    # and fetch seeded images by reaching gunicorn directly over the VPN.
+    try:
+        app.register_blueprint(phone_brick_bp, url_prefix="/api", name="phone_brick_bp_api")
+    except (ValueError, AssertionError):
+        pass
+
+    # Same /api dual-mount for Discord bindings: the hugpy bot reaches central
+    # directly (resolve a model for a channel/user, drain the outbox) and may
+    # bypass nginx, so these must resolve on gunicorn itself too.
+    try:
+        app.register_blueprint(discord_bp, url_prefix="/api", name="discord_bp_api")
+    except (ValueError, AssertionError):
+        pass
+
+    # Optional: mount the media_intelligence HTTP bridge at /media/analyze.
+    #
+    # The chat's media-intelligence path (ui mediaIntelligence.ts -> tryServerBridge)
+    # POSTs {file:<upload ref>, kind, source:<filename>} to /api/media/analyze. nginx
+    # (and ApiPrefixMiddleware) strips the /api, so the route registered IN Flask is
+    # /media/analyze. The bridge runs the media_intelligence MediaPipeline and returns
+    # ONE typed DocumentIntelligence record ({ok, result:{...}}) — instead of the UI
+    # orchestrating the per-task /ml/* endpoints itself.
+    #
+    # ADDITIVE + FAULT-TOLERANT: media_intelligence (and its [bridge] extra, Flask) is
+    # an OPTIONAL dependency that is NOT part of the hugpy wheel. If it isn't installed
+    # in the venv, log and skip — the app must always boot. This stays hugpy's own arm;
+    # the @hugpy/console PTY boundary is untouched.
+    #
+    # Contract: the bridge accepts {"file": <handle>} and maps it via resolve_file —
+    # the one host-specific seam. The UI's `file` is whatever POST /uploads returned,
+    # which today is the absolute path under UPLOADS_HOME (UploadUtils falls back to
+    # `path` when the server emits no opaque id), and may be a bare id later. _resolve_upload
+    # accepts EITHER form and jails it under the storage root (same jail as
+    # functions.media_extract), so this can never become an arbitrary-file-read.
+    try:
+        from media_intelligence.bridge import build_blueprint as _build_media_bridge
+
+        def _resolve_upload(handle):
+            if not handle:
+                return None
+            from abstract_hugpy_dev.imports.src.constants.constants import (
+                UPLOADS_HOME, DEFAULT_ROOT,
+            )
+            cand = handle if os.path.isabs(handle) else os.path.join(
+                UPLOADS_HOME, os.path.basename(handle)
+            )
+            rp = os.path.realpath(cand)
+            roots = [os.path.realpath(r) for r in (UPLOADS_HOME, DEFAULT_ROOT) if r]
+            if not any(rp == root or rp.startswith(root + os.sep) for root in roots):
+                return None  # outside the storage root -> refuse (no arbitrary read)
+            return rp if os.path.isfile(rp) else None
+
+        app.register_blueprint(_build_media_bridge(resolve_file=_resolve_upload))
+    except ImportError as _exc:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "media_intelligence bridge not mounted (optional dep missing): %s", _exc
+        )
+    except Exception as _exc:
+        import logging as _logging
+        _logging.getLogger(__name__).error(
+            "media_intelligence bridge install failed: %s", _exc
+        )
+
+    # Standalone (distribution) mode: accept /api/* without a proxy, and serve
+    # the built UI when one exists. Both are no-ops in the proxied dev/prod
+    # topology (nginx already strips /api; webpack serves the UI).
+    app.wsgi_app = ApiPrefixMiddleware(app.wsgi_app)
+    dist_dir = _ui_dist_dir()
+    if dist_dir:
+        _mount_ui(app, dist_dir)
+    # Server-side operator auth gate on console-side management routes. Inert
+    # until HUGPY_AUTH_MODE=external (or HUGPY_OPERATOR_TOKEN is set), so this
+    # is safe to deploy and verify before activation.
+    try:
+        from .app.operator_auth import install_operator_gate
+        install_operator_gate(app)
+    except Exception as _exc:
+        import logging as _logging
+        _logging.getLogger(__name__).error("operator gate install failed: %s", _exc)
+    return app

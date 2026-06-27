@@ -1,0 +1,793 @@
+"""GPU worker registry.
+
+A *worker* is a remote box that runs the standalone worker agent
+(``abstract_hugpy_dev.worker_agent``), exposes an HTTP inference endpoint, and
+joins this central node so its GPU(s) can serve one or more models from the
+manifest.
+
+This module is the single source of truth for the pool. It owns:
+
+    - persistence of the worker list to a JSON file beside the model manifest
+      (so the pool survives restarts),
+    - registration / heartbeat / removal,
+    - model assignment (which worker may serve which model_key),
+    - liveness (a worker is ``online`` only if it has heartbeat-ed recently),
+    - selection (pick an online worker that is assigned + ready for a model).
+
+Routing (chat/streaming) and the ``/llm/workers`` routes are dumb consumers of
+the functions exported here.
+"""
+from __future__ import annotations
+
+import os
+import json
+import time
+import uuid
+import threading
+from contextlib import contextmanager
+from typing import Any, Dict, List, Optional
+
+try:
+    import fcntl  # POSIX advisory file locks — cross-process coordination.
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    fcntl = None
+
+from .schemas import settings
+
+
+def _default_workers_path() -> str:
+    """Sit the worker registry next to the model manifest (…/projects/)."""
+    return os.path.join(os.path.dirname(settings.manifest_path), "workers.json")
+
+
+# A worker that hasn't checked in within this window is considered offline.
+HEARTBEAT_TIMEOUT_SECONDS = 45.0
+
+
+def tracked_pkg_name() -> str:
+    """Distribution name workers track + central reports its version of.
+
+    Must match the worker's ``--pkg-name`` (``WORKER_PKG_NAME``). Default is the
+    dev distribution.
+    """
+    return os.environ.get("HUGPY_PKG_NAME", "abstract_hugpy_dev")
+
+
+def required_pkg_version() -> Optional[str]:
+    """The dev package version central wants every worker to be running.
+
+    Advertised back to workers in every register/heartbeat response. Resolution
+    order:
+      1. ``HUGPY_REQUIRED_PKG_VERSION`` env (explicit pin), then
+      2. a ``required_pkg_version`` file beside the manifest, then
+      3. **central's own installed version** of the tracked dist.
+
+    (3) is the zero-config path: the existing deploy (`pip install -U
+    <dist>` on central) becomes the signal — workers converge to whatever
+    version central is itself running. ``None`` (dist not installed, no override)
+    means "not managing versions" and workers never self-update.
+    """
+    env = os.environ.get("HUGPY_REQUIRED_PKG_VERSION")
+    if env and env.strip():
+        # Explicit operator pin — honored verbatim, INCLUDING a PEP 440 local
+        # ("+build") version, for a fleet deliberately set up to install from
+        # central's private --pkg-index.
+        return env.strip()
+
+    # The file/installed fallbacks must resolve to a PUBLICLY installable version.
+    # A local version (contains "+", e.g. "0.1.51+c8b13590d") only exists on
+    # central's private index; advertising one to the common PyPI-based worker
+    # makes its self-update fail on a version pip can't find (rc=1 every
+    # heartbeat) and would force a downgrade off a newer public release. So a
+    # local fallback version means "not managing versions" → workers stay put.
+    def _public(v: Optional[str]) -> Optional[str]:
+        return v if (v and "+" not in v) else None
+
+    path = os.environ.get("HUGPY_REQUIRED_PKG_VERSION_FILE") or \
+        os.path.join(os.path.dirname(settings.manifest_path), "required_pkg_version")
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            pinned = fh.read().strip()
+        if pinned:
+            return _public(pinned)
+    except OSError:
+        pass
+    # Do NOT auto-derive a pin from central's own installed version. That dev
+    # build is frequently a local "+build" (e.g. 0.1.41+phone5) that PyPI workers
+    # can't install, and even a clean value would silently downgrade a worker on
+    # a newer public release. Version management is therefore OPT-IN: set a clean
+    # public version via HUGPY_REQUIRED_PKG_VERSION or the required_pkg_version
+    # file. Otherwise central does not manage worker versions (workers stay put).
+    return None
+
+
+def pkg_index_dir() -> str:
+    """Directory of built wheels that central serves as a PEP-503 simple index.
+
+    The ``sync.trigger`` build drops the freshly-built dev wheel here. Override
+    with ``HUGPY_PKG_INDEX_DIR``; defaults to a ``pip_index`` dir beside the
+    model manifest.
+    """
+    return os.environ.get("HUGPY_PKG_INDEX_DIR") or \
+        os.path.join(os.path.dirname(settings.manifest_path), "pip_index")
+
+
+def _now() -> float:
+    return time.time()
+
+
+def _is_online(worker: Dict[str, Any]) -> bool:
+    last = worker.get("last_seen") or 0
+    return (_now() - last) <= HEARTBEAT_TIMEOUT_SECONDS
+
+
+def _public_view(worker: Dict[str, Any]) -> Dict[str, Any]:
+    """The shape returned to API callers — derived ``status`` included.
+
+    ``status`` is *liveness* (online/offline from last_seen). ``admission`` is the
+    operator gate (pending/approved/blocked) and is independent of liveness. Rows
+    written before the admission feature have no ``admission`` key; they are
+    grandfathered to ``approved`` here so an existing fleet keeps serving.
+    """
+    return {
+        **worker,
+        "status": "online" if _is_online(worker) else "offline",
+        "admission": worker.get("admission", "approved"),
+    }
+
+
+def _engine_unusable(worker: Dict[str, Any]) -> bool:
+    """True only when a worker EXPLICITLY reports it has no inference engine.
+
+    Workers that don't report engine status (older agents) are assumed capable,
+    so this never excludes a pre-feature fleet — it only skips a worker that
+    affirmatively says ``engine.installed == False`` (e.g. llama-cpp missing),
+    which would otherwise be picked and fail every request.
+    """
+    eng = worker.get("engine")
+    return isinstance(eng, dict) and eng.get("installed") is False
+
+
+def _has_usable_gpu(worker: Dict[str, Any]) -> bool:
+    """Whether the worker advertises a GPU with free VRAM (for efficiency ranking)."""
+    return any((g.get("memory_free") or 0) > 0 for g in (worker.get("gpus") or []))
+
+
+def _match_keys(model_key: str) -> set:
+    """Normalized aliases a model might be named by, for tolerant matching.
+
+    A model can be referenced as its registry key, its hub_id (owner/name), or
+    just the trailing name — and with different case. We compare on the set of
+    these forms so an assignment made via one spelling still routes a chat that
+    uses another. Example: "Qwen/Qwen2.5-Coder-3B-Instruct-GGUF",
+    "Qwen2.5-Coder-3B-Instruct-GGUF" and the lowercased variants all match.
+    """
+    if not model_key:
+        return set()
+    raw = str(model_key).strip()
+    forms = {raw, raw.lower()}
+    tail = raw.split("/")[-1]
+    forms.add(tail)
+    forms.add(tail.lower())
+    return forms
+
+
+class WorkerStore:
+    """Disk-authoritative, multi-process-safe registry of GPU workers.
+
+    Under gunicorn/uwsgi the API runs as several processes, so an in-memory
+    dict would split-brain: a worker registered in process A would be invisible
+    to a heartbeat or chat request handled by process B (the classic symptom is
+    "registers + shows in the UI, but heartbeats 410 and chats never offload").
+
+    To avoid that, ``workers.json`` is the single source of truth: every read
+    re-loads it, and every mutation takes an exclusive ``fcntl`` lock, reloads,
+    mutates, and writes back atomically. A short-lived in-process RLock just
+    keeps threads within one process from racing the same fd.
+    """
+
+    # Read-cache TTL: the console polls /llm/workers every ~10s; without this
+    # every poll does an open+flock+read of workers.json, which BLOCKS on a
+    # degraded mount and stalls the API. Reads serve from cache within the TTL;
+    # writes always go to disk and refresh the cache, so liveness stays correct.
+    _READ_TTL = 3.0
+
+    def __init__(self, path: Optional[str] = None) -> None:
+        self._path = path or _default_workers_path()
+        self._lock = threading.RLock()
+        self._cache: Optional[Dict[str, Dict[str, Any]]] = None
+        self._cache_at = 0.0
+        self._ensure_parent()
+
+    # -- persistence (disk-authoritative) ----------------------------------
+    def _ensure_parent(self) -> None:
+        parent = os.path.dirname(self._path)
+        if parent:
+            try:
+                os.makedirs(parent, exist_ok=True)
+            except OSError:
+                pass
+
+    def _read_unlocked(self, fh=None) -> Dict[str, Dict[str, Any]]:
+        """Parse the workers map from an open fh, or from disk if none given.
+
+        A non-empty file that fails to parse is treated as CORRUPTION, not as an
+        empty registry: we log and re-raise rather than return {}. Otherwise a
+        torn write (this unit restarts often) would be silently 'healed' into an
+        empty fleet, and the next write would persist that empty set — wiping
+        every worker. Absent/empty files still return {} (normal cold start).
+        """
+        try:
+            if fh is not None:
+                fh.seek(0)
+                raw = fh.read()
+            elif os.path.exists(self._path):
+                with open(self._path, "r", encoding="utf-8") as f:
+                    raw = f.read()
+            else:
+                return {}
+        except OSError:
+            return {}
+        if not raw.strip():
+            return {}
+        try:
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                raise ValueError("workers registry root is not a JSON object")
+            return {w["id"]: w for w in data.get("workers", []) if w.get("id")}
+        except (ValueError, KeyError) as exc:
+            import logging as _logging
+            _logging.getLogger(__name__).error(
+                "workers registry %s is unparseable (%d bytes) — refusing to treat "
+                "as empty; leaving the file intact for recovery (%s)",
+                self._path, len(raw), exc,
+            )
+            raise
+
+    def _write_unlocked(self, fh, workers: Dict[str, Dict[str, Any]]) -> None:
+        """Overwrite the open, locked fh with the workers map."""
+        payload = json.dumps({"workers": list(workers.values())}, indent=2)
+        fh.seek(0)
+        fh.truncate()
+        fh.write(payload)
+        fh.flush()
+        try:
+            os.fsync(fh.fileno())
+        except OSError:
+            pass
+
+    def _load(self) -> Dict[str, Dict[str, Any]]:
+        """Read-only snapshot of the registry, cached for a few seconds.
+
+        Polls (list/get/pick) hit this; the cache keeps a hung/slow mount from
+        blocking every request. Writes refresh the cache, so freshly-registered
+        or reassigned workers are visible immediately to the writing process.
+        """
+        now = time.time()
+        with self._lock:
+            if self._cache is not None and (now - self._cache_at) < self._READ_TTL:
+                return self._cache
+            try:
+                data = self._read_unlocked()
+            except (ValueError, KeyError):
+                # Corrupt on-disk file: don't crash polls — serve the last good
+                # snapshot if we have one (the error is already logged).
+                if self._cache is not None:
+                    return self._cache
+                raise
+            self._cache = data
+            self._cache_at = now
+            return data
+
+    @contextmanager
+    def _transaction(self):
+        """Yield the on-disk workers map under an exclusive cross-process lock.
+
+        Reload -> mutate (caller) -> persist. The yielded dict is written back
+        when the block exits without raising. Falls back to a plain in-process
+        critical section when ``fcntl`` is unavailable.
+        """
+        with self._lock:
+            self._ensure_parent()
+            # Open r+ (create if missing) so we hold one fd for lock+read+write.
+            fd = os.open(self._path, os.O_RDWR | os.O_CREAT, 0o644)
+            fh = os.fdopen(fd, "r+", encoding="utf-8")
+            try:
+                if fcntl is not None:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+                workers = self._read_unlocked(fh)
+                yield workers
+                self._write_unlocked(fh, workers)
+                # Refresh the read-cache so this process sees its own write
+                # immediately (and other processes within the TTL).
+                self._cache = workers
+                self._cache_at = time.time()
+            finally:
+                try:
+                    if fcntl is not None:
+                        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                finally:
+                    fh.close()
+
+    # -- registration / lifecycle ------------------------------------------
+    def register(
+        self,
+        *,
+        name: str,
+        url: str,
+        gpus: Optional[List[Dict[str, Any]]] = None,
+        role: str = "worker",
+        models: Optional[List[str]] = None,
+        worker_id: Optional[str] = None,
+        pkg_version: Optional[str] = None,
+        rpc_endpoint: Optional[str] = None,
+        free_ram: Optional[int] = None,
+        engine: Optional[Dict[str, Any]] = None,
+        pool: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Add a worker (or re-register an existing one by id/url).
+
+        Re-registration is keyed first on the supplied ``worker_id``, then on
+        ``url`` — so an agent that restarts and advertises the same URL keeps
+        its assignments instead of creating a duplicate row.
+        """
+        url = (url or "").rstrip("/")
+        with self._transaction() as workers:
+            existing = None
+            if worker_id and worker_id in workers:
+                existing = workers[worker_id]
+            else:
+                for w in workers.values():
+                    if w.get("url") == url:
+                        existing = w
+                        break
+
+            if existing is not None:
+                # Grandfather pre-feature rows to approved; never silently revive a
+                # blocked worker (the route refuses it, but don't let a re-register
+                # flip it back to serving).
+                existing.setdefault("admission", "approved")
+                existing.update(
+                    name=name or existing.get("name"),
+                    url=url or existing.get("url"),
+                    gpus=gpus if gpus is not None else existing.get("gpus", []),
+                    role=role or existing.get("role", "worker"),
+                    last_seen=_now(),
+                )
+                if models is not None:
+                    existing["models"] = sorted(set(models))
+                if pkg_version is not None:
+                    existing["pkg_version"] = pkg_version
+                if rpc_endpoint is not None:
+                    existing["rpc_endpoint"] = rpc_endpoint
+                if free_ram is not None:
+                    existing["free_ram"] = free_ram
+                if engine is not None:
+                    existing["engine"] = engine
+                # Only a NON-EMPTY declared pool re-asserts on re-register, so an
+                # operator-set pool isn't wiped by a worker that doesn't declare
+                # WORKER_POOL (which sends ""). Declaring workers still win.
+                if pool and pool.strip():
+                    existing["pool"] = pool.strip()
+                return _public_view(existing)
+
+            wid = worker_id or uuid.uuid4().hex
+            worker = {
+                "id": wid,
+                "name": name or wid,
+                "url": url,
+                "role": role or "worker",
+                "gpus": gpus or [],
+                "models": sorted(set(models or [])),
+                "pkg_version": pkg_version,
+                "rpc_endpoint": rpc_endpoint,
+                "free_ram": free_ram,
+                "engine": engine,
+                # Dedicated-pool label. "" = general pool. A pooled worker serves
+                # ONLY requests tagged for its pool (reserved capacity); general
+                # traffic never lands on it. See workers_for_model.
+                "pool": (pool or "").strip(),
+                # New workers land pending: they appear in the console but do not
+                # serve traffic until an operator admits them (approval-required).
+                "admission": "pending",
+                "created_at": _now(),
+                "last_seen": _now(),
+            }
+            workers[wid] = worker
+            return _public_view(worker)
+
+    def heartbeat(
+        self,
+        worker_id: str,
+        *,
+        gpus: Optional[List[Dict[str, Any]]] = None,
+        loaded_models: Optional[List[str]] = None,
+        provisioning: Optional[List[str]] = None,
+        provision_progress: Optional[Dict[str, Any]] = None,
+        spill: Optional[Dict[str, Any]] = None,
+        url: Optional[str] = None,
+        pkg_version: Optional[str] = None,
+        role: Optional[str] = None,
+        rpc_endpoint: Optional[str] = None,
+        free_ram: Optional[int] = None,
+        engine: Optional[Dict[str, Any]] = None,
+        pool: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Mark a worker alive and refresh its live GPU / loaded-model stats."""
+        with self._transaction() as workers:
+            worker = workers.get(worker_id)
+            if worker is None:
+                return None
+            worker["last_seen"] = _now()
+            if url:
+                worker["url"] = url.rstrip("/")
+            if gpus is not None:
+                worker["gpus"] = gpus
+            if loaded_models is not None:
+                worker["loaded_models"] = loaded_models
+            if provisioning is not None:
+                worker["provisioning"] = provisioning
+            if provision_progress is not None:
+                worker["provision_progress"] = provision_progress
+            if spill is not None:
+                worker["spill"] = spill
+            if pkg_version is not None:
+                worker["pkg_version"] = pkg_version
+            if role is not None:
+                worker["role"] = role
+            if rpc_endpoint is not None:
+                worker["rpc_endpoint"] = rpc_endpoint
+            if free_ram is not None:
+                worker["free_ram"] = free_ram
+            if engine is not None:
+                worker["engine"] = engine
+            if pool and pool.strip():   # non-empty only — see register() note
+                worker["pool"] = pool.strip()
+            return _public_view(worker)
+
+    def remove(self, worker_id: str) -> bool:
+        with self._transaction() as workers:
+            return workers.pop(worker_id, None) is not None
+
+    def set_pool(self, worker_id: str, pool: str) -> Optional[Dict[str, Any]]:
+        """Operator override of a worker's dedicated pool ("" clears). Survives
+        heartbeats from workers that don't declare WORKER_POOL (they send "",
+        which the register/heartbeat guards ignore)."""
+        with self._transaction() as workers:
+            worker = workers.get(worker_id)
+            if worker is None:
+                return None
+            worker["pool"] = (pool or "").strip()
+            return _public_view(worker)
+
+    _ADMISSION_STATES = ("pending", "approved", "blocked")
+
+    def set_admission(self, worker_id: str, state: str) -> Optional[Dict[str, Any]]:
+        """Set a worker's admission gate (pending/approved/blocked).
+
+        ``approved`` lets it serve; ``pending`` parks it (visible, idle);
+        ``blocked`` evicts it — the register/heartbeat routes refuse a blocked
+        worker so its agent stops instead of respawning. Persisted, so the gate
+        survives the worker's next heartbeat (unlike ``remove``, which a heartbeat
+        would undo).
+        """
+        if state not in self._ADMISSION_STATES:
+            raise ValueError(f"admission must be one of {self._ADMISSION_STATES}")
+        with self._transaction() as workers:
+            worker = workers.get(worker_id)
+            if worker is None:
+                return None
+            worker["admission"] = state
+            return _public_view(worker)
+
+    # -- model assignment ---------------------------------------------------
+    def assign_model(
+        self,
+        worker_id: str,
+        model_key: str,
+        spill: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Assign a model to a worker, with optional per-assignment spill config.
+
+        ``spill`` is an opaque dict of GPU/CPU knobs (e.g. n_gpu_layers,
+        gpu_mem_gib, cpu_mem_gib) the worker applies when it loads the model.
+        Omitted / None means "use the worker's autofit default."
+        """
+        with self._transaction() as workers:
+            worker = workers.get(worker_id)
+            if worker is None:
+                return None
+            models = set(worker.get("models", []))
+            models.add(model_key)
+            worker["models"] = sorted(models)
+            if spill is not None:
+                by_model = worker.setdefault("spill_by_model", {})
+                # An empty dict clears any override back to autofit.
+                if spill:
+                    by_model[model_key] = spill
+                else:
+                    by_model.pop(model_key, None)
+            return _public_view(worker)
+
+    def unassign_model(self, worker_id: str, model_key: str) -> Optional[Dict[str, Any]]:
+        with self._transaction() as workers:
+            worker = workers.get(worker_id)
+            if worker is None:
+                return None
+            worker["models"] = sorted(set(worker.get("models", [])) - {model_key})
+            worker.get("spill_by_model", {}).pop(model_key, None)
+            return _public_view(worker)
+
+    def spill_for(self, worker_id: str, model_key: str) -> Dict[str, Any]:
+        """Per-assignment spill override for (worker, model), or {} for autofit."""
+        worker = self._load().get(worker_id)
+        if worker is None:
+            return {}
+        return dict(worker.get("spill_by_model", {}).get(model_key, {}))
+
+    # -- queries ------------------------------------------------------------
+    def get(self, worker_id: str) -> Optional[Dict[str, Any]]:
+        worker = self._load().get(worker_id)
+        return _public_view(worker) if worker else None
+
+    def all(self) -> List[Dict[str, Any]]:
+        return [_public_view(w) for w in self._load().values()]
+
+    def workers_for_model(self, model_key: str, *, online_only: bool = True,
+                          pool: Optional[str] = None) -> List[Dict[str, Any]]:
+        wanted = _match_keys(model_key)
+        want_pool = (pool or "").strip()
+        out = []
+        for w in self.all():
+            # Only admitted workers serve. Pending (awaiting operator approval) and
+            # blocked workers are never picked for inference, even if assigned.
+            if w.get("admission") != "approved":
+                continue
+            # Capability guard: skip a worker that reports no inference engine —
+            # it would accept the dispatch and fail, wasting a hop before the
+            # local fallback. (Workers not reporting engine status are kept.)
+            if _engine_unusable(w):
+                continue
+            # Dedicated-pool reservation: a request for pool P uses ONLY pool-P
+            # workers; a general request (no pool) uses ONLY un-pooled workers.
+            # So dedicated capacity is reserved for its app and never consumed by
+            # general traffic — and a pool request that finds no pool worker
+            # falls back to local (caller's None handling), not to the shared pool.
+            if (w.get("pool") or "").strip() != want_pool:
+                continue
+            assigned = w.get("models", [])
+            # Match on the raw key OR any normalized alias (hub_id vs key vs
+            # case), so an assignment made via one form still routes a chat that
+            # names the model a slightly different way.
+            if not (model_key in assigned or wanted & {a for m in assigned for a in _match_keys(m)}):
+                continue
+            if online_only and w["status"] != "online":
+                continue
+            out.append(w)
+        return out
+
+    def pick_for_model(self, model_key: str, pool: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Choose an online worker to serve ``model_key`` (optionally within a
+        dedicated ``pool``).
+
+        Preference order:
+            1. workers that already report the model as loaded (warm),
+            2. otherwise the least-recently-picked online assignee.
+
+        Returns ``None`` when no online worker (in the requested pool) is assigned
+        to the model, which signals the caller to fall back to local execution.
+        """
+        candidates = self.workers_for_model(model_key, online_only=True, pool=pool)
+        if not candidates:
+            # Fall back to assigned workers even with a stale heartbeat. Heartbeat
+            # (worker->central) can time out when central is briefly slow, while
+            # offload (central->worker) still works — so an assigned worker that
+            # looks "offline" is often still serviceable. The stream proxy fails
+            # fast to local if the worker is genuinely unreachable.
+            candidates = self.workers_for_model(model_key, online_only=False, pool=pool)
+        if not candidates:
+            return None
+
+        # Version gate (soft): prefer workers running central's required package
+        # version, so a chat doesn't land on a worker mid-rollout that's still on
+        # old code. Soft — if NONE have converged yet, we still serve from the
+        # (stale-but-working) assignees rather than forcing a local-only outage
+        # during the ~heartbeat-long update window.
+        required = required_pkg_version()
+        if required:
+            matched = [w for w in candidates if w.get("pkg_version") == required]
+            if matched:
+                candidates = matched
+
+        # Efficiency-aware ranking (capability already filtered above). Prefer,
+        # in order: a worker that already has the model warm (avoids a multi-GB
+        # reload), then one with a usable GPU over CPU-only, then the
+        # least-recently-picked (spreads load). Stable id tiebreak so the order
+        # never wobbles. (Full need-vs-capacity placement is the allocator's job;
+        # this is the lightweight default pick.)
+        def _rank(w: Dict[str, Any]):
+            warm = model_key in (w.get("loaded_models") or [])
+            return (0 if warm else 1,
+                    0 if _has_usable_gpu(w) else 1,
+                    w.get("last_picked", 0),
+                    w.get("id", ""))
+        candidates.sort(key=_rank)
+        chosen = candidates[0]
+
+        # Persist the pick so round-robin survives across processes.
+        with self._transaction() as workers:
+            stored = workers.get(chosen["id"])
+            if stored is not None:
+                stored["last_picked"] = _now()
+                chosen = stored
+        return _public_view(chosen)
+
+
+worker_store = WorkerStore()
+
+
+# Module-level convenience wrappers (mirrors the manifest.py / peers.py style of
+# exposing plain functions for routes to import).
+def register_worker(**kwargs) -> Dict[str, Any]:
+    return worker_store.register(**kwargs)
+
+
+def heartbeat_worker(worker_id: str, **kwargs) -> Optional[Dict[str, Any]]:
+    # kwargs: gpus, loaded_models, spill — all optional, passed straight through.
+    return worker_store.heartbeat(worker_id, **kwargs)
+
+
+def remove_worker(worker_id: str) -> bool:
+    return worker_store.remove(worker_id)
+
+
+def set_worker_admission(worker_id: str, state: str) -> Optional[Dict[str, Any]]:
+    return worker_store.set_admission(worker_id, state)
+
+
+def set_worker_pool(worker_id: str, pool: str) -> Optional[Dict[str, Any]]:
+    return worker_store.set_pool(worker_id, pool)
+
+
+def enroll_required() -> bool:
+    """Whether a valid enrollment token is mandatory to register/heartbeat.
+
+    Default OFF (gradual rollout): tokenless workers may still register, but land
+    ``pending`` like everyone else. Flip ``HUGPY_WORKER_ENROLL_REQUIRED`` truthy
+    once the fleet is re-enrolled to refuse tokenless / revoked workers outright.
+    """
+    return os.environ.get("HUGPY_WORKER_ENROLL_REQUIRED", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def assign_model(worker_id: str, model_key: str,
+                 spill: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    return worker_store.assign_model(worker_id, model_key, spill=spill)
+
+
+def unassign_model(worker_id: str, model_key: str) -> Optional[Dict[str, Any]]:
+    return worker_store.unassign_model(worker_id, model_key)
+
+
+def spill_for(worker_id: str, model_key: str) -> Dict[str, Any]:
+    return worker_store.spill_for(worker_id, model_key)
+
+
+def list_workers() -> List[Dict[str, Any]]:
+    return worker_store.all()
+
+
+def get_worker(worker_id: str) -> Optional[Dict[str, Any]]:
+    return worker_store.get(worker_id)
+
+
+def pick_worker_for_model(model_key: str, pool: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    return worker_store.pick_for_model(model_key, pool=pool)
+
+
+def fleet_snapshot() -> list:
+    """The deterministic allocator's view of the fleet, from the live registry.
+
+    Each worker → a Node with summed free VRAM (across its GPUs), free RAM,
+    rpc_endpoint, and online flag. This snapshot + a task's Need is all the
+    allocator looks at, so the same registry state yields the same placement.
+    """
+    from ......managers.resolvers.allocator import Node
+    nodes = []
+    for w in worker_store.all():
+        gpus = w.get("gpus") or []
+        free_vram = sum(int(g.get("memory_free") or 0) for g in gpus)
+        nodes.append(Node(
+            id=w["id"],
+            free_vram=free_vram,
+            free_ram=int(w.get("free_ram") or 0),
+            rpc_endpoint=w.get("rpc_endpoint"),
+            can_lead=(w.get("role") != "rpc"),   # rpc nodes are backends, not leads
+            online=(w.get("status") == "online"),
+        ))
+    return nodes
+
+
+def plan_placement(bytes_needed: int, *, cpu_ok: bool = False, headroom: float = 1.15):
+    """Deterministically place a task needing ``bytes_needed`` on the live fleet.
+
+    Returns the allocator's Placement (whole / shard / cpu / none). For a 'shard'
+    result, ``placement.rpc_servers`` + ``placement.tensor_split`` are what the
+    lead is handed as a spill override.
+    """
+    from ......managers.resolvers.allocator import Need, allocate
+    return allocate(
+        Need(bytes_needed=int(bytes_needed), cpu_ok=cpu_ok, headroom=headroom),
+        fleet_snapshot(),
+    )
+
+
+def _shard_eligible() -> Dict[str, int]:
+    """Models the operator allows to shard, with a VRAM byte estimate.
+
+    Parsed from ``HUGPY_SHARD_MODELS`` = ``"key:bytes,key2:bytes"`` (bytes may use
+    a ``g``/``gb`` suffix, e.g. ``BigModel:140gb``). A model NOT listed never
+    shards — so this whole path is a no-op until the operator opts a model in.
+    """
+    out: Dict[str, int] = {}
+    for part in os.environ.get("HUGPY_SHARD_MODELS", "").split(","):
+        part = part.strip()
+        if not part or ":" not in part:
+            continue
+        key, _, raw = part.rpartition(":")
+        raw = raw.strip().lower()
+        mult = 2**30 if raw.endswith(("g", "gb")) else 1
+        num = raw.rstrip("gb").strip()
+        try:
+            out[key.strip()] = int(float(num) * mult)
+        except ValueError:
+            continue
+    return out
+
+
+def placement_for_model(model_key: str) -> Optional[Dict[str, Any]]:
+    """Allocator-driven shard placement for the remote.py seam.
+
+    Returns ``{"worker": <lead dict>, "spill": {...}}`` only when ``model_key`` is
+    shard-eligible AND the allocator decides it must shard across the pool; else
+    ``None`` so the caller uses ordinary whole-model routing. The spill carries
+    ``rpc_servers`` + a VRAM-proportional ``tensor_split`` + ``n_gpu_layers=-1``.
+    """
+    elig = _shard_eligible()
+    need = elig.get(model_key) or elig.get(str(model_key).split("/")[-1])
+    if not need:
+        return None
+    placement = plan_placement(need, cpu_ok=False)
+    if placement.kind != "shard":
+        return None
+    lead = get_worker(placement.lead_id)
+    if not lead or not lead.get("url"):
+        return None
+    return {
+        "worker": lead,
+        "spill": {
+            "rpc_servers": ",".join(placement.rpc_servers),
+            "tensor_split": list(placement.tensor_split),
+            "n_gpu_layers": -1,
+        },
+    }
+
+
+# Register this pool's selector with the core router (web -> core — the correct
+# dependency direction). resolve() consults it to offload a (model, task) to a
+# live GPU worker, falling back to local. This module is imported at web-app
+# startup; the standalone worker agent never imports it, so the core router
+# simply runs everything local there (and delegated requests carry _force_local).
+try:
+    from ......managers.resolvers import (
+        set_worker_provider as _set_worker_provider,
+        set_placement_provider as _set_placement_provider,
+    )
+    _set_worker_provider(pick_worker_for_model, spill_for)
+    # Allocator-driven sharding. No-op until a model is opted in via
+    # HUGPY_SHARD_MODELS, so it never affects ordinary routing by default.
+    _set_placement_provider(placement_for_model)
+except Exception as _exc:  # never let registration break importing the pool
+    import logging as _logging
+    _logging.getLogger(__name__).warning("worker provider registration failed: %s", _exc)
