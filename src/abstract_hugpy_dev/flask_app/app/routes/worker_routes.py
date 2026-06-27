@@ -900,6 +900,37 @@ def slots_load():
                     "slots": SlotPool().overview()})
 
 
+@worker_bp.route("/llm/cache", methods=["GET"])
+def cache_status():
+    """SSD hot-cache overview (used/budget/free + cached entries + what's warming)."""
+    from ....managers.serve import model_cache
+    return jsonify(model_cache.status())
+
+
+@worker_bp.route("/llm/cache/warm", methods=["POST"])
+def cache_warm():
+    """Background-warm a model's GGUF onto the SSD cache so its next load is fast.
+    Returns immediately; the copy runs detached (idempotent, single-flight)."""
+    import os as _os
+    from ....managers.serve import model_cache
+    body = request.get_json(silent=True) or {}
+    key = body.get("model_key")
+    if not key:
+        return jsonify({"ok": False, "error": "model_key required"}), 400
+    if not model_cache.enabled():
+        return jsonify({"ok": False, "error": "model cache not enabled on this node"}), 503
+    try:
+        src = _model_file_for(key, get_model_config(key))
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 404
+    if not src or not _os.path.isfile(src):
+        return jsonify({"ok": False, "error": f"no gguf on disk for {key}"}), 404
+    if model_cache.is_complete(src):
+        return jsonify({"ok": True, "already_warm": True, "model_key": key})
+    model_cache._warm_async(src)
+    return jsonify({"ok": True, "warming": True, "model_key": key})
+
+
 @worker_bp.route("/llm/slots/unload", methods=["POST"])
 def slots_unload():
     body = request.get_json(silent=True) or {}
