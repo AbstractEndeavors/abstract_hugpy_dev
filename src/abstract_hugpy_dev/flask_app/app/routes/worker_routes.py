@@ -552,14 +552,17 @@ def workers_load(worker_id):
     reflects residency from the worker's heartbeat (loaded_models), polling
     /llm/workers; if the warm fails, the next inference lazy-loads it anyway.
 
-    Body: {model_key, spill?, force?}. force=true skips the preflight (still
-    bounded by the worker's own limits)."""
+    Body: {model_key, spill?, force?, redownload?}. force=true skips the preflight
+    (still bounded by the worker's own limits). redownload=true first wipes the
+    model's files on the worker and re-pulls them from central before warming —
+    for a corrupt/stale on-disk copy (a plain load only downloads when MISSING)."""
     import httpx
     import threading
 
     raw = request.get_json(silent=True) or {}
     body = AssignRequest(**raw)
     force = bool(raw.get("force"))
+    redownload = bool(raw.get("redownload"))
     if body.model_key not in get_models_dict(dict_return=True):
         abort(404, description="Unknown model key.")
     worker = get_worker(worker_id)
@@ -575,18 +578,27 @@ def workers_load(worker_id):
 
     # passed (or forced/undecided) → assign, then warm in the background
     assign_model(worker_id, body.model_key, spill=body.spill)
-    url = (worker.get("url") or "").rstrip("/") + "/probe/" + body.model_key
+    base = (worker.get("url") or "").rstrip("/")
+    url = base + "/probe/" + body.model_key
 
     def _warm():
         try:
+            if redownload:
+                # Wipe the model's files on the worker + re-pull from central BEFORE
+                # warming. A full download can take minutes, so it rides this same
+                # background thread — the request never blocks.
+                httpx.post(base + "/models/redownload",
+                           json={"model_key": body.model_key}, timeout=3600.0)
             httpx.post(url, timeout=900.0)  # worker loads synchronously; can be slow
         except Exception:
             pass  # best-effort — lazy-load on first inference covers a warm failure
 
     threading.Thread(target=_warm, name=f"warm-{worker_id[:8]}", daemon=True).start()
-    return jsonify({"loaded": "loading", "assigned": True, "preflight": verdict,
-                    "worker": get_worker(worker_id),
-                    "note": "assigned + warming on the worker — watch loaded_models for residency"})
+    note = ("redownloading (wipe + re-pull from central) then warming on the worker"
+            if redownload else
+            "assigned + warming on the worker — watch loaded_models for residency")
+    return jsonify({"loaded": "loading", "assigned": True, "redownload": redownload,
+                    "preflight": verdict, "worker": get_worker(worker_id), "note": note})
 
 
 # ──────────────────────────────────────────────────────────────────────────

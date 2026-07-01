@@ -225,6 +225,35 @@ def model_is_local(model_key: str) -> bool:
         return False
 
 
+def wipe_model(model_key: str) -> bool:
+    """Delete the model's local files so the next provision re-downloads it.
+
+    Used by the `redownload` path: a plain provision only fetches when the model
+    is MISSING (see model_is_local), so refreshing a corrupt/stale copy requires
+    removing it first. Returns True if the path is gone afterwards. Jailed against
+    obviously-wrong targets (root/home/short paths)."""
+    import os
+    import shutil
+    try:
+        from .imports import get_model_path
+        path = get_model_path(model_key)
+    except Exception:
+        return False
+    if not path:
+        return False
+    rp = os.path.realpath(path)
+    if len(rp) < 6 or rp in ("/", os.path.expanduser("~")):
+        return False  # refuse a dangerous target
+    try:
+        if os.path.isdir(rp):
+            shutil.rmtree(rp, ignore_errors=True)
+        elif os.path.exists(rp):
+            os.unlink(rp)
+    except OSError:
+        pass
+    return not os.path.exists(rp)
+
+
 def _local_destination(meta: dict) -> str:
     """Where this file-set should live on the worker (same layout as central)."""
     from .imports import route_destination

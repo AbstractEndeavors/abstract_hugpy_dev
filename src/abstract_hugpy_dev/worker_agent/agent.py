@@ -674,6 +674,34 @@ def build_app(state: "WorkerState") -> Flask:
             "loaded_models": loaded_model_keys(),
         })
 
+    @app.route("/models/redownload", methods=["POST"])
+    def redownload():
+        # Force a CLEAN re-pull from central: evict from VRAM, DELETE the model's
+        # local files, then re-provision (download) it. Body: {"model_key": ...}.
+        # A plain /load only downloads when files are MISSING, so it can't refresh
+        # a corrupt/stale on-disk copy — this can.
+        body = request.get_json(silent=True) or {}
+        model_key = body.get("model_key")
+        if not model_key:
+            return jsonify({"ok": False, "error": "missing model_key"}), 400
+        try:
+            from ..managers.dispatch import evict as _evict
+            from .provision import (
+                wipe_model, ensure_model_present, ensure_model_registered,
+            )
+            try:
+                _evict(model_key)   # drop from VRAM so its files aren't held open
+            except Exception:
+                pass
+            ensure_model_registered(model_key, state.central_url)
+            wiped = wipe_model(model_key)
+            ok = ensure_model_present(model_key, state.central_url)
+            return jsonify({"ok": bool(ok), "wiped": bool(wiped),
+                            "redownloaded": bool(ok), "model_key": model_key,
+                            "loaded_models": loaded_model_keys()})
+        except Exception as exc:
+            return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 500
+
     return app
 
 
