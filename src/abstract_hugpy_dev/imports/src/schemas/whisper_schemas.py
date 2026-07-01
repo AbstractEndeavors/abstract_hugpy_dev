@@ -45,7 +45,9 @@ class TranscribeRequest(BaseModel):
 
     model_key: Optional[str] = None
     pool: Optional[str] = None   # dedicated worker pool (routing); None = general
-    model_size: str = "small"
+    # `base` is the fast-cold-start CPU default and is cached as base.pt in the
+    # openai-whisper .pt store; overridable per-request via this field.
+    model_size: str = "base"
     language: Optional[str] = "english"
     task: Literal["transcribe", "translate"] = "transcribe"
     whisper_model_path: Optional[str] = None

@@ -3,6 +3,7 @@ from ..functions import *
 # Explicit imports so they work regardless of the functions star-export.
 from ....imports.config.models.models_config import (
     prune_model, set_model_media, media_state,
+    media_default_state, set_media_default,
 )
 
 llm_bp, logger = get_bp("llm_bp", __name__)
@@ -30,11 +31,16 @@ def peers():
 @llm_bp.route("/models", methods=["GET"])
 def list_models():
     manifest = get_models_dict(dict_return=True)
+    media_default = media_default_state()
     output = []
     for key, model in manifest.items():
         model = update_model_status(model)
+        mk = model.get("model_key") or key
         # Whether this model is offered in the media-intelligence chat dropdown.
-        model["media"] = media_state(model.get("model_key") or key)
+        model["media"] = media_state(mk)
+        # Whether this model is THE preselected default for the media chat.
+        # Exactly one model carries media_default=True (or none, if unset).
+        model["media_default"] = (mk == media_default)
         output.append(model)
 
     return jsonify(output)
@@ -168,3 +174,22 @@ def set_model_media_route(model_key):
     body = request.get_json(silent=True) or {}
     enabled = body.get("enabled", body.get("media", True))
     return jsonify(set_model_media(model_key, enabled))
+
+
+@llm_bp.route("/models/<model_key>/media-default", methods=["POST"])
+def set_model_media_default_route(model_key):
+    """Set (or clear) the single default media-chat model — the one the media
+    chat dropdown preselects.
+
+    Body: {"default": bool} (defaults to True). default=True makes this model THE
+    default, replacing any previous one; default=False clears it only if this
+    model is the current default. Single global value, persisted server-side
+    (media_default.json) so every client agrees.
+
+    Setting a model as default does NOT require it to be media-enabled."""
+    manifest = get_models_dict(dict_return=True)
+    if model_key not in manifest:
+        abort(404, description="Unknown model key.")
+    body = request.get_json(silent=True) or {}
+    is_default = body.get("default", body.get("enabled", True))
+    return jsonify(set_media_default(model_key, is_default))

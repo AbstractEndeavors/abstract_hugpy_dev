@@ -100,7 +100,7 @@ class DeepCoder:
             "torch_dtype": self.cfg.torch_dtype,
             "local_files_only": self.cfg.local_files_only,
             "low_cpu_mem_usage": True,
-            "trust_remote_code": True,
+            "trust_remote_code": self.cfg.trust_remote_code,  # opt-in; default OFF
         }
 
         if self.cfg.device == "cuda":
@@ -534,7 +534,7 @@ class DeepCoder:
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             tok_src,
-            trust_remote_code=True,
+            trust_remote_code=self.cfg.trust_remote_code,  # opt-in; default OFF
             local_files_only=self.cfg.local_files_only,
             use_fast=True,
         )

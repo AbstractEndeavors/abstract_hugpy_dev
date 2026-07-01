@@ -93,6 +93,32 @@ def torch_cuda_status() -> dict:
         return {"available": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
+def _llama_cpp_supports_vision() -> bool:
+    """Whether this worker's llama.cpp can actually decode images (mtmd).
+
+    True when a multimodal chat handler is importable — the same capability the
+    in-process vision runner needs to load an mmproj projector. Central reads this
+    (engine.supports_vision) and ONLY routes image turns to workers that report it,
+    so an older text-only build is never handed an image to guess at. Without this
+    field a worker is treated as text-only and every vision turn falls back to the
+    central's local engine — even when the worker has the VL model loaded.
+    """
+    try:
+        from llama_cpp import llama_chat_format as _cf
+        for _name in ("Qwen25VLChatHandler", "Llava16ChatHandler",
+                      "Llava15ChatHandler", "MiniCPMv26ChatHandler",
+                      "MoondreamChatHandler"):
+            if hasattr(_cf, _name):
+                return True
+    except Exception:
+        pass
+    try:
+        import llama_cpp.mtmd_cpp  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
 def llama_cpp_cuda_status() -> dict:
     """Whether *llama.cpp* (GGUF backend) was built with GPU offload support.
 
@@ -111,6 +137,7 @@ def llama_cpp_cuda_status() -> dict:
             "installed": True,
             "version": getattr(llama_cpp, "__version__", None),
             "supports_gpu_offload": supports,
+            "supports_vision": _llama_cpp_supports_vision(),
         }
     except Exception as exc:  # noqa: BLE001
         return {"installed": False, "error": f"{type(exc).__name__}: {exc}"}

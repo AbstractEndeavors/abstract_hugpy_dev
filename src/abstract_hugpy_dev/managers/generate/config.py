@@ -29,6 +29,11 @@ class DeepCoderConfig:
     use_quantization: bool = False
     use_flash_attention: bool = False
     local_files_only: bool = DEFAULT_LOCAL_FILES_ONLY
+    # SECURITY: loading a model with custom code (auto_map / modeling_*.py)
+    # EXECUTES the author's Python on load — i.e. arbitrary RCE from an untrusted
+    # HF repo. OFF by default; only ever True via an explicit opt-in (per call, or
+    # the operator switch HUGPY_TRUST_REMOTE_CODE). Never defaults on.
+    trust_remote_code: bool = False
 
     max_new_tokens_cap: int = 16000
 
@@ -44,6 +49,7 @@ class DeepCoderConfig:
             self.use_quantization,
             self.use_flash_attention,
             self.local_files_only,
+            self.trust_remote_code,
             self.max_new_tokens_cap,
             self.cpu_threads,
             self.cpu_interop_threads,
@@ -76,6 +82,7 @@ def build_deepcoder_runtime(
     use_quantization: bool = False,
     use_flash_attention: bool = False,
     local_files_only: bool = True,
+    trust_remote_code: bool = False,
     max_new_tokens_cap: int = 16000,
     max_concurrent_generations: int = 1,
     cpu_threads: Optional[int] = None,
@@ -98,6 +105,14 @@ def build_deepcoder_runtime(
 
     chosen_device, chosen_dtype = pick_device_and_dtype(torch, device, torch_dtype)
 
+    # SECURITY: trust_remote_code lets a model repo run arbitrary Python on load.
+    # Default OFF; True only via an explicit opt-in here OR the operator switch
+    # HUGPY_TRUST_REMOTE_CODE (1/true/yes/on). Never on by default.
+    allow_remote_code = bool(trust_remote_code) or (
+        os.environ.get("HUGPY_TRUST_REMOTE_CODE", "").strip().lower()
+        in ("1", "true", "yes", "on")
+    )
+
     return DeepCoderConfig(
         model_dir=model_dir,
         device=chosen_device,
@@ -105,6 +120,7 @@ def build_deepcoder_runtime(
         use_quantization=use_quantization and chosen_device == "cuda",
         use_flash_attention=use_flash_attention and chosen_device == "cuda",
         local_files_only=local_files_only,
+        trust_remote_code=allow_remote_code,
         max_new_tokens_cap=max_new_tokens_cap,
         max_concurrent_generations=max_concurrent_generations,
         cpu_threads=cpu_threads,

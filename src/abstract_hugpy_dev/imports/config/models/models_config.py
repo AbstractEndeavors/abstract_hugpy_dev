@@ -451,6 +451,56 @@ def set_model_media(model_key, enabled):
     return {"model_key": model_key, "media": enabled}
 
 
+# ---------------------------------------------------------------------------
+# Default media-chat model — the ONE model the media-intelligence chat dropdown
+# preselects. Single global value (a model_key), not per-model. Persisted beside
+# the media allow-flag store (same mechanism: a plain JSON file next to the
+# discovery report) so every client agrees deterministically and it survives a
+# restart. Shape on disk: {"default": "<model_key>"} or {"default": null}.
+# Kept in its OWN file (not merged into media_models.json) so the whole-file
+# rewrites of _save_media / _save_media_default never clobber each other.
+def _media_default_path():
+    return os.path.join(os.path.dirname(MODELS_DISCOVERY_PATH), "media_default.json")
+
+
+def media_default_state():
+    """The currently-stored default media model_key, or None if unset/cleared."""
+    p = _media_default_path()
+    if os.path.isfile(p):
+        data = safe_load_from_json(p)
+        if isinstance(data, dict):
+            val = data.get("default")
+            return val or None
+        if isinstance(data, str):       # tolerate a bare key on disk
+            return data or None
+    return None
+
+
+def set_media_default(model_key, enabled):
+    """Set or clear the single default media model (single-default semantics).
+
+    enabled True  -> make ``model_key`` the default, REPLACING any previous one.
+    enabled False -> clear the default IFF ``model_key`` is the current default
+                     (clearing a non-default key is a no-op, never disturbs the
+                     standing default).
+
+    NOTE: setting a default does NOT require the model to be media-enabled — the
+    caller may flag a model as default independently of its media allow-flag.
+    Returns the resulting state for that key."""
+    enabled = bool(enabled)
+    current = media_default_state()
+    if enabled:
+        new_default = model_key
+    else:
+        new_default = None if current == model_key else current
+    safe_dump_to_file(data={"default": new_default}, file_path=_media_default_path())
+    return {
+        "model_key": model_key,
+        "media_default": new_default == model_key,
+        "default": new_default,
+    }
+
+
 def get_models_dict(models_dict_path=None, dict_return=False, return_dict=False,
                     discovery=None):
     """Build the registry: MODELS + discovery (test downloads).

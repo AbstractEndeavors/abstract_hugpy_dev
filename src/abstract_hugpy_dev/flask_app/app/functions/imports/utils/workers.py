@@ -131,6 +131,7 @@ def _public_view(worker: Dict[str, Any]) -> Dict[str, Any]:
     """
     return {
         **worker,
+        **_vram_summary(worker),
         "status": "online" if _is_online(worker) else "offline",
         "admission": worker.get("admission", "approved"),
     }
@@ -151,6 +152,35 @@ def _engine_unusable(worker: Dict[str, Any]) -> bool:
 def _has_usable_gpu(worker: Dict[str, Any]) -> bool:
     """Whether the worker advertises a GPU with free VRAM (for efficiency ranking)."""
     return any((g.get("memory_free") or 0) > 0 for g in (worker.get("gpus") or []))
+
+
+def _vram_summary(worker: Dict[str, Any]) -> Dict[str, Any]:
+    """Flat, normalized GPU/VRAM rollup derived from the per-GPU ``gpus[]`` list.
+
+    The registry stores VRAM only nested inside ``gpus[]`` (refreshed every
+    heartbeat), so each consumer had to dig — and the worker summary read as
+    "gpu: None" even for a box with a real card. This surfaces a single primary
+    GPU name plus summed totals so the console and a VRAM-fit ("worker slot")
+    allocator can read flat fields, exactly the way the local slot pool reads a
+    flat RAM number. All counts are bytes; ``None`` where unknown (never
+    fabricated — an empty/again-unreported ``gpus`` yields None, not 0).
+    """
+    gpus = [g for g in (worker.get("gpus") or []) if isinstance(g, dict)]
+    if not gpus:
+        return {"gpu": None, "gpu_count": 0, "vram_total": None, "vram_free": None, "vram_used": None}
+    name   = next((g.get("name") for g in gpus if g.get("name")), None)
+    totals = [g.get("memory_total") for g in gpus if g.get("memory_total")]
+    frees  = [g.get("memory_free")  for g in gpus if g.get("memory_free") is not None]
+    vram_total = sum(totals) if totals else None
+    vram_free  = sum(frees)  if frees  else None
+    vram_used  = (vram_total - vram_free) if (vram_total is not None and vram_free is not None) else None
+    return {
+        "gpu": name,
+        "gpu_count": len(gpus),
+        "vram_total": vram_total,
+        "vram_free": vram_free,
+        "vram_used": vram_used,
+    }
 
 
 def _match_keys(model_key: str) -> set:

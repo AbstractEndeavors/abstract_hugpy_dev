@@ -467,6 +467,128 @@ def workers_probe(worker_id):
                         "error": f"{type(exc).__name__}: {exc}"})
 
 
+# ── worker slots: VRAM-fit preflight + load (the GPU analog of /llm/slots) ──
+#
+# The local slot pool refuses a model that won't fit RAM before it OOMs the box
+# (slot_agent._build_cmd preflight). Worker slots do the same against a worker's
+# free VRAM: a cheap, instant central-side reject so a too-big model never even
+# reaches the card. The flat vram_free now on every worker record (_vram_summary)
+# is what makes this a one-line comparison instead of a heavy live probe.
+
+# VRAM need over the raw GGUF size: weights resident on the GPU plus kv-cache /
+# context and CUDA runtime overhead. A need-side multiplier (overhead scales with
+# the model), the VRAM counterpart of the local preflight's 0.95 fill guard.
+VRAM_HEADROOM = float(os.environ.get("HUGPY_VRAM_HEADROOM", "1.15"))
+
+
+def _model_gguf_bytes(model_key):
+    """Total on-disk GGUF size for a model (sums all shards), or None if unknown.
+
+    ``_model_file_for`` and ``_total_gguf_bytes`` are underscore-private, so they
+    are NOT pulled in by ``from .imports import *`` — import them explicitly here
+    (a bare reference would NameError and, caught below, silently read as None)."""
+    try:
+        from ....managers.serve.serve import _model_file_for
+        from ....managers.serve.slot_agent import _total_gguf_bytes
+        src = _model_file_for(model_key, get_model_config(model_key))
+    except Exception:
+        return None
+    if not src:
+        return None
+    try:
+        return _total_gguf_bytes(src)
+    except Exception:
+        return None
+
+
+def _worker_fit(model_key, worker):
+    """Capacity preflight for placing a model on a worker — the GPU analog of the
+    local RAM preflight, but DUAL. A GPU worker holds weights in VRAM and can
+    spill the remainder to host RAM, so a load only truly *fails* when the model
+    exceeds BOTH combined — that's what we block on. Separately we flag whether it
+    fits VRAM outright (``gpu_resident``) vs would partially offload to CPU
+    (slower), so the UI can warn without refusing.
+
+    Why dual: a worker like an 8 GB card on a 16 GB box can't be judged on VRAM
+    alone — a model bigger than VRAM may still load (spilling to RAM), and one
+    bigger than VRAM+RAM can't load at all. ``fit=None`` when the model can't be
+    sized (then we don't block — defer to the live load). All byte counts."""
+    need_raw = _model_gguf_bytes(model_key)
+    vram = worker.get("vram_free")
+    ram = worker.get("free_ram")
+    gib = float(2 ** 30)
+    if need_raw is None:
+        return {"fit": None, "gpu_resident": None, "need": None, "need_raw": None,
+                "vram_free": vram, "ram_free": ram, "reason": "model size unknown — not preflighted"}
+    need = int(need_raw * VRAM_HEADROOM)
+    capacity = (vram or 0) + (ram or 0)
+    fit = (need_raw <= capacity) if capacity else None
+    gpu_resident = (vram is not None) and (need <= vram)
+    where = worker.get("gpu") or "this worker"
+    if fit is False:
+        reason = (f"won't fit {where}: model is {need_raw/gib:.1f} GiB but only "
+                  f"{(vram or 0)/gib:.1f} GiB VRAM + {(ram or 0)/gib:.1f} GiB RAM free "
+                  f"({capacity/gib:.1f} GiB total)")
+    elif fit and not gpu_resident:
+        reason = (f"fits but would partially offload to CPU: needs ~{need/gib:.1f} GiB, "
+                  f"only {(vram or 0)/gib:.1f} GiB VRAM free on {where} — slower than GPU-resident")
+    else:
+        reason = None
+    return {"fit": fit, "gpu_resident": gpu_resident, "need": need, "need_raw": need_raw,
+            "vram_free": vram, "ram_free": ram, "capacity": capacity,
+            "headroom": VRAM_HEADROOM, "reason": reason}
+
+
+@worker_bp.route("/llm/workers/<worker_id>/load", methods=["POST"])
+def workers_load(worker_id):
+    """Place a model on a GPU worker: VRAM preflight → assign → load into VRAM.
+
+    The worker-slot analog of /llm/slots/load. Refuses cleanly (409) when the
+    model won't fit the worker's free VRAM, instead of letting it OOM the card.
+    On a pass it assigns the model (registry) and kicks a best-effort warm on the
+    worker so it becomes GPU-resident. The warm is BACKGROUND: loading a model can
+    take minutes (the worker's /probe loads it synchronously), and the request
+    must not block — the local slot loader is async for the same reason. The UI
+    reflects residency from the worker's heartbeat (loaded_models), polling
+    /llm/workers; if the warm fails, the next inference lazy-loads it anyway.
+
+    Body: {model_key, spill?, force?}. force=true skips the preflight (still
+    bounded by the worker's own limits)."""
+    import httpx
+    import threading
+
+    raw = request.get_json(silent=True) or {}
+    body = AssignRequest(**raw)
+    force = bool(raw.get("force"))
+    if body.model_key not in get_models_dict(dict_return=True):
+        abort(404, description="Unknown model key.")
+    worker = get_worker(worker_id)
+    if worker is None:
+        abort(404, description="Unknown worker id.")
+
+    verdict = _worker_fit(body.model_key, worker)
+    if verdict.get("fit") is False and not force:
+        # `error` so the shared fetchJson surfaces the human reason (it only reads
+        # error/detail/message); `reason`+`preflight` kept for programmatic use.
+        return jsonify({"loaded": False, "error": verdict["reason"],
+                        "reason": verdict["reason"], "preflight": verdict}), 409
+
+    # passed (or forced/undecided) → assign, then warm in the background
+    assign_model(worker_id, body.model_key, spill=body.spill)
+    url = (worker.get("url") or "").rstrip("/") + "/probe/" + body.model_key
+
+    def _warm():
+        try:
+            httpx.post(url, timeout=900.0)  # worker loads synchronously; can be slow
+        except Exception:
+            pass  # best-effort — lazy-load on first inference covers a warm failure
+
+    threading.Thread(target=_warm, name=f"warm-{worker_id[:8]}", daemon=True).start()
+    return jsonify({"loaded": "loading", "assigned": True, "preflight": verdict,
+                    "worker": get_worker(worker_id),
+                    "note": "assigned + warming on the worker — watch loaded_models for residency"})
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Package distribution — central serves the dev wheel as a PEP-503 simple index.
 #

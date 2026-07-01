@@ -187,8 +187,42 @@ def _run_fetch(body: dict):
     return jsonify(result), (200 if result.get("ok") else 400)
 
 
+def _save_multipart_upload():
+    """If this request is a multipart POST carrying a file part, save it under
+    UPLOADS_HOME (exactly like POST /uploads does) and return the server path.
+    Returns None when there's no usable file part.
+
+    The console UI pre-uploads to /uploads and then POSTs JSON {file:<path>};
+    this fallback lets /ml/* also accept a direct multipart file in one shot."""
+    if not request.files:
+        return None
+    f = request.files.get("file") or next(iter(request.files.values()), None)
+    if not f or not f.filename:
+        return None
+    import uuid
+    from werkzeug.utils import secure_filename
+    try:
+        from ..functions import UPLOADS_HOME  # same constant /uploads uses
+    except Exception:
+        UPLOADS_HOME = globals().get("UPLOADS_HOME") or os.path.join(
+            os.environ.get("DEFAULT_ROOT", "/tmp"), "uploads")
+    os.makedirs(UPLOADS_HOME, exist_ok=True)
+    name = f"{uuid.uuid4().hex[:8]}_{secure_filename(f.filename)}"
+    dest = os.path.join(UPLOADS_HOME, name)
+    f.save(dest)
+    return dest
+
+
 def _run_ml(task: str):
     body = request.get_json(silent=True) or {}
+    # Multipart fallback: accept a direct multipart/form-data POST carrying a file
+    # part (in addition to the JSON {file:<server path>} the console sends after
+    # pre-uploading). Save it like /uploads and inject its server path so the
+    # downstream pipeline is identical to the JSON path.
+    if not body and request.files:
+        saved = _save_multipart_upload()
+        if saved is not None:
+            body = {**request.form.to_dict(), "file": saved}
     # Deterministic ingest amenities (read a file / URL) bypass the model resolver.
     if task == "document-extraction":
         return _run_extract(body)

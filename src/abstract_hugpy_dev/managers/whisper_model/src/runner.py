@@ -1,3 +1,4 @@
+import asyncio  # used by run() via asyncio.to_thread; not provided by the star imports
 from .imports import *
 from .model import *
 

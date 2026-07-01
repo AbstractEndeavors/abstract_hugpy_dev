@@ -1,9 +1,9 @@
 from .imports import *
 from .utils import *
-from .model import get_whisper_model
+from .model import get_whisper_model, WHISPER_TRANSCRIBE_LOCK
 def whisper_transcribe(
     audio_path: str,
-    model_size: str = "small",
+    model_size: str = "base",
     language: str | None = "english",
     task: str = "transcribe",
     whisper_model_path: str | None = None,
@@ -24,11 +24,15 @@ def whisper_transcribe(
     if language:
         options["language"] = language
 
-    return model.transcribe(audio_path, **options)
+    # Single-flight: only one CPU inference runs at a time. With no swap on this
+    # box, stacking concurrent transcribes would multiply anon RAM and saturate
+    # the CPU; serializing keeps each request honest.
+    with WHISPER_TRANSCRIBE_LOCK:
+        return model.transcribe(audio_path, **options)
 def transcribe_from_video(
     video_path: str,
     audio_path: str | None = None,
-    model_size: str = "small",
+    model_size: str = "base",
     language: str | None = "english",
     task: str = "transcribe",
     whisper_model_path: str | None = None,
@@ -49,7 +53,7 @@ def transcribe_from_video(
 
 def transcribe_file(
     file_path: str,
-    model_size: str = "small",
+    model_size: str = "base",
     language: str | None = "english",
     task: str = "transcribe",
     whisper_model_path: str | None = None,
@@ -85,7 +89,7 @@ def transcribe_file(
 
 def transcribe_file_with_workspace(
     file_path: str,
-    model_size: str = "small",
+    model_size: str = "base",
     language: str | None = "english",
     task: str = "transcribe",
     whisper_model_path: str | None = None,

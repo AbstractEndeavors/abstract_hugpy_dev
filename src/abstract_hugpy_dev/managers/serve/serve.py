@@ -73,18 +73,25 @@ DEFAULT_LLAMA_THREADS = int(get_env_value("DEFAULT_LLAMA_THREADS") or 6)
 # default for a CUDA-built llama-server); 0 = CPU only; N = first N layers.
 # Without this flag llama-server defaults to CPU — the usual "GPU sits idle".
 DEFAULT_LLAMA_NGL = int(get_env_value("DEFAULT_LLAMA_NGL") or -1)
-# Default always-on serving mechanism, per OS. systemd exists only on Linux; on
-# macOS/Windows (or a Linux box without systemd) the portable `supervised` driver
-# runs each llama-server as a tracked background process instead. Env override
-# still wins.
+# Default serving mechanism for a model with no explicit serve_mode.
+#
+# HISTORY: this defaulted to `systemd` (one always-on unit per model) from an era
+# when a "served model" *was* a local always-on llama-server. That predates the
+# worker fleet + local slot pool: today routing is worker-first (resolve() →
+# DelegatingRunner), then the on-demand slot pool, with a local server only as a
+# fallback. An always-on-systemd default therefore (a) pins CPU/RAM on a possibly
+# GPU-less central for models that workers already serve, and (b) makes the
+# Serving overview report "systemd / always-on" for models that were never
+# installed and aren't running. So the modern default is `swap`: on-demand,
+# slot-first (serve_endpoint still prefers a slot), no pinned unit. An operator
+# who genuinely wants a pinned local unit sets serve_mode=systemd per model, and
+# DEFAULT_SERVE_MODE=<mode> (env) still overrides globally.
 from ..._platform import IS_LINUX as _IS_LINUX
 def _default_serve_mode() -> str:
     explicit = get_env_value("DEFAULT_SERVE_MODE")
     if explicit:
         return explicit
-    if _IS_LINUX and os.path.isdir("/run/systemd/system"):
-        return "systemd"
-    return "supervised"
+    return "swap"
 DEFAULT_SERVE_MODE = _default_serve_mode()
 
 # Deterministic auto-port range for systemd units when a model has no explicit
@@ -218,7 +225,7 @@ class ServeSpec:
     ctx_size: int = DEFAULT_LLAMA_CTX
     threads: int = DEFAULT_LLAMA_THREADS
     n_gpu_layers: int = DEFAULT_LLAMA_NGL
-    always_on: bool = True
+    always_on: bool = False   # modern default: on-demand, not a pinned unit
     ttl_seconds: Optional[int] = None
     user: str = LLAMA_SERVICE_USER
     group: str = LLAMA_SERVICE_GROUP
@@ -282,8 +289,8 @@ def serve_spec_for(model_key=None, *, cfg=None) -> ServeSpec:
         ctx_size=_ctx_for(cfg, model_key, extra),
         threads=int(extra.get("threads") or DEFAULT_LLAMA_THREADS),
         n_gpu_layers=int(extra.get("n_gpu_layers", DEFAULT_LLAMA_NGL)),
-        always_on=bool(extra.get("always_on", True)),
-        ttl_seconds=extra.get("ttl_seconds") or (None if extra.get("always_on", True) else LLAMA_SWAP_TTL),
+        always_on=bool(extra.get("always_on", False)),
+        ttl_seconds=extra.get("ttl_seconds") or (None if extra.get("always_on", False) else LLAMA_SWAP_TTL),
         extra_args=tuple(extra_args),
     )
 
