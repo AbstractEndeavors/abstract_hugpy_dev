@@ -15,7 +15,7 @@ from discord.ext import commands
 from ..config import HISTORY_MAX_TURNS
 from ..hugpy_client import HugpyError
 from ..streamer import MessageStreamer
-from .helpers import forward_attachment, model_autocomplete, model_label
+from .helpers import forward_attachment, model_autocomplete, model_label, clean_model_key
 
 log = logging.getLogger(__name__)
 
@@ -50,7 +50,7 @@ class ChatCog(commands.Cog):
     ) -> None:
         # A console-managed Discord binding for this channel/user wins; otherwise
         # the user's saved pref / configured default (resolved inside the bot).
-        model_key = model_key or await self.bot.resolve_model_for(user_id, channel_id)
+        model_key = clean_model_key(model_key) or await self.bot.resolve_model_for(user_id, channel_id)
         history = list(self._history[channel_id]) if remember else []
         messages = history + [{"role": "user", "content": prompt}]
 

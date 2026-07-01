@@ -3,6 +3,7 @@ non-streaming result delivery."""
 from __future__ import annotations
 
 import io
+import re
 import time
 
 import discord
@@ -29,8 +30,26 @@ async def cached_models(bot) -> list[dict]:
 
 def model_label(model: dict) -> str:
     key = model.get("key") or model.get("name") or "?"
-    status = model.get("status") or ("installed" if model.get("installed") else "")
-    return f"{key} ({status})" if status else key
+    status = (model.get("status") or "").strip()
+    # Surface a status suffix ONLY when it's something other than the ordinary
+    # "installed". An "(installed)" on every model is noise, and — because this
+    # label is what users read in the dropdown / `/models` list — it collides
+    # with the plain model key when the name is typed or copied as input.
+    if status and status.lower() != "installed":
+        return f"{key} ({status})"
+    return key
+
+
+_STATUS_SUFFIX = re.compile(r"\s*\([^)]*\)\s*$")
+
+
+def clean_model_key(s: str | None) -> str | None:
+    """Strip a trailing ' (status)' a user may have copied from a model label
+    (valid model keys never end in a parenthetical), so 'Foo (installed)' still
+    resolves to 'Foo'."""
+    if not s:
+        return s
+    return _STATUS_SUFFIX.sub("", s).strip() or s
 
 
 async def model_autocomplete(
