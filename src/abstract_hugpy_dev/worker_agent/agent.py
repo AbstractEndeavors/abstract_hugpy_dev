@@ -465,6 +465,76 @@ _SPILL_ENV = {
 }
 
 
+# ── operator resource limits (two-tier) ─────────────────────────────────────
+# This box's OWN unit config is the hard ceiling; central may set per-worker
+# limits but they apply only as a TIGHTENING (min of the two). Originals are
+# captured at import so a central limit can be raised again later without
+# being mistaken for local config.
+_CAP_KNOBS = {
+    "ram_max_gib": "HUGPY_RAM_MAX_GIB",
+    "gpu_mem_gib": "HUGPY_GPU_MEM_GIB",
+    "threads": "DEFAULT_LLAMA_THREADS",
+}
+_LOCAL_CAP_ENV = {k: os.environ.get(env) for k, env in _CAP_KNOBS.items()}
+
+
+def _local_caps() -> dict:
+    """The operator-configured ceilings from this box's own config, reported to
+    central so it can only tighten, never exceed them. Reserves ride along for
+    display."""
+    out: dict = {}
+    for key in _CAP_KNOBS:
+        raw = _LOCAL_CAP_ENV.get(key)
+        if raw in (None, ""):
+            continue
+        try:
+            out[key] = int(raw) if key == "threads" else float(raw)
+        except ValueError:
+            continue
+    for key, env in (("ram_reserve_gib", "HUGPY_RAM_RESERVE_GIB"),
+                     ("vram_reserve_gib", "HUGPY_VRAM_RESERVE_GIB")):
+        raw = os.environ.get(env)
+        if raw:
+            try:
+                out[key] = float(raw)
+            except ValueError:
+                pass
+    return out
+
+
+def _apply_central_limits(worker: dict | None) -> None:
+    """Adopt central's per-worker limits as min(central, local config)."""
+    limits = (worker or {}).get("limits") or {}
+    for key, env in _CAP_KNOBS.items():
+        vals = []
+        local_raw = _LOCAL_CAP_ENV.get(key)
+        if local_raw not in (None, ""):
+            try:
+                vals.append(float(local_raw))
+            except ValueError:
+                pass
+        if limits.get(key) is not None:
+            try:
+                vals.append(float(limits[key]))
+            except (TypeError, ValueError):
+                pass
+        if not vals:
+            # Neither side sets it: clear a previously-applied central limit.
+            if local_raw in (None, "") and env in os.environ:
+                os.environ.pop(env, None)
+            continue
+        eff = min(vals)
+        os.environ[env] = str(int(eff)) if key == "threads" else str(eff)
+
+
+def _loaded_detail() -> dict:
+    try:
+        from ..managers.llama.runners.get import loaded_runner_detail
+        return loaded_runner_detail()
+    except Exception:
+        return {}
+
+
 def _apply_spill(spill: dict | None) -> None:
     """Translate a per-request spill override dict into the env vars the spill
     module reads. Only set keys that were provided; the model loads lazily, so
@@ -1104,10 +1174,14 @@ def _heartbeat_loop(client: CentralClient, state: WorkerState, args) -> None:
                     "free_ram": _free_ram_bytes(),
                     "engine": llama_cpp_cuda_status(),
                     "pool": os.environ.get("WORKER_POOL", ""),
+                    "caps": _local_caps(),
+                    "loaded_detail": _loaded_detail(),
                 },
             )
             # Adopt any assignment change made in the UI + pre-provision it.
             _sync_assignment(state, worker)
+            # Adopt central's resource limits (min of central + local config).
+            _apply_central_limits(worker)
             # Converge to central's required package version (re-execs on update).
             _self_update_if_needed((worker or {}).get("required_pkg_version"), args)
         except WorkerRejected as exc:
@@ -1138,6 +1212,7 @@ def _register(client: CentralClient, state: WorkerState, args) -> None:
         "pkg_version": _installed_pkg_version(args.pkg_name),
         "engine": llama_cpp_cuda_status(),
         "pool": os.environ.get("WORKER_POOL", ""),
+        "caps": _local_caps(),
     }
     try:
         worker = client.register(payload)
@@ -1149,6 +1224,7 @@ def _register(client: CentralClient, state: WorkerState, args) -> None:
     # Adopt central's view of what we serve (it may already have assignments
     # for this worker_id from a previous session) and pre-provision them.
     _sync_assignment(state, worker)
+    _apply_central_limits(worker)
     logger.info("registered as worker id=%s serving models=%s", state.worker_id, worker.get("models"))
     # Converge to central's required package version before serving (re-execs).
     _self_update_if_needed(worker.get("required_pkg_version"), args)

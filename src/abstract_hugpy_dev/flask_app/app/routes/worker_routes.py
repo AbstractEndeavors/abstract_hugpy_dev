@@ -39,7 +39,8 @@ from ....managers.serve.slots import SlotPool, slots_enabled, slot_install_steps
 # it serves as a simple index. Imported directly (not via the functions star) so
 # this doesn't depend on the re-export chain picking up the new names.
 from ..functions.imports.utils.workers import (
-    required_pkg_version, pkg_index_dir, set_worker_admission, set_worker_pool, enroll_required,
+    required_pkg_version, pkg_index_dir, set_worker_admission, set_worker_pool,
+    set_worker_limits, enroll_required,
 )
 from ..functions.imports.utils.enrollment_tokens import (
     create_enrollment_token, verify_enrollment_token,
@@ -105,6 +106,9 @@ class RegisterRequest(BaseModel):
     # Dedicated-pool label (WORKER_POOL). "" = general. A pooled worker serves
     # ONLY requests tagged for its pool — reserved capacity for an external app.
     pool: str | None = None
+    # The box's OWN configured resource ceilings (unit env: ram_max_gib,
+    # gpu_mem_gib, threads, reserves). Central-set limits are clamped to these.
+    caps: dict | None = None
 
 
 # Hostnames/IPs a worker might self-report that are NOT reachable from central.
@@ -183,6 +187,10 @@ class HeartbeatRequest(BaseModel):
     free_ram: int | None = None
     engine: dict | None = None
     pool: str | None = None
+    caps: dict | None = None
+    # Per-loaded-model load facts: {key: {model_bytes, n_gpu_layers,
+    # total_layers, gpu_pct}} — drives the console's serving rows.
+    loaded_detail: dict | None = None
 
 
 class AssignRequest(BaseModel):
@@ -236,6 +244,7 @@ def workers_register():
         free_ram=body.free_ram,
         engine=body.engine,
         pool=body.pool,
+        caps=body.caps,
     )
     if worker.get("admission") == "blocked":
         # Operator evicted this worker; 403 tells the agent to stop, not respawn.
@@ -299,6 +308,8 @@ def workers_heartbeat(worker_id):
         free_ram=body.free_ram,
         engine=body.engine,
         pool=body.pool,
+        caps=body.caps,
+        loaded_detail=body.loaded_detail,
     )
     if worker is None:
         # The agent thinks it's registered but central forgot it (restart,
@@ -348,6 +359,22 @@ def workers_set_pool(worker_id):
     A worker that declares WORKER_POOL still re-asserts its own on next heartbeat."""
     body = request.get_json(silent=True) or {}
     worker = set_worker_pool(worker_id, body.get("pool", ""))
+    if worker is None:
+        abort(404, description="Unknown worker id.")
+    return jsonify(worker)
+
+
+@worker_bp.route("/llm/workers/<worker_id>/limits", methods=["POST"])
+def workers_set_limits(worker_id):
+    """Operator resource limits for a worker ({"ram_max_gib", "gpu_mem_gib",
+    "threads"}; {} clears). Clamped server-side to the worker's self-reported
+    caps — the box's own config is the hard ceiling, central may only tighten.
+    The worker adopts the effective limits on its next heartbeat."""
+    body = request.get_json(silent=True) or {}
+    try:
+        worker = set_worker_limits(worker_id, body.get("limits", body))
+    except ValueError as exc:
+        abort(400, description=str(exc))
     if worker is None:
         abort(404, description="Unknown worker id.")
     return jsonify(worker)

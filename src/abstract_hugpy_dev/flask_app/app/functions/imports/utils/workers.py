@@ -137,6 +137,25 @@ def _public_view(worker: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _clamp_limits(limits: Dict[str, Any], caps: Dict[str, Any]) -> Dict[str, Any]:
+    """Clamp operator limits to the worker's own configured caps.
+
+    The worker's unit config is authoritative ("central shall be forced to
+    view that as its max") — central can set anything LESS, never more."""
+    out: Dict[str, Any] = {}
+    for k, v in limits.items():
+        cap = caps.get(k)
+        if cap is not None:
+            try:
+                v = min(float(v), float(cap))
+                if k == "threads":
+                    v = int(v)
+            except (TypeError, ValueError):
+                continue
+        out[k] = v
+    return out
+
+
 def _engine_unusable(worker: Dict[str, Any]) -> bool:
     """True only when a worker EXPLICITLY reports it has no inference engine.
 
@@ -363,6 +382,7 @@ class WorkerStore:
         free_ram: Optional[int] = None,
         engine: Optional[Dict[str, Any]] = None,
         pool: Optional[str] = None,
+        caps: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Add a worker (or re-register an existing one by id/url).
 
@@ -403,6 +423,8 @@ class WorkerStore:
                     existing["free_ram"] = free_ram
                 if engine is not None:
                     existing["engine"] = engine
+                if caps is not None:
+                    existing["caps"] = caps
                 # Only a NON-EMPTY declared pool re-asserts on re-register, so an
                 # operator-set pool isn't wiped by a worker that doesn't declare
                 # WORKER_POOL (which sends ""). Declaring workers still win.
@@ -422,6 +444,7 @@ class WorkerStore:
                 "rpc_endpoint": rpc_endpoint,
                 "free_ram": free_ram,
                 "engine": engine,
+                "caps": caps,
                 # Dedicated-pool label. "" = general pool. A pooled worker serves
                 # ONLY requests tagged for its pool (reserved capacity); general
                 # traffic never lands on it. See workers_for_model.
@@ -451,6 +474,8 @@ class WorkerStore:
         free_ram: Optional[int] = None,
         engine: Optional[Dict[str, Any]] = None,
         pool: Optional[str] = None,
+        caps: Optional[Dict[str, Any]] = None,
+        loaded_detail: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Mark a worker alive and refresh its live GPU / loaded-model stats."""
         with self._transaction() as workers:
@@ -480,6 +505,14 @@ class WorkerStore:
                 worker["free_ram"] = free_ram
             if engine is not None:
                 worker["engine"] = engine
+            if loaded_detail is not None:
+                worker["loaded_detail"] = loaded_detail
+            if caps is not None:
+                worker["caps"] = caps
+                # Worker-side config is the hard ceiling: if its caps tightened
+                # below an operator limit, re-clamp the stored limit now.
+                if worker.get("limits"):
+                    worker["limits"] = _clamp_limits(worker["limits"], caps)
             if pool and pool.strip():   # non-empty only — see register() note
                 worker["pool"] = pool.strip()
             return _public_view(worker)
@@ -487,6 +520,36 @@ class WorkerStore:
     def remove(self, worker_id: str) -> bool:
         with self._transaction() as workers:
             return workers.pop(worker_id, None) is not None
+
+    # Operator-settable per-worker resource limits. Central may only TIGHTEN:
+    # a worker's own configured caps (reported in its heartbeat as ``caps``)
+    # are the hard ceiling, so every write is clamped against them.
+    _LIMIT_KEYS = ("ram_max_gib", "gpu_mem_gib", "threads")
+
+    def set_limits(self, worker_id: str,
+                   limits: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Set (or clear, with None/{}) central's resource limits for a worker.
+
+        Values are clamped to the worker's self-reported caps — the box's own
+        config always wins. Unknown keys are dropped; non-numeric values raise.
+        """
+        with self._transaction() as workers:
+            worker = workers.get(worker_id)
+            if worker is None:
+                return None
+            if not limits:
+                worker.pop("limits", None)
+                return _public_view(worker)
+            clean: Dict[str, Any] = {}
+            for k in self._LIMIT_KEYS:
+                if k not in limits or limits[k] in (None, ""):
+                    continue
+                try:
+                    clean[k] = float(limits[k]) if k != "threads" else int(limits[k])
+                except (TypeError, ValueError):
+                    raise ValueError(f"limit {k} must be numeric")
+            worker["limits"] = _clamp_limits(clean, worker.get("caps") or {})
+            return _public_view(worker)
 
     def set_pool(self, worker_id: str, pool: str) -> Optional[Dict[str, Any]]:
         """Operator override of a worker's dedicated pool ("" clears). Survives
@@ -693,6 +756,10 @@ def set_worker_admission(worker_id: str, state: str) -> Optional[Dict[str, Any]]
 
 def set_worker_pool(worker_id: str, pool: str) -> Optional[Dict[str, Any]]:
     return worker_store.set_pool(worker_id, pool)
+
+
+def set_worker_limits(worker_id: str, limits) -> Optional[Dict[str, Any]]:
+    return worker_store.set_limits(worker_id, limits)
 
 
 def enroll_required() -> bool:

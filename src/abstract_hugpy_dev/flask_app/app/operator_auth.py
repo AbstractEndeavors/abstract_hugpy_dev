@@ -60,7 +60,7 @@ _SENSITIVE = [
     # Worker admission / control — operator actions (register & heartbeat are
     # M2M and deliberately NOT here). Admission is what makes a worker
     # dispatch-eligible, so gating it closes anonymous self-admission → SSRF.
-    ({"POST"},                   re.compile(r"^/llm/workers/[^/]+/(admit|block|admission|assign|unassign|unload|probe|pool)$")),
+    ({"POST"},                   re.compile(r"^/llm/workers/[^/]+/(admit|block|admission|assign|unassign|unload|probe|pool|limits)$")),
     ({"DELETE"},                 re.compile(r"^/llm/workers/[^/]+$")),
     # Serving / slot control (operator) — the GET status reads stay open.
     ({"POST"},                   re.compile(r"^/llm/serving/[^/]+$")),

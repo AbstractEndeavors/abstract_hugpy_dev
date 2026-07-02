@@ -52,6 +52,43 @@ def clear_llama_runners() -> "list[str]":
     return [k for k in keys if evict_llama_runner(k)]
 
 
+def loaded_runner_detail() -> dict:
+    """Per-loaded-model load facts (for the worker heartbeat / console serving
+    rows): file bytes, layers offloaded vs total, and the resulting GPU share —
+    what the load actually DID, not an estimate. HTTP-backed runners (slots,
+    shard leads) expose none of this; they report an empty detail."""
+    import os as _os
+
+    out: dict = {}
+    with _LLAMA_LOCK:
+        items = list(_LLAMA_INSTANCES.items())
+    for key, r in items:
+        d: dict = {}
+        path = getattr(r, "model_path", None)
+        if path:
+            try:
+                d["model_bytes"] = _os.path.getsize(path)
+            except OSError:
+                pass
+            try:
+                from ...spill import _gguf_layer_count
+                d["total_layers"] = _gguf_layer_count(path)
+            except Exception:
+                pass
+        ngl = getattr(r, "n_gpu_layers", None)
+        if ngl is not None:
+            d["n_gpu_layers"] = ngl
+            total = d.get("total_layers")
+            if ngl == -1:
+                d["gpu_pct"] = 100
+            elif total:
+                d["gpu_pct"] = round(100 * min(int(ngl), total) / total)
+            elif int(ngl) == 0:
+                d["gpu_pct"] = 0
+        out[key] = d
+    return out
+
+
 def get_llama_runner(model_key: str) -> "LlamaCppBaseRunner":
     """Get-or-build the singleton runner for a model_key.
 
