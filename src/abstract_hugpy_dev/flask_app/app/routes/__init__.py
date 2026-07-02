@@ -10,3 +10,4 @@ from .phone_brick_routes import phone_brick_bp
 from .discord_routes import discord_bp
 from .auth_proxy_routes import auth_proxy_bp
 from .welcome_routes import welcome_bp
+from .comms_routes import comms_bp

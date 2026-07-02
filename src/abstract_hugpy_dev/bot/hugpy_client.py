@@ -174,6 +174,36 @@ class HugpyClient:
         """Task categories central can serve: {"tasks": [...], "defaults": {...}}."""
         return await self._json("GET", "/prompt/tasks")
 
+    # ── F4 settings + F2 principal link ────────────────────────────────────
+    async def settings_ns(self, ns: str) -> dict:
+        """All values in a settings namespace (runtime SoT on central) —
+        {key: value}. The bot READS these (channel modes, personalities,
+        delegation); writes happen from the console."""
+        out = await self._json("GET", f"/settings/{ns}")
+        return out.get("values") or {}
+
+    async def set_user_model(self, user_id: int, model_key: str | None) -> dict:
+        """Persist a user's default model in central settings (M2M route,
+        same trust tier as the discord outbox/inbox endpoints)."""
+        return await self._json("POST", "/discord/prefs",
+                                json={"user_id": str(user_id),
+                                      "model_key": model_key})
+
+    async def discord_link(self, token: str, discord_user_id: int) -> dict:
+        """DISC-05: bind a Discord user to the principal behind this token."""
+        return await self._json("POST", "/auth/discord-link",
+                                json={"token": token,
+                                      "discord_user_id": str(discord_user_id)})
+
+    async def cancel_chat(self, request_id: str) -> dict:
+        """Ask central to stop an in-flight generation (F1 control plane).
+
+        Central cancels a locally-served stream through its job store and
+        fans out to GPU workers for relayed ones — either way the model stops
+        producing and the slot frees, instead of us merely closing our end of
+        the SSE pipe."""
+        return await self._json("POST", f"/llm/chat/cancel/{request_id}")
+
     # ── streaming chat ────────────────────────────────────────────────────
     async def chat_stream(
         self,
@@ -190,6 +220,8 @@ class HugpyClient:
         max_new_tokens: int | None = None,
         unbounded: bool | None = None,
         request_id: str | None = None,
+        transport: str | None = None,
+        channel: str | None = None,
     ) -> AsyncIterator[str]:
         """Yield generated text chunks; raises HugpyError on an error event."""
         body: dict[str, Any] = {}
@@ -208,6 +240,8 @@ class HugpyClient:
             ("max_new_tokens", max_new_tokens),
             ("unbounded", unbounded),
             ("request_id", request_id),
+            ("transport", transport),
+            ("channel", channel),
         ):
             if value is not None:
                 body[key] = value

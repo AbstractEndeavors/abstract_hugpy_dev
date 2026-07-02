@@ -60,16 +60,75 @@ class HugpyBot(commands.Bot):
         """Local fallback: the user's saved pref, else the configured default."""
         return self.prefs.get_model(user_id) or config.DEFAULT_MODEL_KEY
 
+    # ── F4 runtime settings (central is the SoT; the bot only reads) ──────
+    _SETTINGS_TTL = 10.0
+
+    async def settings_ns(self, ns: str) -> dict:
+        """Cached view of a central settings namespace. Central unreachable →
+        the last known values (or {}), so a blip never mutes the bot."""
+        cache = getattr(self, "_settings_cache", None)
+        if cache is None:
+            cache = self._settings_cache = {}
+        hit = cache.get(ns)
+        import time as _time
+        now = _time.monotonic()
+        if hit and now - hit[0] < self._SETTINGS_TTL:
+            return hit[1]
+        try:
+            values = await self.hugpy.settings_ns(ns)
+        except Exception:
+            log.debug("settings fetch failed for %s", ns, exc_info=True)
+            values = hit[1] if hit else {}
+        cache[ns] = (now, values)
+        return values
+
+    async def channel_settings(self, channel_id) -> dict:
+        return (await self.settings_ns("discord.channels")).get(
+            str(channel_id)) or {}
+
+    async def channel_personality(self, channel_id) -> dict | None:
+        """DISC-06: the personality assigned to this channel (from the
+        personality registry), or None."""
+        name = (await self.channel_settings(channel_id)).get("personality")
+        if not name:
+            return None
+        p = (await self.settings_ns("personalities")).get(str(name))
+        return {**p, "name": name} if isinstance(p, dict) else None
+
+    async def set_user_model(self, user_id: int, model_key: str | None) -> None:
+        """Write-through: central settings (authoritative, console-visible)
+        plus the local prefs file (offline fallback)."""
+        try:
+            await self.hugpy.set_user_model(user_id, model_key)
+        except Exception:
+            log.debug("central pref write failed; local only", exc_info=True)
+        await self.prefs.set_model(user_id, model_key)
+
     async def resolve_model_for(self, user_id: int, channel_id: int | None = None) -> str | None:
-        """Pick the model for a turn. A console-managed Discord binding for this
-        (channel, user) wins; otherwise fall back to the user pref / default.
-        Resolution priority lives in central (channel+user > channel > user)."""
+        """Pick the model for a turn. Precedence (defined once, here):
+        explicit per-turn choice is handled by the caller before this runs;
+        then console-managed Discord binding > channel personality's model
+        (the personality owns its model) > channel delegation (CON-07,
+        fallback when the personality doesn't pin one) > user pref (central
+        settings, then local file) > configured default."""
         try:
             bound = await self.hugpy.resolve_discord_model(channel_id=channel_id, user_id=user_id)
             if bound:
                 return bound
         except Exception:
-            log.debug("discord resolve failed; using local model_for", exc_info=True)
+            log.debug("discord resolve failed; trying settings", exc_info=True)
+        if channel_id is not None:
+            persona = await self.channel_personality(channel_id)
+            if persona and persona.get("model_key"):
+                return persona["model_key"]
+            delegated = (await self.settings_ns("delegation")).get(
+                f"channel:{channel_id}")
+            if delegated:
+                return delegated
+        central_pref = (await self.settings_ns("discord.users")).get(
+            str(user_id)) or {}
+        if central_pref.get("model"):
+            return central_pref["model"]
         return self.model_for(user_id)
 
     # ── outbound: model -> Discord (the "mobile arm") ─────────────────────

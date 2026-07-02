@@ -1,75 +1,18 @@
 from .imports import *
-# jobs.py
-@dataclass
-class Job:
-    id: str
-    model_key: str
-    status: JOBSTATUS = "queued"
-    message: str = ""
-    error: str | None = None
-    progress: float = 0.0                 # 0.0–1.0
-    total_bytes: int | None = None
-    downloaded_bytes: int | None = None
-    # Resilience telemetry: which retry attempt we're on, whether the transfer
-    # is currently stalled (no byte growth), and the live throughput.
-    attempt: int = 0
-    max_attempts: int = 0
-    stalled: bool = False
-    bytes_per_second: float | None = None
-    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
-    updated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
-    # runtime-only, never serialized: the download subprocess and the model dict
-    # (kept so a manual retry can resume without re-resolving the config).
-    _proc: "mp.Process | None" = field(default=None, repr=False, compare=False)
-    _model: "dict | None" = field(default=None, repr=False, compare=False)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "id": self.id,
-            "model_key": self.model_key,
-            "status": self.status,
-            "message": self.message,
-            "error": self.error,
-            "progress": round(self.progress, 4),
-            "total_bytes": self.total_bytes,
-            "downloaded_bytes": self.downloaded_bytes,
-            "attempt": self.attempt,
-            "max_attempts": self.max_attempts,
-            "stalled": self.stalled,
-            "bytes_per_second": self.bytes_per_second,
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
-        }
-
-class JobStore:
-    def __init__(self) -> None:
-        self._jobs: dict[str, Job] = {}
-        self._lock = threading.Lock()
-
-    def create(self, model_key: str) -> Job:
-        job = Job(id=str(uuid.uuid4()), model_key=model_key)
-        with self._lock:
-            self._jobs[job.id] = job
-        return job
-
-    def update(self, job_id: str, **changes) -> Job | None:
-        with self._lock:
-            job = self._jobs.get(job_id)
-            if job is None:
-                return None
-            for k, v in changes.items():
-                if hasattr(job, k):
-                    setattr(job, k, v)
-            job.updated_at = datetime.now(timezone.utc).isoformat()
-            return job
-
-    def get(self, job_id: str) -> Job | None:
-        with self._lock:
-            return self._jobs.get(job_id)
-
-    def all(self) -> list[Job]:
-        with self._lock:
-            return list(self._jobs.values())
-
-
-job_store = JobStore()
+# jobs.py — compat shim. The Job/JobStore that used to live here (download
+# jobs only) is now the shared, all-transport store in comms.jobs (F5): one
+# schema for chat requests AND downloads, canonical lifecycle
+# pending→processing→streaming→(done|cancelled|failed), with the old
+# queued/running/completed names normalized on write. Download callers keep
+# importing from here unchanged; the singleton is the same store every other
+# transport enqueues into.
+from abstract_hugpy_dev.comms.jobs import (
+    CANONICAL_STATUSES,
+    LEGACY_FOR_CANONICAL,
+    TERMINAL_STATUSES,
+    Job,
+    JobError,
+    JobStore,
+    job_store,
+    normalize_status,
+)

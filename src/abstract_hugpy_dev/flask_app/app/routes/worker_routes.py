@@ -195,7 +195,16 @@ class AssignRequest(BaseModel):
 
 @worker_bp.route("/llm/workers", methods=["GET"])
 def workers_list():
-    return jsonify(list_workers())
+    """Worker registry (F3.2): running module version surfaced prominently —
+    control-plane/worker version skew is silent behavior drift, so every row
+    carries version_ok against central's required_pkg_version."""
+    required = required_pkg_version()
+    rows = list_workers()
+    for w in rows:
+        w["required_pkg_version"] = required
+        w["version_ok"] = (required is None
+                           or w.get("pkg_version") == required)
+    return jsonify(rows)
 
 
 @worker_bp.route("/llm/queue", methods=["GET"])
@@ -398,15 +407,29 @@ def workers_unassign(worker_id):
 
 @worker_bp.route("/llm/chat/cancel/<request_id>", methods=["POST"])
 def chat_cancel(request_id):
-    """Cancel an in-flight chat by relaying to whichever worker is running it.
+    """Cancel an in-flight chat, wherever it runs.
 
-    The browser knows the request_id (echoed in the SSE 'request' event). We
-    don't track which worker owns it, so we fan the cancel out to every online
-    worker; the one running it stops, the rest 404 harmlessly.
+    Local-first (F1.3): publish control.cancel on the comms bus — the wired
+    consumer calls job_store.cancel, which fires the cancel handle the local
+    stream attached, so a generation served by THIS process actually stops
+    (pre-comms, only worker-relayed requests were cancellable).
+
+    Then the legacy fan-out: a request relayed to a GPU worker executes there,
+    so its cancel event lives in that worker's process. We don't track which
+    worker owns it; every online worker gets the cancel, the owner stops, the
+    rest 404 harmlessly.
     """
     import httpx
+    from abstract_hugpy_dev.comms import bus, job_store, TOPIC_CONTROL_CANCEL
 
-    cancelled = False
+    # Direct store cancel first — its return is cross-process truth (live
+    # here, or flagged on the shared mirror for the sibling gunicorn worker
+    # that owns the stream). The bus publish keeps control observable to any
+    # subscriber; wire_cancel's redundant second cancel is a no-op.
+    cancelled = job_store.cancel(request_id,
+                                 reason="cancelled via /llm/chat/cancel")
+    bus.publish(TOPIC_CONTROL_CANCEL, job_id=request_id, source="web",
+                payload={"reason": "cancelled via /llm/chat/cancel"})
     for w in list_workers():
         if w.get("status") != "online":
             continue
@@ -442,6 +465,64 @@ def workers_unload(worker_id):
     except Exception as exc:
         return jsonify({"ok": False, "evicted": False,
                         "error": f"{type(exc).__name__}: {exc}"})
+
+
+def _relay_worker_op(worker_id: str, op_path: str, body: dict,
+                     timeout: float, action: str) -> "tuple":
+    """CON-05/06 + UTIL-02 relay: forward a privileged op to the worker's
+    control agent and return its TYPED result verbatim (F3.4: errors are
+    data, not exceptions). Operator-gated in _SENSITIVE; every call audited."""
+    import httpx
+    from .comms_routes import audit
+
+    worker = get_worker(worker_id)
+    if worker is None:
+        abort(404, description="Unknown worker id.")
+    audit(f"worker.{action}", {"worker_id": worker_id,
+                               "worker": worker.get("name"), "body": body})
+    url = (worker.get("url") or "").rstrip("/") + op_path
+    try:
+        r = httpx.post(url, json=body, timeout=timeout)
+        return jsonify(r.json()), r.status_code
+    except Exception as exc:
+        return jsonify({"ok": False,
+                        "error": {"code": type(exc).__name__,
+                                  "message": str(exc)}}), 502
+
+
+@worker_bp.route("/llm/workers/<worker_id>/restart", methods=["POST"])
+def workers_restart(worker_id):
+    """CON-06: restart the worker agent process. The agent re-execs itself
+    (rootless — central can't reach its systemctl --user); its persistent
+    worker id means it re-registers as the same row. Availability is
+    heartbeat-driven, so the row goes offline->online as it comes back."""
+    return _relay_worker_op(worker_id, "/ops/restart",
+                            request.get_json(silent=True) or {},
+                            timeout=15.0, action="restart")
+
+
+@worker_bp.route("/llm/workers/<worker_id>/update", methods=["POST"])
+def workers_update(worker_id):
+    """CON-05: trigger the worker's module self-update NOW (same converge
+    path as the heartbeat's required_pkg_version handshake, minus the wait).
+    Body: {"version": "..."} to pin; default = central's required version.
+    Confirm afterward via the worker registry's pkg_version."""
+    return _relay_worker_op(worker_id, "/ops/update",
+                            request.get_json(silent=True) or {},
+                            timeout=30.0, action="update")
+
+
+@worker_bp.route("/llm/workers/<worker_id>/pip", methods=["POST"])
+def workers_pip(worker_id):
+    """UTIL-02: pip install into the worker's env, through the operator gate.
+    Body: {"package": "name==ver"}. The gate + audit ARE the feature; the
+    install is trivial. Long timeout — pip resolves are slow."""
+    body = request.get_json(silent=True) or {}
+    pkg = str(body.get("package") or "").strip()
+    if not pkg:
+        abort(400, description='body must include {"package": "..."}')
+    return _relay_worker_op(worker_id, "/ops/pip", {"package": pkg},
+                            timeout=600.0, action="pip")
 
 
 @worker_bp.route("/llm/workers/<worker_id>/probe", methods=["POST"])

@@ -197,4 +197,19 @@ def get_hugpy_flask(name=None,allowed_origins=None,debug=False):
     except Exception as _exc:
         import logging as _logging
         _logging.getLogger(__name__).error("operator gate install failed: %s", _exc)
+
+    # F1/F5 wiring: control.cancel messages on the bus reach the shared job
+    # store (which fires the cancel handle each live stream attached), and job
+    # lifecycle transitions publish back onto the bus for any subscriber
+    # (console live view, keeper, future relays). Idempotent; must never block
+    # boot.
+    try:
+        from abstract_hugpy_dev.comms import wire_cancel, wire_job_events
+        from abstract_hugpy_dev.comms.settings import wire_settings_events
+        wire_cancel()
+        wire_job_events(source="central")
+        wire_settings_events(source="central")
+    except Exception as _exc:
+        import logging as _logging
+        _logging.getLogger(__name__).error("comms bus wiring failed: %s", _exc)
     return app

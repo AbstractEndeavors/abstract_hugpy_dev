@@ -6,6 +6,7 @@ import asyncio
 import itertools
 import logging
 import time
+import uuid
 from collections import defaultdict, deque
 
 import discord
@@ -54,10 +55,34 @@ class ChatCog(commands.Cog):
         history = list(self._history[channel_id]) if remember else []
         messages = history + [{"role": "user", "content": prompt}]
 
+        # DISC-06: a channel personality bundles system prompt + params.
+        # Its system prompt heads the message list every turn; its params are
+        # DEFAULTS only — explicit per-turn values keep winning. (Its model
+        # was already applied in resolve_model_for; explicit model wins.)
+        persona = await self.bot.channel_personality(channel_id)
+        if persona:
+            if persona.get("system"):
+                messages = ([{"role": "system", "content": persona["system"]}]
+                            + messages)
+            params = persona.get("params") or {}
+            if temperature is None:
+                temperature = params.get("temperature")
+            if top_p is None:
+                top_p = params.get("top_p")
+            if do_sample is None:
+                do_sample = params.get("do_sample")
+            if max_new_tokens is None:
+                max_new_tokens = params.get("max_new_tokens")
+
         streamer = MessageStreamer(send)
         turn_id = f"t{next(self._turn_ids)}"
+        # The request_id central's job store tracks this turn under — /stop
+        # cancels through it, so the generation actually stops server-side
+        # instead of us just dropping our end of the SSE pipe.
+        request_id = uuid.uuid4().hex
         self._active[turn_id] = {
             "task": asyncio.current_task(),
+            "request_id": request_id,
             "channel_id": channel_id,
             "user_id": user_id,
             "model": model_key,
@@ -69,6 +94,8 @@ class ChatCog(commands.Cog):
                 messages=messages, model_key=model_key, file=file,
                 temperature=temperature, top_p=top_p,
                 max_new_tokens=max_new_tokens, do_sample=do_sample,
+                request_id=request_id,
+                transport="discord", channel=str(channel_id),
             ):
                 await streamer.feed(chunk)
             await streamer.finish()
@@ -108,7 +135,14 @@ class ChatCog(commands.Cog):
         is_dm = message.guild is None
         mentioned = self.bot.user in message.mentions
         if not (is_dm or mentioned):
-            return
+            # DISC-04: a channel flipped to respond-to-all (console-set, F4
+            # settings) answers every message, not just mentions. Default
+            # stays mention-only — respond-to-all in a busy channel is a
+            # queue flood, which is why CON-01's live view exists.
+            mode = (await self.bot.channel_settings(message.channel.id)
+                    ).get("respond")
+            if mode != "all":
+                return
 
         prompt = message.content
         for mention in (f"<@{self.bot.user.id}>", f"<@!{self.bot.user.id}>"):
@@ -235,16 +269,49 @@ class ChatCog(commands.Cog):
                 )
                 return
         for info in targets.values():
+            # Server-side first: central's control plane stops the generation
+            # and frees the slot (locally-served or worker-relayed). Then the
+            # task cancel tears down our SSE read. Best-effort — an old
+            # central without the route still gets the task cancel.
+            rid = info.get("request_id")
+            if rid:
+                try:
+                    await self.bot.hugpy.cancel_chat(rid)
+                except Exception as exc:
+                    log.debug("central-side cancel of %s failed: %s", rid, exc)
             info["task"].cancel()
         stopped = ", ".join(f"`{tid}`" for tid in targets)
         await interaction.response.send_message(f"⏹️ stopped {stopped}", ephemeral=True)
+
+    @app_commands.command(
+        name="link",
+        description="Link your Discord account to a hugpy principal token")
+    @app_commands.describe(token="The principal token an operator issued you (hpp_…)")
+    async def link(self, interaction: discord.Interaction, token: str) -> None:
+        """DISC-05: proves possession of a principal token and binds this
+        Discord account to that principal. Ephemeral — the token never
+        appears in the channel."""
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            out = await self.bot.hugpy.discord_link(token.strip(), interaction.user.id)
+        except HugpyError as exc:
+            await interaction.followup.send(f"⚠️ link failed: {exc}", ephemeral=True)
+            return
+        p = out.get("principal") or {}
+        await interaction.followup.send(
+            f"🔗 linked to principal `{p.get('id')}`"
+            f" ({p.get('name') or 'unnamed'}, groups: "
+            f"{', '.join(p.get('groups') or []) or 'none'})",
+            ephemeral=True,
+        )
 
     model_group = app_commands.Group(name="model", description="Your default hugpy model")
 
     @model_group.command(name="set", description="Set your default model")
     @app_commands.autocomplete(model=model_autocomplete)
     async def model_set(self, interaction: discord.Interaction, model: str) -> None:
-        await self.bot.prefs.set_model(interaction.user.id, model)
+        # Write-through: central settings (console-visible) + local fallback.
+        await self.bot.set_user_model(interaction.user.id, model)
         await interaction.response.send_message(f"✅ default model: `{model}`", ephemeral=True)
 
     @model_group.command(name="show", description="Show your current default model")
@@ -255,7 +322,7 @@ class ChatCog(commands.Cog):
 
     @model_group.command(name="clear", description="Clear your default model")
     async def model_clear(self, interaction: discord.Interaction) -> None:
-        await self.bot.prefs.set_model(interaction.user.id, None)
+        await self.bot.set_user_model(interaction.user.id, None)
         await interaction.response.send_message("✅ default model cleared", ephemeral=True)
 
 

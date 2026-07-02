@@ -143,6 +143,37 @@ def pool_for_key(token: Optional[str]) -> Optional[str]:
     return None
 
 
+def key_id_for_token(token: Optional[str]) -> Optional[str]:
+    """The key record id behind a plaintext token (or None). Lets the
+    principal layer (comms.principals) attribute a request to a stable key
+    identity without ever storing the plaintext."""
+    if not token:
+        return None
+    hashed = _hash(token.strip())
+    with _LOCK:
+        data = _load()
+        for key_id, rec in data["keys"].items():
+            if rec.get("revoked"):
+                continue
+            if rec.get("hash") == hashed:
+                return key_id
+    return None
+
+
+def key_name_for_token(token: Optional[str]) -> Optional[str]:
+    if not token:
+        return None
+    hashed = _hash(token.strip())
+    with _LOCK:
+        data = _load()
+        for rec in data["keys"].values():
+            if rec.get("revoked"):
+                continue
+            if rec.get("hash") == hashed:
+                return rec.get("name") or None
+    return None
+
+
 def api_key_required() -> bool:
     with _LOCK:
         return bool(_load().get("require_key"))

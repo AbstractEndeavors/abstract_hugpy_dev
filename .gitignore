@@ -1,25 +1,16 @@
-# Python
-__pycache__/
-*.py[cod]
-*.egg-info/
+
 build/
 dist/
-# virtualenvs
-venv/
-.venv/
-env/
-# node
-node_modules/
-# logs / secrets (templates stay)
-*.log
-.env
-.env.*
-!.env.example
-!.env.sample
-
 logs/
+*.egg-info/
+__pycache__/
 *.pyc
 *.pyo
 *.whl
 *.tar.gz
 *.asc
+.env
+.venv/
+venv/
+/e --abort
+*.log

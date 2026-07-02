@@ -232,7 +232,7 @@ def cancel_download(job_id: str) -> dict:
     job = job_store.get(job_id)
     if not job:
         abort(404, description="Unknown job ID.")
-    if job.status not in ("queued", "running"):
+    if job.terminal:
         return {"cancelled": False, "reason": f"job is {job.status}"}
 
     # Set status FIRST so the monitor's auto-resume loop sees the cancel and
@@ -256,7 +256,7 @@ def retry_download(job_id: str) -> dict:
     job = job_store.get(job_id)
     if not job:
         abort(404, description="Unknown job ID.")
-    if job.status in ("queued", "running"):
+    if not job.terminal:
         return {"retried": False, "reason": f"job is already {job.status}"}
     model = getattr(job, "_model", None)
     if not model:

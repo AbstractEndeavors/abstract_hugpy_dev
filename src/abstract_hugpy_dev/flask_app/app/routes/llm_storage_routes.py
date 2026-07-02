@@ -63,14 +63,18 @@ def start_download(model_key):
         abort(404, description="Unknown model key.")
     logger.info(model)
     body = request.get_json(silent=True) or {}
-    job = job_store.create(model_key)
+    job = job_store.create(model_key, kind="download", transport="web")
     start_cancellable_download(job, model, total_bytes=body.get("total_bytes"))
-    return jsonify(job.to_dict())
+    return jsonify(job.to_legacy_dict())
 
 
 @llm_bp.route("/jobs", methods=["GET"])
 def list_jobs():
-    return jsonify([job.to_dict() for job in job_store.all()])
+    # The store is shared with chat/inference jobs now — this surface is the
+    # download manager's, so only download jobs belong on it (legacy wire
+    # shape: queued/running/completed, error as string — ModelTable reads it).
+    return jsonify([job.to_legacy_dict() for job in job_store.all()
+                    if job.kind == "download"])
 
 
 @llm_bp.route("/jobs/<job_id>", methods=["GET"])
@@ -78,7 +82,7 @@ def get_job(job_id):
     job = job_store.get(job_id)
     if not job:
         abort(404, description="Unknown job ID.")
-    return jsonify(job.to_dict())
+    return jsonify(job.to_legacy_dict())
 
 
 @llm_bp.route("/jobs/<job_id>/cancel", methods=["POST"])
@@ -115,9 +119,9 @@ def download_repo():
         from ..functions.imports.utils.manifest import key_for_hub_id
         model_key = key_for_hub_id(body.hub_id)
 
-    job = job_store.create(model_key)
+    job = job_store.create(model_key, kind="download", transport="web")
     start_cancellable_download(job, model, total_bytes=body.total_bytes)
-    return jsonify({**job.to_dict(), "model_key": model_key})
+    return jsonify({**job.to_legacy_dict(), "model_key": model_key})
 
 
 @llm_bp.route("/models/<model_key>", methods=["DELETE"])

@@ -25,6 +25,14 @@ class ChatBody(BaseModel):
     # the API key's bound pool (default) + this field (override, if the key
     # allows it). "" / None = the general pool.
     pool: Optional[str] = None
+    # Attribution for the F5 job record (unified jobs view): which transport
+    # originated this (web | discord | cli | v1) and its conversational
+    # context id (discord channel, web session). Never used for routing.
+    transport: Optional[str] = None
+    channel: Optional[str] = None
+    # Resolved server-side in chat_stream() from the request's credential and
+    # ALWAYS overwritten there — never trusted from the client body.
+    principal: Optional[str] = None
 
     @model_validator(mode="after")
     def _require_one_input(self):

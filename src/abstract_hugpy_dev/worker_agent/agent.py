@@ -54,7 +54,9 @@ from .imports import *
 from ..central import central_base_url
 # request_id -> asyncio.Event, so POST /infer/cancel can stop an in-flight
 # stream mid-generation. Populated by _stream_sync, tripped by the cancel route.
-_CANCELS: dict = {}
+# Cancellation now rides the shared comms JobStore (attach_cancel/cancel) —
+# the per-process _CANCELS dict this file used to keep is gone (F1.3: no
+# side channels).
 
 
 # ---------------------------------------------------------------------------
@@ -514,20 +516,32 @@ def _stream_sync(payload: dict, request_id: str | None = None):
     Auto-continuation + seam-dedup now live in the core
     ``abstract_hugpy_dev.managers.dispatch.execute_chat_stream`` engine — the exact
     same one the central node drives — so worker chat and local chat behave
-    identically. This wrapper only materializes an inlined upload, registers a
-    cancel Event (POST /infer/cancel trips it), drives the async engine in a
-    sync loop, and encodes each StreamEvent as an SSE line.
+    identically. This wrapper only materializes an inlined upload, registers the
+    request in the shared comms JobStore with a cancel handle (POST
+    /infer/cancel trips it — same F5 substrate central uses, no private
+    cancel dict), drives the async engine in a sync loop, and encodes each
+    StreamEvent as an SSE line.
     """
     from .._platform import async_runtime
+    from ..comms import job_store
     tmp = _materialize_file(payload)
 
     # Register a cancel Event for this request so /infer/cancel can trip it, and
     # thread its id through the engine so all continuation passes share it. The
-    # Event binds to the shared runtime loop on first await; the cancel route
-    # trips it via call_soon_threadsafe (cross-thread set is otherwise unsafe).
+    # Event binds to the shared runtime loop on first await; cancellation sets
+    # it via call_soon_threadsafe (cross-thread set is otherwise unsafe).
     cancel_event = asyncio.Event()
     if request_id:
-        _CANCELS[request_id] = cancel_event
+        try:
+            existing = job_store.get(request_id)
+            if existing is None or existing.terminal:
+                job_store.create(str(payload.get("model_key") or ""),
+                                 id=request_id, kind="chat", transport="worker")
+            job_store.attach_cancel(
+                request_id,
+                lambda: async_runtime.call_soon_threadsafe(cancel_event.set))
+        except Exception:
+            pass
         payload.setdefault("request_id", request_id)
 
     agen = None
@@ -537,15 +551,30 @@ def _stream_sync(payload: dict, request_id: str | None = None):
         # of a fresh per-request loop — fixes "bound to a different event loop"
         # for any cached asyncio primitive. iter_sync owns step-cancel + aclose.
         for event in async_runtime.iter_sync(agen):
+            if request_id and getattr(event, "type", None) == "token":
+                try:
+                    job_store.on_output(request_id)
+                except Exception:
+                    pass
             yield _sse(_event_to_dict(event))
     except Exception as exc:
         # Last-resort guard: never let an exception escape into the WSGI layer
         # (that aborts the stream with a raw traceback). Emit a clean error.
         logger.warning("stream failed: %s: %s", type(exc).__name__, exc)
+        if request_id:
+            try:
+                job_store.finish(request_id, error=exc)
+            except Exception:
+                pass
         yield _sse({"type": "error", "message": f"{type(exc).__name__}: {exc}"})
     finally:
         if request_id:
-            _CANCELS.pop(request_id, None)
+            # done, or cancelled if a cancel was requested; no-op if the
+            # except above already marked it failed.
+            try:
+                job_store.finish(request_id)
+            except Exception:
+                pass
         _cleanup_file(tmp)
 
 
@@ -626,14 +655,88 @@ def build_app(state: "WorkerState") -> Flask:
 
     @app.route("/infer/cancel/<request_id>", methods=["POST"])
     def infer_cancel(request_id):
-        ev = _CANCELS.get(request_id)
-        if ev is None:
+        # Same substrate as central (F5): the job's attached cancel handle sets
+        # the stream's Event on the shared runtime loop via call_soon_threadsafe
+        # (a bare cross-thread Event.set() is unsafe — wakes futures on another
+        # loop). Wire contract unchanged: 404 for unknown/finished requests.
+        from ..comms import job_store
+        job = job_store.get(request_id)
+        if job is None or job.terminal:
             return jsonify({"cancelled": False, "reason": "unknown or finished request"}), 404
-        # The Event lives on the shared runtime loop; set it THERE — a bare
-        # cross-thread Event.set() is unsafe (wakes futures on another loop).
-        from .._platform import async_runtime
-        async_runtime.call_soon_threadsafe(ev.set)
+        job_store.cancel(request_id, reason="cancelled via /infer/cancel")
         return jsonify({"cancelled": True, "request_id": request_id})
+
+    # -- privileged ops (F3.4 control agent; CON-05/06 + UTIL-02) ----------
+    # Central relays these through its operator gate + audit log. Every
+    # response is typed data ({ok, error:{code,message}}), never a traceback.
+
+    @app.route("/ops/restart", methods=["POST"])
+    def ops_restart():
+        # Respond first, then re-exec: the caller needs the ack before the
+        # process replaces itself. Persistent worker-id -> same registry row.
+        from .._platform.procutil import reexec
+        threading.Timer(0.5, reexec).start()
+        return jsonify({"ok": True, "restarting": True,
+                        "worker_id": state.worker_id})
+
+    @app.route("/ops/update", methods=["POST"])
+    def ops_update():
+        # CON-05 on demand: same converge path as the heartbeat handshake
+        # (pip install pinned target from PyPI or --pkg-index, then re-exec),
+        # minus the wait and the retry backoff — the operator asked NOW.
+        args = getattr(state, "args", None)
+        if args is None:
+            return jsonify({"ok": False, "error": {
+                "code": "NoArgs", "message": "agent started without CLI args "
+                "context; update unavailable"}}), 501
+        body = request.get_json(silent=True) or {}
+        target = str(body.get("version") or "").strip()
+        if not target:
+            return jsonify({"ok": False, "error": {
+                "code": "NoVersion",
+                "message": 'body must include {"version": "x.y.z"} '
+                           '(central sends its required_pkg_version)'}}), 400
+        cmd = [sys.executable, "-m", "pip", "install", "-U", "--no-deps"]
+        if args.pkg_index:
+            cmd += ["--index-url", args.pkg_index]
+        cmd.append(f"{args.pkg_name}=={target}")
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=560)
+            rc, tail = proc.returncode, (proc.stdout + proc.stderr)[-2000:]
+        except Exception as exc:
+            return jsonify({"ok": False, "error": {
+                "code": type(exc).__name__, "message": str(exc)}}), 502
+        if rc == 0:
+            from .._platform.procutil import reexec
+            threading.Timer(0.5, reexec).start()
+            return jsonify({"ok": True, "installed": f"{args.pkg_name}=={target}",
+                            "restarting": True})
+        return jsonify({"ok": False, "error": {
+            "code": "PipFailed", "message": f"pip rc={rc}", "detail": tail}}), 502
+
+    @app.route("/ops/pip", methods=["POST"])
+    def ops_pip():
+        # UTIL-02: install into this worker's env. Argv-list (no shell), rc +
+        # output tail returned as data. The operator gate + audit live on
+        # central; this endpoint trusts central's relay like every other op.
+        body = request.get_json(silent=True) or {}
+        pkg = str(body.get("package") or "").strip()
+        if not pkg or pkg.startswith("-"):
+            return jsonify({"ok": False, "error": {
+                "code": "BadPackage",
+                "message": 'body must include {"package": "name==ver"} '
+                           "(flags are not accepted)"}}), 400
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-m", "pip", "install", pkg],
+                capture_output=True, text=True, timeout=560)
+            rc, tail = proc.returncode, (proc.stdout + proc.stderr)[-2000:]
+        except Exception as exc:
+            return jsonify({"ok": False, "error": {
+                "code": type(exc).__name__, "message": str(exc)}}), 502
+        return (jsonify({"ok": rc == 0, "package": pkg, "rc": rc,
+                         "output_tail": tail}), 200 if rc == 0 else 502)
 
     @app.route("/probe/<path:model_key>", methods=["POST", "GET"])
     def probe(model_key):
@@ -1195,6 +1298,16 @@ def main(argv: list[str] | None = None) -> int:
     state.port = args.port
     state.role = args.role
 
+    # F1/F5 wiring: control.cancel on this process's bus reaches the shared
+    # job store (fires the cancel handle each live stream attached), and job
+    # transitions publish back onto the bus. Same substrate as central.
+    try:
+        from ..comms import wire_cancel, wire_job_events
+        wire_cancel()
+        wire_job_events(source=f"worker:{args.name or ''}")
+    except Exception as _exc:
+        logger.warning("comms bus wiring failed: %s", _exc)
+
     # role=rpc: launch the llama.cpp rpc-server and advertise this box's GPU as a
     # shard backend. The endpoint host is the same outbound IP we advertise for
     # /infer (reachable from the lead); central stores it as an rpc_servers entry.
@@ -1219,6 +1332,7 @@ def main(argv: list[str] | None = None) -> int:
 
     logger.info("worker inference server listening on %s (advertising %s)",
                 f"{args.host}:{args.port}", state.url)
+    state.args = args   # the /ops endpoints need pkg_name/pkg_index/id_file
     build_app(state).run(host=args.host, port=args.port, threaded=True)
     return 0
 

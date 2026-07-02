@@ -117,6 +117,84 @@ def _bot(args: argparse.Namespace) -> int:
     return 0
 
 
+def _chat(args: argparse.Namespace) -> int:
+    """DISC-01 — the terminal is just another transport on the same
+    substrate: it streams /chat/stream with a request_id (so the run shows in
+    the unified jobs view and the console can cancel it), authenticates with
+    a real credential (principal token or API key — no implicit god-mode),
+    and Ctrl-C cancels SERVER-SIDE via /llm/chat/cancel before exiting.
+    Stdlib-only (urllib), like keeper.py, so it runs on thin installs."""
+    import json as _json
+    import signal
+    import urllib.request
+    import uuid as _uuid
+
+    base = (args.central or os.environ.get("HUGPY_BASE_URL")
+            or "http://127.0.0.1:7002").rstrip("/")
+    token = (args.token or os.environ.get("HUGPY_TOKEN")
+             or os.environ.get("HUGPY_API_KEY") or "").strip()
+
+    def _post(path: str, payload: dict, stream: bool = False):
+        req = urllib.request.Request(
+            base + path, data=_json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json",
+                     **({"Authorization": f"Bearer {token}"} if token else {})},
+            method="POST")
+        return urllib.request.urlopen(req, timeout=None if stream else 15)
+
+    prompt = " ".join(args.prompt) if args.prompt else None
+    if not prompt:
+        try:
+            prompt = input("hugpy> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return 0
+    if not prompt:
+        return 0
+
+    rid = _uuid.uuid4().hex
+    body = {"prompt": prompt, "request_id": rid, "transport": "cli"}
+    if args.model:
+        body["model_key"] = args.model
+
+    def _cancel(_sig=None, _frm=None):
+        print("\n[cancelling server-side…]", file=sys.stderr)
+        try:
+            _post(f"/llm/chat/cancel/{rid}", {})
+        except Exception:
+            pass
+        raise SystemExit(130)
+    signal.signal(signal.SIGINT, _cancel)
+
+    try:
+        resp = _post("/chat/stream", body, stream=True)
+    except Exception as exc:
+        print(f"hugpy chat: cannot reach central at {base}: {exc}",
+              file=sys.stderr)
+        return 1
+    finish = "stop"
+    for raw in resp:
+        line = raw.decode("utf-8", "replace").strip()
+        if not line.startswith("data:"):
+            continue
+        try:
+            event = _json.loads(line[5:].strip())
+        except ValueError:
+            continue
+        etype = event.get("type")
+        if etype == "token":
+            print(event.get("text") or "", end="", flush=True)
+        elif etype == "error":
+            print(f"\nhugpy chat: {event.get('message')}", file=sys.stderr)
+            return 1
+        elif etype == "done":
+            finish = event.get("finish_reason") or "stop"
+            break
+    print()
+    if finish == "cancelled":
+        print("[cancelled]", file=sys.stderr)
+    return 0
+
+
 def _install_engine(args: argparse.Namespace) -> int:
     """Provision the native llama.cpp binaries (llama-server / rpc-server).
 
@@ -175,6 +253,15 @@ def main(argv: list[str] | None = None) -> int:
                    "machine (or an LXD instance) via chat + shell actions",
                    add_help=False)       # keeper.py owns its own --help
 
+    c = sub.add_parser("chat", help="stream a chat from a hugpy central in the "
+                       "terminal (tracked + cancellable like every transport)")
+    c.add_argument("prompt", nargs="*", help="the prompt (omit for interactive)")
+    c.add_argument("--central", help="central base URL (default: HUGPY_BASE_URL "
+                   "or http://127.0.0.1:7002)")
+    c.add_argument("--model", help="model_key (default: central decides)")
+    c.add_argument("--token", help="principal token (hpp_…) or API key "
+                   "(default: HUGPY_TOKEN / HUGPY_API_KEY)")
+
     e = sub.add_parser("install-engine",
                        help="download/build the native llama.cpp server binary")
     e.add_argument("--cuda", action="store_true", help="fetch/build a CUDA-enabled engine")
@@ -203,6 +290,8 @@ def main(argv: list[str] | None = None) -> int:
         return _install_engine(args)
     if args.cmd == "bot":
         return _bot(args)
+    if args.cmd == "chat":
+        return _chat(args)
     parser.error("unknown command")
     return 2
 

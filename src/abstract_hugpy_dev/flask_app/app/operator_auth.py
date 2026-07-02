@@ -76,6 +76,18 @@ _SENSITIVE = [
     ({"DELETE"},                 re.compile(r"^/discord/bridges/[^/]+$")),
     ({"POST"},                   re.compile(r"^/discord/bridges/[^/]+/(send|keeper-reply|approve|reject)$")),
     ({"GET"},                    re.compile(r"^/discord/bridges/[^/]+/messages$")),
+    # F2 principals: minting identities/tokens is operator-only. The
+    # /auth/discord-link handshake and /auth/whoami stay open — the principal
+    # token IS their credential.
+    ({"GET", "POST"},            re.compile(r"^/auth/principals$")),
+    ({"DELETE"},                 re.compile(r"^/auth/principals/[^/]+$")),
+    ({"POST"},                   re.compile(r"^/auth/principals/[^/]+/token$")),
+    # F4 settings: reads stay open (UIs render from them); writes are the
+    # console's authoritative control plane (CON-08) -> operator-only.
+    ({"POST", "PUT", "DELETE"},  re.compile(r"^/settings/.+$")),
+    # Worker ops (CON-05/06, UTIL-02): restart / module update / pip install
+    # are privileged executor actions on a worker — operator-only, audited.
+    ({"POST"},                   re.compile(r"^/llm/workers/[^/]+/(restart|update|pip)$")),
 ]
 
 _SESSION_CACHE: dict[str, tuple[bool, float]] = {}

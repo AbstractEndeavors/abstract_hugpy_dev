@@ -1,95 +1,92 @@
 """Process-wide registry of in-flight chat requests, for the console's live
 queue view.
 
-Generation is serialized (per-model generate_lock / max_concurrent_generations),
-so at any moment some requests are GENERATING and others are WAITING for the
-slot. This tracks that lifecycle thread-safely (one gunicorn process, many
-threads) and exposes a snapshot the UI polls via ``GET /api/llm/queue``.
+Now a thin shim over the shared comms JobStore (F5): begin/on_token/end
+create and drive real Jobs in the one store every transport uses, so the
+queue view, the /jobs surface, and the cancel plane all see the same records.
+The public API and the ``GET /api/llm/queue`` snapshot shape are unchanged:
 
-States: ``waiting`` (accepted, no token yet — queued or provisioning) →
-``active`` (producing tokens). Entries are removed when the stream ends (success,
-error, or client disconnect — the stream's ``finally`` always calls ``end``).
+States (view-level): ``waiting`` (accepted, no token yet — canonical
+pending/processing) → ``active`` (producing tokens — canonical streaming).
+Entries leave the live view when the stream ends (the stream's ``finally``
+still calls ``end``, which marks the job terminal instead of popping it).
+
+Download jobs live in the same store but are excluded here — this is the
+chat/inference queue, and downloads have their own /jobs surface.
 """
 from __future__ import annotations
 
-import time
-import threading
+from abstract_hugpy_dev.comms.jobs import job_store, normalize_status
 
-_lock = threading.Lock()
-_entries: "dict[str, dict]" = {}
+# view state <- canonical status
+_VIEW_STATE = {"pending": "waiting", "processing": "waiting",
+               "streaming": "active"}
+_QUEUE_KINDS_EXCLUDED = {"download"}
 
 
 def begin(request_id, model_key=None, model_name=None, kind="chat") -> None:
     if not request_id:
         return
-    with _lock:
-        # Preserve an existing started_at if the same id re-registers.
-        prior = _entries.get(request_id)
-        _entries[request_id] = {
-            "request_id": request_id,
-            "model_key": model_key,
-            "model": model_name or model_key or "?",
-            "kind": kind,
-            "state": "waiting",
-            "started_at": prior["started_at"] if prior else time.time(),
-            "first_token_at": None,
-            "tokens": 0,
-        }
+    # Preserve an existing live entry if the same id re-registers.
+    existing = job_store.get(request_id)
+    if existing is not None and not existing.terminal:
+        job_store.update(request_id, model_key=model_key or existing.model_key,
+                         model_name=model_name or existing.model_name)
+        return
+    job_store.create(model_key or "", id=request_id, kind=kind,
+                     model_name=model_name, transport=kind)
 
 
 def mark_active(request_id) -> None:
-    with _lock:
-        e = _entries.get(request_id)
-        if e and e["state"] != "active":
-            e["state"] = "active"
-            e["first_token_at"] = time.time()
+    job_store.on_output(request_id, n=0)
 
 
 def on_token(request_id) -> None:
-    """First token flips the entry active; every token bumps the counter. One
-    lock acquisition per token (cheap; only a few streams run at once)."""
-    with _lock:
-        e = _entries.get(request_id)
-        if not e:
-            return
-        if e["state"] != "active":
-            e["state"] = "active"
-            e["first_token_at"] = time.time()
-        e["tokens"] += 1
+    """First token flips the entry active; every token bumps the counter."""
+    job_store.on_output(request_id)
 
 
 def end(request_id) -> None:
     if not request_id:
         return
-    with _lock:
-        _entries.pop(request_id, None)
+    # finish() resolves the terminal state: cancelled if a cancel was
+    # requested, else done. No-op if the stream already marked it.
+    job_store.finish(request_id)
+
+
+def fail(request_id, error=None) -> None:
+    """Terminal-with-error, for callers that know the stream broke."""
+    if request_id:
+        job_store.finish(request_id, error=error)
 
 
 def snapshot() -> list:
-    """Public, JSON-safe view. Waiting first, then longest-running."""
-    now = time.time()
-    with _lock:
-        out = []
-        for e in _entries.values():
-            started = e["started_at"]
-            ft = e["first_token_at"]
-            out.append({
-                "request_id": e["request_id"],
-                "model_key": e["model_key"],
-                "model": e["model"],
-                "kind": e["kind"],
-                "state": e["state"],
-                "elapsed": round(now - started, 1),
-                # seconds spent WAITING before the first token (queue time).
-                "wait": round((ft or now) - started, 1),
-                "tokens": e["tokens"],
-            })
+    """Public, JSON-safe view. Waiting first, then longest-running —
+    identical shape to the pre-comms implementation."""
+    out = []
+    for d in job_store.snapshot():
+        if d["kind"] in _QUEUE_KINDS_EXCLUDED:
+            continue
+        state = _VIEW_STATE.get(d["status"], d["status"])
+        out.append({
+            "request_id": d["id"],
+            "model_key": d["model_key"] or None,
+            "model": d["model"],
+            "kind": d["kind"],
+            "state": state,
+            "elapsed": d["elapsed"],
+            "wait": d["wait"],
+            "tokens": d["tokens"],
+        })
     out.sort(key=lambda x: (x["state"] != "waiting", -x["elapsed"]))
     return out
 
 
 def counts() -> dict:
-    with _lock:
-        waiting = sum(1 for e in _entries.values() if e["state"] == "waiting")
-        active = sum(1 for e in _entries.values() if e["state"] == "active")
+    live = [d for d in job_store.snapshot()
+            if d["kind"] not in _QUEUE_KINDS_EXCLUDED]
+    waiting = sum(1 for d in live
+                  if _VIEW_STATE.get(d["status"]) == "waiting")
+    active = sum(1 for d in live
+                 if _VIEW_STATE.get(d["status"]) == "active")
     return {"waiting": waiting, "active": active, "total": waiting + active}

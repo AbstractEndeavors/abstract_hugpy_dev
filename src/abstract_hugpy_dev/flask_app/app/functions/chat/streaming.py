@@ -136,10 +136,13 @@ async def stream_events(body: ChatBody):
         prompt_kwargs["file"] = body.file
     if body.images:
         prompt_kwargs["images"] = body.images
-    if body.request_id:
-        # Stable id the engine threads through every continuation pass; also lets
-        # the browser correlate the stream.
-        prompt_kwargs["request_id"] = body.request_id
+    # Stable id the engine threads through every continuation pass; also lets
+    # the browser correlate the stream. Minted here when the client didn't send
+    # one, so EVERY chat is registered in the shared job store and cancellable —
+    # an untracked stream can't be stopped.
+    import uuid as _uuid
+    rid = body.request_id or _uuid.uuid4().hex
+    prompt_kwargs["request_id"] = rid
 
     # Text-only chat to a multi-task (e.g. vision) model: route to its
     # text-generation task instead of the default image-text-to-text, so a
@@ -159,11 +162,13 @@ async def stream_events(body: ChatBody):
 
     logger.info("prompt_kwargs == %s", prompt_kwargs)
 
-    # Register this request in the live queue (waiting -> active on first token,
-    # removed on stream end/error/disconnect via finally). Best-effort: queue
-    # bookkeeping must never break a chat.
-    from abstract_hugpy_dev.managers.dispatch import activity
-    rid = body.request_id
+    # Register this request in the shared job store (F5): pending -> streaming
+    # on first token, terminal on stream end/error/disconnect via finally. The
+    # same record backs the console queue view, /llm/jobs, and the cancel
+    # plane. Best-effort: job bookkeeping must never break a chat.
+    import asyncio
+    from abstract_hugpy_dev.comms import job_store
+    from abstract_hugpy_dev._platform import async_runtime
     try:
         _name = None
         try:
@@ -172,20 +177,47 @@ async def stream_events(body: ChatBody):
             _name = getattr(_cfg, "name", None) or body.model_key
         except Exception:
             _name = body.model_key
-        activity.begin(rid, body.model_key, _name)
+        _existing = job_store.get(rid)
+        if _existing is None or _existing.terminal:
+            job_store.create(body.model_key or "", id=rid, kind="chat",
+                             transport=body.transport or "web",
+                             channel=body.channel,
+                             principal=body.principal,
+                             model_name=_name)
+    except Exception:
+        pass
+
+    # A real cancel path (F1.3): the job carries a handle that sets this
+    # event on the shared runtime loop; execute_chat_stream honors it between
+    # and during passes. Anything — the cancel route, a bus control message —
+    # stops this stream through job_store.cancel(rid).
+    cancel_event = asyncio.Event()
+    try:
+        job_store.attach_cancel(
+            rid, lambda: async_runtime.call_soon_threadsafe(cancel_event.set))
     except Exception:
         pass
 
     try:
-        async for event in execute_chat_stream(**prompt_kwargs):
+        async for event in execute_chat_stream(cancel_event=cancel_event,
+                                               **prompt_kwargs):
             if getattr(event, "type", None) == "token":
-                activity.on_token(rid)
+                job_store.on_output(rid)
             yield event_to_sse(event)
     except Exception as exc:
         logger.exception("stream_events failed")
+        try:
+            job_store.finish(rid, error=exc)
+        except Exception:
+            pass
         yield sse_event({"type": "error", "message": _friendly_stream_error(exc)})
     finally:
-        activity.end(rid)
+        # Resolves to done, or cancelled if a cancel was requested; no-op when
+        # the except above already marked it failed.
+        try:
+            job_store.finish(rid)
+        except Exception:
+            pass
 
 
 def _friendly_stream_error(exc: Exception) -> str:
@@ -238,14 +270,43 @@ def _resolve_request_pool(explicit):
     return key_pool
 
 
+def _resolve_request_principal():
+    """Attribution (F2): who is asking, from whatever credential they sent.
+    Must run in request context — the SSE generator has none. Best-effort;
+    a chat never fails over attribution."""
+    try:
+        from abstract_hugpy_dev.comms.principals import principal_store
+        bearer = _request_bearer()
+        if bearer and bearer.startswith("hpp_"):
+            p = principal_store.resolve_token(bearer)
+            if p is not None:
+                return p.id
+        if bearer:
+            from abstract_hugpy_dev.flask_app.app.functions.imports.utils.\
+                api_keys import key_id_for_token
+            kid = key_id_for_token(bearer)
+            if kid:
+                return f"apikey:{kid}"
+        from abstract_hugpy_dev.flask_app.app.operator_auth import (
+            operator_authenticated)
+        if operator_authenticated():
+            return "operator"
+    except Exception:
+        pass
+    return None
+
+
 def chat_stream(mimetype=None, headers=None, **kwargs):
     logger.info(kwargs)
     body = ChatBody(**kwargs)
-    # Resolve the dedicated pool HERE — the SSE generator runs on the shared async
-    # runtime loop, which has no flask.request context.
+    # Resolve the dedicated pool + principal HERE — the SSE generator runs on
+    # the shared async runtime loop, which has no flask.request context. The
+    # principal always overwrites whatever the client sent (never trusted).
     eff_pool = _resolve_request_pool(getattr(body, "pool", None))
+    updates = {"principal": _resolve_request_principal()}
     if eff_pool:
-        body = body.model_copy(update={"pool": eff_pool})
+        updates["pool"] = eff_pool
+    body = body.model_copy(update=updates)
 
     return Response(
         stream_with_context(chat_iter_sync(stream_events(body), heartbeat=SSE_KEEPALIVE)),
