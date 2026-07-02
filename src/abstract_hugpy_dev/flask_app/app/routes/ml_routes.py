@@ -113,7 +113,11 @@ def _have(mod: str) -> bool:
 def _ml_pool() -> str:
     """The reserved worker pool these endpoints route to (env-overridable).
     Empty string disables the default (normal pool resolution then applies)."""
-    return (os.environ.get("HUGPY_ML_POOL", "ml") or "").strip()
+    # Default UN-pooled (opt-in reservation): with a pool default, any install
+    # lacking a pool-tagged worker had its ENTIRE media arm silently falling
+    # back to central — models assigned to general workers were never used.
+    # Set HUGPY_ML_POOL=ml (+ tag a worker) to opt into a dedicated pool.
+    return (os.environ.get("HUGPY_ML_POOL", "") or "").strip()
 
 
 def _general_route_tasks() -> set:
