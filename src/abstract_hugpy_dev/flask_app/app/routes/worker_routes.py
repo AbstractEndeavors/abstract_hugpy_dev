@@ -790,6 +790,11 @@ def model_file_manifest(model_key):
     total = 0
     for root, _dirs, names in os.walk(dest):
         for name in names:
+            # Transfer machinery artifacts are not model content: chunk-hash
+            # sidecars (server-side cache) and .part/.state staging files
+            # (worker-side, in case a worker dir is ever served back out).
+            if ".chunksums-" in name or name.endswith((".part", ".part.state.json")):
+                continue
             full = os.path.join(root, name)
             try:
                 size = os.path.getsize(full)
@@ -831,6 +836,81 @@ def model_file(model_key):
     return send_file(target, as_attachment=True,
                      download_name=os.path.basename(target),
                      conditional=True)
+
+
+# Per-chunk hashing for verified transfers. 32 MiB chunks: big enough that a
+# 40 GB file is ~1280 sums (tiny JSON), small enough that a failed/corrupt
+# chunk re-fetch is cheap. Clamped so a caller can't request degenerate sizes.
+_CHUNKSUM_DEFAULT = 32 * 1024 * 1024
+_CHUNKSUM_MIN, _CHUNKSUM_MAX = 4 * 1024 * 1024, 256 * 1024 * 1024
+
+
+def _chunk_sums(path: str, chunk_bytes: int) -> list[str]:
+    """SHA-256 of each ``chunk_bytes`` slice of ``path``, sidecar-cached.
+
+    Hashing a 40 GB file off HDD takes minutes — it must happen once per
+    (file, chunk size), not per worker pull. The sidecar is keyed by size +
+    mtime so a re-uploaded file re-hashes; failure to WRITE the sidecar is
+    tolerated (read-only mounts) at the cost of re-hashing next time.
+    """
+    import hashlib
+    import json
+
+    st = os.stat(path)
+    side = f"{path}.chunksums-{chunk_bytes}.json"
+    try:
+        with open(side, "r", encoding="utf-8") as fh:
+            cached = json.load(fh)
+        if cached.get("size") == st.st_size and cached.get("mtime") == int(st.st_mtime):
+            return cached["sums"]
+    except Exception:
+        pass
+    sums = []
+    with open(path, "rb") as fh:
+        while True:
+            buf = fh.read(chunk_bytes)
+            if not buf:
+                break
+            sums.append(hashlib.sha256(buf).hexdigest())
+    try:
+        tmp = side + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"size": st.st_size, "mtime": int(st.st_mtime),
+                       "chunk_bytes": chunk_bytes, "sums": sums}, fh)
+        os.replace(tmp, side)
+    except OSError:
+        pass
+    return sums
+
+
+@worker_bp.route("/llm/models/<path:model_key>/chunksums", methods=["GET"])
+def model_file_chunksums(model_key):
+    """Per-chunk SHA-256 manifest for one file — the verify half of a chunked,
+    resumable transfer. The worker downloads chunk-aligned ranges, hashes each
+    as it lands, and re-fetches ONLY chunks that fail — so completeness is
+    proven content, not a size that a preallocated-then-crashed pull can fake.
+    """
+    _model, dest = _model_dir_or_404(model_key)
+    rel = request.args.get("path", "")
+    if not rel:
+        abort(400, description="Missing ?path=")
+    target = os.path.realpath(os.path.join(dest, rel))
+    if target != dest and not target.startswith(dest + os.sep):
+        abort(403, description="Path escapes model directory.")
+    if not os.path.isfile(target):
+        abort(404, description="No such file.")
+    try:
+        chunk = int(request.args.get("chunk") or _CHUNKSUM_DEFAULT)
+    except ValueError:
+        chunk = _CHUNKSUM_DEFAULT
+    chunk = max(_CHUNKSUM_MIN, min(chunk, _CHUNKSUM_MAX))
+    return jsonify({
+        "path": rel,
+        "size": os.path.getsize(target),
+        "chunk_bytes": chunk,
+        "algo": "sha256",
+        "sums": _chunk_sums(target, chunk),
+    })
 
 
 @worker_bp.route("/llm/models/<path:model_key>/archive", methods=["GET"])

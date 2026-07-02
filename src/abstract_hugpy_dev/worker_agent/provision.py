@@ -25,6 +25,7 @@ finds them with no further config.
 from __future__ import annotations
 
 import os
+import json
 import time
 import logging
 import threading
@@ -324,22 +325,56 @@ def _download_with_retry(url: str, dest_path: str, expected_size: int | None,
         try:
             _download_file(url, dest_path, expected_size,
                            on_bytes=on_bytes if i == 0 else None)
-            if expected_size is None:
+            size_ok = (expected_size is None
+                       or (os.path.exists(dest_path)
+                           and os.path.getsize(dest_path) == expected_size))
+            if size_ok and _gguf_header_ok(dest_path):
                 return
-            if os.path.exists(dest_path) and os.path.getsize(dest_path) == expected_size:
-                return
-            last_exc = RuntimeError(
-                f"size mismatch for {os.path.basename(dest_path)}: "
-                f"{os.path.getsize(dest_path) if os.path.exists(dest_path) else 0}"
-                f"/{expected_size}")
+            if size_ok:
+                # Right size, garbage content (preallocated-then-crashed pull).
+                # Size alone lies here — and the resumer treats full-size files
+                # as complete, so remove the shell before retrying.
+                try:
+                    os.remove(dest_path)
+                except OSError:
+                    pass
+                last_exc = RuntimeError(
+                    f"corrupt GGUF header for {os.path.basename(dest_path)} — "
+                    "removed, re-downloading")
+            else:
+                last_exc = RuntimeError(
+                    f"size mismatch for {os.path.basename(dest_path)}: "
+                    f"{os.path.getsize(dest_path) if os.path.exists(dest_path) else 0}"
+                    f"/{expected_size}")
         except Exception as exc:  # noqa: BLE001 — retry transient network errors
             last_exc = exc
         time.sleep(min(2 ** i, 8))
     raise last_exc or RuntimeError(f"failed to download {url}")
 
 
+def _gguf_header_ok(path: str) -> bool:
+    """Cheap validity check: GGUF files must start with the b'GGUF' magic.
+
+    A crashed multi-connection pull leaves a PREALLOCATED full-size file of
+    zeros — it passes the size check forever, and llama.cpp only reveals the
+    truth at load time ('invalid magic characters'). Non-.gguf files pass
+    unchecked (no cheap magic for them)."""
+    if not path.lower().endswith(".gguf"):
+        return True
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(4) == b"GGUF"
+    except OSError:
+        return False
+
+
 def _missing_or_short(dest: str, files: list[dict]) -> list[tuple]:
-    """Return [(rel, expected_size, reason)] for files not fully present."""
+    """Return [(rel, expected_size, reason)] for files not fully present.
+
+    Side effect: a full-size file with a corrupt GGUF header is UNLINKED here
+    (and reported as "corrupt") — the resume logic downstream treats
+    right-sized files as complete, so the only way to force a clean re-pull
+    is to remove the shell before the download pass sees it."""
     out = []
     for entry in files:
         rel = entry.get("path")
@@ -351,6 +386,12 @@ def _missing_or_short(dest: str, files: list[dict]) -> list[tuple]:
             out.append((rel, size, "absent"))
         elif size is not None and os.path.getsize(target) != size:
             out.append((rel, size, "short"))
+        elif not _gguf_header_ok(target):
+            try:
+                os.remove(target)
+            except OSError:
+                pass
+            out.append((rel, size, "corrupt"))
     return out
 
 
@@ -427,6 +468,98 @@ def _segment_ranges(size: int) -> list[tuple[int, int]]:
     return ranges
 
 
+# ── verified chunked transfer ────────────────────────────────────────────────
+# Content-verified, crash-safe pulls: central serves per-chunk SHA-256 sums
+# (GET .../chunksums), the worker fetches chunk-aligned ranges into a .part
+# staging file, hashes each chunk AS IT LANDS, records verified chunks in a
+# .state sidecar (so a crash resumes from proven content, not a byte offset),
+# and only os.replace()s onto the final name once every chunk verified.
+# "Exists under its final name" therefore MEANS complete — the invariant the
+# old preallocate-then-size-check scheme couldn't give (a crashed pull left a
+# full-size zero shell that passed as present forever).
+
+def _chunk_bytes() -> int:
+    try:
+        return max(4 * 2**20, min(int(os.environ.get("HUGPY_CHUNK_BYTES", 32 * 2**20)),
+                                  256 * 2**20))
+    except ValueError:
+        return 32 * 2**20
+
+
+def _fetch_chunksums(base: str, rel: str, chunk_bytes: int) -> list[str] | None:
+    """Per-chunk sums from central, or None (older central / any failure —
+    the caller falls back to the size+magic scheme)."""
+    try:
+        d = _get_json(base + "/chunksums?path=" + urllib.parse.quote(rel)
+                      + f"&chunk={chunk_bytes}", timeout=590)
+        sums = d.get("sums")
+        return list(sums) if sums else None
+    except Exception as exc:  # noqa: BLE001
+        logger.info("no chunksums for %s (%s) — size+magic mode", rel, exc)
+        return None
+
+
+def _load_chunk_state(state_path: str, nchunks: int) -> set[int]:
+    try:
+        with open(state_path, "r", encoding="utf-8") as fh:
+            got = json.load(fh).get("verified") or []
+        return {i for i in got if isinstance(i, int) and 0 <= i < nchunks}
+    except Exception:
+        return set()
+
+
+def _save_chunk_state(state_path: str, verified: set[int]) -> None:
+    try:
+        tmp = state_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"verified": sorted(verified)}, fh)
+        os.replace(tmp, state_path)
+    except OSError:
+        pass  # state is an optimization; losing it only costs re-verification
+
+
+def _fetch_chunk_verified(url: str, part_path: str, index: int, size: int,
+                          chunk_bytes: int, want_sha: str, on_bytes=None,
+                          attempts: int = 4) -> None:
+    """Fetch chunk ``index``, verify its SHA-256, write it at its offset."""
+    import hashlib
+
+    start = index * chunk_bytes
+    end = min(start + chunk_bytes, size) - 1
+    last_exc: Exception | None = None
+    for i in range(attempts):
+        try:
+            req = urllib.request.Request(url, headers={"Range": f"bytes={start}-{end}"})
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                if resp.getcode() != 206:
+                    raise RuntimeError("server ignored Range request")
+                buf = resp.read(end - start + 1)
+            if len(buf) != end - start + 1:
+                raise RuntimeError(f"short chunk {index}: {len(buf)}/{end - start + 1}")
+            got = hashlib.sha256(buf).hexdigest()
+            if got != want_sha:
+                raise RuntimeError(f"chunk {index} hash mismatch")
+            with open(part_path, "r+b") as fh:
+                fh.seek(start)
+                fh.write(buf)
+            if on_bytes and i == 0:
+                on_bytes(len(buf))
+            return
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            time.sleep(min(2 ** i, 8))
+    raise last_exc or RuntimeError(f"failed chunk {index} of {url}")
+
+
+def _ensure_part(part_path: str, size: int) -> None:
+    """Preallocate the staging file — only if absent or wrong-sized, so a
+    resumed pull never clobbers already-verified chunks."""
+    os.makedirs(os.path.dirname(part_path) or ".", exist_ok=True)
+    if not os.path.exists(part_path) or os.path.getsize(part_path) != size:
+        with open(part_path, "wb") as fh:
+            fh.truncate(size)
+
+
 def fetch_from_central(central_url: str, model_key: str, progress=None) -> bool:
     """Pull a model's ENTIRE directory from central — parallel and segmented.
 
@@ -494,43 +627,107 @@ def fetch_from_central(central_url: str, model_key: str, progress=None) -> bool:
             done = pstate["done"]
         progress(min(done, total) if total else done, total, "files")
 
+    # Per-file transfer context for the staged/verified scheme. Everything
+    # downloads into <target>.part and is promoted by _finalize only after
+    # verification — a crash mid-pull leaves a .part (+ chunk state), never a
+    # plausible-looking final file.
+    cb = _chunk_bytes()
+    ctx: dict = {}   # rel -> {size, part, state, sums, verified, lock}
+
     def _build_units(entries):
         """Flatten entries into download units, capping total connections.
 
-        A unit is (rel, size, start, end); start/end None means whole file.
-        Large files (with Range support) become several segment units.
+        Preferred unit is a VERIFIED CHUNK (central supplied per-chunk sums:
+        fetch chunk-aligned range → hash → write → record). Fallbacks: plain
+        byte-range segments (Range but no sums), then whole-file streaming —
+        both still staged to .part and sealed by size+magic at finalize.
         """
         units = []
         for entry in entries:
             rel, size = entry["path"], entry.get("size")
-            target = os.path.join(dest, rel)
+            part = os.path.join(dest, rel) + ".part"
+            c = ctx.setdefault(rel, {"lock": threading.Lock()})
+            c.update(size=size, part=part, state=None, sums=None, verified=None)
+            sums = None
             if ranged_ok and size and size >= _SEGMENT_MIN_BYTES:
-                os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
-                with open(target, "wb") as fh:   # preallocate for offset writes
-                    fh.truncate(size)
-                for start, end in _segment_ranges(size):
-                    units.append((rel, size, start, end))
+                sums = _fetch_chunksums(base, rel, cb)
+                if sums is not None and len(sums) != -(-size // cb):
+                    logger.warning("chunksums length mismatch for %s (%d vs %d) — "
+                                   "falling back to size+magic", rel, len(sums),
+                                   -(-size // cb))
+                    sums = None
+            if sums is not None:
+                _ensure_part(part, size)
+                state_path = part + ".state.json"
+                verified = _load_chunk_state(state_path, len(sums))
+                c.update(state=state_path, sums=sums, verified=verified)
+                units += [(rel, size, "chunk", i)
+                          for i in range(len(sums)) if i not in verified]
+            elif ranged_ok and size and size >= _SEGMENT_MIN_BYTES:
+                _ensure_part(part, size)
+                units += [(rel, size, "segment", se) for se in _segment_ranges(size)]
             else:
-                units.append((rel, size, None, None))
+                units.append((rel, size, "whole", None))
         return units
 
     def _run_unit(unit):
-        rel, size, start, end = unit
+        rel, size, kind, arg = unit
         url = base + "/file?path=" + urllib.parse.quote(rel)
-        target = os.path.join(dest, rel)
+        c = ctx[rel]
         try:
-            if start is None:
-                _download_with_retry(url, target, size, on_bytes=_on_bytes)
-            else:
-                _download_segment_with_retry(url, target, start, end, on_bytes=_on_bytes)
+            if kind == "whole":
+                _download_with_retry(url, c["part"], size, on_bytes=_on_bytes)
+            elif kind == "segment":
+                _download_segment_with_retry(url, c["part"], arg[0], arg[1],
+                                             on_bytes=_on_bytes)
+            else:  # verified chunk
+                _fetch_chunk_verified(url, c["part"], arg, size, cb,
+                                      c["sums"][arg], on_bytes=_on_bytes)
+                with c["lock"]:
+                    c["verified"].add(arg)
+                    _save_chunk_state(c["state"], c["verified"])
         except Exception as exc:  # noqa: BLE001 — gate below re-fetches/decides
-            logger.warning("download of %s failed: %s; will re-try in verify pass",
-                           rel, exc)
+            logger.warning("download of %s (%s %s) failed: %s; will re-try in "
+                           "verify pass", rel, kind, arg, exc)
+
+    def _finalize(entries):
+        """Promote fully-landed .part files onto their final names (atomic)."""
+        for entry in entries:
+            rel, size = entry["path"], entry.get("size")
+            c = ctx.get(rel)
+            if not c or not os.path.exists(c["part"]):
+                continue
+            part = c["part"]
+            if size is not None and os.path.getsize(part) != size:
+                continue                     # still incomplete — next pass resumes
+            if c["sums"] is not None:
+                with c["lock"]:
+                    if len(c["verified"]) < len(c["sums"]):
+                        continue             # unverified chunks remain
+            if not _gguf_header_ok(part):
+                # Chunk-verified content with a bad header means CENTRAL's copy
+                # is corrupt — re-pulling would reproduce it. Fail loud.
+                logger.error("%s: staged file fails the GGUF magic check — "
+                             "central's copy may itself be corrupt", rel)
+                for p in (part, c.get("state")):
+                    if p:
+                        try:
+                            os.remove(p)
+                        except OSError:
+                            pass
+                continue
+            os.replace(part, os.path.join(dest, rel))
+            if c.get("state"):
+                try:
+                    os.remove(c["state"])
+                except OSError:
+                    pass
 
     def _parallel(entries):
         units = _build_units(entries)
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
             list(pool.map(_run_unit, units))
+        _finalize(entries)
 
     # Initial pass over the pending files (computed above).
     _parallel(pending)

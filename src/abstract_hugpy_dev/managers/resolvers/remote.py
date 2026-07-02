@@ -198,6 +198,14 @@ def _event_from_worker_line(d: dict, request_id: str):
     browser still sees progress.
     """
     t = d.get("type")
+    if t == "status" and d.get("stage") == "dispatch":
+        # The worker runs the same dispatch engine and announces ITS OWN
+        # allocation — "served_by: local" meaning local-to-the-worker. Relayed
+        # verbatim it lands AFTER central's true banner and overwrites it, so
+        # the console shows "local" while the worker is in fact serving (the
+        # great phantom-fallback of 2026-07-02). Central owns the allocation
+        # banner; drop the worker's inner one.
+        return None
     if t == "token":
         return TokenEvent(request_id=request_id, text=d.get("text", ""))
     if t == "done":
@@ -244,7 +252,10 @@ async def _worker_stream(worker: dict, payload: dict, request_id: str):
                     d = json.loads(raw)
                 except ValueError:
                     continue
-                yield _event_from_worker_line(d, request_id)
+                ev = _event_from_worker_line(d, request_id)
+                if ev is None:      # suppressed (worker's inner dispatch banner)
+                    continue
+                yield ev
 
 
 async def _worker_run_once(worker: dict, payload: dict, result_type, request_id: str, model_key: str):

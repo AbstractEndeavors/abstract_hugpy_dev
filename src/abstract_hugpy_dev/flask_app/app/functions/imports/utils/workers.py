@@ -594,11 +594,18 @@ class WorkerStore:
             # falls back to local (caller's None handling), not to the shared pool.
             if (w.get("pool") or "").strip() != want_pool:
                 continue
-            assigned = w.get("models", [])
+            # Candidates = models this worker is ASSIGNED **or currently reports
+            # LOADED**. A worker holding the model warm (loaded via probe, or
+            # left resident after an unassign) is the best possible server —
+            # ignoring it sent the request to a cold local fallback while a
+            # GPU sat there with the weights already up. Loaded-ness is
+            # heartbeat-fresh; if it evicts between beats the relay fails
+            # pre-token and the caller falls back as always.
+            serveable = list(w.get("models", [])) + list(w.get("loaded_models", []))
             # Match on the raw key OR any normalized alias (hub_id vs key vs
             # case), so an assignment made via one form still routes a chat that
             # names the model a slightly different way.
-            if not (model_key in assigned or wanted & {a for m in assigned for a in _match_keys(m)}):
+            if not (model_key in serveable or wanted & {a for m in serveable for a in _match_keys(m)}):
                 continue
             if online_only and w["status"] != "online":
                 continue
