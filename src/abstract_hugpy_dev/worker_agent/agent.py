@@ -535,6 +535,56 @@ def _loaded_detail() -> dict:
         return {}
 
 
+# ── worker-local slot pool (CON-02) ─────────────────────────────────────────
+# With SLOT_COUNT > 0 the agent supervises N slot_agent children — the same
+# slot machinery central runs, but agent-managed (rootless, no systemd units
+# to install). Slot children run llama_cpp.server (no C++ llama-server binary
+# needed on workers), and get_llama_runner's slot-first path then serves this
+# worker's requests from slots: resident, TTL'd, crash-ISOLATED (a load that
+# aborts kills a child, not the agent — the failure mode that took the whole
+# agent down on 2026-07-02).
+
+def _slot_statuses() -> list | None:
+    try:
+        from ..managers.serve.slots import SlotPool, slots_enabled
+        if not slots_enabled():
+            return None
+        return SlotPool().statuses()
+    except Exception:
+        return None
+
+
+def _supervise_slots() -> None:
+    """Spawn and keep alive SLOT_COUNT slot_agent children (no-op when 0)."""
+    from ..managers.serve.slots import slots_enabled, _slot_count
+
+    if not slots_enabled():
+        return
+    top_pkg = __name__.split(".")[0]
+    module = f"{top_pkg}.managers.serve.slot_agent"
+    n = _slot_count()
+    procs: dict[int, subprocess.Popen] = {}
+
+    def _spawn(i: int) -> None:
+        env = dict(os.environ)
+        env["SLOT_ID"] = str(i)
+        procs[i] = subprocess.Popen([sys.executable, "-m", module], env=env)
+        logger.info("slot supervisor: started slot %d (pid %s)", i, procs[i].pid)
+
+    def _loop() -> None:
+        for i in range(1, n + 1):
+            _spawn(i)
+        while True:
+            time.sleep(20)
+            for i, p in list(procs.items()):
+                if p.poll() is not None:
+                    logger.warning("slot %d died (rc=%s) — respawning", i, p.returncode)
+                    _spawn(i)
+
+    threading.Thread(target=_loop, daemon=True, name="slot-supervisor").start()
+    logger.info("slot supervisor: managing %d slot(s) via llama_cpp.server children", n)
+
+
 def _apply_spill(spill: dict | None) -> None:
     """Translate a per-request spill override dict into the env vars the spill
     module reads. Only set keys that were provided; the model loads lazily, so
@@ -1176,6 +1226,7 @@ def _heartbeat_loop(client: CentralClient, state: WorkerState, args) -> None:
                     "pool": os.environ.get("WORKER_POOL", ""),
                     "caps": _local_caps(),
                     "loaded_detail": _loaded_detail(),
+                    "slots": _slot_statuses(),
                 },
             )
             # Adopt any assignment change made in the UI + pre-provision it.
@@ -1383,6 +1434,9 @@ def main(argv: list[str] | None = None) -> int:
                         central_url=args.central)
     state.port = args.port
     state.role = args.role
+
+    # Worker-local slot pool (SLOT_COUNT env; 0/unset = off, unchanged).
+    _supervise_slots()
 
     # F1/F5 wiring: control.cancel on this process's bus reaches the shared
     # job store (fires the cancel handle each live stream attached), and job

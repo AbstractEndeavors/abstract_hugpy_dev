@@ -476,6 +476,7 @@ class WorkerStore:
         pool: Optional[str] = None,
         caps: Optional[Dict[str, Any]] = None,
         loaded_detail: Optional[Dict[str, Any]] = None,
+        slots: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Mark a worker alive and refresh its live GPU / loaded-model stats."""
         with self._transaction() as workers:
@@ -507,6 +508,8 @@ class WorkerStore:
                 worker["engine"] = engine
             if loaded_detail is not None:
                 worker["loaded_detail"] = loaded_detail
+            if slots is not None:
+                worker["slots"] = slots
             if caps is not None:
                 worker["caps"] = caps
                 # Worker-side config is the hard ceiling: if its caps tightened

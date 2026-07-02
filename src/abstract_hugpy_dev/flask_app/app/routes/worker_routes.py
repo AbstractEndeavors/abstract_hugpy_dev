@@ -191,6 +191,9 @@ class HeartbeatRequest(BaseModel):
     # Per-loaded-model load facts: {key: {model_bytes, n_gpu_layers,
     # total_layers, gpu_pct}} — drives the console's serving rows.
     loaded_detail: dict | None = None
+    # This worker's OWN slot pool statuses (agent-supervised llama_cpp.server
+    # children) — rendered in its Compute-tab row like central's slots.
+    slots: list | None = None
 
 
 class AssignRequest(BaseModel):
@@ -310,6 +313,7 @@ def workers_heartbeat(worker_id):
         pool=body.pool,
         caps=body.caps,
         loaded_detail=body.loaded_detail,
+        slots=body.slots,
     )
     if worker is None:
         # The agent thinks it's registered but central forgot it (restart,

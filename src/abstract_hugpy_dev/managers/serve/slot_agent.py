@@ -192,25 +192,48 @@ def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None):
                 f"{avail / 1e9:.1f} GB budgetable (after reserve) with no GPU offload "
                 f"on this node — free RAM (recycle the API worker) or pick a smaller quant")
 
-    argv = [
-        LLAMA_SERVER_BIN, "-m", path,
-        "--host", "127.0.0.1", "--port", str(SLOT_CHILD_PORT),
-        "--n-gpu-layers", str(ngl), "-c", str(ctx), "-t", str(threads),
-    ]
-    if cpus:
-        # Soft pin via llama.cpp's own affinity (taskset is escaped by llama.cpp's
-        # per-thread sched_setaffinity). For HARD, kernel-enforced dedication use
-        # hugpy-slot-cpus -> cgroup AllowedCPUs. "0-3" / "0,2,4" -> hex mask.
-        mask = _cpus_to_hexmask(cpus)
-        if mask:
-            argv += ["--cpu-mask", mask, "--cpu-strict", "1"]
-    # Vision GGUF: load the multimodal projector so /v1/chat/completions accepts
-    # image_url content. No-op for text models (no projector beside the model).
-    from ...imports.src.utils import find_mmproj
-    mmproj = find_mmproj(path)
-    if mmproj:
-        argv += ["--mmproj", mmproj]
-        logger.info("slot %s: vision model — loading projector %s", SLOT_ID, mmproj)
+    import shutil
+    server_bin = LLAMA_SERVER_BIN if (LLAMA_SERVER_BIN and (
+        os.path.isfile(LLAMA_SERVER_BIN) or shutil.which(LLAMA_SERVER_BIN))) else None
+
+    if server_bin:
+        argv = [
+            server_bin, "-m", path,
+            "--host", "127.0.0.1", "--port", str(SLOT_CHILD_PORT),
+            "--n-gpu-layers", str(ngl), "-c", str(ctx), "-t", str(threads),
+        ]
+        if cpus:
+            # Soft pin via llama.cpp's own affinity (taskset is escaped by llama.cpp's
+            # per-thread sched_setaffinity). For HARD, kernel-enforced dedication use
+            # hugpy-slot-cpus -> cgroup AllowedCPUs. "0-3" / "0,2,4" -> hex mask.
+            mask = _cpus_to_hexmask(cpus)
+            if mask:
+                argv += ["--cpu-mask", mask, "--cpu-strict", "1"]
+        # Vision GGUF: load the multimodal projector so /v1/chat/completions accepts
+        # image_url content. No-op for text models (no projector beside the model).
+        from ...imports.src.utils import find_mmproj
+        mmproj = find_mmproj(path)
+        if mmproj:
+            argv += ["--mmproj", mmproj]
+            logger.info("slot %s: vision model — loading projector %s", SLOT_ID, mmproj)
+    else:
+        # No C++ llama-server on this box (typical for WORKERS): fall back to
+        # the OpenAI-compatible server inside llama-cpp-python — the engine
+        # every node already has, so there's no binary to distribute or build.
+        # Same /v1 surface, so the slot proxy needs no changes. No --cpu-mask
+        # equivalent (threads + the unit's cgroup govern CPU); vision models
+        # stay on the native/in-process path (no --mmproj here).
+        import sys as _sys
+        argv = [
+            _sys.executable, "-m", "llama_cpp.server",
+            "--model", path,
+            "--host", "127.0.0.1", "--port", str(SLOT_CHILD_PORT),
+            "--n_gpu_layers", str(ngl), "--n_ctx", str(ctx),
+            "--n_threads", str(threads),
+        ]
+        if cpus:
+            logger.info("slot %s: cpu pin %r ignored in llama_cpp.server mode",
+                        SLOT_ID, cpus)
     return argv, ngl, ctx, threads, cpus
 
 
@@ -238,9 +261,16 @@ class Slot:
     def healthy(self) -> bool:
         if not self._child_alive():
             return False
+        import httpx
         try:
-            import httpx
-            return httpx.get(self.child_base + "/health", timeout=2.0).status_code == 200
+            if httpx.get(self.child_base + "/health", timeout=2.0).status_code == 200:
+                return True
+        except Exception:
+            pass
+        try:
+            # llama_cpp.server (the python fallback child) has no /health;
+            # /v1/models answering is its liveness signal.
+            return httpx.get(self.child_base + "/v1/models", timeout=2.0).status_code == 200
         except Exception:
             return False
 
