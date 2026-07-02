@@ -454,6 +454,9 @@ _SPILL_ENV = {
     "n_gpu_layers": "HUGPY_N_GPU_LAYERS",
     "gpu_mem_gib": "HUGPY_GPU_MEM_GIB",
     "cpu_mem_gib": "HUGPY_CPU_MEM_GIB",
+    # Explicit per-model core budget (slot loads pass it to the child;
+    # in-process loads read DEFAULT_LLAMA_THREADS at build).
+    "threads": "DEFAULT_LLAMA_THREADS",
     "tensor_split": "HUGPY_TENSOR_SPLIT",
     "main_gpu": "HUGPY_MAIN_GPU",
     "n_gpu": "HUGPY_N_GPU",

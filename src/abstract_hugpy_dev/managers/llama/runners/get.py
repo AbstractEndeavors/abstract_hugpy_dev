@@ -75,6 +75,9 @@ def loaded_runner_detail() -> dict:
                 d["total_layers"] = _gguf_layer_count(path)
             except Exception:
                 pass
+        thr = getattr(r, "n_threads", None)
+        if thr is not None:
+            d["threads"] = thr
         ngl = getattr(r, "n_gpu_layers", None)
         if ngl is not None:
             d["n_gpu_layers"] = ngl
@@ -160,6 +163,16 @@ def _build_runner(model_key: str) -> "LlamaCppBaseRunner":
                     mpath = mpath or get_gguf_file(mdir, cfg)
                     if mpath:
                         opts = {"path": _os.fspath(mpath)}
+                    # Explicit per-model budgets (assign spill → env via the
+                    # agent's _apply_spill) ride as per-load opts: slot
+                    # processes were spawned earlier and never see env changes.
+                    for env_name, key in (("HUGPY_GPU_MEM_GIB", "gpu_mem_gib"),
+                                          ("HUGPY_CPU_MEM_GIB", "cpu_mem_gib"),
+                                          ("DEFAULT_LLAMA_THREADS", "threads")):
+                        v = _os.environ.get(env_name)
+                        if v:
+                            opts = opts or {}
+                            opts[key] = v
                 except Exception:
                     opts = None
                 sep = SlotPool().endpoint_for(model_key, opts=opts)

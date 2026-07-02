@@ -146,7 +146,7 @@ def _cpus_to_hexmask(cpus: str) -> str:
 
 
 def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None,
-               path=None):
+               path=None, gpu_mem_gib=None, cpu_mem_gib=None):
     """argv for the child llama-server + the resolved (ngl, ctx, threads, cpus)."""
     from .serve import (
         _model_file_for, _ctx_for, get_model_config,
@@ -176,7 +176,20 @@ def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None,
         logger.warning("model_cache unavailable (%s); loading from %s", exc, path)
 
     # Autofit from the VRAM free RIGHT NOW, so later slots take what's left.
-    auto = autofit_gpu_layers(path)
+    # An explicit per-model VRAM budget (gpu_mem_gib) caps what autofit may
+    # plan with — the model's contract, not the card's whole remainder.
+    free_cap = None
+    if gpu_mem_gib not in (None, ""):
+        try:
+            free_cap = int(float(gpu_mem_gib) * 2**30)
+        except (TypeError, ValueError):
+            free_cap = None
+    if free_cap is not None:
+        from ..spill import free_vram_bytes as _fvb
+        fv = _fvb()
+        auto = autofit_gpu_layers(path, free_vram=min(fv, free_cap) if fv else free_cap)
+    else:
+        auto = autofit_gpu_layers(path)
     ngl = n_gpu_layers if n_gpu_layers is not None else auto
     ctx = int(ctx) if ctx else (_ctx_for(cfg, model_key) if cfg is not None else 4096)
     threads = int(threads) if threads else DEFAULT_LLAMA_THREADS
@@ -186,6 +199,22 @@ def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None,
     # node) the weights are CPU-RAM-resident, so a model bigger than free RAM will
     # OOM mid-load. Sum ALL shards (the resolved path is only shard 1) and fail
     # fast with a clear message instead of letting RSS climb into an OOM 500.
+    # Per-model RAM budget (cpu_mem_gib): the CPU-resident share must fit the
+    # model's OWN allowance, not just whatever the box has free.
+    if cpu_mem_gib not in (None, ""):
+        try:
+            from ..spill import cpu_resident_bytes
+            ram_budget = float(cpu_mem_gib) * 1e9
+            ngl_eff = n_gpu_layers if n_gpu_layers is not None else auto
+            need_cpu = cpu_resident_bytes(path, int(ngl_eff)) or 0
+            if need_cpu > ram_budget:
+                raise RuntimeError(
+                    f"{model_key}: CPU-resident share ~{need_cpu / 1e9:.1f} GB exceeds "
+                    f"this model's RAM budget ({float(cpu_mem_gib):.1f} GB) — raise the "
+                    "budget, offload more layers, or pick a smaller quant")
+        except (TypeError, ValueError):
+            pass
+
     if auto <= 0:
         need = _total_gguf_bytes(path)
         avail = _mem_available_bytes()
@@ -306,7 +335,8 @@ class Slot:
 
     # -- lifecycle ---------------------------------------------------------
     def load(self, model_key, n_gpu_layers=None, ctx=None, threads=None,
-             cpus=None, gpu=None, path=None) -> dict:
+             cpus=None, gpu=None, path=None, gpu_mem_gib=None,
+             cpu_mem_gib=None) -> dict:
         with self.lock:
             if self.model_key == model_key and self.healthy():
                 self.last_used = time.time()
@@ -314,7 +344,8 @@ class Slot:
 
             self._kill()
             argv, self.ngl, self.ctx, self.threads, self.cpus = _build_cmd(
-                model_key, n_gpu_layers, ctx, threads, cpus, path=path)
+                model_key, n_gpu_layers, ctx, threads, cpus, path=path,
+                gpu_mem_gib=gpu_mem_gib, cpu_mem_gib=cpu_mem_gib)
             # per-load GPU pin overrides the slot's MAIN_GPU default
             self.gpu = gpu if gpu not in (None, "") else MAIN_GPU
             self.expected_bytes = _model_expected_bytes(model_key)
@@ -395,7 +426,9 @@ def build_app():
             return jsonify(slot.load(body["model_key"], body.get("n_gpu_layers"),
                                      body.get("ctx"), body.get("threads"),
                                      body.get("cpus"), body.get("gpu"),
-                                     path=body.get("path")))
+                                     path=body.get("path"),
+                                     gpu_mem_gib=body.get("gpu_mem_gib"),
+                                     cpu_mem_gib=body.get("cpu_mem_gib")))
         except Exception as exc:  # noqa: BLE001
             return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
 
