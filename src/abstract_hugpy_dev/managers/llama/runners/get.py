@@ -16,6 +16,42 @@ _LLAMA_INSTANCES: Dict[str, "LlamaCppBaseRunner"] = {}
 _LLAMA_LOCK = threading.Lock()
 
 
+def evict_llama_runner(model_key: str) -> bool:
+    """Drop the heavy singleton for ``model_key`` and free its weights.
+
+    dispatch.evict only releases the adapter wrapper; the loaded ``Llama``
+    handle (VRAM/RAM-resident weights) lives HERE in ``_LLAMA_INSTANCES``, so
+    without this cascade the console's "free VRAM" evicted nothing and the
+    memory stayed pinned until process death. Close the llama_cpp handle when
+    it has one (HTTP runners don't — their memory belongs to the server).
+    """
+    with _LLAMA_LOCK:
+        runner = _LLAMA_INSTANCES.pop(model_key, None)
+    if runner is None:
+        return False
+    llm = getattr(runner, "llm", None)
+    try:
+        if llm is not None and hasattr(llm, "close"):
+            llm.close()
+    except Exception:
+        logger.warning("evict_llama_runner: close() failed for %s", model_key,
+                       exc_info=True)
+    try:
+        runner.llm = None
+    except Exception:
+        pass
+    import gc
+    gc.collect()
+    return True
+
+
+def clear_llama_runners() -> "list[str]":
+    """Evict every heavy singleton (the clear() analog of evict_llama_runner)."""
+    with _LLAMA_LOCK:
+        keys = list(_LLAMA_INSTANCES)
+    return [k for k in keys if evict_llama_runner(k)]
+
+
 def get_llama_runner(model_key: str) -> "LlamaCppBaseRunner":
     """Get-or-build the singleton runner for a model_key.
 
@@ -59,6 +95,29 @@ def _build_runner(model_key: str) -> "LlamaCppBaseRunner":
         logger.info("get_llama_runner: using HTTP runner for %s", model_key)
         return candidate
     except Exception:
+        # Slot-first local serving: a local load should land in a SLOT when one
+        # is available — the model stays resident past this request (TTL, not
+        # process lifetime), shows up in the console's Slots panel, and a load
+        # that can't happen carries the slot agent's preflight REASON instead of
+        # silently ballooning gunicorn RSS. This is the path dispatch's
+        # worker-fallback takes too, so "served locally" now means "in a slot"
+        # whenever the pool can take it. The slot's llama-server also loads
+        # --mmproj itself, so vision models served this way see images.
+        try:
+            from ...serve.slots import SlotPool, slots_enabled
+            if slots_enabled():
+                sep = SlotPool().endpoint_for(model_key)
+                if sep:
+                    logger.info("get_llama_runner: %s -> slot %s (loaded on demand)",
+                                model_key, sep)
+                    return LlamaCppRunner(model_key, base_url=sep)
+                logger.warning("get_llama_runner: every slot is busy with another "
+                               "model — %s falls back to in-process", model_key)
+        except Exception as exc:
+            # endpoint_for surfaces the slot agent's preflight reason verbatim
+            # (e.g. "needs ~42 GB RAM (all shards) but only 12 GB available").
+            logger.warning("get_llama_runner: slot load refused for %s: %s — "
+                           "falling back", model_key, exc)
         # Vision GGUFs: the in-process llama-cpp-python multimodal handler fails to
         # load the projector ("Failed to load mtmd context from <mmproj>"). A native
         # llama-server --mmproj loads it C-side and serves images correctly, so spawn/

@@ -150,7 +150,16 @@ def _engine_unusable(worker: Dict[str, Any]) -> bool:
 
 
 def _has_usable_gpu(worker: Dict[str, Any]) -> bool:
-    """Whether the worker advertises a GPU with free VRAM (for efficiency ranking)."""
+    """Whether the worker advertises a GPU with free VRAM (for efficiency ranking).
+
+    Capability-honest, like vision routing: a worker whose llama.cpp build
+    AFFIRMATIVELY reports it cannot offload (engine.supports_gpu_offload is
+    False) ranks as GPU-less no matter what nvidia-smi shows — n_gpu_layers is
+    silently ignored by a CPU-only wheel, so its "GPU" would never be used.
+    Older agents that don't report the flag keep their GPU credit (no guessing).
+    """
+    if (worker.get("engine") or {}).get("supports_gpu_offload") is False:
+        return False
     return any((g.get("memory_free") or 0) > 0 for g in (worker.get("gpus") or []))
 
 

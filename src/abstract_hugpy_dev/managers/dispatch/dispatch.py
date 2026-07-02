@@ -382,28 +382,40 @@ def loaded_model_keys() -> List[Tuple[str, str]]:
 
 
 def evict(model_key: str, task: Optional[str] = None) -> bool:
-    """Drop runner(s) from the cache.
+    """Drop runner(s) from the cache AND free the model's weights.
 
     If task is None, all task-variants for that model_key are dropped.
     Returns True if anything was evicted.
 
-    The underlying model may still be loaded if the inner singleton
-    (REGISTRY for DeepCoder, _LLAMA_INSTANCES for llama.cpp) holds it.
-    Eviction here only releases the runner wrapper.
+    Popping the wrapper alone is not enough: the llama.cpp singleton
+    (_LLAMA_INSTANCES) holds the loaded weights, so without the cascade the
+    VRAM/RAM stayed pinned after "unload" until the process died.
     """
     with _INSTANCES_LOCK:
         if task is not None:
-            return _INSTANCES.pop((model_key, task), None) is not None
-        to_drop = [k for k in list(_INSTANCES) if k[0] == model_key]
-        for k in to_drop:
-            _INSTANCES.pop(k, None)
-        return bool(to_drop)
+            dropped = _INSTANCES.pop((model_key, task), None) is not None
+        else:
+            to_drop = [k for k in list(_INSTANCES) if k[0] == model_key]
+            for k in to_drop:
+                _INSTANCES.pop(k, None)
+            dropped = bool(to_drop)
+    try:
+        from ..llama.runners.get import evict_llama_runner
+        heavy = evict_llama_runner(model_key)
+    except Exception:
+        heavy = False
+    return dropped or heavy
 
 
 def clear() -> None:
-    """Drop all cached runners. Tests use this; production probably shouldn't."""
+    """Drop all cached runners (and their loaded weights)."""
     with _INSTANCES_LOCK:
         _INSTANCES.clear()
+    try:
+        from ..llama.runners.get import clear_llama_runners
+        clear_llama_runners()
+    except Exception:
+        pass
 
 
 def supported_task_keys() -> List[Tuple[str, str]]:

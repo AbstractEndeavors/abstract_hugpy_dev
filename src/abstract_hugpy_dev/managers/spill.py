@@ -141,6 +141,14 @@ def autofit_gpu_layers(model_path: str,
     """How many GGUF layers fit in free VRAM. -1 (all) when the whole file fits."""
     if free_vram is None:
         free_vram = free_vram_bytes()
+        # Operator VRAM budget (the console's "VRAM budget…" mode / spill
+        # gpu_mem_gib) caps the autofit. GGUF loads ignored this before — the
+        # knob only reached the transformers path, so a per-model budget on a
+        # GGUF worker silently did nothing.
+        gpu_gib = _env_float("HUGPY_GPU_MEM_GIB")
+        if gpu_gib is not None:
+            cap = int(gpu_gib * 2**30)
+            free_vram = min(free_vram, cap) if free_vram else cap
     if not free_vram:                       # no GPU / unknown -> CPU only
         return 0
 
@@ -151,7 +159,15 @@ def autofit_gpu_layers(model_path: str,
     if file_bytes <= 0:
         return 0
 
-    budget = int(free_vram * _VRAM_SAFETY)
+    # Weights are not the whole story: llama_context still needs VRAM AFTER
+    # the weights land (KV cache scales with n_ctx, plus compute-graph
+    # buffers). The flat safety factor leaves only ~3.5 GB on a 24 GB card —
+    # a 70B uploads ~20 GB of weights and then dies with "Failed to create
+    # llama_context". Reserve an explicit context allowance under the margin.
+    ctx_reserve = int((_env_float("HUGPY_VRAM_CTX_RESERVE_GIB") or 2.5) * 2**30)
+    budget = int(free_vram * _VRAM_SAFETY) - ctx_reserve
+    if budget <= 0:
+        return 0
     if budget >= file_bytes:
         return -1                           # everything fits on the GPU
 

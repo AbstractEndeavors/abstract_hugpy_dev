@@ -1186,6 +1186,45 @@ def _central_base_url() -> str:
     return f"{proto}://{host}"
 
 
+def _primary_lan_ip() -> str:
+    """This box's primary outbound-interface IP, via the UDP-connect trick
+    (connect() on a datagram socket sends nothing; it just resolves the route).
+    Empty string when the box has no route at all."""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return ""
+    finally:
+        s.close()
+
+
+@worker_bp.route("/llm/workers/central-address", methods=["GET"])
+def workers_central_address():
+    """A worker-reachable origin for the console's install command.
+
+    The console renders the one-line installer from the browser's origin; when
+    the operator browses central on the box itself (http://localhost:7002) that
+    origin is loopback — useless pasted on a remote GPU box. base_url is the
+    request origin with a loopback host swapped for this box's primary
+    interface IP (scheme and port preserved), so the copied command both
+    fetches the script and bakes a central URL the worker can actually reach.
+    """
+    from urllib.parse import urlsplit
+    proto = request.headers.get("X-Forwarded-Proto", request.scheme)
+    host = request.headers.get("X-Forwarded-Host") or request.host
+    hostname = (urlsplit(f"//{host}").hostname or "").lower()
+    loopback = hostname in _UNREACHABLE_HOSTS
+    lan_ip = _primary_lan_ip()
+    if loopback and lan_ip:
+        port = urlsplit(f"//{host}").port
+        host = f"{lan_ip}:{port}" if port else lan_ip
+    return jsonify({"base_url": f"{proto}://{host}", "lan_ip": lan_ip,
+                    "request_host_loopback": loopback})
+
+
 @worker_bp.route("/llm/workers/install.sh", methods=["GET"])
 def worker_install_script():
     central = _central_base_url()

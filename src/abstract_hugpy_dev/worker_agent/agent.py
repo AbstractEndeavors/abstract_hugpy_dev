@@ -810,7 +810,11 @@ def build_app(state: "WorkerState") -> Flask:
 
 def _free_vram_bytes() -> int | None:
     try:
-        #from abstract_hugpy_dev.managers.spill import free_vram_bytes
+        # Relative import (rename-proof for the prod mirror). This line was
+        # once commented out, which left a bare NameError swallowed below —
+        # every probe/unload reported vram_free null and fit=false even when
+        # the weights landed on the GPU.
+        from ..managers.spill import free_vram_bytes
         return free_vram_bytes()
     except Exception:
         return None

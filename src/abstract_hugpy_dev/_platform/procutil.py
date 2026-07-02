@@ -87,6 +87,24 @@ def _safe_terminate(proc) -> None:
             pass
 
 
+def _module_argv() -> "list[str] | None":
+    """argv that relaunches a ``python -m pkg`` invocation correctly.
+
+    Under ``-m``, ``sys.argv[0]`` is the path to the package's ``__main__.py``;
+    exec'ing that runs it as a plain script with no package context, so every
+    relative import inside dies (the post-self-update crash workers hit). The
+    main module's ``__spec__`` remembers the real module name — rebuild the
+    ``-m`` form from it. None when the process wasn't started with ``-m``.
+    """
+    spec = getattr(sys.modules.get("__main__"), "__spec__", None)
+    name = getattr(spec, "name", None)
+    if not name:
+        return None
+    if name.endswith(".__main__"):
+        name = name[: -len(".__main__")]
+    return [sys.executable, "-m", name] + sys.argv[1:]
+
+
 def reexec(argv: Optional[Sequence[str]] = None) -> "int | None":
     """Restart the current interpreter with ``argv`` (default: this process).
 
@@ -95,7 +113,10 @@ def reexec(argv: Optional[Sequence[str]] = None) -> "int | None":
     self-update) want anyway. Returns nothing on POSIX; calls ``sys.exit`` on
     Windows.
     """
-    args = list(argv) if argv is not None else ([sys.executable] + sys.argv)
+    if argv is not None:
+        args = list(argv)
+    else:
+        args = _module_argv() or [sys.executable] + sys.argv
     if IS_WINDOWS:
         proc = subprocess.Popen(args)
         sys.exit(proc.wait())
