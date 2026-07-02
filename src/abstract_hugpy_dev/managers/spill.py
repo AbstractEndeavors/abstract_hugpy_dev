@@ -75,17 +75,67 @@ def _env_int(name: str) -> Optional[int]:
 # ---------------------------------------------------------------------------
 # hardware probes (best-effort, never raise)
 # ---------------------------------------------------------------------------
+def vram_reserve_bytes() -> int:
+    """VRAM kept out of every budget (HUGPY_VRAM_RESERVE_GIB, default 1.0).
+
+    The box may have GPU consumers central knows nothing about (a desktop
+    session, another app). Reserving a slice at the probe layer means autofit,
+    preflights, and heartbeat-fed budgets all leave it alone, while the raw
+    per-GPU numbers shown in the console stay truthful."""
+    gib = _env_float("HUGPY_VRAM_RESERVE_GIB")
+    return int((1.0 if gib is None else gib) * 2**30)
+
+
+def ram_reserve_bytes() -> int:
+    """RAM kept out of every budget (HUGPY_RAM_RESERVE_GIB, default 4.0).
+
+    Same idea as the VRAM reserve: local processes central can't see need
+    room, and a load that consumes MemAvailable to the floor gets the whole
+    agent OOM-killed mid-request."""
+    gib = _env_float("HUGPY_RAM_RESERVE_GIB")
+    return int((4.0 if gib is None else gib) * 2**30)
+
+
 def free_vram_bytes() -> Optional[int]:
-    """Free VRAM on the primary GPU, or None if no GPU / can't tell."""
+    """Budgetable free VRAM on the primary GPU (raw minus the operator
+    reserve), or None if no GPU / can't tell."""
     from .._platform.hardware import free_vram_bytes as _free_vram
 
-    return _free_vram(_env_int("HUGPY_MAIN_GPU") or 0)
+    raw = _free_vram(_env_int("HUGPY_MAIN_GPU") or 0)
+    if raw is None:
+        return None
+    return max(0, raw - vram_reserve_bytes())
 
 
 def free_ram_bytes() -> Optional[int]:
+    """Budgetable free RAM: raw minus the operator reserve, optionally hard-
+    capped by HUGPY_RAM_MAX_GIB (an allocation CEILING for this box — "hugpy
+    may use at most N GiB" — regardless of how much is actually free)."""
     from .._platform.hardware import free_ram_bytes as _free_ram
 
-    return _free_ram()
+    raw = _free_ram()
+    if raw is None:
+        return None
+    value = max(0, raw - ram_reserve_bytes())
+    cap = _env_float("HUGPY_RAM_MAX_GIB")
+    if cap is not None:
+        value = min(value, int(cap * 2**30))
+    return value
+
+
+def cpu_resident_bytes(model_path: str, n_gpu_layers: int) -> Optional[int]:
+    """Rough RAM footprint of a GGUF load: the weight share NOT offloaded."""
+    try:
+        file_bytes = os.path.getsize(model_path)
+    except OSError:
+        return None
+    if n_gpu_layers == -1:
+        return 0
+    if n_gpu_layers <= 0:
+        return file_bytes
+    total = _gguf_layer_count(model_path) or _ASSUMED_LAYERS
+    frac = min(1.0, max(0.0, 1.0 - (n_gpu_layers / max(total, 1))))
+    return int(file_bytes * frac)
 
 
 def _gguf_layer_count(model_path: str) -> Optional[int]:

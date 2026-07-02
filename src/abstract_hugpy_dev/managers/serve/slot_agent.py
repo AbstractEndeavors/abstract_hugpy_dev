@@ -181,11 +181,16 @@ def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None):
     if auto <= 0:
         need = _total_gguf_bytes(path)
         avail = _mem_available_bytes()
+        if avail:
+            # Honor the operator RAM reserve (HUGPY_RAM_RESERVE_GIB) so slot
+            # loads leave headroom for processes central can't see.
+            from ..spill import ram_reserve_bytes
+            avail = max(0, avail - ram_reserve_bytes())
         if need and avail and need > avail * 0.95:
             raise RuntimeError(
                 f"{model_key}: needs ~{need / 1e9:.1f} GB RAM (all shards) but only "
-                f"{avail / 1e9:.1f} GB available and no GPU offload on this node — "
-                f"free RAM (recycle the API worker) or pick a smaller quant")
+                f"{avail / 1e9:.1f} GB budgetable (after reserve) with no GPU offload "
+                f"on this node — free RAM (recycle the API worker) or pick a smaller quant")
 
     argv = [
         LLAMA_SERVER_BIN, "-m", path,

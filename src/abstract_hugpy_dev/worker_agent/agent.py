@@ -153,10 +153,16 @@ def _safe_int(value) -> int | None:
 
 
 def _free_ram_bytes() -> int | None:
-    """Available RAM in bytes — feeds the allocator's CPU tier. Best-effort."""
-    from .._platform.hardware import free_ram_bytes
+    """Available RAM in bytes — feeds the allocator's CPU tier. Best-effort.
 
-    return free_ram_bytes()
+    Reserve-adjusted (managers.spill honors HUGPY_RAM_RESERVE_GIB) so central
+    plans against RAM this box can actually spare — local processes central
+    can't see keep their headroom."""
+    try:
+        from ..managers.spill import free_ram_bytes
+        return free_ram_bytes()
+    except Exception:
+        return None
 
 
 def _spawn_rpc_server(args):

@@ -78,7 +78,12 @@ class LlamaCppPythonRunner(LlamaCppBaseRunner):
 
         self.model_path = os.fspath(model_path)
         self.n_ctx = n_ctx
-        self.n_threads = n_threads or max(1, (os.cpu_count() or 4) - 1)
+        # DEFAULT_LLAMA_THREADS caps generation threads box-wide (the slot
+        # agent already honors it) — an operator core budget for hugpy.
+        env_threads = os.environ.get("DEFAULT_LLAMA_THREADS", "").strip()
+        self.n_threads = (n_threads
+                          or (int(env_threads) if env_threads.isdigit() else None)
+                          or max(1, (os.cpu_count() or 4) - 1))
         self.generate_lock = threading.Lock()
 
         # GPU/CPU spill. The resolver/dispatch path doesn't pass n_gpu_layers,
@@ -89,6 +94,23 @@ class LlamaCppPythonRunner(LlamaCppBaseRunner):
         if n_gpu_layers is not None:
             gpu_kwargs["n_gpu_layers"] = n_gpu_layers
         self.n_gpu_layers = gpu_kwargs.get("n_gpu_layers", 0)
+
+        # CPU-side preflight (the slot agent has the same guard): the layers
+        # that DON'T offload are RAM-resident, and a load that eats past
+        # MemAvailable gets the whole process OOM-killed mid-request — the
+        # caller sees "peer closed connection" instead of a reason. Fail fast
+        # with the reason. free_ram_bytes is reserve-adjusted
+        # (HUGPY_RAM_RESERVE_GIB), so headroom for processes central can't
+        # see is part of the check.
+        from ....spill import cpu_resident_bytes, free_ram_bytes
+        need = cpu_resident_bytes(self.model_path, self.n_gpu_layers)
+        avail = free_ram_bytes()
+        if need and avail is not None and need > avail * 0.95:
+            raise RuntimeError(
+                f"{model_key}: needs ~{need / 1e9:.1f} GB RAM for the "
+                f"CPU-resident layers but only {avail / 1e9:.1f} GB is "
+                f"budgetable (after HUGPY_RAM_RESERVE_GIB) — offload more "
+                f"layers, free RAM, or pick a smaller quant")
 
         # Vision GGUF: load the multimodal projector beside the model via a chat
         # handler so create_chat_completion accepts image_url content. None for
