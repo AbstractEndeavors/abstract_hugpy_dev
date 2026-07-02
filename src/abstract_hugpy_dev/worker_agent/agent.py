@@ -557,6 +557,27 @@ def _slot_statuses() -> list | None:
         return None
 
 
+# Live slot children, module-global so the self-update path can terminate
+# them BEFORE re-exec: an orphaned slot survives the update and keeps serving
+# OLD code forever (the adoption probe can't tell versions apart) — the
+# "adopted stale slot" failure of 2026-07-02.
+_SLOT_PROCS: dict[int, subprocess.Popen] = {}
+
+
+def _kill_slots() -> None:
+    for i, p in list(_SLOT_PROCS.items()):
+        try:
+            if p.poll() is None:
+                p.terminate()
+                p.wait(timeout=10)
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
+        _SLOT_PROCS.pop(i, None)
+
+
 def _supervise_slots() -> None:
     """Spawn and keep alive SLOT_COUNT slot_agent children (no-op when 0)."""
     from ..managers.serve.slots import slots_enabled, _slot_count
@@ -566,7 +587,7 @@ def _supervise_slots() -> None:
     top_pkg = __name__.split(".")[0]
     module = f"{top_pkg}.managers.serve.slot_agent"
     n = _slot_count()
-    procs: dict[int, subprocess.Popen] = {}
+    procs = _SLOT_PROCS
 
     def _slot_answering(i: int) -> bool:
         """A slot from a PREVIOUS agent process may still own the port (agent
@@ -1202,6 +1223,10 @@ def _self_update_if_needed(required: str | None, args) -> None:
     if rc == 0:
         logger.info("self-update installed %s==%s; restarting agent",
                     args.pkg_name, required)
+        # Terminate supervised slots BEFORE re-exec: orphaned slots would be
+        # adopted by the new agent and keep serving the OLD code forever.
+        # The fresh agent respawns them on the new version.
+        _kill_slots()
         from .._platform.procutil import reexec
         reexec()
     else:

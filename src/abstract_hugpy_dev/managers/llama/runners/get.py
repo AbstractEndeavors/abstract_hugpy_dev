@@ -163,6 +163,16 @@ def _build_runner(model_key: str) -> "LlamaCppBaseRunner":
                     mpath = mpath or get_gguf_file(mdir, cfg)
                     if mpath:
                         opts = {"path": _os.fspath(mpath)}
+                        # Ship the model's REAL context window too — the slot
+                        # can't resolve cfg (separate process) and its bare
+                        # default (4096) truncates long chats mid-stream
+                        # ("ASGI callable returned without completing
+                        # response" → incomplete chunked read up the chain).
+                        try:
+                            from ...serve.serve import _ctx_for
+                            opts["ctx"] = int(_ctx_for(cfg, model_key))
+                        except Exception:
+                            pass
                     # Explicit per-model budgets (assign spill → env via the
                     # agent's _apply_spill) ride as per-load opts: slot
                     # processes were spawned earlier and never see env changes.
