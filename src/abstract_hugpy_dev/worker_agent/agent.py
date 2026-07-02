@@ -565,7 +565,22 @@ def _supervise_slots() -> None:
     n = _slot_count()
     procs: dict[int, subprocess.Popen] = {}
 
+    def _slot_answering(i: int) -> bool:
+        """A slot from a PREVIOUS agent process may still own the port (agent
+        re-exec orphans its children) — adopt it instead of bind-fighting."""
+        try:
+            from ..managers.serve.slots import slot_urls
+            import urllib.request as _url
+            with _url.urlopen(slot_urls()[i - 1] + "/health", timeout=2) as r:
+                return r.getcode() == 200
+        except Exception:
+            return False
+
     def _spawn(i: int) -> None:
+        if _slot_answering(i):
+            logger.info("slot supervisor: slot %d already serving (adopted)", i)
+            procs.pop(i, None)
+            return
         env = dict(os.environ)
         env["SLOT_ID"] = str(i)
         procs[i] = subprocess.Popen([sys.executable, "-m", module], env=env)
@@ -576,10 +591,15 @@ def _supervise_slots() -> None:
             _spawn(i)
         while True:
             time.sleep(20)
-            for i, p in list(procs.items()):
-                if p.poll() is not None:
+            for i in range(1, n + 1):
+                p = procs.get(i)
+                if p is not None and p.poll() is None:
+                    continue                      # our child, alive
+                if _slot_answering(i):
+                    continue                      # adopted orphan, alive
+                if p is not None:
                     logger.warning("slot %d died (rc=%s) — respawning", i, p.returncode)
-                    _spawn(i)
+                _spawn(i)
 
     threading.Thread(target=_loop, daemon=True, name="slot-supervisor").start()
     logger.info("slot supervisor: managing %d slot(s) via llama_cpp.server children", n)

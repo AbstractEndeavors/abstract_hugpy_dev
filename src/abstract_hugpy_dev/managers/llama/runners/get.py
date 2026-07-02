@@ -143,7 +143,26 @@ def _build_runner(model_key: str) -> "LlamaCppBaseRunner":
         try:
             from ...serve.slots import SlotPool, slots_enabled
             if slots_enabled():
-                sep = SlotPool().endpoint_for(model_key)
+                # Resolve key→GGUF path HERE and hand it to the slot: models
+                # registered from central live in THIS process's in-memory
+                # registry, which a slot (separate process) never sees.
+                opts = None
+                try:
+                    import os as _os
+                    cfg = get_model_config(model_key)
+                    mdir = ensure_model(model_key)
+                    mpath = None
+                    try:
+                        from ...serve.overrides import resolve_override_gguf
+                        mpath = resolve_override_gguf(model_key, mdir)
+                    except Exception:
+                        mpath = None
+                    mpath = mpath or get_gguf_file(mdir, cfg)
+                    if mpath:
+                        opts = {"path": _os.fspath(mpath)}
+                except Exception:
+                    opts = None
+                sep = SlotPool().endpoint_for(model_key, opts=opts)
                 if sep:
                     logger.info("get_llama_runner: %s -> slot %s (loaded on demand)",
                                 model_key, sep)

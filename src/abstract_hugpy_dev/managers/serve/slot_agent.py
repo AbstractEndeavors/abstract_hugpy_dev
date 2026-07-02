@@ -145,7 +145,8 @@ def _cpus_to_hexmask(cpus: str) -> str:
     return format(bits, "x") if bits else ""
 
 
-def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None):
+def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None,
+               path=None):
     """argv for the child llama-server + the resolved (ngl, ctx, threads, cpus)."""
     from .serve import (
         _model_file_for, _ctx_for, get_model_config,
@@ -153,8 +154,15 @@ def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None):
     )
     from ..spill import autofit_gpu_layers
 
-    cfg = get_model_config(model_key)
-    path = _model_file_for(model_key, cfg)
+    cfg = None
+    if path and os.path.isfile(path):
+        # Caller-resolved path (the worker agent registers central's models
+        # IN-MEMORY, which a slot — a separate process — never sees; the agent
+        # therefore resolves key→file itself and hands us the path).
+        pass
+    else:
+        cfg = get_model_config(model_key)
+        path = _model_file_for(model_key, cfg)
     if not path or not os.path.isfile(path):
         raise FileNotFoundError(f"{model_key}: no GGUF on disk (resolved {path!r})")
 
@@ -170,7 +178,7 @@ def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None):
     # Autofit from the VRAM free RIGHT NOW, so later slots take what's left.
     auto = autofit_gpu_layers(path)
     ngl = n_gpu_layers if n_gpu_layers is not None else auto
-    ctx = int(ctx) if ctx else _ctx_for(cfg, model_key)
+    ctx = int(ctx) if ctx else (_ctx_for(cfg, model_key) if cfg is not None else 4096)
     threads = int(threads) if threads else DEFAULT_LLAMA_THREADS
     cpus = str(cpus).strip() if cpus not in (None, "") else None
 
@@ -298,7 +306,7 @@ class Slot:
 
     # -- lifecycle ---------------------------------------------------------
     def load(self, model_key, n_gpu_layers=None, ctx=None, threads=None,
-             cpus=None, gpu=None) -> dict:
+             cpus=None, gpu=None, path=None) -> dict:
         with self.lock:
             if self.model_key == model_key and self.healthy():
                 self.last_used = time.time()
@@ -306,7 +314,7 @@ class Slot:
 
             self._kill()
             argv, self.ngl, self.ctx, self.threads, self.cpus = _build_cmd(
-                model_key, n_gpu_layers, ctx, threads, cpus)
+                model_key, n_gpu_layers, ctx, threads, cpus, path=path)
             # per-load GPU pin overrides the slot's MAIN_GPU default
             self.gpu = gpu if gpu not in (None, "") else MAIN_GPU
             self.expected_bytes = _model_expected_bytes(model_key)
@@ -386,7 +394,8 @@ def build_app():
         try:
             return jsonify(slot.load(body["model_key"], body.get("n_gpu_layers"),
                                      body.get("ctx"), body.get("threads"),
-                                     body.get("cpus"), body.get("gpu")))
+                                     body.get("cpus"), body.get("gpu"),
+                                     path=body.get("path")))
         except Exception as exc:  # noqa: BLE001
             return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
 
