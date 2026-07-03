@@ -70,8 +70,12 @@ class LlamaCppRunner(LlamaCppBaseRunner):
             base = serve_endpoint(self.model_key)
         except Exception:
             return False
-        if not base or base.rstrip("/") == self.base_url:
+        if not base:
             return False
+        # SAME URL is still a successful refresh: serve resolution is
+        # side-effecting — it (re)loads the model into the slot and WAITS for
+        # it to go healthy — so retrying the identical endpoint after it
+        # returns is exactly right (post-reexec cold window, mid-reload).
         self.base_url = base.rstrip("/")
         self.served_model = serve_model_name(self.model_key)
         return True
