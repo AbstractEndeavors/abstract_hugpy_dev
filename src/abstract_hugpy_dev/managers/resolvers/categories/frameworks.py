@@ -14,6 +14,13 @@ FRAMEWORK_RUNNERS: Dict[Tuple[str, str], Type[Runner]] = {
     ("transformers", "sentence-similarity"):          FeatureExtractionRunner,
     ("transformers", "text-to-image"):                ImageGenRunner,
     ("transformers", "keyword-extraction"):           KeywordRunner,
+    # Vision-analysis family — ONE generic transformers-pipeline runner, a
+    # subclass per task (see managers/vision_analysis). Adding the next HF
+    # image task = a two-line subclass + a row here and in builders.
+    ("transformers", "depth-estimation"):             DepthEstimationRunner,
+    ("transformers", "object-detection"):             ObjectDetectionRunner,
+    ("transformers", "image-classification"):         ImageClassificationRunner,
+    ("transformers", "image-segmentation"):           ImageSegmentationRunner,
 }
 
 # Derived from FRAMEWORK_RUNNERS so it can't drift.

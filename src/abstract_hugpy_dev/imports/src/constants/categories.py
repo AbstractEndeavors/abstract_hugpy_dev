@@ -12,6 +12,11 @@ HF_TASK_TO_TASKS = {
     "feature-extraction": ["feature-extraction", "sentence-similarity", "keyword-extraction"],
     "sentence-similarity": ["feature-extraction", "sentence-similarity", "keyword-extraction"],
     "text-to-image": ["text-to-image"],
+    # Vision-analysis family — HF pipeline tags map 1:1.
+    "depth-estimation": ["depth-estimation"],
+    "object-detection": ["object-detection"],
+    "image-classification": ["image-classification"],
+    "image-segmentation": ["image-segmentation"],
 }
 RUNNER_PAIRS = {
     ("transformers", "text-generation"), ("llama_cpp", "text-generation"),
@@ -20,6 +25,8 @@ RUNNER_PAIRS = {
     ("transformers", "text-summarization"), ("transformers", "text2text-generation"),
     ("transformers", "feature-extraction"), ("transformers", "sentence-similarity"),
     ("transformers", "text-to-image"), ("transformers", "keyword-extraction"),
+    ("transformers", "depth-estimation"), ("transformers", "object-detection"),
+    ("transformers", "image-classification"), ("transformers", "image-segmentation"),
 }
 MEDIA_DEFAULTS: Dict[str, str] = {
     "document": DEFAULT_CHAT_MODEL,
@@ -40,4 +47,8 @@ TASK_DEFAULTS: Dict[str, str] = {
     "sentence-similarity":          DEFAULT_EMBED_MODEL,
     "text-to-image":                DEFAULT_IMAGEGEN_MODEL,
     "keyword-extraction":           DEFAULT_KEYWORDS_MODEL,
+    "depth-estimation":             DEFAULT_DEPTH_MODEL,
+    "object-detection":             DEFAULT_DETECT_MODEL,
+    "image-classification":         DEFAULT_IMG_CLASSIFY_MODEL,
+    "image-segmentation":           DEFAULT_SEGMENT_MODEL,
 }

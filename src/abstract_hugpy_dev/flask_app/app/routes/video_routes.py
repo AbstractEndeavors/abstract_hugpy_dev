@@ -40,6 +40,12 @@ from abstract_hugpy_dev.video_intel.crop_schema import (
     TemporalRegion,
     make_crop,
 )
+from abstract_hugpy_dev.video_intel.frame_schema import make_frame_extract
+from abstract_hugpy_dev.video_intel.gen_schema import (
+    GenPromptPart,
+    make_generate_image,
+)
+from abstract_hugpy_dev.video_intel.chains import resolve_video_parts
 
 video_bp, logger = get_bp("video_bp", __name__)
 
@@ -108,6 +114,78 @@ def video_crop():
     except (ValueError, TypeError) as exc:  # invalid axis combo / bad fields = 400
         return jsonify({"error": str(exc)}), 400
     job_id = media_bus.enqueue("crop", spec)
+    return jsonify({"job_id": job_id}), 200
+
+
+# --------------------------------------------------------------------------- #
+# 2b) POST /video/jobs/frame_extract — validate + enqueue a frame-extract job
+# --------------------------------------------------------------------------- #
+@video_bp.route("/video/jobs/frame_extract", methods=["POST"])
+def video_frame_extract():
+    body = request.get_json(silent=True) or {}
+    source_d = body.get("source")
+    if not isinstance(source_d, dict):
+        return jsonify({"error": "missing or invalid 'source' MediaRef"}), 400
+    win = body.get("window")
+    try:
+        source = make_media_ref(**source_d)
+        window = TemporalRegion(**win) if win is not None else None
+        spec = make_frame_extract(
+            source=source,
+            fps=body.get("fps"),
+            quality=body.get("quality"),
+            fmt=body.get("fmt"),
+            window=window,
+            max_frames=body.get("max_frames"),
+        )
+    except (ValueError, TypeError) as exc:  # bad fields / axis combo = 400
+        return jsonify({"error": str(exc)}), 400
+    job_id = media_bus.enqueue("frame_extract", spec)
+    return jsonify({"job_id": job_id}), 200
+
+
+# --------------------------------------------------------------------------- #
+# 2c) POST /video/jobs/generate_image — validate + resolve video parts + enqueue
+# --------------------------------------------------------------------------- #
+@video_bp.route("/video/jobs/generate_image", methods=["POST"])
+def video_generate_image():
+    body = request.get_json(silent=True) or {}
+    parts_in = body.get("parts")
+    if not isinstance(parts_in, list) or not parts_in:
+        return jsonify({"error": "missing or empty 'parts' list"}), 400
+    try:
+        parts = []
+        for pd in parts_in:
+            if not isinstance(pd, dict):
+                raise ValueError("each part must be an object")
+            media_d = pd.get("media")
+            media = make_media_ref(**media_d) if isinstance(media_d, dict) else None
+            parts.append(GenPromptPart(
+                kind=pd.get("kind"),
+                text=pd.get("text"),
+                media=media,
+            ))
+        spec = make_generate_image(
+            parts=tuple(parts),
+            model_id=body.get("model_id"),
+            width=body.get("width"),
+            height=body.get("height"),
+            steps=body.get("steps"),
+            guidance=body.get("guidance"),
+            seed=body.get("seed"),
+            negative=body.get("negative"),
+        )
+    except (ValueError, TypeError) as exc:  # bad fields / part combo = 400
+        return jsonify({"error": str(exc)}), 400
+
+    # Resolve any VIDEO parts to image frames BEFORE enqueue (Phase 7 chain), so
+    # the runner never sees a video part. Extraction failure -> 400 (see chains).
+    try:
+        resolved = resolve_video_parts(spec)
+    except (ValueError, TypeError) as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    job_id = media_bus.enqueue("generate_image", resolved)
     return jsonify({"job_id": job_id}), 200
 
 

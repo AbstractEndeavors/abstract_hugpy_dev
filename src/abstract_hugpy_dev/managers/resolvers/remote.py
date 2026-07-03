@@ -339,6 +339,20 @@ def _alloc_status(request_id: str, worker: Optional[dict]):
     )
 
 
+def _local_fallback_allowed() -> bool:
+    """Whether central may run a WORKER-SELECTED model locally after the
+    worker path fails.
+
+    Default NO: an operator who assigned a model to a GPU worker designated
+    where it runs — silently re-running a multi-GB model on a (typically
+    GPU-less) central burns its CPU/RAM and hides the worker failure (the
+    2026-07-02 central-meltdown mode). Models with NO worker selected still
+    run local as always. Set HUGPY_LOCAL_FALLBACK=always to restore the old
+    degrade-to-local behavior."""
+    return (os.environ.get("HUGPY_LOCAL_FALLBACK", "").strip().lower()
+            in ("always", "1", "true", "yes", "on"))
+
+
 def _worker_vision_capable(worker: Optional[dict]) -> bool:
     """True only when the worker AFFIRMATIVELY reports its llama.cpp build can run
     vision (mtmd) — engine.supports_vision. Central does not guess: it trusts what
@@ -406,6 +420,12 @@ def make_delegating_runner(framework: str, task: str):
                             request_id=req.request_id, model_key=self.model_key,
                         )
                     except Exception as exc:
+                        if not _local_fallback_allowed():
+                            raise RuntimeError(
+                                f"worker {worker.get('name') or worker.get('id')} "
+                                f"failed for {self.model_key}: {exc} (local "
+                                f"fallback disabled for worker-assigned models; "
+                                f"set HUGPY_LOCAL_FALLBACK=always to allow)") from exc
                         logger.warning("worker run failed (%s); running %s locally",
                                        exc, self.model_key)
             result = self._local_runner().run(req=req)
@@ -429,19 +449,29 @@ def make_delegating_runner(framework: str, task: str):
                     # "local" below, so the banner ends on the actual server.
                     yield _alloc_status(req.request_id, worker)
                     produced_tokens = False
+                    wname = worker.get("name") or worker.get("id") or "worker"
                     try:
                         async for ev in _worker_stream(worker, payload, req.request_id):
                             etype = getattr(ev, "type", None)
                             if etype == "error":
                                 # A worker that errors AFTER streaming tokens can't
                                 # be replayed locally (would duplicate output) — so
-                                # surface it as interrupted. But a worker that errors
-                                # BEFORE any token (missing engine, stale task list,
-                                # etc.) should NOT fail the request: fall back to
-                                # local instead of relaying the worker's error.
+                                # surface it as interrupted. A worker that errors
+                                # BEFORE any token used to degrade to local — but a
+                                # worker-ASSIGNED model running on central is a
+                                # policy violation (and a CPU meltdown for big
+                                # models), so by default the worker's error is
+                                # surfaced instead (see _local_fallback_allowed).
                                 if produced_tokens:
                                     yield ErrorEvent(request_id=req.request_id,
                                                      message=f"worker stream interrupted: {ev.message}")
+                                    return
+                                if not _local_fallback_allowed():
+                                    yield ErrorEvent(
+                                        request_id=req.request_id,
+                                        message=f"worker {wname} failed before output: "
+                                                f"{ev.message} (local fallback disabled "
+                                                f"for worker-assigned models)")
                                     return
                                 logger.warning("worker %s errored before output (%s); "
                                                "running %s locally", worker.get("id"),
@@ -456,6 +486,13 @@ def make_delegating_runner(framework: str, task: str):
                             # Stream ended with no done/error marker.
                             if produced_tokens:
                                 return
+                            if not _local_fallback_allowed():
+                                yield ErrorEvent(
+                                    request_id=req.request_id,
+                                    message=f"worker {wname} produced no output "
+                                            f"(local fallback disabled for "
+                                            f"worker-assigned models)")
+                                return
                             logger.warning("worker %s produced no output; running %s locally",
                                            worker.get("id"), self.model_key)
                     except Exception as exc:
@@ -463,6 +500,14 @@ def make_delegating_runner(framework: str, task: str):
                             # Stream already started — don't replay it locally.
                             yield ErrorEvent(request_id=req.request_id,
                                              message=f"worker stream interrupted: {exc}")
+                            return
+                        if not _local_fallback_allowed():
+                            yield ErrorEvent(
+                                request_id=req.request_id,
+                                message=f"worker {wname} unreachable/failed: {exc} "
+                                        f"(local fallback disabled for worker-"
+                                        f"assigned models; set "
+                                        f"HUGPY_LOCAL_FALLBACK=always to allow)")
                             return
                         logger.warning("worker offload failed (%s); running %s locally",
                                        exc, self.model_key)

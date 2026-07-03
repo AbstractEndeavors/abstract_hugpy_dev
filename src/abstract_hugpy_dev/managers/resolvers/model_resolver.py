@@ -340,15 +340,28 @@ def validate_registry() -> None:
       1. (framework, primary_task) has a runner registered.
       2. Every task in cfg.tasks has a runner AND a builder registered.
 
-    Raises RuntimeError listing ALL broken entries — not just the first —
-    so a single import gives you the full list of registry bugs to fix.
+    CURATED staples (declared in code, models_config.MODELS) fail HARD —
+    that's a code bug, and import is the right place to catch it, listing
+    ALL broken entries at once. DISCOVERED entries (data: a row someone put
+    in model_discovery.json) must never brick package import — a data file
+    is not allowed to take the whole service down (2026-07-03: a discovered
+    'chatterbox' row declaring text-to-speech with no runner made every
+    import — and thus any service restart — fail). Unservable discovered
+    entries are DROPPED with a loud error log instead, mirroring the
+    merge-time "registry: dropped" convention.
     """
     errors: list[str] = []
 
-    for model_key, cfg in MODEL_REGISTRY.items():
+    try:
+        from ...imports.config.models.models_config import MODELS as _STAPLES
+    except Exception:
+        _STAPLES = {}
+
+    for model_key, cfg in list(MODEL_REGISTRY.items()):
+        entry_errors: list[str] = []
         primary_key = (cfg.framework, cfg.primary_task)
         if primary_key not in FRAMEWORK_RUNNERS:
-            errors.append(
+            entry_errors.append(
                 f"  {model_key}: primary_task={cfg.primary_task!r} on "
                 f"framework={cfg.framework!r} has no runner registered"
             )
@@ -356,15 +369,27 @@ def validate_registry() -> None:
         for task in cfg.tasks:
             task_key = (cfg.framework, task)
             if task_key not in FRAMEWORK_RUNNERS:
-                errors.append(
+                entry_errors.append(
                     f"  {model_key}: task={task!r} in cfg.tasks on "
                     f"framework={cfg.framework!r} has no runner registered"
                 )
             if task_key not in MODEL_REQUEST_BUILDERS:
-                errors.append(
+                entry_errors.append(
                     f"  {model_key}: task={task!r} in cfg.tasks on "
                     f"framework={cfg.framework!r} has no request builder registered"
                 )
+
+        if not entry_errors:
+            continue
+        if model_key in _STAPLES:
+            errors.extend(entry_errors)     # code bug — fail import
+        else:
+            MODEL_REGISTRY.pop(model_key, None)
+            logger.error(
+                "registry: dropped discovered model %s — cannot be served "
+                "(%s). Register the missing runner/builder pair and it will "
+                "be picked up on the next import.",
+                model_key, "; ".join(e.strip() for e in entry_errors))
 
     if errors:
         raise RuntimeError(

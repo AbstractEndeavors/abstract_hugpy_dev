@@ -1,0 +1,90 @@
+"""Composition chains — map §7 (video -> frames -> generate).
+
+`resolve_video_parts(spec)` turns a GenerateImageSpec that may contain VIDEO
+parts into an equivalent spec containing only text + image parts, by running
+frame extraction on each video part and substituting the resulting frame
+MediaRefs as image parts (in order). This is PLAIN CODE in a small module — NOT
+a special case buried inside the runner — so `run_generate_image` never sees a
+video part.
+
+It is invoked in the enqueue path (the generate_image route) BEFORE the spec is
+handed to the bus.
+
+Manual frame-pick is the DEFAULT UX: the UI adds picked frames as image parts
+directly, so in practice a raw video part is the FALLBACK path. This uniform-N
+sampling is exactly that fallback.
+
+Error policy (documented choice): frame extraction failures SURFACE as a raised
+ValueError here. The route catches it and returns 400 — i.e. we only ever return
+a resolved spec when extraction actually succeeded; we never silently pass an
+unresolved (or partly-resolved) spec through to the bus.
+"""
+from __future__ import annotations
+
+import math
+from uuid import uuid4
+
+from .frame_schema import make_frame_extract
+from .gen_schema import GenerateImageSpec, GenPromptPart, image_part, make_generate_image
+from .runners.ffmpeg_frames import run_frame_extract
+
+
+def _extract_uniform_frames(media, uniform_n: int):
+    """Run frame extraction on a single video MediaRef, returning ~uniform_n
+    frame MediaRefs sampled uniformly across it. Raises ValueError on failure
+    (surfaced to the route as a 400)."""
+    duration = media.duration_s
+    if duration is None or duration <= 0:
+        raise ValueError(
+            f"cannot uniformly sample video {media.asset_id}: unknown/zero duration"
+        )
+    # fps chosen so fps*duration == uniform_n -> ~uniform_n frames across the clip.
+    fps = uniform_n / duration
+    # cap sits comfortably above the expected count (ffmpeg's fps filter may emit
+    # one extra at a boundary); the cap is a safety valve, not the target.
+    cap = uniform_n + 4
+    fe_spec = make_frame_extract(
+        source=media,
+        fps=fps,
+        quality=90,
+        fmt="jpg",
+        window=None,
+        max_frames=cap,
+    )
+    result = run_frame_extract(fe_spec, job_id=uuid4().hex)
+    if not result.ok:
+        err = result.error
+        raise ValueError(
+            f"frame extraction failed for video {media.asset_id}: "
+            f"{err.code}: {err.message}" if err else
+            f"frame extraction failed for video {media.asset_id}"
+        )
+    if not result.outputs:
+        raise ValueError(
+            f"frame extraction produced no frames for video {media.asset_id}"
+        )
+    return result.outputs
+
+
+def resolve_video_parts(spec: GenerateImageSpec, *, uniform_n: int = 4) -> GenerateImageSpec:
+    """Return a NEW GenerateImageSpec whose parts contain only text + image
+    (no video). Text/image parts pass through unchanged; each video part is
+    replaced (in order) by the image parts of its uniformly-sampled frames."""
+    new_parts = []
+    for p in spec.parts:
+        if p.kind == "video":
+            frames = _extract_uniform_frames(p.media, uniform_n)
+            new_parts.extend(image_part(ref) for ref in frames)
+        else:
+            new_parts.append(p)
+    # Re-validate through the factory so the resolved spec is provably video-free.
+    return make_generate_image(
+        parts=tuple(new_parts),
+        model_id=spec.model_id,
+        width=spec.width,
+        height=spec.height,
+        steps=spec.steps,
+        guidance=spec.guidance,
+        seed=spec.seed,
+        negative=spec.negative,
+    )

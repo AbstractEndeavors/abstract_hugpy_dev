@@ -28,6 +28,8 @@ from uuid import uuid4
 from abstract_hugpy_dev.imports.src.constants.constants import DEFAULT_ROOT
 
 from .crop_schema import CropSpec, SpatialRegion, TemporalRegion, make_crop
+from .frame_schema import make_frame_extract
+from .gen_schema import GenPromptPart, make_generate_image
 from .job_schema import JOB_REGISTRY
 from .media_schema import make_media_ref
 from .result_schema import JobResult
@@ -67,9 +69,47 @@ def _crop_from_dict(d: dict) -> CropSpec:
     return make_crop(source=source, spatial=spatial, temporal=temporal)
 
 
+def _frame_extract_from_dict(d: dict):
+    """Rebuild a FrameExtractSpec from its asdict() form, through the validating
+    factories (make_media_ref + optional TemporalRegion + make_frame_extract)."""
+    source = make_media_ref(**d["source"])
+    win = d.get("window")
+    window = TemporalRegion(**win) if win is not None else None
+    return make_frame_extract(
+        source=source,
+        fps=d["fps"],
+        quality=d["quality"],
+        fmt=d["fmt"],
+        window=window,
+        max_frames=d.get("max_frames"),
+    )
+
+
+def _generate_image_from_dict(d: dict):
+    """Rebuild a GenerateImageSpec from its asdict() form, through the validating
+    factories. Each part's media (if any) round-trips via make_media_ref."""
+    parts = []
+    for pd in d["parts"]:
+        media_d = pd.get("media")
+        media = make_media_ref(**media_d) if media_d is not None else None
+        parts.append(GenPromptPart(kind=pd["kind"], text=pd.get("text"), media=media))
+    return make_generate_image(
+        parts=tuple(parts),
+        model_id=d["model_id"],
+        width=d["width"],
+        height=d["height"],
+        steps=d["steps"],
+        guidance=d["guidance"],
+        seed=d.get("seed"),
+        negative=d.get("negative"),
+    )
+
+
 # name -> (dict -> spec). Grows as Phase 4+ specs land.
 SPEC_DESERIALIZERS: Dict[str, Callable[[dict], object]] = {
     "crop": _crop_from_dict,
+    "frame_extract": _frame_extract_from_dict,
+    "generate_image": _generate_image_from_dict,
 }
 
 

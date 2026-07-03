@@ -12,7 +12,11 @@ Phase 4+ appends the remaining runner keys here:
 from __future__ import annotations
 
 from .ffmpeg_crop import run_crop
+from .ffmpeg_frames import run_frame_extract
+from .imagegen import run_generate_image
 
 DISPATCH = {
     ("ffmpeg", "crop"): run_crop,
+    ("ffmpeg", "frame_extract"): run_frame_extract,
+    ("diffusers", "generate_image"): run_generate_image,
 }

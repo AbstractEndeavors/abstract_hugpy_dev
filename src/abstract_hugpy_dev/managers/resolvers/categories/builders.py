@@ -277,6 +277,36 @@ def _build_keywords_request(kwargs: Dict[str, Any], model_key: str) -> KeywordTa
     return KeywordTaskRequest(**out)
 
 
+def _build_vision_analysis_request(kwargs: Dict[str, Any], model_key: str) -> "VisionAnalysisRequest":
+    """One builder for the whole vision-analysis family (depth, detection,
+    classification, segmentation): input is always one image."""
+    image_path = kwargs.get("image_path") or kwargs.get("file")
+    image_b64 = kwargs.get("image_b64")
+    if image_path is None and image_b64 is None:
+        raise ValueError(
+            "vision-analysis request needs 'image_path', 'file', or "
+            f"'image_b64'; got keys: {sorted(kwargs)}"
+        )
+    if image_path is not None and derive_media_type(image_path) != "image":
+        raise ValueError(
+            f"vision-analysis needs an image file; got "
+            f"{derive_media_type(image_path)!r} ({os.path.basename(image_path)})"
+        )
+
+    out: Dict[str, Any] = {
+        "model_key": model_key,
+        "request_id": kwargs.get("request_id", make_request_id()),
+    }
+    if image_path is not None:
+        out["image_path"] = image_path
+    else:
+        out["image_b64"] = image_b64
+    for k in ("top_k", "threshold", "candidate_labels", "return_b64", "pool"):
+        if k in kwargs:
+            out[k] = kwargs[k]
+    return VisionAnalysisRequest(**out)
+
+
 # ---------------------------------------------------------------------------
 # Registries — single source of truth.
 # ---------------------------------------------------------------------------
@@ -295,6 +325,10 @@ MODEL_REQUEST_BUILDERS: Dict[Tuple[str, str], Callable[[Dict[str, Any], str], Ba
     ("transformers", "sentence-similarity"):          _build_similarity_request,
     ("transformers", "text-to-image"):                _build_imagegen_request,
     ("transformers", "keyword-extraction"):           _build_keywords_request,
+    ("transformers", "depth-estimation"):             _build_vision_analysis_request,
+    ("transformers", "object-detection"):             _build_vision_analysis_request,
+    ("transformers", "image-classification"):         _build_vision_analysis_request,
+    ("transformers", "image-segmentation"):           _build_vision_analysis_request,
 }
 
 

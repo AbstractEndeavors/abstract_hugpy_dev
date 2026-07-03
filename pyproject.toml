@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "abstract_hugpy_dev"
-version = "0.1.89"
+version = "0.1.90"
 description = "Self-hosted LLM console: model registry & downloads, streaming chat, OpenAI-compatible /v1 API with on-site keys, GPU worker fleet with cross-machine RPC sharding"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -84,7 +84,7 @@ vision = ["opencv-python-headless", "onnxruntime"]
 ocr = ["abstract_ocr", "pytest"]
 # Web extraction / scraping (selenium, playwright, opencv via abstract_webtools).
 web = ["abstract_webtools"]
-transformers = ["torch", "transformers", "accelerate", "sentencepiece"]  # sentencepiece: T5/flan tokenizers
+transformers = ["torch", "transformers", "accelerate", "sentencepiece", "timm"]  # sentencepiece: T5/flan tokenizers; timm: DETR/vision backbones
 gpu = ["pynvml"]             # optional richer GPU probing (falls back to nvidia-smi)
 embed = ["sentence-transformers"]
 finetune = ["peft"]

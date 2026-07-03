@@ -1,0 +1,143 @@
+"""Pure `(diffusers, generate_image)` runner — map §4.4 / §6.
+
+`run_generate_image(spec, job_id) -> JobResult`. A THIN wrapper over the EXISTING
+inference plane (`managers.dispatch.execute_prompt`) — it does NOT import
+diffusers itself. The prompt is resolved from the spec's ordered parts (text
+parts joined; image parts noted), the plane is driven once, and the produced
+image file is re-ingested into a MediaRef.
+
+Pure discipline (map §6): EXPECTED failures (no prompt, an unresolved video
+part, the plane raising / returning not-ok, no usable output) are returned as
+JobResult(ok=False, JobError(...)) — DATA, never a raise. Only the worker loop
+may catch an UNEXPECTED raise.
+
+The inference-plane import is LAZY (inside the function), NOT at module top. That
+keeps merely importing `video_intel.runners` (which the ffmpeg crop/frame_extract
+runners need) decoupled from the health of the managers/dispatch plane — so a
+registry hiccup there can never break the media runners' import path.
+
+ROUTING: `pool` is intentionally left UNSET (see the joined kwargs). With
+HUGPY_ML_POOL empty / no pool passed, the plane runs generation in-process
+(central/local). If a GPU worker should have taken it, that is a routing symptom
+to surface — this runner does NOT force pool="ml".
+"""
+from __future__ import annotations
+
+import os
+
+from ..gen_schema import GenerateImageSpec
+from ..media_store import ingest
+from ..result_schema import JobError, JobResult
+
+
+def run_generate_image(spec: GenerateImageSpec, job_id: str) -> JobResult:
+    # ---- safety net: video parts MUST be resolved to image parts upstream ----
+    # (video_intel.chains.resolve_video_parts runs in the enqueue path). If a raw
+    # video part reaches the runner, refuse loudly rather than silently drop it.
+    for i, p in enumerate(spec.parts):
+        if p.kind == "video":
+            return JobResult(job_id, ok=False, error=JobError(
+                code="unresolved_video_part",
+                message=(
+                    f"part[{i}] is a raw video part; it must be resolved to "
+                    "image frames via chains.resolve_video_parts before enqueue"
+                ),
+                retryable=False,
+            ))
+
+    # ---- resolve the prompt: join text parts (ordered); collect image paths ----
+    texts = [p.text.strip() for p in spec.parts
+             if p.kind == "text" and p.text and p.text.strip()]
+    prompt = "\n".join(texts).strip()
+    image_paths = [p.media.uri for p in spec.parts
+                   if p.kind == "image" and p.media is not None]
+
+    if not prompt:
+        # sd-turbo is text-to-image; without any text we have nothing to condition
+        # on (image2image conditioning is a future model flag — see below).
+        return JobResult(job_id, ok=False, error=JobError(
+            code="no_prompt",
+            message="generate_image has no text part to build a prompt from",
+            retryable=False,
+        ))
+
+    # NOTE on image parts: sd-turbo is text-to-image, and execute_prompt has no
+    # image-conditioning seam wired here yet, so image parts are collected but not
+    # (yet) passed as conditioning. We still generate from the text and record
+    # that images were present. image2image is a future model flag.
+    _ = image_paths  # collected for a future image-conditioning seam
+
+    # ---- build kwargs; leave `pool` UNSET (routing note in the docstring) ----
+    kwargs = dict(
+        task="text-to-image",
+        prompt=prompt,
+        model_key=spec.model_id,
+        width=spec.width,
+        height=spec.height,
+        num_inference_steps=spec.steps,
+        guidance_scale=spec.guidance,
+        num_images=1,
+        # The plane may serve this on a REMOTE GPU worker: the result's `path`
+        # is then worker-local. The b64 bytes are how the artifact reaches
+        # this machine (materialized below when the path isn't local).
+        return_b64=True,
+    )
+    # only include optional knobs when set, so a None can't confuse a builder
+    if spec.seed is not None:
+        kwargs["seed"] = spec.seed
+    if spec.negative is not None:
+        kwargs["negative_prompt"] = spec.negative
+
+    # ---- drive the EXISTING plane once (lazy import; keep the runner pure) ----
+    try:
+        from abstract_hugpy_dev.managers.dispatch import execute_prompt
+        from abstract_hugpy_dev._platform.async_runtime import run
+        res = run(execute_prompt(**kwargs))
+    except Exception as exc:  # unknown model / registry / plane error -> DATA
+        return JobResult(job_id, ok=False, error=JobError(
+            code="generation_failed",
+            message=f"inference plane raised: {type(exc).__name__}: {exc}",
+            retryable=True,
+        ))
+
+    if not getattr(res, "ok", False):
+        return JobResult(job_id, ok=False, error=JobError(
+            code="generation_failed",
+            message=str(getattr(res, "error", None) or "unknown"),
+            retryable=True,
+        ))
+
+    images = getattr(res, "images", None) or ()
+    if not images:
+        return JobResult(job_id, ok=False, error=JobError(
+            code="generation_no_output",
+            message="plane returned ok but produced no images",
+            retryable=True,
+        ))
+
+    img = images[0]
+    path = getattr(img, "path", None)
+    if not path or not os.path.isfile(path):
+        # The plane served this on a remote worker — its `path` lives on THAT
+        # machine's disk. The result rides the bytes for exactly this case:
+        # materialize them locally and continue.
+        b64 = getattr(img, "b64", None)
+        if not b64:
+            return JobResult(job_id, ok=False, error=JobError(
+                code="generation_no_output",
+                message=(f"generated image has no usable file path on disk "
+                         f"and no inline bytes: {path!r}"),
+                retryable=False,
+            ))
+        import base64
+        from abstract_hugpy_dev.imports.src.constants.constants import UPLOADS_HOME
+        out_dir = os.path.join(UPLOADS_HOME, "generated")
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, f"{job_id}_0.png")
+        with open(path, "wb") as fh:
+            fh.write(base64.b64decode(b64))
+
+    # Re-ingest so the output's dims/mime are authoritatively resolved (§9.2).
+    # (ingest jails the path under UPLOADS_HOME/DEFAULT_ROOT.)
+    ref = ingest(path)
+    return JobResult(job_id, ok=True, outputs=(ref,))

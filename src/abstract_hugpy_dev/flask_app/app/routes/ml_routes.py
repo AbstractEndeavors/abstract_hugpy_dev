@@ -76,6 +76,11 @@ ML_TASKS = {
     "imagine":    "text-to-image",
     "extract":    "document-extraction",
     "fetch":      "url-extraction",
+    # Vision-analysis family (generic pipeline runner).
+    "depth":      "depth-estimation",
+    "detect":     "object-detection",
+    "classify":   "image-classification",
+    "segment":    "image-segmentation",
 }
 
 # Deterministic ingest amenities that are NOT model inference: they read text from
@@ -99,6 +104,10 @@ ML_DEP = {
     "imagine":    ("diffusers", "imagegen"),
     "extract":    ("pdfplumber", "extract"),
     "fetch":      ("bs4", "web"),
+    "depth":      ("transformers", "transformers"),
+    "detect":     ("transformers", "transformers"),
+    "classify":   ("transformers", "transformers"),
+    "segment":    ("transformers", "transformers"),
 }
 
 

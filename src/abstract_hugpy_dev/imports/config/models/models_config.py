@@ -77,6 +77,34 @@ MODELS = {
         "folder": "stabilityai/sd-turbo", "tasks": ["text-to-image"],
         "primary_task": "text-to-image", "port": None,
     },
+
+    # Vision-analysis staples — small, permissively-licensed defaults for the
+    # generic pipeline runner family (managers/vision_analysis). Each is the
+    # TASK_DEFAULTS anchor for its task; heavier variants ride discovery.
+    "depth-anything-v2-small": {
+        "model_max_length": None, "include": None, "name": "depth-anything-v2-small",
+        "framework": "transformers", "hub_id": "depth-anything/Depth-Anything-V2-Small-hf",
+        "filename": None, "folder": "depth-anything/Depth-Anything-V2-Small-hf",
+        "tasks": ["depth-estimation"], "primary_task": "depth-estimation", "port": None,
+    },
+    "detr-resnet-50": {
+        "model_max_length": None, "include": None, "name": "detr-resnet-50",
+        "framework": "transformers", "hub_id": "facebook/detr-resnet-50",
+        "filename": None, "folder": "facebook/detr-resnet-50",
+        "tasks": ["object-detection"], "primary_task": "object-detection", "port": None,
+    },
+    "vit-base-patch16-224": {
+        "model_max_length": None, "include": None, "name": "vit-base-patch16-224",
+        "framework": "transformers", "hub_id": "google/vit-base-patch16-224",
+        "filename": None, "folder": "google/vit-base-patch16-224",
+        "tasks": ["image-classification"], "primary_task": "image-classification", "port": None,
+    },
+    "segformer-b0-ade": {
+        "model_max_length": None, "include": None, "name": "segformer-b0-ade",
+        "framework": "transformers", "hub_id": "nvidia/segformer-b0-finetuned-ade-512-512",
+        "filename": None, "folder": "nvidia/segformer-b0-finetuned-ade-512-512",
+        "tasks": ["image-segmentation"], "primary_task": "image-segmentation", "port": None,
+    },
 }
 
 

@@ -157,6 +157,11 @@ DEFAULT_SUMMARIZE_MODEL = get_env_value("DEFAULT_SUMMARIZE_MODEL") or "flan-t5-l
 DEFAULT_EMBED_MODEL = get_env_value("DEFAULT_EMBED_MODEL") or "all-minilm-l6-v2"
 DEFAULT_IMAGEGEN_MODEL = get_env_value("DEFAULT_IMAGEGEN_MODEL") or "sd-turbo"
 DEFAULT_KEYWORDS_MODEL = get_env_value("DEFAULT_KEYWORDS_MODEL") or "all-minilm-l6-v2"
+# Vision-analysis family (generic transformers-pipeline runner).
+DEFAULT_DEPTH_MODEL = get_env_value("DEFAULT_DEPTH_MODEL") or "depth-anything-v2-small"
+DEFAULT_DETECT_MODEL = get_env_value("DEFAULT_DETECT_MODEL") or "detr-resnet-50"
+DEFAULT_IMG_CLASSIFY_MODEL = get_env_value("DEFAULT_IMG_CLASSIFY_MODEL") or "vit-base-patch16-224"
+DEFAULT_SEGMENT_MODEL = get_env_value("DEFAULT_SEGMENT_MODEL") or "segformer-b0-ade"
 
 DISK_AUTHORITATIVE = make_list(get_env_value("DISK_AUTHORITATIVE") or "name,folder,framework,filename")
 OVERLAY_ALLOWED = set(make_list(get_env_value("OVERLAY_ALLOWED") or "port, host, timeout_s, include"))

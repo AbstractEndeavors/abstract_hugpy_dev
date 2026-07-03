@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from typing import Tuple, Type
 
 from .crop_schema import CropSpec
+from .frame_schema import FrameExtractSpec
+from .gen_schema import GenerateImageSpec
 
 
 @dataclass(frozen=True)
@@ -33,4 +35,6 @@ class JobSpec:
 #                            ("diffusers", "generate_image"), "gpu", 900),
 JOB_REGISTRY = {
     "crop": JobSpec("crop", CropSpec, ("ffmpeg", "crop"), "media", 300),  # runner branches spatial/temporal
+    "frame_extract": JobSpec("frame_extract", FrameExtractSpec, ("ffmpeg", "frame_extract"), "media", 600),
+    "generate_image": JobSpec("generate_image", GenerateImageSpec, ("diffusers", "generate_image"), "gpu", 900),
 }
