@@ -1,18 +1,27 @@
 """Pure `(diffusers, generate_scene)` runner — one query -> N consecutive frames.
 
-`run_generate_scene(spec, job_id) -> JobResult`. Coherence mode is seed +
-prompt-schedule v1 (NO img2img — the managers plane has no img2img pair wired;
-confirmed). The runner walks n_frames SEQUENTIALLY, derives a per-frame prompt
-(base + a positional tag + an optional motion schedule) and a per-frame seed
-(base_seed + i when a seed is set), and drives the SAME inference plane as
-generate_image (managers.dispatch.execute_prompt) once per frame. Each frame is
-materialized to a padded frame_%05d.png under DEFAULT_ROOT and re-ingested. When
-spec.assemble, the frames are muxed into a browser-playable H.264 mp4 (yuv420p +
-faststart) that is ingested LAST (so it classifies as kind="video").
+`run_generate_scene(spec, job_id) -> JobResult`. Two coherence modes, chosen by
+whether the spec carries a START-FRAME image part (the FIRST image part):
 
-An img2img chain can drop in later WITHOUT reshaping the loop: swap the per-frame
-execute_prompt call for an img2img call that also conditions on the previous
-frame path (the sequential loop + padded frame paths already exist for it).
+  * NO start frame -> v1: seed + prompt-schedule. The runner walks n_frames
+    SEQUENTIALLY, derives a per-frame prompt (base + a positional tag + an
+    optional motion schedule) and a per-frame seed (base_seed + i), and drives
+    the SAME text-to-image plane (managers.dispatch.execute_prompt) once/frame.
+
+  * START-FRAME present -> IMG2IMG (image-to-image plane). If img2img is not
+    available on the fleet (the sd-turbo advertisement flip is HELD), returns a
+    retryable `image_to_image_unavailable` JobError — an HONEST failure, never a
+    silent fall back to text-to-image. When available:
+      - chain=True  (default): frame 0 conditions on the start frame; each later
+        frame conditions on the PREVIOUS frame's saved output (true sequential
+        chaining) with base + motion step i.
+      - chain=False: every frame conditions on the start frame (no drift) with
+        base + motion step i.
+
+Each frame is materialized to a padded frame_%05d.png under DEFAULT_ROOT and
+re-ingested. When spec.assemble, the frames are muxed into a browser-playable
+H.264 mp4 (yuv420p + faststart) that is ingested LAST (so it classifies as
+kind="video").
 
 Pure discipline (map §6): EXPECTED failures (no prompt, an unresolved video part,
 the plane raising / returning not-ok / no usable output, assembly failing) are
@@ -30,6 +39,7 @@ remote-GPU-bound and is intentionally NOT gated here.
 from __future__ import annotations
 
 import base64
+import logging
 import os
 import shutil
 import subprocess
@@ -42,6 +52,9 @@ from ..media_store import ingest
 from ..result_schema import JobError, JobResult
 from ..scene_schema import GenerateSceneSpec, FRAME_CAP
 from ._gpu_guard import guard_gpu_worker
+from ._img2img import img2img_available
+
+logger = logging.getLogger(__name__)
 
 # Serialize ONLY the mp4 assembly subprocess (see module docstring). Generation
 # is remote-GPU-bound and is not gated here.
@@ -71,6 +84,61 @@ def _assemble_scene_mp4(frame_dir: str, mp4_path: str, fps: int) -> None:
         raise RuntimeError(
             f"ffmpeg assembly failed rc={result.returncode}: {(result.stderr or '')[-500:]}"
         )
+
+
+def _generate_one_frame(kwargs: dict, out_dir: str, i: int, job_id: str):
+    """Drive the EXISTING inference plane once and materialize the result to a
+    SEQUENTIAL padded frame_%05d.png. Returns (frame_path, None) on success, or
+    (None, JobResult) carrying a JobError on any expected failure.
+
+    Shared by BOTH the v1 (text-to-image) and img2img loops so the plane-drive +
+    materialize logic (and its DATA error shapes) exist in exactly one place. The
+    inference-plane import stays LAZY (keeps this runner pure)."""
+    try:
+        from abstract_hugpy_dev.managers.dispatch import execute_prompt
+        from abstract_hugpy_dev._platform.async_runtime import run
+        res = run(execute_prompt(**kwargs))
+    except Exception as exc:  # unknown model / registry / plane error -> DATA
+        return None, JobResult(job_id, ok=False, error=JobError(
+            code="generation_failed",
+            message=f"inference plane raised on frame {i}: {type(exc).__name__}: {exc}",
+            retryable=True,
+        ))
+
+    if not getattr(res, "ok", False):
+        return None, JobResult(job_id, ok=False, error=JobError(
+            code="generation_failed",
+            message=f"frame {i}: {str(getattr(res, 'error', None) or 'unknown')}",
+            retryable=True,
+        ))
+
+    images = getattr(res, "images", None) or ()
+    if not images:
+        return None, JobResult(job_id, ok=False, error=JobError(
+            code="generation_no_output",
+            message=f"plane returned ok but produced no image for frame {i}",
+            retryable=True,
+        ))
+
+    frame_path = os.path.join(out_dir, f"frame_{i:05d}.png")
+    img = images[0]
+    src_path = getattr(img, "path", None)
+    if src_path and os.path.isfile(src_path):
+        shutil.copyfile(src_path, frame_path)
+    else:
+        # Plane served this remotely: its `path` lives on THAT machine; the
+        # inline b64 bytes are how the artifact reaches this machine.
+        b64 = getattr(img, "b64", None)
+        if not b64:
+            return None, JobResult(job_id, ok=False, error=JobError(
+                code="generation_no_output",
+                message=(f"frame {i}: generated image has no usable file path "
+                         f"on disk and no inline bytes: {src_path!r}"),
+                retryable=False,
+            ))
+        with open(frame_path, "wb") as fh:
+            fh.write(base64.b64decode(b64))
+    return frame_path, None
 
 
 def run_generate_scene(spec: GenerateSceneSpec, job_id: str) -> JobResult:
@@ -107,7 +175,34 @@ def run_generate_scene(spec: GenerateSceneSpec, job_id: str) -> JobResult:
             retryable=False,
         ))
 
+    # ---- start-frame image (img2img seam) ----
+    # The FIRST image part is the init/start frame. Reuse the existing parts list
+    # (no new init_image field); its local path is media.uri (parts materialize
+    # exactly as in generate_image).
+    start_frame = next(
+        (p.media.uri for p in spec.parts if p.kind == "image" and p.media is not None),
+        None,
+    )
+    # Runner-applied default when None (LOCKED CONTRACT): 0.45.
+    strength = spec.strength if spec.strength is not None else 0.45
+
+    # A start-frame image REQUIRES a servable img2img pair. The sd-turbo
+    # advertisement flip is HELD, so on live central this is FALSE -> honest,
+    # retryable failure. NEVER silently fall back to text-to-image.
+    if start_frame is not None and not img2img_available(spec.model_id):
+        logger.info(
+            "scene %s: start-frame image present but image-to-image is not "
+            "available on the fleet (model=%s); returning honest failure",
+            job_id, spec.model_id,
+        )
+        return JobResult(job_id, ok=False, error=JobError(
+            code="image_to_image_unavailable",
+            message="image-to-image not available on the fleet",
+            retryable=True,
+        ))
+
     # ---- GPU-worker guard ONCE before the loop (shared refusal policy) ----
+    # The img2img probe above is ADDITIONAL to this guard, not a replacement.
     _refusal = guard_gpu_worker(spec.model_id, job_id)
     if _refusal is not None:
         return _refusal
@@ -116,80 +211,89 @@ def run_generate_scene(spec: GenerateSceneSpec, job_id: str) -> JobResult:
     os.makedirs(out_dir, exist_ok=True)
 
     refs = []
-    for i in range(spec.n_frames):
-        # ---- per-frame prompt schedule (v1): positional tag + optional motion ----
-        prompt = base_prompt + f", frame {i + 1} of {spec.n_frames}"
-        if spec.motion:
-            # .replace (NOT .format): user strings may contain stray braces.
-            prompt += ", " + spec.motion.replace("{i}", str(i + 1)).replace("{n}", str(spec.n_frames))
 
-        # ---- per-frame kwargs — SAME shape as imagegen ----
-        kwargs = dict(
-            task="text-to-image",
-            prompt=prompt,
-            model_key=spec.model_id,
-            width=spec.width,
-            height=spec.height,
-            num_inference_steps=spec.steps,
-            guidance_scale=spec.guidance,
-            num_images=1,
-            return_b64=True,
+    if start_frame is not None:
+        # ---- img2img path: condition each frame on an init image ----
+        mode = "chain" if spec.chain else "parallel"
+        logger.info(
+            "scene %s: IMG2IMG-%s path (model=%s start_frame=%s strength=%s n=%d)",
+            job_id, mode, spec.model_id, os.path.basename(start_frame),
+            strength, spec.n_frames,
         )
-        # per-frame seed: base_seed + i for coherence; omit -> random per frame
-        if spec.seed is not None:
-            kwargs["seed"] = spec.seed + i
-        if spec.negative is not None:
-            kwargs["negative_prompt"] = spec.negative
+        prev_output = start_frame   # chain: previous frame's OUTPUT feeds the next
+        for i in range(spec.n_frames):
+            # chain:    frame 0 = base prompt; frame i>0 = base + motion step i.
+            # parallel: every frame = base + motion step i (all off the start frame).
+            include_motion = bool(spec.motion) and (spec.chain is False or i > 0)
+            prompt = base_prompt
+            if include_motion:
+                # .replace (NOT .format): user strings may contain stray braces.
+                prompt += ", " + spec.motion.replace("{i}", str(i + 1)).replace("{n}", str(spec.n_frames))
 
-        # ---- drive the EXISTING plane once (lazy import; keep the runner pure) ----
-        try:
-            from abstract_hugpy_dev.managers.dispatch import execute_prompt
-            from abstract_hugpy_dev._platform.async_runtime import run
-            res = run(execute_prompt(**kwargs))
-        except Exception as exc:  # unknown model / registry / plane error -> DATA
-            return JobResult(job_id, ok=False, error=JobError(
-                code="generation_failed",
-                message=f"inference plane raised on frame {i}: {type(exc).__name__}: {exc}",
-                retryable=True,
-            ))
+            # chain conditions on the PREVIOUS frame's saved output (true drift);
+            # parallel conditions on the start frame every time (no drift).
+            cond_path = prev_output if spec.chain else start_frame
+            kwargs = dict(
+                task="image-to-image",
+                image_path=cond_path,
+                strength=strength,
+                prompt=prompt,
+                model_key=spec.model_id,
+                width=spec.width,
+                height=spec.height,
+                num_inference_steps=spec.steps,
+                guidance_scale=spec.guidance,
+                num_images=1,
+                return_b64=True,
+            )
+            if spec.seed is not None:
+                kwargs["seed"] = spec.seed + i
+            if spec.negative is not None:
+                kwargs["negative_prompt"] = spec.negative
 
-        if not getattr(res, "ok", False):
-            return JobResult(job_id, ok=False, error=JobError(
-                code="generation_failed",
-                message=f"frame {i}: {str(getattr(res, 'error', None) or 'unknown')}",
-                retryable=True,
-            ))
+            frame_path, err = _generate_one_frame(kwargs, out_dir, i, job_id)
+            if err is not None:
+                return err
+            if spec.chain:
+                prev_output = frame_path   # TRUE sequential chaining
+            # Re-ingest so the frame's dims/mime are authoritatively resolved (§9.2).
+            refs.append(ingest(frame_path))
+    else:
+        # ---- v1 path: seed + prompt-schedule (NO img2img), UNTOUCHED ----
+        logger.info(
+            "scene %s: V1 text-to-image path (seed+prompt-schedule; model=%s n=%d)",
+            job_id, spec.model_id, spec.n_frames,
+        )
+        for i in range(spec.n_frames):
+            # ---- per-frame prompt schedule (v1): positional tag + optional motion ----
+            prompt = base_prompt + f", frame {i + 1} of {spec.n_frames}"
+            if spec.motion:
+                # .replace (NOT .format): user strings may contain stray braces.
+                prompt += ", " + spec.motion.replace("{i}", str(i + 1)).replace("{n}", str(spec.n_frames))
 
-        images = getattr(res, "images", None) or ()
-        if not images:
-            return JobResult(job_id, ok=False, error=JobError(
-                code="generation_no_output",
-                message=f"plane returned ok but produced no image for frame {i}",
-                retryable=True,
-            ))
+            # ---- per-frame kwargs — SAME shape as imagegen ----
+            kwargs = dict(
+                task="text-to-image",
+                prompt=prompt,
+                model_key=spec.model_id,
+                width=spec.width,
+                height=spec.height,
+                num_inference_steps=spec.steps,
+                guidance_scale=spec.guidance,
+                num_images=1,
+                return_b64=True,
+            )
+            # per-frame seed: base_seed + i for coherence; omit -> random per frame
+            if spec.seed is not None:
+                kwargs["seed"] = spec.seed + i
+            if spec.negative is not None:
+                kwargs["negative_prompt"] = spec.negative
 
-        # ---- materialize the frame to a SEQUENTIAL padded path ----
-        frame_path = os.path.join(out_dir, f"frame_{i:05d}.png")
-        img = images[0]
-        src_path = getattr(img, "path", None)
-        if src_path and os.path.isfile(src_path):
-            shutil.copyfile(src_path, frame_path)
-        else:
-            # Plane served this remotely: its `path` lives on THAT machine; the
-            # inline b64 bytes are how the artifact reaches this machine.
-            b64 = getattr(img, "b64", None)
-            if not b64:
-                return JobResult(job_id, ok=False, error=JobError(
-                    code="generation_no_output",
-                    message=(f"frame {i}: generated image has no usable file path "
-                             f"on disk and no inline bytes: {src_path!r}"),
-                    retryable=False,
-                ))
-            with open(frame_path, "wb") as fh:
-                fh.write(base64.b64decode(b64))
-
-        # Re-ingest so the frame's dims/mime are authoritatively resolved (§9.2).
-        refs.append(ingest(frame_path))
+            frame_path, err = _generate_one_frame(kwargs, out_dir, i, job_id)
+            if err is not None:
+                return err
+            # Re-ingest so the frame's dims/mime are authoritatively resolved (§9.2).
+            refs.append(ingest(frame_path))
 
     # ---- optional assembly: frames -> browser-playable mp4 (ingested LAST) ----
     if spec.assemble:

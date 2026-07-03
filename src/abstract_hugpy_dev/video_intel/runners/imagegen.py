@@ -3,8 +3,10 @@
 `run_generate_image(spec, job_id) -> JobResult`. A THIN wrapper over the EXISTING
 inference plane (`managers.dispatch.execute_prompt`) — it does NOT import
 diffusers itself. The prompt is resolved from the spec's ordered parts (text
-parts joined; image parts noted), the plane is driven once, and the produced
-image file is re-ingested into a MediaRef.
+parts joined). When the spec carries an image part AND img2img is servable on the
+fleet, the FIRST image is used as an img2img init image (strength knob; default
+0.45); otherwise the image is ignored and text-to-image runs (v1 behavior). The
+plane is driven once and the produced image file is re-ingested into a MediaRef.
 
 Pure discipline (map §6): EXPECTED failures (no prompt, an unresolved video
 part, the plane raising / returning not-ok, no usable output) are returned as
@@ -23,11 +25,15 @@ to surface — this runner does NOT force pool="ml".
 """
 from __future__ import annotations
 
+import logging
 import os
 
 from ..gen_schema import GenerateImageSpec
 from ..media_store import ingest
 from ..result_schema import JobError, JobResult
+from ._img2img import img2img_available
+
+logger = logging.getLogger(__name__)
 
 
 def run_generate_image(spec: GenerateImageSpec, job_id: str) -> JobResult:
@@ -61,11 +67,21 @@ def run_generate_image(spec: GenerateImageSpec, job_id: str) -> JobResult:
             retryable=False,
         ))
 
-    # NOTE on image parts: sd-turbo is text-to-image, and execute_prompt has no
-    # image-conditioning seam wired here yet, so image parts are collected but not
-    # (yet) passed as conditioning. We still generate from the text and record
-    # that images were present. image2image is a future model flag.
-    _ = image_paths  # collected for a future image-conditioning seam
+    # ---- image-conditioning seam: use the FIRST image part as an init image via
+    # img2img — but ONLY when img2img is servable on the fleet. The sd-turbo
+    # advertisement flip is HELD, so on live central this is unavailable; we then
+    # DO NOT regress the existing "image ignored, text-to-image runs" flow — we
+    # still generate from the text and log LOUDLY. image2image is the model flag.
+    start_frame = image_paths[0] if image_paths else None
+    strength = spec.strength if spec.strength is not None else 0.45   # documented default
+    use_img2img = start_frame is not None and img2img_available(spec.model_id)
+    if start_frame is not None and not use_img2img:
+        logger.warning(
+            "generate_image %s: %d image part(s) supplied but image-to-image is "
+            "NOT available on the fleet (model=%s); ignoring the init image and "
+            "running text-to-image (v1 behavior preserved)",
+            job_id, len(image_paths), spec.model_id,
+        )
 
     # ---- GPU-worker guard (2026-07-03 central-meltdown fix) ----
     # The guard block was extracted VERBATIM into the shared helper so every
@@ -79,20 +95,42 @@ def run_generate_image(spec: GenerateImageSpec, job_id: str) -> JobResult:
         return _refusal
 
     # ---- build kwargs; leave `pool` UNSET (routing note in the docstring) ----
-    kwargs = dict(
-        task="text-to-image",
-        prompt=prompt,
-        model_key=spec.model_id,
-        width=spec.width,
-        height=spec.height,
-        num_inference_steps=spec.steps,
-        guidance_scale=spec.guidance,
-        num_images=1,
-        # The plane may serve this on a REMOTE GPU worker: the result's `path`
-        # is then worker-local. The b64 bytes are how the artifact reaches
-        # this machine (materialized below when the path isn't local).
-        return_b64=True,
-    )
+    if use_img2img:
+        logger.info(
+            "generate_image %s: IMG2IMG path (model=%s init=%s strength=%s)",
+            job_id, spec.model_id, os.path.basename(start_frame), strength,
+        )
+        kwargs = dict(
+            task="image-to-image",
+            image_path=start_frame,
+            strength=strength,
+            prompt=prompt,
+            model_key=spec.model_id,
+            width=spec.width,
+            height=spec.height,
+            num_inference_steps=spec.steps,
+            guidance_scale=spec.guidance,
+            num_images=1,
+            # The plane may serve this on a REMOTE GPU worker: the result's `path`
+            # is then worker-local. The b64 bytes are how the artifact reaches
+            # this machine (materialized below when the path isn't local).
+            return_b64=True,
+        )
+    else:
+        kwargs = dict(
+            task="text-to-image",
+            prompt=prompt,
+            model_key=spec.model_id,
+            width=spec.width,
+            height=spec.height,
+            num_inference_steps=spec.steps,
+            guidance_scale=spec.guidance,
+            num_images=1,
+            # The plane may serve this on a REMOTE GPU worker: the result's `path`
+            # is then worker-local. The b64 bytes are how the artifact reaches
+            # this machine (materialized below when the path isn't local).
+            return_b64=True,
+        )
     # only include optional knobs when set, so a None can't confuse a builder
     if spec.seed is not None:
         kwargs["seed"] = spec.seed

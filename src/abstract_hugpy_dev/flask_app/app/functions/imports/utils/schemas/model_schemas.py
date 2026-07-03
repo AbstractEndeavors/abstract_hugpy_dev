@@ -35,3 +35,4 @@ class ModelSearchResult(BaseModel):
     private: bool | None = None
     total_bytes: int | None = None
     last_modified: str | None = None
+    created_at: str | None = None

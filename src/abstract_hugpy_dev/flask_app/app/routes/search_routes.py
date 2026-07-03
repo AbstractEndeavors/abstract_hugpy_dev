@@ -86,6 +86,7 @@ def search_models():
                 private=getattr(model, "private", None),
                 total_bytes=model_size(hub_id) if with_size else None,   # #2
                 last_modified=str(getattr(model, "last_modified", "")) or None,
+                created_at=str(getattr(model, "created_at", "")) or None,
             ).model_dump()
         )
 
