@@ -975,16 +975,17 @@ def build_app(state: "WorkerState") -> Flask:
                 return jsonify({"ok": False, "error": {
                     "code": "BadValue", "message": "slot_count must be 0..16"}}), 400
             settings["slot_count"] = n
-        if "on_demand_ttl_s" in body:
-            try:
-                ttl = int(body["on_demand_ttl_s"])
-            except (TypeError, ValueError):
-                return jsonify({"ok": False, "error": {
-                    "code": "BadValue", "message": "on_demand_ttl_s must be an integer"}}), 400
-            if not 60 <= ttl <= 86400:
-                return jsonify({"ok": False, "error": {
-                    "code": "BadValue", "message": "on_demand_ttl_s must be 60..86400"}}), 400
-            settings["on_demand_ttl_s"] = ttl
+        for _tkey in ("on_demand_ttl_s", "reconcile_interval_s"):
+            if _tkey in body:
+                try:
+                    tval = int(body[_tkey])
+                except (TypeError, ValueError):
+                    return jsonify({"ok": False, "error": {
+                        "code": "BadValue", "message": f"{_tkey} must be an integer"}}), 400
+                if not 60 <= tval <= 86400:
+                    return jsonify({"ok": False, "error": {
+                        "code": "BadValue", "message": f"{_tkey} must be 60..86400"}}), 400
+                settings[_tkey] = tval
         if "residency" in body:
             # DEEP-MERGE per model key: {"model": "warm"|"on-demand"|null}.
             # null (or "") removes the override, restoring the warm default.
@@ -1177,11 +1178,20 @@ def _sync_assignment(state: "WorkerState", worker: dict) -> None:
     logger.info("assignment updated: serving %s", models or "(nothing)")
 
     for model_key in models:
-        with state._provision_lock:
-            if model_key in state._provisioning:
-                continue
-            state._provisioning.add(model_key)
+        _kick_provision(state, model_key)
 
+
+def _kick_provision(state: "WorkerState", model_key: str) -> None:
+    """Provision (and per-policy preload) ONE assigned model in the background.
+
+    Shared by assignment adoption and the UTIL-08 reconcile loop; the
+    _provisioning guard makes concurrent kicks a no-op."""
+    with state._provision_lock:
+        if model_key in state._provisioning:
+            return
+        state._provisioning.add(model_key)
+
+    if True:  # (indentation shim — keeps the battle-tested _bg body verbatim)
         def _bg(mk=model_key):
             def _prog(done, total, fname=None):
                 # Mirrors the inference-time SSE progress, but recorded on state
@@ -1231,6 +1241,58 @@ def _sync_assignment(state: "WorkerState", worker: dict) -> None:
                     state._provision_progress.pop(mk, None)
 
         threading.Thread(target=_bg, daemon=True).start()
+
+
+# ── UTIL-08: desired-state reconcile ─────────────────────────────────────────
+# Assignment adoption only fires on CHANGE, so a failed pull used to drift
+# forever (assigned, files absent, nobody retries until the operator touches
+# the assignment). The reconcile loop re-kicks provisioning for any assigned
+# model whose files are missing; models_local in the heartbeat gives central
+# the disk-truth to SHOW the drift meanwhile.
+
+_MODELS_LOCAL_CACHE: dict = {"at": 0.0, "value": []}
+
+
+def _models_local(state: "WorkerState") -> list[str]:
+    """Assigned models whose files are actually on THIS worker's disk (60s
+    cache — model_is_local walks directories; don't pay that every beat)."""
+    now = time.time()
+    if now - _MODELS_LOCAL_CACHE["at"] < 60.0:
+        return _MODELS_LOCAL_CACHE["value"]
+    out: list[str] = []
+    try:
+        from .provision import model_is_local
+        for mk in list(state.assigned_models):
+            try:
+                if model_is_local(mk):
+                    out.append(mk)
+            except Exception:  # noqa: BLE001 — one bad row must not hide the rest
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+    _MODELS_LOCAL_CACHE.update(at=now, value=out)
+    return out
+
+
+def _reconcile_loop(state: "WorkerState") -> None:
+    """Every reconcile_interval_s (default 600): any assigned model that is
+    NOT local and NOT already provisioning gets its provisioning re-kicked.
+    Converges failed pulls instead of drifting until the next assignment
+    change; the _provisioning guard + single-flight lock keep it idempotent."""
+    while True:
+        time.sleep(max(60, int(_RUNTIME_SETTINGS.get("reconcile_interval_s", 600))))
+        try:
+            local = set(_models_local(state))
+            for mk in list(state.assigned_models):
+                with state._provision_lock:
+                    busy = mk in state._provisioning
+                if mk not in local and not busy:
+                    logger.warning("reconcile: assigned model %s is missing on "
+                                   "disk — re-kicking provisioning", mk)
+                    _MODELS_LOCAL_CACHE["at"] = 0.0   # re-check after the pull
+                    _kick_provision(state, mk)
+        except Exception as exc:  # noqa: BLE001 — the loop must never die
+            logger.warning("reconcile iteration failed: %s", exc)
 
 
 def _load_worker_id(path: str) -> str | None:
@@ -1288,7 +1350,8 @@ def _update_state_path(args) -> str:
 # heartbeat reports the EFFECTIVE values + their source so the console always
 # shows truth.
 
-_SETTINGS_KEYS = {"slot_count", "residency", "on_demand_ttl_s"}  # widen key by key
+_SETTINGS_KEYS = {"slot_count", "residency", "on_demand_ttl_s",
+                  "reconcile_interval_s"}   # widen key by key
 _SETTINGS_SOURCE: dict = {}              # key -> "settings" | "env" | "default"
 _RUNTIME_SETTINGS: dict = {}             # the loaded settings, for live readers
 
@@ -1508,6 +1571,7 @@ def _heartbeat_loop(client: CentralClient, state: WorkerState, args) -> None:
                     "gpus": detect_gpus(),
                     "loaded_models": loaded_model_keys(),
                     "loading": _loading_model_keys(),
+                    "models_local": _models_local(state),
                     "provisioning": sorted(state._provisioning),
                     "provision_progress": state.provision_snapshot(),
                     "spill": _spill_describe(),
@@ -1774,6 +1838,9 @@ def main(argv: list[str] | None = None) -> int:
 
     # Residency policy sweep (item 3): evicts idle on-demand models.
     threading.Thread(target=_residency_sweep_loop, daemon=True).start()
+
+    # UTIL-08 reconcile: failed pulls converge instead of drifting forever.
+    threading.Thread(target=_reconcile_loop, args=(state,), daemon=True).start()
 
     logger.info("worker inference server listening on %s (advertising %s)",
                 f"{args.host}:{args.port}", state.url)

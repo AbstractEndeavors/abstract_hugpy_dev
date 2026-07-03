@@ -590,6 +590,7 @@ class WorkerStore:
         gpus: Optional[List[Dict[str, Any]]] = None,
         loaded_models: Optional[List[str]] = None,
         loading: Optional[List[str]] = None,
+        models_local: Optional[List[str]] = None,
         provisioning: Optional[List[str]] = None,
         provision_progress: Optional[Dict[str, Any]] = None,
         spill: Optional[Dict[str, Any]] = None,
@@ -633,6 +634,8 @@ class WorkerStore:
                 worker["loaded_models"] = merged
             if loading is not None:
                 worker["loading"] = loading   # weights load in flight ("heating")
+            if models_local is not None:
+                worker["models_local"] = models_local   # disk-truth (UTIL-08)
             if provisioning is not None:
                 worker["provisioning"] = provisioning
             if provision_progress is not None:

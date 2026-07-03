@@ -238,6 +238,9 @@ class HeartbeatRequest(BaseModel):
     # "heating" attribution (distinct from provisioning=pulling files and
     # loaded_models=resident/serving).
     loading: list[str] | None = None
+    # UTIL-08 disk-truth: which ASSIGNED models actually have files on the
+    # worker's disk — lets the console show "assigned but missing" drift.
+    models_local: list[str] | None = None
     # Models the worker is currently pulling from central/HF in the background.
     provisioning: list[str] | None = None
     # Per-model download progress for the models in `provisioning`:
@@ -374,6 +377,7 @@ def workers_heartbeat(worker_id):
         gpus=[g.model_dump() for g in body.gpus] if body.gpus is not None else None,
         loaded_models=body.loaded_models,
         loading=body.loading,
+        models_local=body.models_local,
         provisioning=body.provisioning,
         provision_progress=body.provision_progress,
         spill=body.spill,
