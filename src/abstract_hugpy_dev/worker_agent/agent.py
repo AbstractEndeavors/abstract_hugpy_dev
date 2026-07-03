@@ -1208,7 +1208,14 @@ def _kick_provision(state: "WorkerState", model_key: str) -> None:
                         entry["source"] = fname[len("source="):]
             try:
                 from .provision import ensure_model_present, model_is_local
-                if not model_is_local(mk):
+                # Hardening: model_is_local RAISES for a key this worker's
+                # registry hasn't learned yet — that must trigger the pull
+                # (which starts with ensure_model_registered), not abort it.
+                try:
+                    _has_files = model_is_local(mk)
+                except Exception:  # noqa: BLE001
+                    _has_files = False
+                if not _has_files:
                     logger.info("pre-provisioning assigned model %s…", mk)
                     ensure_model_present(mk, state.central_url, progress=_prog)
                     logger.info("pre-provisioned %s", mk)
@@ -1418,6 +1425,39 @@ def _effective_config() -> dict:
     return out
 
 
+# ── ComfyUI presence (slice A of the comfy engine) ──────────────────────────
+# The operator installs ComfyUI on the box (own service/venv); the agent
+# ADOPTS it: probe the local instance and advertise `comfy` in the heartbeat
+# so central can route comfy-templated work here (slice B) and the console
+# shows the capability. COMFY_URL overrides the default local port.
+
+_COMFY_CACHE: dict = {"at": 0.0, "value": {"available": False}}
+
+
+def _comfy_status() -> dict:
+    """Probe the local ComfyUI (60s cache): {"available", "url", "version"?}."""
+    now = time.time()
+    if now - _COMFY_CACHE["at"] < 60.0:
+        return _COMFY_CACHE["value"]
+    url = (os.environ.get("COMFY_URL") or "http://127.0.0.1:8188").rstrip("/")
+    out: dict = {"available": False, "url": url}
+    try:
+        import httpx
+        r = httpx.get(url + "/system_stats", timeout=2.0)
+        if r.status_code == 200:
+            out["available"] = True
+            try:
+                sysinfo = (r.json() or {}).get("system") or {}
+                if sysinfo.get("comfyui_version"):
+                    out["version"] = sysinfo["comfyui_version"]
+            except Exception:  # noqa: BLE001 — version is decoration
+                pass
+    except Exception:  # noqa: BLE001 — not installed / not running
+        pass
+    _COMFY_CACHE.update(at=now, value=out)
+    return out
+
+
 def _residency_sweep_loop() -> None:
     """Evict idle on-demand models (item 3 residency policy).
 
@@ -1586,6 +1626,7 @@ def _heartbeat_loop(client: CentralClient, state: WorkerState, args) -> None:
                     "caps": _local_caps(),
                     "env": env_status(),
                     "config": _effective_config(),
+                    "comfy": _comfy_status(),
                     "loaded_detail": _loaded_detail(),
                     "slots": _slot_statuses(),
                 },

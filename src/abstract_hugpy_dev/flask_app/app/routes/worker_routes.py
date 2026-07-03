@@ -262,6 +262,8 @@ class HeartbeatRequest(BaseModel):
     # Effective operator serving-config (settings > env > default) — e.g.
     # {slot_count, slot_count_source}; set via POST /llm/workers/<id>/config.
     config: dict | None = None
+    # ComfyUI presence on the worker (slice A): {"available", "url", "version"?}.
+    comfy: dict | None = None
     # Per-loaded-model load facts: {key: {model_bytes, n_gpu_layers,
     # total_layers, gpu_pct}} — drives the console's serving rows.
     loaded_detail: dict | None = None
@@ -391,6 +393,7 @@ def workers_heartbeat(worker_id):
         caps=body.caps,
         env=body.env,
         config=body.config,
+        comfy=body.comfy,
         loaded_detail=body.loaded_detail,
         slots=body.slots,
     )
