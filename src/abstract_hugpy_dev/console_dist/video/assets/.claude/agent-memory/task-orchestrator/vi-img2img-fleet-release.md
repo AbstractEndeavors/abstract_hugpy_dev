@@ -1,9 +1,48 @@
 ---
 name: vi-img2img-fleet-release
-description: The pinned-wheel fleet-release STOP boundary + hold-the-advertisement-flip pattern for hugpy inference-plane task additions that need the GPU worker
+description: img2img fleet-release — EXECUTED at 0.1.95 (flip live) but now DARK because ServeMode displaced sd-turbo from the fleet; the pinned-wheel STOP boundary + hold-the-flip pattern; verify live state before re-running a stale runbook
 metadata:
   type: reference
 ---
+
+**STATUS UPDATE (2026-07-03 ~14:5x UTC) — THE GO-LIVE WAS ALREADY EXECUTED; a stale
+runbook nearly made me redo it.** A prior/concurrent run published `abstract_hugpy_dev==0.1.95`
+(engine + Img2ImgRunner), converged op+computron, flipped `sd-turbo →
+["text-to-image","image-to-image"]` (git `42db1e3`), and restarted central. PyPI has since
+advanced to 0.1.98 (concurrent ServeMode/ModelPicker bumps from the SAME tree). Live central
+runs 0.1.95 code, flip in effect, `img2img_available("sd-turbo")` = True.
+- **I was handed a runbook that still assumed the flip was HELD and op was at 0.1.92.** It
+  was stale. Ground truth (git log + `pip show` on op + live `/api/version` + a real request)
+  contradicted it. **Lesson: for a fleet release, verify the LIVE state — git log for a
+  GO-LIVE commit, op's actual `pip show` version, and drive ONE real request through central —
+  BEFORE executing any "publish → converge → flip" runbook. Re-running a done release would
+  have dragged in a concurrent workstream's unrelated bumps and re-converged for nothing.**
+- **NEW LANDMINE — a completed go-live can be rendered DARK by ServeMode slot churn.** The
+  go-live model `sd-turbo` is no longer scheduled on ANY worker: the concurrent ServeMode
+  workstream reassigned the only diffusion GPU worker (`op`, RTX 3090) to
+  `[Qwen-Image-Bench, Qwen-Image-Edit-2509, Qwen3.6-35B-A3B, Qwen2.5-VL-7B, flux-klein-q4,
+  sdxl-turbo]`. So BOTH sd-turbo text-to-image AND img2img now fail `no_live_gpu_worker`
+  (NOT `image_to_image_unavailable` — the flip is live; the request passes the probe and dies
+  at the GPU guard). Advertising a task ≠ a worker serving it. **Distinguish the two failure
+  codes: `image_to_image_unavailable` = flip/probe (config); `no_live_gpu_worker` = scheduling
+  (ServeMode/slots). Read the code before concluding "the flip didn't work."**
+- **The user's actual "not available on the fleet" pain is a DIFFERENT model.** The daemon
+  journal shows real img2img traffic against `Qwen-Image-Edit-2509` and `flux-klein-q4` (the
+  models loaded on op), which are deliberately NOT advertised for image-to-image. Fixing that
+  is a product decision (curate-advertise Qwen-Image-Edit — a real edit model, but it needs a
+  Qwen-specific runner since `Img2ImgRunner` is `AutoPipelineForImage2Image`/SD-family only)
+  OR reschedule sd-turbo — both outside the img2img slice's lane (slots are fenced off, owned
+  by the concurrent ServeMode terminal). Escalate; don't unilaterally advertise Qwen/flux or
+  touch slots.
+- **Release mechanism confirmed & routine:** `touch
+  /mnt/root_800/vm_mgr/share/projects/hugpy/signals/publish-dev.trigger` → host `hugpy-jobs`
+  timer (15s poll) claims it, delegates `abstract_hugpy_dev.publish.trigger` to `pyit-jobs`
+  (holds PyPI creds), waits, deletes token on success (`.failed` on failure). Version = the
+  literal `pyproject.toml [project].version` in the share dev tree (publish-dev does NOT
+  auto-bump; publish-prod does). Progress in `signals/jobs.log`. computron (.158) is NOT
+  reachable by this key; op IS (pubkey).
+
+--- (historical pattern, still valid, from the pre-go-live run) ---
 
 Adding a NEW inference TASK (e.g. `image-to-image`) that a GPU worker must execute hits a
 split-brain deploy: **central runs from the share (edits go live on restart, no release),

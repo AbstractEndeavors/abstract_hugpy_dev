@@ -207,7 +207,7 @@ class Img2ImgRunner:
 
             try:
                 import torch
-                from diffusers import AutoPipelineForImage2Image
+                from diffusers import AutoPipelineForImage2Image, DiffusionPipeline
             except ImportError as exc:
                 raise RuntimeError(
                     "diffusers + torch are required for image-to-image tasks "
@@ -218,15 +218,42 @@ class Img2ImgRunner:
             # GPU guard block — VERBATIM from ImageGenRunner: fp16 on cuda, fp32
             # on cpu, move the whole pipe to the resolved device.
             cuda = torch.cuda.is_available()
-            pipe = AutoPipelineForImage2Image.from_pretrained(
-                model_dir,
-                torch_dtype=torch.float16 if cuda else torch.float32,
-            )
-            pipe = pipe.to("cuda" if cuda else "cpu")
+            dtype = torch.float16 if cuda else torch.float32
+            # AutoPipelineForImage2Image only maps the classic families (SD /
+            # SDXL / flux1 …); natively image-conditioned EDIT pipelines
+            # (QwenImageEditPlusPipeline, Flux2KleinPipeline, …) are absent from
+            # its mapping and it raises "can't find a pipeline linked to <cls>".
+            # Those classes are img2img by construction, so fall back to
+            # DiffusionPipeline, which instantiates the concrete class straight
+            # from model_index.json.
+            fallback = False
+            try:
+                pipe = AutoPipelineForImage2Image.from_pretrained(
+                    model_dir, torch_dtype=dtype,
+                )
+            except ValueError as exc:
+                logger.info(
+                    "Img2ImgRunner: AutoPipeline has no img2img mapping for "
+                    "model=%s (%s); falling back to the concrete pipeline class",
+                    self.model_key, exc,
+                )
+                pipe = DiffusionPipeline.from_pretrained(model_dir, torch_dtype=dtype)
+                fallback = True
+            if cuda and fallback:
+                # Edit pipelines are typically far larger than the classic SD
+                # families — component-wise CPU offload lets them run within a
+                # single consumer GPU's VRAM instead of OOMing at .to("cuda").
+                try:
+                    pipe.enable_model_cpu_offload()
+                except Exception:
+                    pipe = pipe.to("cuda")
+            else:
+                pipe = pipe.to("cuda" if cuda else "cpu")
 
             logger.info(
-                "Img2ImgRunner: loaded model=%s dir=%s device=%s",
+                "Img2ImgRunner: loaded model=%s dir=%s device=%s class=%s%s",
                 self.model_key, model_dir, "cuda" if cuda else "cpu",
+                type(pipe).__name__, " (cpu-offload)" if cuda and fallback else "",
             )
             self._PIPELINES[self.model_key] = pipe
             return pipe
@@ -299,7 +326,32 @@ class Img2ImgRunner:
             device = "cuda" if torch.cuda.is_available() else "cpu"
             call_kwargs["generator"] = torch.Generator(device).manual_seed(req.seed)
 
-        output = self.pipeline(**call_kwargs)
+        # Concrete edit pipelines (QwenImageEditPlus, Flux2Klein, …) don't share
+        # the SD img2img signature — e.g. no `strength`, `true_cfg_scale` in
+        # place of guidance. Filter kwargs to what THIS pipeline's __call__
+        # actually accepts (a **kwargs pipeline keeps everything) and log the
+        # drops, instead of detonating on an unexpected-keyword TypeError.
+        import inspect
+        pipe = self.pipeline
+        try:
+            sig = inspect.signature(pipe.__call__)
+            has_var_kw = any(p.kind is inspect.Parameter.VAR_KEYWORD
+                             for p in sig.parameters.values())
+            if not has_var_kw:
+                accepted = set(sig.parameters)
+                dropped = [k for k in call_kwargs if k not in accepted]
+                if dropped:
+                    logger.warning(
+                        "Img2ImgRunner: %s.__call__ does not accept %s — "
+                        "dropping for model=%s",
+                        type(pipe).__name__, dropped, self.model_key,
+                    )
+                    call_kwargs = {k: v for k, v in call_kwargs.items()
+                                   if k in accepted}
+        except (TypeError, ValueError):
+            pass  # unsignaturable callable — send as-is
+
+        output = pipe(**call_kwargs)
 
         out_dir = os.path.join(UPLOADS_HOME, "generated")
         os.makedirs(out_dir, exist_ok=True)
