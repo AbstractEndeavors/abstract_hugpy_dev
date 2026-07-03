@@ -46,6 +46,20 @@ logger = logging.getLogger(__name__)
 _INSTANCES: Dict[Tuple[str, str], Runner] = {}
 _INSTANCES_LOCK = threading.Lock()
 
+# Models whose runner build (weight load) is IN FLIGHT right now — read by the
+# worker heartbeat so the console can attribute "heating" (load in progress)
+# distinctly from "serving" (resident) and "cold" (assigned, not loaded).
+# Separate lock: heartbeats must read this while a slow build holds
+# _INSTANCES_LOCK for minutes.
+_BUILDING: set = set()
+_BUILDING_LOCK = threading.Lock()
+
+
+def loading_model_keys() -> List[str]:
+    """model_keys whose runner/weights are currently loading in this process."""
+    with _BUILDING_LOCK:
+        return sorted(_BUILDING)
+
 
 def _get_or_build_runner(res: Resolution) -> Runner:
     """Cache-coherent runner lookup. Double-checked locking under the cache lock."""
@@ -62,7 +76,13 @@ def _get_or_build_runner(res: Resolution) -> Runner:
             "instantiating runner: model=%s task=%s class=%s framework=%s",
             res.model_key, res.task, res.runner_cls.__name__, res.framework,
         )
-        instance = res.runner_cls(res.cfg)
+        with _BUILDING_LOCK:
+            _BUILDING.add(res.model_key)
+        try:
+            instance = res.runner_cls(res.cfg)
+        finally:
+            with _BUILDING_LOCK:
+                _BUILDING.discard(res.model_key)
         _INSTANCES[res.cache_key] = instance
         return instance
 

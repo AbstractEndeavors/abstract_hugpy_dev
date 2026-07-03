@@ -234,6 +234,10 @@ def _resolve_worker_url(advertised: str | None, port: int | None) -> str:
 class HeartbeatRequest(BaseModel):
     gpus: list[GpuInfo] | None = None
     loaded_models: list[str] | None = None
+    # Models whose weights are LOADING on the worker right now — the console's
+    # "heating" attribution (distinct from provisioning=pulling files and
+    # loaded_models=resident/serving).
+    loading: list[str] | None = None
     # Models the worker is currently pulling from central/HF in the background.
     provisioning: list[str] | None = None
     # Per-model download progress for the models in `provisioning`:
@@ -366,6 +370,7 @@ def workers_heartbeat(worker_id):
         worker_id,
         gpus=[g.model_dump() for g in body.gpus] if body.gpus is not None else None,
         loaded_models=body.loaded_models,
+        loading=body.loading,
         provisioning=body.provisioning,
         provision_progress=body.provision_progress,
         spill=body.spill,

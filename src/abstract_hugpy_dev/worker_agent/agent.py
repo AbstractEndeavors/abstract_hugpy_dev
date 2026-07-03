@@ -769,6 +769,15 @@ def loaded_model_keys() -> list[str]:
         return []
 
 
+def _loading_model_keys() -> list[str]:
+    """Models whose weights are LOADING right now — the console's 'heating'."""
+    try:
+        from ..managers.dispatch.dispatch import loading_model_keys
+        return loading_model_keys()
+    except Exception:
+        return []
+
+
 def _spill_describe() -> dict:
     try:
         #from abstract_hugpy_dev.managers.spill import describe
@@ -1312,6 +1321,7 @@ def _heartbeat_loop(client: CentralClient, state: WorkerState, args) -> None:
                 {
                     "gpus": detect_gpus(),
                     "loaded_models": loaded_model_keys(),
+                    "loading": _loading_model_keys(),
                     "provisioning": sorted(state._provisioning),
                     "provision_progress": state.provision_snapshot(),
                     "spill": _spill_describe(),

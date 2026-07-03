@@ -522,6 +522,7 @@ class WorkerStore:
         *,
         gpus: Optional[List[Dict[str, Any]]] = None,
         loaded_models: Optional[List[str]] = None,
+        loading: Optional[List[str]] = None,
         provisioning: Optional[List[str]] = None,
         provision_progress: Optional[Dict[str, Any]] = None,
         spill: Optional[Dict[str, Any]] = None,
@@ -562,6 +563,8 @@ class WorkerStore:
                     if mk and s.get("healthy") and mk not in merged:
                         merged.append(mk)
                 worker["loaded_models"] = merged
+            if loading is not None:
+                worker["loading"] = loading   # weights load in flight ("heating")
             if provisioning is not None:
                 worker["provisioning"] = provisioning
             if provision_progress is not None:
