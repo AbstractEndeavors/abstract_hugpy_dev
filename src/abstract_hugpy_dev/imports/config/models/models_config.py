@@ -75,13 +75,12 @@ MODELS = {
         "model_max_length": 77, "include": None, "name": "sd-turbo",
         "framework": "transformers", "hub_id": "stabilityai/sd-turbo", "filename": None,
         "folder": "stabilityai/sd-turbo",
-        # GO-LIVE (after op wheel updated): "tasks": ["text-to-image", "image-to-image"]
-        # HELD: the img2img RUNNER/BUILDER/registry pair are wired and INERT, but
-        # the pinned GPU worker (abstract_hugpy_dev==0.1.92) cannot serve img2img.
-        # Advertising it here would make live central route image-to-image to that
-        # old-wheel worker and fail. Flip this ONE line only after the fleet wheel
-        # is updated. validate_registry already accepts the flip (pair registered).
-        "tasks": ["text-to-image"],
+        # GO-LIVE flipped 2026-07-03 (was held): the fleet wheel is 0.1.95
+        # (op/computron converged — carries Img2ImgRunner), so advertising
+        # image-to-image now routes to workers that actually serve it.
+        # Runner/builder/RUNNER_PAIRS were wired (inert) in the same release;
+        # validate_registry accepts this.
+        "tasks": ["text-to-image", "image-to-image"],
         "primary_task": "text-to-image", "port": None,
     },
 
