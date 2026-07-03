@@ -532,6 +532,11 @@ class WorkerStore:
                 # WORKER_POOL (which sends ""). Declaring workers still win.
                 if pool and pool.strip():
                     existing["pool"] = pool.strip()
+                # 4b organic backfill: every re-register refreshes the
+                # assignment memory, so designations that predate the memory
+                # feature become durable without an explicit assign.
+                if existing.get("models"):
+                    _remember_assignments(existing)
                 return _public_view(existing)
 
             wid = worker_id or uuid.uuid4().hex
