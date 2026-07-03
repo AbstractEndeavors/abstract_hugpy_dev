@@ -25,6 +25,22 @@ from .schemas import GeneratedImage, ImageGenRequest, ImageGenResult
 
 logger = logging.getLogger(__name__)
 
+# Per-model GENERATE serialization, shared by both runners. A diffusers
+# pipeline object is NOT safe under concurrent __call__ (scheduler state
+# races) — and the scene fan-out (video_intel/runners/scene.py) deliberately
+# issues concurrent frame requests that may land on the same worker. Different
+# models still generate in parallel; same-model calls queue.
+_GEN_LOCKS: Dict[str, threading.Lock] = {}
+_GEN_LOCKS_GUARD = threading.Lock()
+
+
+def _generate_lock(model_key: str) -> threading.Lock:
+    with _GEN_LOCKS_GUARD:
+        lock = _GEN_LOCKS.get(model_key)
+        if lock is None:
+            lock = _GEN_LOCKS[model_key] = threading.Lock()
+        return lock
+
 
 class ImageGenRunner:
     """Runner for diffusers text-to-image pipelines.
@@ -105,7 +121,8 @@ class ImageGenRunner:
             device = "cuda" if torch.cuda.is_available() else "cpu"
             call_kwargs["generator"] = torch.Generator(device).manual_seed(req.seed)
 
-        output = self.pipeline(**call_kwargs)
+        with _generate_lock(self.model_key):
+            output = self.pipeline(**call_kwargs)
 
         out_dir = os.path.join(UPLOADS_HOME, "generated")
         os.makedirs(out_dir, exist_ok=True)
@@ -405,7 +422,8 @@ class Img2ImgRunner:
         except (TypeError, ValueError):
             pass  # unsignaturable callable — send as-is
 
-        output = pipe(**call_kwargs)
+        with _generate_lock(self.model_key):
+            output = pipe(**call_kwargs)
 
         out_dir = os.path.join(UPLOADS_HOME, "generated")
         os.makedirs(out_dir, exist_ok=True)

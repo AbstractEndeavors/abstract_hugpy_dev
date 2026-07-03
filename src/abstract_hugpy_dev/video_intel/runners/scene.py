@@ -86,6 +86,88 @@ def _assemble_scene_mp4(frame_dir: str, mp4_path: str, fps: int) -> None:
         )
 
 
+def _scene_concurrency(model_id: str, n_frames: int) -> int:
+    """How many frames to generate at once. HUGPY_SCENE_CONCURRENCY pins it;
+    otherwise self-tune to the number of ONLINE workers assigned this model
+    (the delegating plane's least-recently-picked routing spreads concurrent
+    requests across them, and each worker serializes same-model generates via
+    the runners' per-model lock — so extra in-flight frames just queue).
+    Floor 1 = today's sequential behavior on a one-worker fleet."""
+    env = (os.environ.get("HUGPY_SCENE_CONCURRENCY") or "").strip()
+    if env:
+        try:
+            return max(1, min(int(env), n_frames))
+        except ValueError:
+            pass
+    try:
+        from ...flask_app.app.functions.imports.utils.workers import list_workers
+        live = sum(
+            1 for w in list_workers()
+            if w.get("status") == "online" and model_id in (w.get("models") or [])
+        )
+        return max(1, min(live, n_frames))
+    except Exception:
+        return 1  # registry unavailable (e.g. worker-side import) — sequential
+
+
+def _generate_frames_parallel(frame_kwargs: "list[dict]", out_dir: str,
+                              job_id: str, model_id: str):
+    """Tier-1 scene fan-out: generate INDEPENDENT frames concurrently.
+
+    Only for orders where frames don't feed each other — v1 (seed-schedule
+    text-to-image) and img2img chain=False (every frame off the START frame).
+    chain=True stays strictly sequential at the call site. Cooperative cancel:
+    frames not yet started become no-ops once 'cancelling' is set; in-flight
+    frames finish (same between-frames contract as the sequential path).
+    Returns (ordered_frame_paths, None) or (None, JobResult error)."""
+    from concurrent.futures import ThreadPoolExecutor
+    from ..media_bus import is_cancelling
+
+    n = len(frame_kwargs)
+    workers = _scene_concurrency(model_id, n)
+    if workers <= 1:
+        paths: list = []
+        for i, kw in enumerate(frame_kwargs):
+            if is_cancelling(job_id):
+                return None, JobResult(job_id, ok=False, error=JobError(
+                    code="cancelled",
+                    message=f"cancelled after {i} of {n} frame(s)",
+                    retryable=False))
+            frame_path, err = _generate_one_frame(kw, out_dir, i, job_id)
+            if err is not None:
+                return None, err
+            paths.append(frame_path)
+        return paths, None
+
+    logger.info("scene %s: fan-out %d frames across up to %d concurrent "
+                "generates (model=%s)", job_id, n, workers, model_id)
+
+    def _task(i: int, kw: dict):
+        if is_cancelling(job_id):
+            return i, None, "cancelled"
+        frame_path, err = _generate_one_frame(kw, out_dir, i, job_id)
+        return i, frame_path, err
+
+    results: dict = {}
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for i, frame_path, err in pool.map(
+                lambda args: _task(*args), enumerate(frame_kwargs)):
+            results[i] = (frame_path, err)
+
+    cancelled = sum(1 for p, e in results.values() if e == "cancelled")
+    if cancelled:
+        done = sum(1 for p, e in results.values() if e is None)
+        return None, JobResult(job_id, ok=False, error=JobError(
+            code="cancelled",
+            message=f"cancelled after {done} of {n} frame(s)",
+            retryable=False))
+    for i in range(n):  # first REAL error by frame order, deterministic
+        _path, err = results[i]
+        if err is not None:
+            return None, err
+    return [results[i][0] for i in range(n)], None
+
+
 def _generate_one_frame(kwargs: dict, out_dir: str, i: int, job_id: str):
     """Drive the EXISTING inference plane once and materialize the result to a
     SEQUENTIAL padded frame_%05d.png. Returns (frame_path, None) on success, or
@@ -220,16 +302,7 @@ def run_generate_scene(spec: GenerateSceneSpec, job_id: str) -> JobResult:
             job_id, mode, spec.model_id, os.path.basename(start_frame),
             strength, spec.n_frames,
         )
-        prev_output = start_frame   # chain: previous frame's OUTPUT feeds the next
-        for i in range(spec.n_frames):
-            # Cooperative cancel — honored BETWEEN frames (mid-frame inference
-            # is never interrupted). The console's Cancel sets 'cancelling'.
-            from ..media_bus import is_cancelling
-            if is_cancelling(job_id):
-                return JobResult(job_id, ok=False, error=JobError(
-                    code="cancelled",
-                    message=f"cancelled after {i} of {spec.n_frames} frame(s)",
-                    retryable=False))
+        def _img2img_kwargs(i: int, cond_path: str) -> dict:
             # chain:    frame 0 = base prompt; frame i>0 = base + motion step i.
             # parallel: every frame = base + motion step i (all off the start frame).
             include_motion = bool(spec.motion) and (spec.chain is False or i > 0)
@@ -237,10 +310,6 @@ def run_generate_scene(spec: GenerateSceneSpec, job_id: str) -> JobResult:
             if include_motion:
                 # .replace (NOT .format): user strings may contain stray braces.
                 prompt += ", " + spec.motion.replace("{i}", str(i + 1)).replace("{n}", str(spec.n_frames))
-
-            # chain conditions on the PREVIOUS frame's saved output (true drift);
-            # parallel conditions on the start frame every time (no drift).
-            cond_path = prev_output if spec.chain else start_frame
             kwargs = dict(
                 task="image-to-image",
                 image_path=cond_path,
@@ -258,34 +327,54 @@ def run_generate_scene(spec: GenerateSceneSpec, job_id: str) -> JobResult:
                 kwargs["seed"] = spec.seed + i
             if spec.negative is not None:
                 kwargs["negative_prompt"] = spec.negative
+            return kwargs
 
-            frame_path, err = _generate_one_frame(kwargs, out_dir, i, job_id)
+        if spec.chain:
+            # TRUE sequential chaining — frame i+1 consumes frame i's output;
+            # inherently unparallelizable.
+            prev_output = start_frame
+            for i in range(spec.n_frames):
+                # Cooperative cancel — honored BETWEEN frames (mid-frame
+                # inference is never interrupted).
+                from ..media_bus import is_cancelling
+                if is_cancelling(job_id):
+                    return JobResult(job_id, ok=False, error=JobError(
+                        code="cancelled",
+                        message=f"cancelled after {i} of {spec.n_frames} frame(s)",
+                        retryable=False))
+                frame_path, err = _generate_one_frame(
+                    _img2img_kwargs(i, prev_output), out_dir, i, job_id)
+                if err is not None:
+                    return err
+                prev_output = frame_path
+                # Re-ingest so dims/mime are authoritatively resolved (§9.2).
+                refs.append(ingest(frame_path))
+        else:
+            # parallel mode: every frame conditions on the START frame — the
+            # frames are independent, so fan them out across the fleet (the
+            # plane's least-recently-picked routing spreads concurrent calls).
+            frame_paths, err = _generate_frames_parallel(
+                [_img2img_kwargs(i, start_frame) for i in range(spec.n_frames)],
+                out_dir, job_id, spec.model_id)
             if err is not None:
                 return err
-            if spec.chain:
-                prev_output = frame_path   # TRUE sequential chaining
-            # Re-ingest so the frame's dims/mime are authoritatively resolved (§9.2).
-            refs.append(ingest(frame_path))
+            for frame_path in frame_paths:
+                refs.append(ingest(frame_path))
     else:
-        # ---- v1 path: seed + prompt-schedule (NO img2img), UNTOUCHED ----
+        # ---- v1 path: seed + prompt-schedule (NO img2img) ----
+        # Frames are seed/prompt-scheduled but INDEPENDENT (frame i never sees
+        # frame i-1), so they fan out like img2img parallel mode.
         logger.info(
             "scene %s: V1 text-to-image path (seed+prompt-schedule; model=%s n=%d)",
             job_id, spec.model_id, spec.n_frames,
         )
-        for i in range(spec.n_frames):
-            # Cooperative cancel — same seam as the img2img path above.
-            from ..media_bus import is_cancelling
-            if is_cancelling(job_id):
-                return JobResult(job_id, ok=False, error=JobError(
-                    code="cancelled",
-                    message=f"cancelled after {i} of {spec.n_frames} frame(s)",
-                    retryable=False))
+
+        def _v1_kwargs(i: int) -> dict:
             # ---- per-frame prompt schedule (v1): positional tag + optional motion ----
             prompt = base_prompt + f", frame {i + 1} of {spec.n_frames}"
             if spec.motion:
                 # .replace (NOT .format): user strings may contain stray braces.
                 prompt += ", " + spec.motion.replace("{i}", str(i + 1)).replace("{n}", str(spec.n_frames))
-
             # ---- per-frame kwargs — SAME shape as imagegen ----
             kwargs = dict(
                 task="text-to-image",
@@ -303,10 +392,14 @@ def run_generate_scene(spec: GenerateSceneSpec, job_id: str) -> JobResult:
                 kwargs["seed"] = spec.seed + i
             if spec.negative is not None:
                 kwargs["negative_prompt"] = spec.negative
+            return kwargs
 
-            frame_path, err = _generate_one_frame(kwargs, out_dir, i, job_id)
-            if err is not None:
-                return err
+        frame_paths, err = _generate_frames_parallel(
+            [_v1_kwargs(i) for i in range(spec.n_frames)],
+            out_dir, job_id, spec.model_id)
+        if err is not None:
+            return err
+        for frame_path in frame_paths:
             # Re-ingest so the frame's dims/mime are authoritatively resolved (§9.2).
             refs.append(ingest(frame_path))
 
