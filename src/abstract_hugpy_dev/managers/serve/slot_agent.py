@@ -296,6 +296,13 @@ class Slot:
         # the C++ llama-server handles parallel slots natively and skips it.
         self.child_kind = None
         self.stream_gate = threading.Semaphore(1)
+        # Requests currently streaming through the proxy. The python child is
+        # single-threaded: while it GENERATES it cannot answer a health probe,
+        # so a probe-only healthy() reported False mid-request and (a) the
+        # console flipped the slot to "loading" every time the model was USED,
+        # (b) an overlapping proxy call 503'd instead of waiting on the gate.
+        # Busy == alive by definition — the request is being served right now.
+        self.inflight = 0
         self.child_base = f"http://127.0.0.1:{SLOT_CHILD_PORT}"
 
     # -- health ------------------------------------------------------------
@@ -305,6 +312,10 @@ class Slot:
     def healthy(self) -> bool:
         if not self._child_alive():
             return False
+        if self.inflight > 0:
+            # Mid-generation: the (python) child won't answer a probe, but it
+            # is literally serving a request — that's the healthiest it gets.
+            return True
         import httpx
         try:
             if httpx.get(self.child_base + "/health", timeout=2.0).status_code == 200:
@@ -327,6 +338,7 @@ class Slot:
             "endpoint": f"http://{SLOT_ADVERTISE}:{SLOT_PORT}",
             "model_key": self.model_key,
             "healthy": self.healthy(),
+            "busy": self.inflight > 0,
             "n_gpu_layers": self.ngl,
             "ctx": self.ctx,
             "threads": self.threads,
@@ -464,6 +476,7 @@ def build_app():
         gated = (slot.child_kind == "python")
         if gated:
             slot.stream_gate.acquire()
+        slot.inflight += 1
         try:
             client = httpx.Client(timeout=None)
             upstream = client.send(
@@ -471,6 +484,7 @@ def build_app():
                 stream=True,
             )
         except Exception:
+            slot.inflight -= 1
             if gated:
                 slot.stream_gate.release()
             raise
@@ -482,6 +496,7 @@ def build_app():
             finally:
                 upstream.close()
                 client.close()
+                slot.inflight -= 1
                 if gated:
                     slot.stream_gate.release()
 
