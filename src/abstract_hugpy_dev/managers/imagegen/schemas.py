@@ -35,6 +35,12 @@ class ImageGenRequest(BaseModel):
     num_inference_steps: Optional[int] = Field(default=None, ge=1, le=200)
     guidance_scale: Optional[float] = Field(default=None, ge=0.0, le=50.0)
     seed: Optional[int] = None
+    # --- img2img (image-to-image) additive fields ---
+    # text-to-image callers never set these (extra="ignore" on the frozen model
+    # keeps them absent for the text2img path); the img2img runner + builder read
+    # them. image_path rides remote._PATH_KEYS so the worker inliner rebuilds it.
+    image_path: Optional[str] = None       # init image; rides remote._PATH_KEYS inliner
+    strength: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     num_images: int = Field(default=1, ge=1, le=4)
     # b64 in the result is what lets HTTP callers (the discord bot) fetch the
     # bytes without a second round-trip; set False for in-process callers that

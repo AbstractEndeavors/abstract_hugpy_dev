@@ -214,6 +214,29 @@ def llama_cpp_status() -> dict:
         return {"installed": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
+def env_status() -> dict:
+    """Runtime-env capability snapshot: which env TIER this worker serves.
+
+    The tier names the venv this unit runs (WORKER_ENV_TIER, default "stable" —
+    the known-good pinned env; "edge" = bleeding-edge libs for models the stable
+    env can't load). Library versions are read from the running env itself, so
+    central sees the truth rather than a config claim.
+    """
+    import platform
+    tier = (os.environ.get("WORKER_ENV_TIER") or "stable").strip().lower()
+    info: dict = {"tier": tier or "stable", "python": platform.python_version()}
+    try:
+        from importlib.metadata import version
+        for pkg in ("llama-cpp-python", "transformers", "torch"):
+            try:
+                info[pkg] = version(pkg)
+            except Exception:  # noqa: BLE001 — absent package: simply unreported
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+    return info
+
+
 # ---------------------------------------------------------------------------
 # Central node client (registration + heartbeat + model files)
 # ---------------------------------------------------------------------------
@@ -692,6 +715,7 @@ def _register(client: CentralClient, state: WorkerState, store: ModelStore, args
         "pkg_version": PKG_VERSION,
         "engine": llama_cpp_status(),
         "pool": os.environ.get("WORKER_POOL", ""),
+        "env": env_status(),
     }
     worker = client.register(payload)
     state.worker_id = worker.get("id", state.worker_id)
@@ -723,6 +747,7 @@ def _heartbeat_loop(client: CentralClient, state: WorkerState,
                     "free_ram": _free_ram_bytes(),
                     "engine": llama_cpp_status(),
                     "pool": os.environ.get("WORKER_POOL", ""),
+                    "env": env_status(),
                 },
             )
             _sync_assignment(state, worker, store)

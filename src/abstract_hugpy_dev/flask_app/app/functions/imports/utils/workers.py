@@ -156,6 +156,58 @@ def _clamp_limits(limits: Dict[str, Any], caps: Dict[str, Any]) -> Dict[str, Any
     return out
 
 
+# Default runtime-environment tier. A worker that doesn't report its env (older
+# agent) and a model with no explicit requirement both resolve to this, so a
+# pre-feature fleet keeps matching exactly as before the tier gate existed.
+DEFAULT_ENV_TIER = "stable"
+
+
+def _model_env_tiers() -> Dict[str, str]:
+    """Operator map of model -> REQUIRED env tier.
+
+    Parsed from ``HUGPY_MODEL_ENV_TIERS`` = ``"key:tier,key2:tier"`` (e.g.
+    ``"Qwen3.6-27B-AEON:edge"``). A model not listed requires the default tier,
+    so this whole gate is a no-op until the operator maps a model.
+    """
+    out: Dict[str, str] = {}
+    for part in os.environ.get("HUGPY_MODEL_ENV_TIERS", "").split(","):
+        part = part.strip()
+        if not part or ":" not in part:
+            continue
+        key, _, tier = part.rpartition(":")
+        key, tier = key.strip(), tier.strip().lower()
+        if key and tier:
+            out[key] = tier
+    return out
+
+
+def env_tier_for_model(model_key: str) -> str:
+    """The runtime-env tier ``model_key`` requires (alias-tolerant lookup)."""
+    tiers = _model_env_tiers()
+    if not tiers:
+        return DEFAULT_ENV_TIER
+    wanted = _match_keys(model_key)
+    for key, tier in tiers.items():
+        if key == model_key or (_match_keys(key) & wanted):
+            return tier
+    return DEFAULT_ENV_TIER
+
+
+def _worker_env_tier(worker: Dict[str, Any]) -> str:
+    """The env tier a worker ADVERTISES (from its own venv, via register/heartbeat).
+
+    Workers that don't report an env (older agents) are treated as serving the
+    default tier — the grandfather rule that keeps a pre-feature fleet routing
+    unchanged. An edge model therefore only lands on a worker that AFFIRMATIVELY
+    advertises the edge env.
+    """
+    env = worker.get("env")
+    tier = env.get("tier") if isinstance(env, dict) else None
+    if tier is None:
+        return DEFAULT_ENV_TIER
+    return str(tier).strip().lower() or DEFAULT_ENV_TIER
+
+
 def _engine_unusable(worker: Dict[str, Any]) -> bool:
     """True only when a worker EXPLICITLY reports it has no inference engine.
 
@@ -383,6 +435,7 @@ class WorkerStore:
         engine: Optional[Dict[str, Any]] = None,
         pool: Optional[str] = None,
         caps: Optional[Dict[str, Any]] = None,
+        env: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Add a worker (or re-register an existing one by id/url).
 
@@ -425,6 +478,8 @@ class WorkerStore:
                     existing["engine"] = engine
                 if caps is not None:
                     existing["caps"] = caps
+                if env is not None:
+                    existing["env"] = env
                 # Only a NON-EMPTY declared pool re-asserts on re-register, so an
                 # operator-set pool isn't wiped by a worker that doesn't declare
                 # WORKER_POOL (which sends ""). Declaring workers still win.
@@ -445,6 +500,9 @@ class WorkerStore:
                 "free_ram": free_ram,
                 "engine": engine,
                 "caps": caps,
+                # Runtime-env capability: {"tier": "stable"|"edge"|..., versions}.
+                # Read from the worker's own venv, so it's truth not config claim.
+                "env": env,
                 # Dedicated-pool label. "" = general pool. A pooled worker serves
                 # ONLY requests tagged for its pool (reserved capacity); general
                 # traffic never lands on it. See workers_for_model.
@@ -475,6 +533,7 @@ class WorkerStore:
         engine: Optional[Dict[str, Any]] = None,
         pool: Optional[str] = None,
         caps: Optional[Dict[str, Any]] = None,
+        env: Optional[Dict[str, Any]] = None,
         loaded_detail: Optional[Dict[str, Any]] = None,
         slots: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[Dict[str, Any]]:
@@ -519,6 +578,8 @@ class WorkerStore:
                 worker["free_ram"] = free_ram
             if engine is not None:
                 worker["engine"] = engine
+            if env is not None:
+                worker["env"] = env
             if loaded_detail is not None:
                 worker["loaded_detail"] = loaded_detail
             if slots is not None:
@@ -655,6 +716,8 @@ class WorkerStore:
                           pool: Optional[str] = None) -> List[Dict[str, Any]]:
         wanted = _match_keys(model_key)
         want_pool = (pool or "").strip()
+        need_tier = env_tier_for_model(model_key)
+        tier_skipped = 0
         out = []
         for w in self.all():
             # Only admitted workers serve. Pending (awaiting operator approval) and
@@ -688,7 +751,24 @@ class WorkerStore:
                 continue
             if online_only and w["status"] != "online":
                 continue
+            # Runtime-env tier gate: the model runs ONLY on a worker whose venv
+            # tier matches (strict both ways — an edge env can regress stable
+            # models just as a stable env can't load edge architectures). Both
+            # sides default to "stable", so an unmapped model on an unreporting
+            # fleet routes exactly as before this gate existed.
+            if _worker_env_tier(w) != need_tier:
+                tier_skipped += 1
+                continue
             out.append(w)
+        if not out and tier_skipped:
+            # The model HAS servers — they were excluded on env tier alone. Say
+            # so, or the operator sees only the downstream "no worker / local
+            # fallback disabled" error with no cause.
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "model %s requires env tier %r; %d otherwise-eligible worker(s) "
+                "skipped (none advertise that tier)",
+                model_key, need_tier, tier_skipped)
         return out
 
     def pick_for_model(self, model_key: str, pool: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -852,21 +932,28 @@ def fleet_snapshot() -> list:
             rpc_endpoint=w.get("rpc_endpoint"),
             can_lead=(w.get("role") != "rpc"),   # rpc nodes are backends, not leads
             online=(w.get("status") == "online"),
+            env_tier=_worker_env_tier(w),
         ))
     return nodes
 
 
-def plan_placement(bytes_needed: int, *, cpu_ok: bool = False, headroom: float = 1.15):
+def plan_placement(bytes_needed: int, *, cpu_ok: bool = False, headroom: float = 1.15,
+                   env_tier: Optional[str] = None):
     """Deterministically place a task needing ``bytes_needed`` on the live fleet.
 
     Returns the allocator's Placement (whole / shard / cpu / none). For a 'shard'
     result, ``placement.rpc_servers`` + ``placement.tensor_split`` are what the
-    lead is handed as a spill override.
+    lead is handed as a spill override. ``env_tier`` (when set) restricts the
+    snapshot to workers serving that runtime-env tier — the allocator stays
+    env-agnostic; we filter its input.
     """
     from ......managers.resolvers.allocator import Need, allocate
+    nodes = fleet_snapshot()
+    if env_tier:
+        nodes = [n for n in nodes if n.env_tier == env_tier]
     return allocate(
         Need(bytes_needed=int(bytes_needed), cpu_ok=cpu_ok, headroom=headroom),
-        fleet_snapshot(),
+        nodes,
     )
 
 
@@ -905,7 +992,8 @@ def placement_for_model(model_key: str) -> Optional[Dict[str, Any]]:
     need = elig.get(model_key) or elig.get(str(model_key).split("/")[-1])
     if not need:
         return None
-    placement = plan_placement(need, cpu_ok=False)
+    placement = plan_placement(need, cpu_ok=False,
+                               env_tier=env_tier_for_model(model_key))
     if placement.kind != "shard":
         return None
     lead = get_worker(placement.lead_id)

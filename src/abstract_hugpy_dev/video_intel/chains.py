@@ -26,6 +26,7 @@ from uuid import uuid4
 
 from .frame_schema import make_frame_extract
 from .gen_schema import GenerateImageSpec, GenPromptPart, image_part, make_generate_image
+from .scene_schema import GenerateSceneSpec, make_generate_scene
 from .runners.ffmpeg_frames import run_frame_extract
 
 
@@ -87,4 +88,38 @@ def resolve_video_parts(spec: GenerateImageSpec, *, uniform_n: int = 4) -> Gener
         guidance=spec.guidance,
         seed=spec.seed,
         negative=spec.negative,
+        strength=spec.strength,   # carry the img2img knob through re-validation
+    )
+
+
+def resolve_video_parts_scene(spec: GenerateSceneSpec, *, uniform_n: int = 4) -> GenerateSceneSpec:
+    """Scene twin of resolve_video_parts: return a NEW GenerateSceneSpec whose
+    parts contain only text + image (no video). Text/image parts pass through
+    unchanged; each video part is replaced (in order) by the image parts of its
+    uniformly-sampled frames. Reuses the same _extract_uniform_frames helper +
+    image_part, and re-validates through make_generate_scene (carrying all scene
+    fields). Extraction failure SURFACES as a raised ValueError (route -> 400)."""
+    new_parts = []
+    for p in spec.parts:
+        if p.kind == "video":
+            frames = _extract_uniform_frames(p.media, uniform_n)
+            new_parts.extend(image_part(ref) for ref in frames)
+        else:
+            new_parts.append(p)
+    # Re-validate through the factory so the resolved spec is provably video-free.
+    return make_generate_scene(
+        parts=tuple(new_parts),
+        model_id=spec.model_id,
+        width=spec.width,
+        height=spec.height,
+        steps=spec.steps,
+        guidance=spec.guidance,
+        n_frames=spec.n_frames,
+        fps=spec.fps,
+        assemble=spec.assemble,
+        seed=spec.seed,
+        motion=spec.motion,
+        negative=spec.negative,
+        strength=spec.strength,   # carry img2img knobs through re-validation
+        chain=spec.chain,
     )

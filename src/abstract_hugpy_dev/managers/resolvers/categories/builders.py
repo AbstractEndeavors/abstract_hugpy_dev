@@ -254,6 +254,51 @@ def _build_imagegen_request(kwargs: Dict[str, Any], model_key: str) -> ImageGenR
     return ImageGenRequest(**out)
 
 
+def _build_img2img_request(kwargs: Dict[str, Any], model_key: str) -> ImageGenRequest:
+    """image-to-image (img2img): text2img PLUS a mandatory init image.
+
+    Mirrors _build_imagegen_request, but ALSO resolves the init image. CRITICAL:
+    a worker rematerializes the inlined image under key ``file`` (not
+    ``image_path``) — so accept EITHER, exactly like _build_vision_request. Raises
+    ValueError with a clear message when no init image is present (img2img has
+    nothing to condition on)."""
+    prompt = kwargs.get("prompt") or kwargs.get("text")
+    if prompt is None and kwargs.get("file"):
+        # a text file may carry the prompt; an image file is the init image, not
+        # the prompt — only read text/document files as prompt text.
+        f = kwargs["file"]
+        if derive_media_type(f) in ("text", "document", "code"):
+            prompt = read_from_file(f)
+    if prompt is None:
+        raise ValueError(
+            "image-to-image request needs 'prompt' or 'text'; "
+            f"got keys: {sorted(kwargs)}"
+        )
+
+    image_path = kwargs.get("image_path") or kwargs.get("file")
+    if image_path is None:
+        raise ValueError(
+            "image-to-image request needs an init image via 'image_path' or "
+            f"'file'; got keys: {sorted(kwargs)}"
+        )
+
+    out: Dict[str, Any] = {
+        "model_key": model_key,
+        "prompt": prompt,
+        "image_path": image_path,
+        "request_id": kwargs.get("request_id", make_request_id()),
+    }
+    for k in ("negative_prompt", "width", "height", "num_inference_steps",
+              "guidance_scale", "seed", "num_images", "return_b64", "pool",
+              "strength"):
+        if k in kwargs:
+            out[k] = kwargs[k]
+    # 'steps' is the colloquial alias clients reach for first.
+    if "steps" in kwargs and "num_inference_steps" not in out:
+        out["num_inference_steps"] = kwargs["steps"]
+    return ImageGenRequest(**out)
+
+
 def _build_keywords_request(kwargs: Dict[str, Any], model_key: str) -> KeywordTaskRequest:
     text = kwargs.get("text") or kwargs.get("prompt")
     if text is None and kwargs.get("file"):
@@ -324,6 +369,7 @@ MODEL_REQUEST_BUILDERS: Dict[Tuple[str, str], Callable[[Dict[str, Any], str], Ba
     ("transformers", "feature-extraction"):           _build_embed_request,
     ("transformers", "sentence-similarity"):          _build_similarity_request,
     ("transformers", "text-to-image"):                _build_imagegen_request,
+    ("transformers", "image-to-image"):               _build_img2img_request,
     ("transformers", "keyword-extraction"):           _build_keywords_request,
     ("transformers", "depth-estimation"):             _build_vision_analysis_request,
     ("transformers", "object-detection"):             _build_vision_analysis_request,

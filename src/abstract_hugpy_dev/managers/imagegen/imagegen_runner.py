@@ -161,3 +161,197 @@ class ImageGenRunner:
         else:
             yield ErrorEvent(request_id=req.request_id,
                              message=result.error or "image generation failed")
+
+
+class Img2ImgRunner:
+    """Runner for diffusers image-to-image (img2img) pipelines.
+
+    SIBLING of ImageGenRunner — same lazy/singleton/thread-offload pattern, but
+    it drives ``AutoPipelineForImage2Image`` and conditions generation on an init
+    image (req.image_path) with an optional denoising ``strength``. It REUSES
+    ImageGenRequest/ImageGenResult (the remote factory wrappers copy request/
+    result types straight off FRAMEWORK_RUNNERS, so reusing them means the worker
+    offload path needs zero changes).
+
+    Its pipeline cache is its OWN (_PIPELINES) — the img2img pipeline object is a
+    different class from text2img's, so it must not share the text2img cache.
+
+    INERT until a model advertises ("transformers","image-to-image"): the sd-turbo
+    advertisement flip is HELD (see models_config.py) so live central never routes
+    img2img to the old-wheel GPU worker.
+    """
+
+    request_type = ImageGenRequest
+    result_type = ImageGenResult
+
+    _PIPELINES: Dict[str, Any] = {}
+    _LOCK = threading.Lock()
+
+    def __init__(self, cfg, **runtime_kwargs):
+        self.cfg = cfg
+        self.model_key = cfg.model_key
+        self._runtime_kwargs = runtime_kwargs
+
+    # --- pipeline loading (lazy, singleton) ---------------------------------
+
+    @property
+    def pipeline(self):
+        cached = self._PIPELINES.get(self.model_key)
+        if cached is not None:
+            return cached
+
+        with self._LOCK:
+            cached = self._PIPELINES.get(self.model_key)
+            if cached is not None:
+                return cached
+
+            try:
+                import torch
+                from diffusers import AutoPipelineForImage2Image
+            except ImportError as exc:
+                raise RuntimeError(
+                    "diffusers + torch are required for image-to-image tasks "
+                    "but are not installed. `pip install diffusers torch`."
+                ) from exc
+
+            model_dir = ensure_model(self.model_key)
+            # GPU guard block — VERBATIM from ImageGenRunner: fp16 on cuda, fp32
+            # on cpu, move the whole pipe to the resolved device.
+            cuda = torch.cuda.is_available()
+            pipe = AutoPipelineForImage2Image.from_pretrained(
+                model_dir,
+                torch_dtype=torch.float16 if cuda else torch.float32,
+            )
+            pipe = pipe.to("cuda" if cuda else "cpu")
+
+            logger.info(
+                "Img2ImgRunner: loaded model=%s dir=%s device=%s",
+                self.model_key, model_dir, "cuda" if cuda else "cpu",
+            )
+            self._PIPELINES[self.model_key] = pipe
+            return pipe
+
+    # --- input helpers -------------------------------------------------------
+
+    def _load_init_image(self, req: ImageGenRequest):
+        """Load the init image (mirrors VisionAnalysisRunner._load_image). A
+        clean error (raised here, caught by run() into an ok=False result) when
+        no init image was provided — img2img has nothing to condition on."""
+        from PIL import Image
+        if not req.image_path:
+            raise ValueError(
+                "image-to-image requires an init image (image_path); none provided"
+            )
+        return Image.open(req.image_path).convert("RGB")
+
+    # --- generation ---------------------------------------------------------
+
+    def _generate(self, req: ImageGenRequest) -> list[GeneratedImage]:
+        """Blocking img2img generate. Called from a worker thread by .run().
+
+        Mirrors ImageGenRunner._generate but conditions on an init image. Only
+        explicitly-set request fields reach the pipeline call.
+        """
+        import torch
+
+        init_img = self._load_init_image(req)
+        # The SD img2img pipeline derives the output size from the init image
+        # (its __call__ takes no width/height), so honor the requested dims by
+        # RESIZING the init here. This also keeps every chained scene frame the
+        # same size, which the mp4 mux requires.
+        if req.width is not None and req.height is not None:
+            init_img = init_img.resize((req.width, req.height))
+
+        call_kwargs: Dict[str, Any] = {
+            "prompt": req.prompt,
+            "num_images_per_prompt": req.num_images,
+            "image": init_img,
+        }
+        # width/height are handled via the resize above (the pipeline ignores
+        # them), so they are intentionally NOT forwarded here.
+        for field in ("negative_prompt", "num_inference_steps", "guidance_scale"):
+            value = getattr(req, field)
+            if value is not None:
+                call_kwargs[field] = value
+        if req.strength is not None:
+            call_kwargs["strength"] = req.strength
+
+        # sd-turbo numeric edge: diffusers computes effective steps as
+        # int(num_inference_steps * strength) and RAISES when that is 0. sd-turbo
+        # runs 1-4 steps, so a low strength (e.g. steps=2 * strength=0.3 -> 0
+        # effective) detonates. Bump steps so int(steps*strength) >= 1 and log
+        # LOUDLY, rather than letting the pipeline raise.
+        steps = call_kwargs.get("num_inference_steps")
+        strength = call_kwargs.get("strength")
+        if (steps is not None and strength is not None
+                and strength > 0 and int(steps * strength) < 1):
+            import math
+            bumped = int(math.ceil(1.0 / strength))
+            logger.warning(
+                "Img2ImgRunner: num_inference_steps=%s * strength=%s -> %d "
+                "effective steps (0 raises in diffusers); bumping steps %s -> %d "
+                "for model=%s", steps, strength, int(steps * strength),
+                steps, bumped, self.model_key,
+            )
+            call_kwargs["num_inference_steps"] = bumped
+
+        if req.seed is not None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            call_kwargs["generator"] = torch.Generator(device).manual_seed(req.seed)
+
+        output = self.pipeline(**call_kwargs)
+
+        out_dir = os.path.join(UPLOADS_HOME, "generated")
+        os.makedirs(out_dir, exist_ok=True)
+
+        images: list[GeneratedImage] = []
+        for index, image in enumerate(output.images):
+            path = os.path.join(out_dir, f"{req.request_id}_{index}.png")
+            image.save(path, format="PNG")
+            b64 = None
+            if req.return_b64:
+                buf = io.BytesIO()
+                image.save(buf, format="PNG")
+                b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+            images.append(GeneratedImage(
+                path=path, b64=b64,
+                width=image.width, height=image.height,
+                seed=req.seed,
+            ))
+        return images
+
+    # --- public API ---------------------------------------------------------
+
+    async def run(self, req: ImageGenRequest) -> ImageGenResult:
+        try:
+            images = await asyncio.to_thread(self._generate, req)
+            return ImageGenResult(
+                request_id=req.request_id,
+                model_key=req.model_key,
+                ok=True,
+                images=images,
+                text=(f"generated {len(images)} image(s): "
+                      + ", ".join(img.path for img in images)),
+            )
+        except Exception as exc:
+            logger.exception(
+                "Img2ImgRunner.run failed: model=%s req=%s",
+                self.model_key, req.request_id,
+            )
+            return ImageGenResult(
+                request_id=req.request_id,
+                model_key=req.model_key,
+                ok=False,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+
+    async def stream(self, req: ImageGenRequest, cancel_event=None):
+        """One-shot wrapped as a stream, mirroring ImageGenRunner."""
+        result = await self.run(req)
+        if result.ok:
+            yield TokenEvent(request_id=req.request_id, text=result.text)
+            yield DoneEvent(request_id=req.request_id, input_tokens=0,
+                            output_chunks=1, finish_reason="stop")
+        else:
+            yield ErrorEvent(request_id=req.request_id,
+                             message=result.error or "image-to-image generation failed")

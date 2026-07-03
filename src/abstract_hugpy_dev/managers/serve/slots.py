@@ -22,11 +22,25 @@ import time
 logger = logging.getLogger("abstract_hugpy_dev.slots")
 
 
+_LOGGED_COUNT = False
+
+
 def _slot_count() -> int:
+    global _LOGGED_COUNT
+    raw = os.environ.get("SLOT_COUNT")
     try:
-        return max(0, int(os.environ.get("SLOT_COUNT", "2")))
+        n = max(0, int(raw)) if raw is not None else 2
     except ValueError:
-        return 2
+        n = 2
+    if not _LOGGED_COUNT:
+        _LOGGED_COUNT = True
+        # De-silence the env-layering ghost: a systemd drop-in can override the
+        # unit's SLOT_COUNT and silently resurrect slots every restart (op's
+        # limits.conf SLOT_COUNT=2). Record the EFFECTIVE value + raw env once
+        # per process so the journal shows the truth.
+        logger.info("SLOT_COUNT effective=%d (env=%r) — if this differs from the "
+                    "unit file, a drop-in is overriding it", n, raw)
+    return n
 
 
 def slots_enabled() -> bool:

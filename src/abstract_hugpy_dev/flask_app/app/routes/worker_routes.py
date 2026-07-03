@@ -34,7 +34,7 @@ from ....managers.serve.overrides import get_override, set_override, available_g
 from ....managers.serve.serve import (
     install_serving, apply_plan, serving_overview, serve_spec_for, spec_row,
 )
-from ....managers.serve.slots import SlotPool, slots_enabled, slot_install_steps
+from ....managers.serve.slots import SlotPool, slots_enabled, slot_install_steps, _slot_count
 # Self-update plumbing: the version central wants workers on, and the wheel dir
 # it serves as a simple index. Imported directly (not via the functions star) so
 # this doesn't depend on the re-export chain picking up the new names.
@@ -166,6 +166,11 @@ class RegisterRequest(BaseModel):
     # The box's OWN configured resource ceilings (unit env: ram_max_gib,
     # gpu_mem_gib, threads, reserves). Central-set limits are clamped to these.
     caps: dict | None = None
+    # Runtime-env capability snapshot: {"tier": "stable"|"edge"|..., "python":
+    # ..., "transformers": ...}. The tier names which venv the unit runs
+    # (WORKER_ENV_TIER); versions are read from the env itself. Models mapped to
+    # a tier (HUGPY_MODEL_ENV_TIERS) route only to workers advertising it.
+    env: dict | None = None
 
 
 # Hostnames/IPs a worker might self-report that are NOT reachable from central.
@@ -245,6 +250,8 @@ class HeartbeatRequest(BaseModel):
     engine: dict | None = None
     pool: str | None = None
     caps: dict | None = None
+    # Runtime-env capability snapshot — see RegisterRequest.env.
+    env: dict | None = None
     # Per-loaded-model load facts: {key: {model_bytes, n_gpu_layers,
     # total_layers, gpu_pct}} — drives the console's serving rows.
     loaded_detail: dict | None = None
@@ -305,6 +312,7 @@ def workers_register():
         engine=body.engine,
         pool=body.pool,
         caps=body.caps,
+        env=body.env,
     )
     if worker.get("admission") == "blocked":
         # Operator evicted this worker; 403 tells the agent to stop, not respawn.
@@ -369,6 +377,7 @@ def workers_heartbeat(worker_id):
         engine=body.engine,
         pool=body.pool,
         caps=body.caps,
+        env=body.env,
         loaded_detail=body.loaded_detail,
         slots=body.slots,
     )
@@ -1257,10 +1266,15 @@ def _sys_resources():
 
 @worker_bp.route("/llm/slots", methods=["GET"])
 def slots_overview():
+    # Surface the EFFECTIVE slot count + raw SLOT_COUNT env so a systemd drop-in
+    # silently overriding it (the resurrection ghost) is visible in the data
+    # plane, not just guessable from how many slot rows appear.
+    import os as _os
+    meta = {"slot_count": _slot_count(), "slot_count_env": _os.environ.get("SLOT_COUNT")}
     if not slots_enabled():
-        return jsonify({"enabled": False, "slots": [], "resources": _sys_resources()})
+        return jsonify({"enabled": False, "slots": [], "resources": _sys_resources(), **meta})
     return jsonify({"enabled": True, "slots": SlotPool().overview(),
-                    "resources": _sys_resources()})
+                    "resources": _sys_resources(), **meta})
 
 
 @worker_bp.route("/llm/free-worker", methods=["POST"])

@@ -173,7 +173,15 @@ def _worker_payload(task: str, req, model_key: str, worker_id: Optional[str],
     rpc_servers/tensor_split) wins over the per-assignment spill when present.
     Returns None to signal "can't offload this turn, run local".
     """
-    payload: Dict[str, Any] = {"task": task, "_force_local": True, **req.model_dump()}
+    payload: Dict[str, Any] = {"_force_local": True, **req.model_dump()}
+    # A request type may carry its OWN `task` field (TranscribeRequest.task is
+    # whisper's transcribe/translate MODE) — dumped last, it clobbered the
+    # DISPATCH task key and every whisper offload died on the worker with
+    # "Unknown task='transcribe'". Keep the domain field under its builder
+    # alias and let the dispatch key own `task`.
+    if payload.get("task") not in (None, task):
+        payload["whisper_task"] = payload.pop("task")
+    payload["task"] = task
     spill = spill_override if spill_override is not None else _spill_for(worker_id, model_key)
     if spill:
         payload["spill"] = spill

@@ -1,4 +1,5 @@
 from .utils import *
+import subprocess
 def extract_frame_ffmpeg(
     video_path: str,
     timestamp: float,

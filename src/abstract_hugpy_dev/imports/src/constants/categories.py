@@ -12,6 +12,7 @@ HF_TASK_TO_TASKS = {
     "feature-extraction": ["feature-extraction", "sentence-similarity", "keyword-extraction"],
     "sentence-similarity": ["feature-extraction", "sentence-similarity", "keyword-extraction"],
     "text-to-image": ["text-to-image"],
+    "image-to-image": ["image-to-image"],
     # Vision-analysis family — HF pipeline tags map 1:1.
     "depth-estimation": ["depth-estimation"],
     "object-detection": ["object-detection"],
@@ -24,7 +25,8 @@ RUNNER_PAIRS = {
     ("transformers", "automatic-speech-recognition"),
     ("transformers", "text-summarization"), ("transformers", "text2text-generation"),
     ("transformers", "feature-extraction"), ("transformers", "sentence-similarity"),
-    ("transformers", "text-to-image"), ("transformers", "keyword-extraction"),
+    ("transformers", "text-to-image"), ("transformers", "image-to-image"),
+    ("transformers", "keyword-extraction"),
     ("transformers", "depth-estimation"), ("transformers", "object-detection"),
     ("transformers", "image-classification"), ("transformers", "image-segmentation"),
 }
@@ -46,6 +48,7 @@ TASK_DEFAULTS: Dict[str, str] = {
     "feature-extraction":           DEFAULT_EMBED_MODEL,
     "sentence-similarity":          DEFAULT_EMBED_MODEL,
     "text-to-image":                DEFAULT_IMAGEGEN_MODEL,
+    "image-to-image":               DEFAULT_IMAGEGEN_MODEL,
     "keyword-extraction":           DEFAULT_KEYWORDS_MODEL,
     "depth-estimation":             DEFAULT_DEPTH_MODEL,
     "object-detection":             DEFAULT_DETECT_MODEL,

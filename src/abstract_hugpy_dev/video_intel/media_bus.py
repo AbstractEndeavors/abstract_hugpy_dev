@@ -33,6 +33,7 @@ from .frame_schema import make_frame_extract
 from .gen_schema import GenPromptPart, make_generate_image
 from .job_schema import JOB_REGISTRY
 from .media_schema import make_media_ref
+from .scene_schema import make_generate_scene
 from .result_schema import JobResult
 from .runners import DISPATCH
 
@@ -110,6 +111,36 @@ def _generate_image_from_dict(d: dict):
         guidance=d["guidance"],
         seed=d.get("seed"),
         negative=d.get("negative"),
+        strength=d.get("strength"),   # img2img (additive; v1 payloads omit it)
+    )
+
+
+def _generate_scene_from_dict(d: dict):
+    """Rebuild a GenerateSceneSpec from its asdict() form, through the validating
+    factories. Each part's media (if any) round-trips via make_media_ref; scene
+    fields (n_frames/fps/assemble/seed/motion/negative) are carried through."""
+    parts = []
+    for pd in d["parts"]:
+        media_d = pd.get("media")
+        media = make_media_ref(**media_d) if media_d is not None else None
+        parts.append(GenPromptPart(kind=pd["kind"], text=pd.get("text"), media=media))
+    return make_generate_scene(
+        parts=tuple(parts),
+        model_id=d["model_id"],
+        width=d["width"],
+        height=d["height"],
+        steps=d["steps"],
+        guidance=d["guidance"],
+        n_frames=d["n_frames"],
+        fps=d["fps"],
+        assemble=d["assemble"],
+        seed=d.get("seed"),
+        motion=d.get("motion"),
+        negative=d.get("negative"),
+        # img2img additive knobs (v1 payloads omit them -> factory defaults:
+        # strength=None -> runner applies 0.45; chain defaults True).
+        strength=d.get("strength"),
+        chain=d.get("chain", True),
     )
 
 
@@ -119,6 +150,7 @@ SPEC_DESERIALIZERS: Dict[str, Callable[[dict], object]] = {
     "frame_extract": _frame_extract_from_dict,
     "audio_extract": _audio_extract_from_dict,
     "generate_image": _generate_image_from_dict,
+    "generate_scene": _generate_scene_from_dict,
 }
 
 

@@ -1,4 +1,5 @@
 from .imports import *
+import subprocess
 def get_audio_path(video_path: str | None = None, audio_path: str | None = None) -> str:
     if audio_path is None:
         if not video_path:

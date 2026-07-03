@@ -77,6 +77,14 @@ class LlamaCppPythonRunner(LlamaCppBaseRunner):
             raise FileNotFoundError(f"No GGUF file found for model_key={model_key}")
 
         self.model_path = os.fspath(model_path)
+        # A 0-byte or truncated GGUF (interrupted download) passes get_gguf_file's
+        # existence check but makes llama.cpp's native loader SIGILL (core dump),
+        # taking the whole process down instead of failing one request. Guard
+        # here — the last check before Llama() touches the file.
+        if not os.path.isfile(self.model_path) or os.path.getsize(self.model_path) == 0:
+            raise FileNotFoundError(
+                f"{model_key}: GGUF missing or empty at {self.model_path!r} — "
+                "refusing to load (would SIGILL llama.cpp)")
         self.n_ctx = n_ctx
         # DEFAULT_LLAMA_THREADS caps generation threads box-wide (the slot
         # agent already honors it) — an operator core budget for hugpy.

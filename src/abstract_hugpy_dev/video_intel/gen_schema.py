@@ -60,6 +60,10 @@ class GenerateImageSpec:
     guidance: float
     seed: Optional[int] = None
     negative: Optional[str] = None
+    # img2img denoising strength (0..1) used when an image part is present AND
+    # img2img is available on the fleet; the runner applies 0.45 when None.
+    # v1 payloads omit it -> None -> unchanged text-to-image behavior.
+    strength: Optional[float] = None
 
 
 def make_generate_image(
@@ -71,6 +75,7 @@ def make_generate_image(
     guidance: float,
     seed: Optional[int] = None,
     negative: Optional[str] = None,
+    strength: Optional[float] = None,
 ) -> GenerateImageSpec:
     """Validate + build a GenerateImageSpec. Raises are LOCAL to construction.
 
@@ -106,6 +111,9 @@ def make_generate_image(
         raise ValueError(f"height must be a positive int; got {height!r}")
     if not (isinstance(steps, int) and steps > 0):
         raise ValueError(f"steps must be a positive int; got {steps!r}")
+    if strength is not None and not (isinstance(strength, (int, float))
+                                     and 0.0 <= float(strength) <= 1.0):
+        raise ValueError(f"strength must be a float in [0, 1] or None; got {strength!r}")
     return GenerateImageSpec(
         parts=parts,
         model_id=model_id,
@@ -115,4 +123,5 @@ def make_generate_image(
         guidance=guidance,
         seed=seed,
         negative=negative,
+        strength=(float(strength) if strength is not None else None),
     )

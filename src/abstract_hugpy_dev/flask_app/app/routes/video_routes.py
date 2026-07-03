@@ -51,7 +51,11 @@ from abstract_hugpy_dev.video_intel.gen_schema import (
     GenPromptPart,
     make_generate_image,
 )
-from abstract_hugpy_dev.video_intel.chains import resolve_video_parts
+from abstract_hugpy_dev.video_intel.scene_schema import make_generate_scene
+from abstract_hugpy_dev.video_intel.chains import (
+    resolve_video_parts,
+    resolve_video_parts_scene,
+)
 
 video_bp, logger = get_bp("video_bp", __name__)
 
@@ -201,6 +205,7 @@ def video_generate_image():
             guidance=body.get("guidance"),
             seed=body.get("seed"),
             negative=body.get("negative"),
+            strength=body.get("strength"),   # img2img (additive, optional)
         )
     except (ValueError, TypeError) as exc:  # bad fields / part combo = 400
         return jsonify({"error": str(exc)}), 400
@@ -213,6 +218,59 @@ def video_generate_image():
         return jsonify({"error": str(exc)}), 400
 
     job_id = media_bus.enqueue("generate_image", resolved)
+    return jsonify({"job_id": job_id}), 200
+
+
+# --------------------------------------------------------------------------- #
+# 2d) POST /video/jobs/generate_scene — one query -> N frames (+ optional mp4)
+# --------------------------------------------------------------------------- #
+@video_bp.route("/video/jobs/generate_scene", methods=["POST"])
+def video_generate_scene():
+    body = request.get_json(silent=True) or {}
+    parts_in = body.get("parts")
+    if not isinstance(parts_in, list) or not parts_in:
+        return jsonify({"error": "missing or empty 'parts' list"}), 400
+    try:
+        parts = []
+        for pd in parts_in:
+            if not isinstance(pd, dict):
+                raise ValueError("each part must be an object")
+            media_d = pd.get("media")
+            media = make_media_ref(**media_d) if isinstance(media_d, dict) else None
+            parts.append(GenPromptPart(
+                kind=pd.get("kind"),
+                text=pd.get("text"),
+                media=media,
+            ))
+        spec = make_generate_scene(
+            parts=tuple(parts),
+            model_id=body.get("model_id"),
+            width=body.get("width"),
+            height=body.get("height"),
+            steps=body.get("steps"),
+            guidance=body.get("guidance"),
+            n_frames=body.get("n_frames"),
+            fps=body.get("fps"),
+            assemble=body.get("assemble"),
+            seed=body.get("seed"),
+            motion=body.get("motion"),
+            negative=body.get("negative"),
+            # img2img additive knobs (optional; absent -> factory defaults:
+            # strength None -> runner 0.45; chain defaults True).
+            strength=body.get("strength"),
+            chain=body.get("chain", True),
+        )
+    except (ValueError, TypeError) as exc:  # bad fields / part combo / frame_cap = 400
+        return jsonify({"error": str(exc)}), 400
+
+    # Resolve any VIDEO parts to image frames BEFORE enqueue (chain twin), so the
+    # runner never sees a video part. Extraction failure -> 400 (see chains).
+    try:
+        resolved = resolve_video_parts_scene(spec)
+    except (ValueError, TypeError) as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    job_id = media_bus.enqueue("generate_scene", resolved)
     return jsonify({"job_id": job_id}), 200
 
 

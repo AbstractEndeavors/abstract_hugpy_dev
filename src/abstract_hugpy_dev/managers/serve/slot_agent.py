@@ -145,6 +145,46 @@ def _cpus_to_hexmask(cpus: str) -> str:
     return format(bits, "x") if bits else ""
 
 
+def _central_url() -> str | None:
+    """Where this slot can reach central to learn/pull request-time models.
+    Agent-managed slots inherit WORKER_CENTRAL_URL from the agent's env;
+    central's own systemd slots serve on-disk models and set neither."""
+    return os.environ.get("WORKER_CENTRAL_URL") or os.environ.get("CENTRAL_URL")
+
+
+def _resolve_cfg(model_key, central_url):
+    """``get_model_config``, but if THIS (slot) process's static registry has
+    never heard of the model — because central registered it at request time,
+    and the slot is a separate process — learn it from central first via the
+    SAME ensure-registered path the agent runs. Fixes slots 503'ing on
+    request-time-provisioned models (the "op flux" saga)."""
+    from .serve import get_model_config
+    try:
+        return get_model_config(model_key)
+    except Exception:
+        if not central_url:
+            raise
+    try:
+        from ...worker_agent.provision import ensure_model_registered
+        ensure_model_registered(model_key, central_url)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("slot %s: ensure_model_registered(%s) failed: %s",
+                       SLOT_ID, model_key, exc)
+    return get_model_config(model_key)   # raise cleanly if still unknown
+
+
+def _ensure_present(model_key, central_url):
+    """Pull a registered-but-absent model's files (request-time model) the same
+    way the agent does, before we hand llama.cpp a path. Fast no-op when the
+    model is already local (the common case: the agent pre-ensures before /load)."""
+    try:
+        from ...worker_agent.provision import ensure_model_present
+        ensure_model_present(model_key, central_url)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("slot %s: ensure_model_present(%s) failed: %s",
+                       SLOT_ID, model_key, exc)
+
+
 def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None,
                path=None, gpu_mem_gib=None, cpu_mem_gib=None):
     """argv for the child llama-server + the resolved (ngl, ctx, threads, cpus)."""
@@ -161,10 +201,22 @@ def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None,
         # therefore resolves key→file itself and hands us the path).
         pass
     else:
-        cfg = get_model_config(model_key)
+        central_url = _central_url()
+        cfg = _resolve_cfg(model_key, central_url)      # ensure-registered fallback
         path = _model_file_for(model_key, cfg)
-    if not path or not os.path.isfile(path):
-        raise FileNotFoundError(f"{model_key}: no GGUF on disk (resolved {path!r})")
+        # Registered but files absent/partial (request-time model) — pull them
+        # the same way the agent does before spawning llama.cpp.
+        if central_url and (not path or not os.path.isfile(path)
+                            or os.path.getsize(path) == 0):
+            _ensure_present(model_key, central_url)
+            path = _model_file_for(model_key, cfg)
+    # Existence AND non-empty: a 0-byte or truncated GGUF (interrupted pull)
+    # passes an isfile check but SIGILLs llama.cpp's native loader on spawn —
+    # fail cleanly here instead of core-dumping the child.
+    if not path or not os.path.isfile(path) or os.path.getsize(path) == 0:
+        raise FileNotFoundError(
+            f"{model_key}: no usable GGUF on disk (resolved {path!r}) — missing "
+            "or empty; refusing to spawn llama.cpp (would SIGILL)")
 
     # Serve from the SSD hot-cache when this model is warmed there (NVMe-fast);
     # otherwise this kicks a background HDD->SSD warm and returns the HDD path for
@@ -503,7 +555,13 @@ def build_app():
             slot.stream_gate.acquire()
         slot.inflight += 1
         try:
-            client = httpx.Client(timeout=None)
+            # Bound connect/write/pool so a dead or wedged child fails send()
+            # fast instead of hanging forever while holding the stream gate +
+            # inflight counter — that leak wedged EVERY later request
+            # (busy=True, model=None). Read stays unbounded: a streamed
+            # generation legitimately runs for minutes.
+            client = httpx.Client(
+                timeout=httpx.Timeout(None, connect=10.0, write=30.0, pool=10.0))
             upstream = client.send(
                 client.build_request(request.method, url, content=body, headers=headers),
                 stream=True,

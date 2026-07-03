@@ -402,6 +402,73 @@ def loaded_model_keys() -> List[Tuple[str, str]]:
         return sorted(_INSTANCES.keys())
 
 
+# Model dirs are immutable once pulled, so walk each once and memoize by path.
+_DISK_DETAIL_CACHE: Dict[str, dict] = {}
+_WEIGHT_EXTS = (".safetensors", ".bin", ".pt", ".pth", ".gguf", ".ckpt", ".onnx")
+
+
+def _dir_size_detail(path: str) -> dict:
+    """Recursively size a model dir: total on-disk bytes + weight-file bytes.
+
+    The weight sum (safetensors/bin/…) is a coarse expected-VRAM proxy — what
+    the framework will pull into memory, minus tokenizer/config/README noise.
+    Cached by path; returns {} for a missing/unreadable dir (caller degrades)."""
+    cached = _DISK_DETAIL_CACHE.get(path)
+    if cached is not None:
+        return cached
+    total = weight = 0
+    try:
+        for root, _dirs, files in os.walk(path):
+            for fn in files:
+                try:
+                    sz = os.path.getsize(os.path.join(root, fn))
+                except OSError:
+                    continue
+                total += sz
+                if fn.lower().endswith(_WEIGHT_EXTS):
+                    weight += sz
+    except OSError:
+        return {}
+    out: dict = {}
+    if total:
+        out["model_bytes"] = total          # frontend renders this as the row's size
+    if weight:
+        out["weight_bytes"] = weight         # expected-VRAM proxy
+    if out:
+        _DISK_DETAIL_CACHE[path] = out
+    return out
+
+
+def loaded_disk_detail() -> dict:
+    """Per-loaded-model on-disk size for EVERY framework (transformers, diffusers,
+    llama_cpp) — keyed by model_key.
+
+    ``loaded_runner_detail`` only sizes in-process GGUF runners, so non-GGUF
+    serving rows carried no size at all. This walks each loaded model's dir
+    (resolved the same way the puller/loader do, via ``route_destination``) so
+    every serving row gets a size server-side — no per-browser computation.
+    GGUF rows are refined afterward by ``loaded_runner_detail`` (exact file
+    bytes + layer split), which overlays this."""
+    out: dict = {}
+    try:
+        from ...imports import route_destination
+        from ...imports.config.main import get_model_config
+    except Exception:
+        return out
+    for (mk, _task) in loaded_model_keys():
+        if mk in out:
+            continue
+        try:
+            cfg = get_model_config(mk, dict_return=True)
+            path = route_destination(cfg)
+        except Exception:
+            continue
+        d = _dir_size_detail(path)
+        if d:
+            out[mk] = d
+    return out
+
+
 def evict(model_key: str, task: Optional[str] = None) -> bool:
     """Drop runner(s) from the cache AND free the model's weights.
 

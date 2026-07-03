@@ -531,11 +531,23 @@ def _apply_central_limits(worker: dict | None) -> None:
 
 
 def _loaded_detail() -> dict:
+    # Size EVERY serving row: start with on-disk dir bytes for all frameworks
+    # (transformers/diffusers/llama), then let the GGUF runner detail overlay
+    # its exact file bytes + layer/GPU split on top. Without the disk base,
+    # non-GGUF rows had no size at all.
+    detail: dict = {}
+    try:
+        from ..managers.dispatch import loaded_disk_detail
+        detail.update(loaded_disk_detail())
+    except Exception:
+        pass
     try:
         from ..managers.llama.runners.get import loaded_runner_detail
-        return loaded_runner_detail()
+        for key, facts in loaded_runner_detail().items():
+            detail.setdefault(key, {}).update(facts)
     except Exception:
-        return {}
+        pass
+    return detail
 
 
 # ── worker-local slot pool (CON-02) ─────────────────────────────────────────
@@ -1252,6 +1264,30 @@ def _terminal_exit(exc: "WorkerRejected") -> None:
     os._exit(0)
 
 
+def env_status() -> dict:
+    """Runtime-env capability snapshot: which env TIER this worker serves.
+
+    The tier names the venv this unit runs (WORKER_ENV_TIER, default "stable" —
+    the known-good pinned env; "edge" = bleeding-edge libs for models the stable
+    env can't load). Library versions are read from the running env itself, so
+    central sees the truth rather than a config claim. Central routes a model
+    mapped in HUGPY_MODEL_ENV_TIERS only to workers advertising that tier.
+    """
+    import platform
+    tier = (os.environ.get("WORKER_ENV_TIER") or "stable").strip().lower()
+    info: dict = {"tier": tier or "stable", "python": platform.python_version()}
+    try:
+        from importlib.metadata import version
+        for pkg in ("llama-cpp-python", "transformers", "torch"):
+            try:
+                info[pkg] = version(pkg)
+            except Exception:  # noqa: BLE001 — absent package: simply unreported
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+    return info
+
+
 def _heartbeat_loop(client: CentralClient, state: WorkerState, args) -> None:
     while True:
         time.sleep(args.heartbeat)
@@ -1273,6 +1309,7 @@ def _heartbeat_loop(client: CentralClient, state: WorkerState, args) -> None:
                     "engine": llama_cpp_cuda_status(),
                     "pool": os.environ.get("WORKER_POOL", ""),
                     "caps": _local_caps(),
+                    "env": env_status(),
                     "loaded_detail": _loaded_detail(),
                     "slots": _slot_statuses(),
                 },
@@ -1312,6 +1349,7 @@ def _register(client: CentralClient, state: WorkerState, args) -> None:
         "engine": llama_cpp_cuda_status(),
         "pool": os.environ.get("WORKER_POOL", ""),
         "caps": _local_caps(),
+        "env": env_status(),
     }
     try:
         worker = client.register(payload)

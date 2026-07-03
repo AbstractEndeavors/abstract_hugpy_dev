@@ -13,6 +13,11 @@ FRAMEWORK_RUNNERS: Dict[Tuple[str, str], Type[Runner]] = {
     ("transformers", "feature-extraction"):           FeatureExtractionRunner,
     ("transformers", "sentence-similarity"):          FeatureExtractionRunner,
     ("transformers", "text-to-image"):                ImageGenRunner,
+    # img2img sibling of text-to-image. INERT until a model advertises the task
+    # (sd-turbo's advertisement flip is HELD — see models_config.py). Registering
+    # the pair makes "image-to-image" a member of KNOWN_TASKS_REGISTRY and lets
+    # validate_registry accept the flip when it goes live.
+    ("transformers", "image-to-image"):               Img2ImgRunner,
     ("transformers", "keyword-extraction"):           KeywordRunner,
     # Vision-analysis family — ONE generic transformers-pipeline runner, a
     # subclass per task (see managers/vision_analysis). Adding the next HF

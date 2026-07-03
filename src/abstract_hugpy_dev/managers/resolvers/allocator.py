@@ -37,6 +37,10 @@ class Node:
     rpc_endpoint: Optional[str] = None    # "host:port" if it can be a shard BACKEND
     can_lead: bool = True                 # serves /infer (role=worker) → can be lead/whole/cpu
     online: bool = True
+    # Runtime-env tier this worker's venv serves ("stable", "edge", ...). The
+    # allocator itself never reads it — callers filter the snapshot to the
+    # need's tier BEFORE allocate(), keeping this module env-agnostic and pure.
+    env_tier: str = "stable"
 
 
 @dataclass(frozen=True)
