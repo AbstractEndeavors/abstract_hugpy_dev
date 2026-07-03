@@ -558,17 +558,44 @@ def _sweep_comfy_checkpoints(merged):
     import re as _re
     from ...src.constants.constants import DEFAULT_ROOT
     from ...src.constants.paths import route_destination
+    from ...src.constants.hugpy_marker import write_hugpy_marker
     root = os.path.join(DEFAULT_ROOT, "checkpoints")
     if not os.path.isdir(root):
         return {}
-    claimed = {v.get("filename") for v in merged.values()
-               if isinstance(v, dict) and v.get("framework") == "comfy"}
+
+    def _ensure_infra(row, fn):
+        """Idempotent layout symlink + hugpy.json marker — the marker is what
+        flips the row's status to 'installed' (and thus into /v1/models)."""
+        try:
+            dest_dir = route_destination(row)
+            os.makedirs(dest_dir, exist_ok=True)
+            link = os.path.join(dest_dir, fn)
+            src = os.path.join(root, fn)
+            if not os.path.exists(link) and os.path.exists(src):
+                os.symlink(src, link)
+            if not os.path.exists(os.path.join(dest_dir, "hugpy.json")):
+                write_hugpy_marker(
+                    dest_dir, hub_id=row.get("hub_id"), name=row.get("name"),
+                    framework="comfy", tasks=row.get("tasks"),
+                    primary_task=row.get("primary_task"), filename=fn,
+                    source="comfy-sweep")
+        except OSError as exc:
+            logger.warning("comfy sweep: infra for %s failed: %s", fn, exc)
+
+    files = {fn for fn in os.listdir(root)
+             if fn.lower().endswith((".safetensors", ".ckpt"))}
+    claimed = set()
+    # Pass 1: curated/staple comfy rows whose checkpoint is in /checkpoints —
+    # make sure THEIR layout link + marker exist too (status -> installed).
+    for v in merged.values():
+        if isinstance(v, dict) and v.get("framework") == "comfy":
+            fn = v.get("filename")
+            claimed.add(fn)
+            if fn in files:
+                _ensure_infra(v, fn)
+    # Pass 2: unclaimed files synthesize their own rows.
     rows = {}
-    for fn in sorted(os.listdir(root)):
-        if not fn.lower().endswith((".safetensors", ".ckpt")):
-            continue
-        if fn in claimed:
-            continue
+    for fn in sorted(files - claimed):
         stem = _re.sub(r"[^A-Za-z0-9]+", "-", fn.rsplit(".", 1)[0]).strip("-").lower()
         key = f"comfy-{stem}"
         if key in merged:
@@ -578,14 +605,7 @@ def _sweep_comfy_checkpoints(merged):
                "framework": "comfy", "hub_id": hub, "filename": fn,
                "folder": hub, "tasks": ["text-to-image", "image-to-image"],
                "primary_task": "text-to-image", "port": None}
-        try:  # manifest-layout symlink (idempotent) so workers can pull it
-            dest_dir = route_destination(row)
-            os.makedirs(dest_dir, exist_ok=True)
-            link = os.path.join(dest_dir, fn)
-            if not os.path.exists(link):
-                os.symlink(os.path.join(root, fn), link)
-        except OSError as exc:
-            logger.warning("comfy sweep: could not link %s: %s", fn, exc)
+        _ensure_infra(row, fn)
         rows[key] = row
     return rows
 
