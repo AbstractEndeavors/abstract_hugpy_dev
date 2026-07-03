@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "abstract_hugpy_dev"
-version = "0.1.99"
+version = "0.1.100"
 description = "Self-hosted LLM console: model registry & downloads, streaming chat, OpenAI-compatible /v1 API with on-site keys, GPU worker fleet with cross-machine RPC sharding"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -41,7 +41,13 @@ dependencies = [
     "requests",
     "abstract_essentials",   # de-vendored stdlib-only core (was imports/src/standalone_utils.py)
     "platformdirs",          # per-OS data/config/cache/engine dirs
-    "huggingface_hub>=0.26,<0.30",   # phone: <0.30 avoids hf-xet (Rust dep, no android wheel); >=0.26 keeps RepoFile
+    # Widened 2026-07-03: transformers 5.x / diffusers 0.39 (img2img edit
+    # pipelines — Flux2Klein, QwenImageEditPlus) require modern hub. Phone/
+    # Termux FRESH installs should still constrain `huggingface_hub<0.30`
+    # manually (hf-xet has no android wheel); existing phone workers are
+    # unaffected (self-update is --no-deps).
+    "huggingface_hub>=0.26",
+
     "beautifulsoup4",        # base import chain (imports/init_imports) does `import bs4`
     "PyPDF2",                # pure-python
     "pdfplumber",            # pure-python (pdfminer.six)
@@ -93,7 +99,11 @@ finetune = ["peft"]
 # similarity ride [embed]; summarize rides [transformers].)
 keywords = ["keybert"]            # keyword-extraction
 audio = ["openai-whisper"]        # automatic-speech-recognition (transcribe)
-imagegen = ["diffusers", "accelerate"]   # text-to-image
+# text-to-image AND image-to-image. Floors proven 2026-07-03: edit pipelines
+# (Flux2KleinPipeline, QwenImageEditPlusPipeline) need diffusers>=0.39 +
+# transformers>=5.12 (Qwen3 text encoders); q4 checkpoints need bitsandbytes.
+imagegen = ["diffusers>=0.39", "accelerate", "transformers>=5.12",
+            "bitsandbytes>=0.46.1"]
 # Deterministic ingest amenities (no model): /ml/extract reads PDF/DOCX/text,
 # /ml/fetch reads readable text from a URL. PDF rides base PyPDF2/pdfplumber;
 # requests is base — only python-docx + beautifulsoup4 are extra.
