@@ -61,6 +61,20 @@ def loading_model_keys() -> List[str]:
         return sorted(_BUILDING)
 
 
+# Per-model last-request time — the residency sweep's idle clock (a model with
+# residency="on-demand" is evicted after on_demand_ttl_s of no requests).
+_LAST_USED: Dict[str, float] = {}
+
+
+def touch_model(model_key: str) -> None:
+    import time as _time
+    _LAST_USED[model_key] = _time.time()
+
+
+def last_used_snapshot() -> Dict[str, float]:
+    return dict(_LAST_USED)
+
+
 def _get_or_build_runner(res: Resolution) -> Runner:
     """Cache-coherent runner lookup. Double-checked locking under the cache lock."""
     cached = _INSTANCES.get(res.cache_key)
@@ -166,6 +180,7 @@ def execute_prompt(*args: Any, **kwargs: Any):
     res = resolve(prompt_kwargs)
     req = res.builder(prompt_kwargs, res.model_key)
     runner = _get_or_build_runner(res)
+    touch_model(res.model_key)   # residency idle clock
     return runner.run(req=req)
 
 
@@ -227,6 +242,7 @@ async def execute_prompt_stream(*args, cancel_event=None, **kwargs):
     res = resolve(prompt_kwargs)
     req = res.builder(prompt_kwargs, res.model_key)
     runner = _get_or_build_runner(res)
+    touch_model(res.model_key)   # residency idle clock
     async for event in stream_runner(runner, req, cancel_event=cancel_event):
         yield event
 # ---------------------------------------------------------------------------

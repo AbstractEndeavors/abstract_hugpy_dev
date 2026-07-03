@@ -975,6 +975,37 @@ def build_app(state: "WorkerState") -> Flask:
                 return jsonify({"ok": False, "error": {
                     "code": "BadValue", "message": "slot_count must be 0..16"}}), 400
             settings["slot_count"] = n
+        if "on_demand_ttl_s" in body:
+            try:
+                ttl = int(body["on_demand_ttl_s"])
+            except (TypeError, ValueError):
+                return jsonify({"ok": False, "error": {
+                    "code": "BadValue", "message": "on_demand_ttl_s must be an integer"}}), 400
+            if not 60 <= ttl <= 86400:
+                return jsonify({"ok": False, "error": {
+                    "code": "BadValue", "message": "on_demand_ttl_s must be 60..86400"}}), 400
+            settings["on_demand_ttl_s"] = ttl
+        if "residency" in body:
+            # DEEP-MERGE per model key: {"model": "warm"|"on-demand"|null}.
+            # null (or "") removes the override, restoring the warm default.
+            if not isinstance(body["residency"], dict):
+                return jsonify({"ok": False, "error": {
+                    "code": "BadValue",
+                    "message": 'residency must be {"<model_key>": "warm"|"on-demand"|null}'}}), 400
+            merged = dict(settings.get("residency") or {})
+            for mk, mode in body["residency"].items():
+                if mode in (None, ""):
+                    merged.pop(mk, None)
+                elif mode in ("warm", "on-demand"):
+                    merged[mk] = mode
+                else:
+                    return jsonify({"ok": False, "error": {
+                        "code": "BadValue",
+                        "message": f"residency[{mk!r}] must be 'warm', 'on-demand' or null"}}), 400
+            if merged:
+                settings["residency"] = merged
+            else:
+                settings.pop("residency", None)
         _save_settings(args, settings)
         logger.info("ops/config: persisted %s — re-exec to apply", settings)
         from .._platform.procutil import reexec
@@ -1179,7 +1210,12 @@ def _sync_assignment(state: "WorkerState", worker: dict) -> None:
                     "WORKER_PRELOAD",
                     "1" if os.environ.get("WORKER_POOL", "").strip() else "0",
                 ).strip().lower() in ("1", "true", "yes", "on")
-                if _preload:
+                if _preload and _residency(mk) == "on-demand":
+                    # Residency policy (item 3): the operator marked this model
+                    # on-demand — never preload; it loads on first request and
+                    # the TTL sweep evicts it after idle.
+                    logger.info("preload SKIPPED for %s (residency: on-demand)", mk)
+                elif _preload:
                     try:
                         from abstract_hugpy_dev.managers.dispatch.dispatch import runner_for
                         logger.info("preloading (warming) %s…", mk)
@@ -1252,8 +1288,15 @@ def _update_state_path(args) -> str:
 # heartbeat reports the EFFECTIVE values + their source so the console always
 # shows truth.
 
-_SETTINGS_KEYS = {"slot_count"}          # widen deliberately, key by key
+_SETTINGS_KEYS = {"slot_count", "residency", "on_demand_ttl_s"}  # widen key by key
 _SETTINGS_SOURCE: dict = {}              # key -> "settings" | "env" | "default"
+_RUNTIME_SETTINGS: dict = {}             # the loaded settings, for live readers
+
+
+def _residency(model_key: str) -> str:
+    """Per-model residency policy: "warm" (assigned=ready preload, the
+    default) or "on-demand" (never preloaded; TTL-evicted after idle)."""
+    return (_RUNTIME_SETTINGS.get("residency") or {}).get(model_key, "warm")
 
 
 def _settings_path(args) -> str:
@@ -1281,6 +1324,8 @@ def _apply_settings_env(args) -> dict:
     every existing consumer (managers.serve.slots._slot_count, …) sees the
     operator's console-set values — and unit drop-ins lose, loudly."""
     settings = _load_settings(args)
+    _RUNTIME_SETTINGS.clear()
+    _RUNTIME_SETTINGS.update(settings)
     if "slot_count" in settings:
         env_was = os.environ.get("SLOT_COUNT")
         os.environ["SLOT_COUNT"] = str(int(settings["slot_count"]))
@@ -1302,8 +1347,46 @@ def _effective_config() -> dict:
         n = _slot_count()
     except Exception:
         n = None
-    return {"slot_count": n,
-            "slot_count_source": _SETTINGS_SOURCE.get("slot_count", "default")}
+    out = {"slot_count": n,
+           "slot_count_source": _SETTINGS_SOURCE.get("slot_count", "default"),
+           "on_demand_ttl_s": int(_RUNTIME_SETTINGS.get("on_demand_ttl_s", 900))}
+    if _RUNTIME_SETTINGS.get("residency"):
+        out["residency"] = dict(_RUNTIME_SETTINGS["residency"])
+    return out
+
+
+def _residency_sweep_loop() -> None:
+    """Evict idle on-demand models (item 3 residency policy).
+
+    Every 60s: any LOADED model whose residency is "on-demand" and whose last
+    request is older than on_demand_ttl_s gets evicted (dispatch.evict cascades
+    to the llama singleton, so the VRAM/RAM actually frees). Warm models are
+    never touched — assigned=ready stays the default contract."""
+    started_at = time.time()
+    while True:
+        time.sleep(60.0)
+        try:
+            res_map = _RUNTIME_SETTINGS.get("residency") or {}
+            if not res_map:
+                continue
+            ttl = int(_RUNTIME_SETTINGS.get("on_demand_ttl_s", 900))
+            from ..managers.dispatch.dispatch import (
+                last_used_snapshot, evict)
+            last_used = last_used_snapshot()
+            now = time.time()
+            for mk in loaded_model_keys():
+                if _residency(mk) != "on-demand":
+                    continue
+                idle = now - last_used.get(mk, started_at)
+                if idle > ttl:
+                    logger.info("residency sweep: evicting %s (on-demand, "
+                                "idle %.0fs > ttl %ds)", mk, idle, ttl)
+                    try:
+                        evict(mk)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("residency evict of %s failed: %s", mk, exc)
+        except Exception as exc:  # noqa: BLE001 — the sweep must never die
+            logger.warning("residency sweep iteration failed: %s", exc)
 
 
 def _load_update_state(args) -> dict:
@@ -1688,6 +1771,9 @@ def main(argv: list[str] | None = None) -> int:
 
     hb = threading.Thread(target=_heartbeat_loop, args=(client, state, args), daemon=True)
     hb.start()
+
+    # Residency policy sweep (item 3): evicts idle on-demand models.
+    threading.Thread(target=_residency_sweep_loop, daemon=True).start()
 
     logger.info("worker inference server listening on %s (advertising %s)",
                 f"{args.host}:{args.port}", state.url)
