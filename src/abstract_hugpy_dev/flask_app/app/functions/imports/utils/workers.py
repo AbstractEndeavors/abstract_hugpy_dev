@@ -535,6 +535,7 @@ class WorkerStore:
         pool: Optional[str] = None,
         caps: Optional[Dict[str, Any]] = None,
         env: Optional[Dict[str, Any]] = None,
+        config: Optional[Dict[str, Any]] = None,
         loaded_detail: Optional[Dict[str, Any]] = None,
         slots: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[Dict[str, Any]]:
@@ -583,6 +584,8 @@ class WorkerStore:
                 worker["engine"] = engine
             if env is not None:
                 worker["env"] = env
+            if config is not None:
+                worker["config"] = config   # effective serving-config + source
             if loaded_detail is not None:
                 worker["loaded_detail"] = loaded_detail
             if slots is not None:

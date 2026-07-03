@@ -256,6 +256,9 @@ class HeartbeatRequest(BaseModel):
     caps: dict | None = None
     # Runtime-env capability snapshot — see RegisterRequest.env.
     env: dict | None = None
+    # Effective operator serving-config (settings > env > default) — e.g.
+    # {slot_count, slot_count_source}; set via POST /llm/workers/<id>/config.
+    config: dict | None = None
     # Per-loaded-model load facts: {key: {model_bytes, n_gpu_layers,
     # total_layers, gpu_pct}} — drives the console's serving rows.
     loaded_detail: dict | None = None
@@ -383,6 +386,7 @@ def workers_heartbeat(worker_id):
         pool=body.pool,
         caps=body.caps,
         env=body.env,
+        config=body.config,
         loaded_detail=body.loaded_detail,
         slots=body.slots,
     )
@@ -615,6 +619,17 @@ def workers_restart(worker_id):
     return _relay_worker_op(worker_id, "/ops/restart",
                             request.get_json(silent=True) or {},
                             timeout=15.0, action="restart")
+
+
+@worker_bp.route("/llm/workers/<worker_id>/config", methods=["POST"])
+def workers_config(worker_id):
+    """Daylight item 3: set a worker's serving config from the console — e.g.
+    {"slot_count": 1}. Persisted in the AGENT's own settings file (beats env
+    drop-ins), applied via agent re-exec; the next heartbeat reports the
+    effective values, so the row shows truth."""
+    return _relay_worker_op(worker_id, "/ops/config",
+                            request.get_json(silent=True) or {},
+                            timeout=15.0, action="config")
 
 
 @worker_bp.route("/llm/workers/<worker_id>/update", methods=["POST"])

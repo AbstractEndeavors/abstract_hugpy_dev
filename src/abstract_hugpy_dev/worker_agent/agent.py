@@ -944,6 +944,43 @@ def build_app(state: "WorkerState") -> Flask:
         return (jsonify({"ok": rc == 0, "package": pkg, "rc": rc,
                          "output_tail": tail}), 200 if rc == 0 else 502)
 
+    @app.route("/ops/config", methods=["POST", "GET"])
+    def ops_config():
+        # Daylight item 3: operator serving-config, persisted in the agent's
+        # OWN settings file (beats env/drop-ins — see _apply_settings_env).
+        # GET returns current settings + effective values; POST merges the
+        # supported keys, persists, and re-execs to apply cleanly (persistent
+        # worker-id -> same registry row; ~seconds of blip).
+        args = getattr(state, "args", None)
+        if args is None:
+            return jsonify({"ok": False, "error": {
+                "code": "NoArgs", "message": "agent started without CLI args"}}), 501
+        if request.method == "GET":
+            return jsonify({"ok": True, "settings": _load_settings(args),
+                            "effective": _effective_config()})
+        body = request.get_json(silent=True) or {}
+        unknown = sorted(set(body) - _SETTINGS_KEYS)
+        if unknown:
+            return jsonify({"ok": False, "error": {
+                "code": "UnknownKeys",
+                "message": f"unsupported: {unknown}; supported: {sorted(_SETTINGS_KEYS)}"}}), 400
+        settings = _load_settings(args)
+        if "slot_count" in body:
+            try:
+                n = int(body["slot_count"])
+            except (TypeError, ValueError):
+                return jsonify({"ok": False, "error": {
+                    "code": "BadValue", "message": "slot_count must be an integer"}}), 400
+            if not 0 <= n <= 16:
+                return jsonify({"ok": False, "error": {
+                    "code": "BadValue", "message": "slot_count must be 0..16"}}), 400
+            settings["slot_count"] = n
+        _save_settings(args, settings)
+        logger.info("ops/config: persisted %s — re-exec to apply", settings)
+        from .._platform.procutil import reexec
+        threading.Timer(0.5, reexec).start()
+        return jsonify({"ok": True, "settings": settings, "restarting": True})
+
     @app.route("/probe/<path:model_key>", methods=["POST", "GET"])
     def probe(model_key):
         # Live VRAM-fit check: actually load the model on this worker's GPU and
@@ -1203,6 +1240,68 @@ def _update_state_path(args) -> str:
     return args.id_file + ".update.json"
 
 
+# ── operator runtime settings (daylight item 3: console-managed serving) ────
+# The agent's OWN config file, set from the console via /ops/config. It is the
+# SOURCE OF TRUTH over env/unit drop-ins for the keys it holds — the fix for
+# the SLOT_COUNT drop-in ghost (a limits.conf silently resurrecting slots on
+# every restart). Precedence: settings file > env > built-in default; the
+# heartbeat reports the EFFECTIVE values + their source so the console always
+# shows truth.
+
+_SETTINGS_KEYS = {"slot_count"}          # widen deliberately, key by key
+_SETTINGS_SOURCE: dict = {}              # key -> "settings" | "env" | "default"
+
+
+def _settings_path(args) -> str:
+    return args.id_file + ".settings.json"
+
+
+def _load_settings(args) -> dict:
+    try:
+        with open(_settings_path(args), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_settings(args, settings: dict) -> None:
+    tmp = _settings_path(args) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(settings, fh, indent=1)
+    os.replace(tmp, _settings_path(args))
+
+
+def _apply_settings_env(args) -> dict:
+    """Project the settings file onto the env BEFORE anything reads it, so
+    every existing consumer (managers.serve.slots._slot_count, …) sees the
+    operator's console-set values — and unit drop-ins lose, loudly."""
+    settings = _load_settings(args)
+    if "slot_count" in settings:
+        env_was = os.environ.get("SLOT_COUNT")
+        os.environ["SLOT_COUNT"] = str(int(settings["slot_count"]))
+        _SETTINGS_SOURCE["slot_count"] = "settings"
+        if env_was is not None and env_was != os.environ["SLOT_COUNT"]:
+            logger.warning("settings override: SLOT_COUNT env/drop-in said %r but "
+                           "the operator's runtime settings say %s — settings win",
+                           env_was, settings["slot_count"])
+    else:
+        _SETTINGS_SOURCE["slot_count"] = (
+            "env" if os.environ.get("SLOT_COUNT") not in (None, "") else "default")
+    return settings
+
+
+def _effective_config() -> dict:
+    """What this agent is ACTUALLY running with (for the heartbeat)."""
+    try:
+        from ..managers.serve.slots import _slot_count
+        n = _slot_count()
+    except Exception:
+        n = None
+    return {"slot_count": n,
+            "slot_count_source": _SETTINGS_SOURCE.get("slot_count", "default")}
+
+
 def _load_update_state(args) -> dict:
     try:
         with open(_update_state_path(args), "r", encoding="utf-8") as fh:
@@ -1335,6 +1434,7 @@ def _heartbeat_loop(client: CentralClient, state: WorkerState, args) -> None:
                     "pool": os.environ.get("WORKER_POOL", ""),
                     "caps": _local_caps(),
                     "env": env_status(),
+                    "config": _effective_config(),
                     "loaded_detail": _loaded_detail(),
                     "slots": _slot_statuses(),
                 },
@@ -1546,7 +1646,11 @@ def main(argv: list[str] | None = None) -> int:
     state.port = args.port
     state.role = args.role
 
-    # Worker-local slot pool (SLOT_COUNT env; 0/unset = off, unchanged).
+    # Operator runtime settings (console-set) project onto the env FIRST, so
+    # the slot supervisor + every other reader sees them; drop-ins lose loudly.
+    _apply_settings_env(args)
+
+    # Worker-local slot pool (SLOT_COUNT; settings > env > default).
     _supervise_slots()
 
     # F1/F5 wiring: control.cancel on this process's bus reaches the shared
