@@ -548,6 +548,48 @@ def set_media_default(model_key, enabled):
     }
 
 
+def _sweep_comfy_checkpoints(merged):
+    """Drop-a-file model registration: every ``*.safetensors``/``*.ckpt`` in
+    ``<root>/checkpoints`` becomes a comfy registry row automatically —
+    symlinked into the manifest layout (so the file endpoints serve it to
+    workers; symlinks everywhere, never copies) and synthesized as
+    ``comfy-<slug>`` with text-to-image + image-to-image. Files already
+    claimed by an existing comfy row (e.g. a curated staple) are skipped."""
+    import re as _re
+    from ...src.constants.constants import DEFAULT_ROOT
+    from ...src.constants.paths import route_destination
+    root = os.path.join(DEFAULT_ROOT, "checkpoints")
+    if not os.path.isdir(root):
+        return {}
+    claimed = {v.get("filename") for v in merged.values()
+               if isinstance(v, dict) and v.get("framework") == "comfy"}
+    rows = {}
+    for fn in sorted(os.listdir(root)):
+        if not fn.lower().endswith((".safetensors", ".ckpt")):
+            continue
+        if fn in claimed:
+            continue
+        stem = _re.sub(r"[^A-Za-z0-9]+", "-", fn.rsplit(".", 1)[0]).strip("-").lower()
+        key = f"comfy-{stem}"
+        if key in merged:
+            continue
+        hub = f"comfy/{stem}"
+        row = {"model_max_length": 77, "include": None, "name": key,
+               "framework": "comfy", "hub_id": hub, "filename": fn,
+               "folder": hub, "tasks": ["text-to-image", "image-to-image"],
+               "primary_task": "text-to-image", "port": None}
+        try:  # manifest-layout symlink (idempotent) so workers can pull it
+            dest_dir = route_destination(row)
+            os.makedirs(dest_dir, exist_ok=True)
+            link = os.path.join(dest_dir, fn)
+            if not os.path.exists(link):
+                os.symlink(os.path.join(root, fn), link)
+        except OSError as exc:
+            logger.warning("comfy sweep: could not link %s: %s", fn, exc)
+        rows[key] = row
+    return rows
+
+
 def get_models_dict(models_dict_path=None, dict_return=False, return_dict=False,
                     discovery=None):
     """Build the registry: MODELS + discovery (test downloads).
@@ -560,6 +602,13 @@ def get_models_dict(models_dict_path=None, dict_return=False, return_dict=False,
     dict_return = dict_return or return_dict
     report = discovery if discovery is not None else _load_discovery_report(models_dict_path)
     merged, dropped = merge_discovery_into_models(report)
+
+    # Comfy checkpoint sweep — drop a file in <root>/checkpoints, get a model.
+    try:
+        for k, v in _sweep_comfy_checkpoints(merged).items():
+            merged.setdefault(k, v)
+    except Exception as exc:  # noqa: BLE001 — the sweep must never break the registry
+        logger.warning("comfy checkpoint sweep failed: %s", exc)
 
     for model_key, why in dropped:
         logger.info("registry: dropped %s (%s)", model_key, why)
