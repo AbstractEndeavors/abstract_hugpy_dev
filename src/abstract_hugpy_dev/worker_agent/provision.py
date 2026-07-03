@@ -934,34 +934,47 @@ def _provision_now(canonical: str, central_url: str | None, progress=None) -> bo
     # truth and needs no HF token. Hugging Face is only a fallback, used when
     # central can't provide the files (no central URL, central unreachable, or
     # central doesn't have them on disk).
+    # Daylight item 4: the chosen SOURCE must be loud — logged AND streamed
+    # through the progress callback (a "source=…" marker the agent stores on
+    # provision_progress), so a silent 55GB HF pull while central held the
+    # files can never happen unnoticed again.
+    central_reason = "no central URL configured"
     if central_url:
         # 1) parallel + segmented per-file transfer — fastest (saturates the
         #    link; a big weights file is split across many connections).
+        if progress:
+            progress(0, 0, "source=central")
         try:
             if fetch_from_central(central_url, canonical, progress=progress):
+                logger.info("PROVENANCE: %s provisioned from CENTRAL (parallel)",
+                            canonical)
                 return True
+            central_reason = "central does not have the files (per-file 409/empty)"
         except Exception as exc:
+            central_reason = f"parallel transfer failed: {type(exc).__name__}: {exc}"
             logger.warning("central parallel transfer of %s failed: %s; "
                            "trying archive", canonical, exc)
         # 2) whole-directory tar stream — single-connection fallback.
         try:
             if fetch_archive_from_central(central_url, canonical, progress=progress):
+                logger.info("PROVENANCE: %s provisioned from CENTRAL (archive)",
+                            canonical)
                 return True
-            logger.info("central cannot provide %s; falling back to Hugging Face",
-                        canonical)
+            central_reason = "central cannot provide the files (archive refused)"
         except Exception as exc:
-            logger.warning("central archive transfer of %s failed: %s; "
-                           "falling back to Hugging Face", canonical, exc)
-    else:
-        logger.info("no central URL configured; provisioning %s from Hugging Face",
-                    canonical)
+            central_reason = f"archive transfer failed: {type(exc).__name__}: {exc}"
 
+    logger.warning("PROVENANCE: %s falling back to HUGGING FACE — central "
+                   "rejected: %s", canonical, central_reason)
     try:
         if progress:
-            progress(0, 0, "huggingface")
+            progress(0, 0, f"source=hf ({central_reason[:120]})")
         fetch_from_hf(canonical)
+        logger.warning("PROVENANCE: %s provisioned from HUGGING FACE (central "
+                       "rejected: %s)", canonical, central_reason)
         return True
     except Exception as exc:
-        logger.error("could not provision %s from central or HF: %s", canonical, exc)
+        logger.error("could not provision %s from central or HF: %s "
+                     "(central rejected: %s)", canonical, exc, central_reason)
         return False
 

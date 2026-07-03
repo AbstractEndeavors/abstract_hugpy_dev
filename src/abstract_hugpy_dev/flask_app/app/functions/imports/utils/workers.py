@@ -34,6 +34,53 @@ except ImportError:  # pragma: no cover - non-POSIX fallback
 
 from .schemas import settings
 
+import logging
+logger = logging.getLogger(__name__)
+
+
+# ── assignment memory (daylight 4b) ─────────────────────────────────────────
+# Operator designations are WORKER-lifetime, not row-lifetime: a console
+# dead-worker sweep DELETE (or a registry loss) used to wipe a worker's
+# models + per-model spill, so a re-register came back empty (2026-07-03:
+# computron lost 4 of 7 designations). Every assign/unassign snapshots the
+# worker's designations here, keyed by its persistent worker id; a fresh-row
+# re-register with a known id restores them. Deleting a row deliberately does
+# NOT delete its memory — that's the point.
+
+def _assign_memory_path() -> str:
+    return os.path.join(os.path.dirname(settings.manifest_path),
+                        "worker_assignments.json")
+
+
+def _load_assign_memory() -> Dict[str, Any]:
+    try:
+        with open(_assign_memory_path(), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _remember_assignments(worker: Dict[str, Any]) -> None:
+    """Snapshot one worker's designations (models + spill) into the memory."""
+    wid = worker.get("id")
+    if not wid:
+        return
+    try:
+        mem = _load_assign_memory()
+        mem[wid] = {
+            "name": worker.get("name"),
+            "models": list(worker.get("models") or []),
+            "spill_by_model": dict(worker.get("spill_by_model") or {}),
+            "remembered_at": _now(),
+        }
+        tmp = _assign_memory_path() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(mem, fh, indent=1)
+        os.replace(tmp, _assign_memory_path())
+    except Exception as exc:  # noqa: BLE001 — memory is best-effort, never fatal
+        logger.warning("assignment memory write failed for %s: %s", wid, exc)
+
 
 def _default_workers_path() -> str:
     """Sit the worker registry next to the model manifest (…/projects/)."""
@@ -488,13 +535,28 @@ class WorkerStore:
                 return _public_view(existing)
 
             wid = worker_id or uuid.uuid4().hex
+            # 4b: a fresh row for a KNOWN worker id (its old row was swept /
+            # the registry was lost) restores the operator's designations from
+            # the assignment memory — designations are worker-lifetime.
+            remembered = _load_assign_memory().get(wid) if worker_id else None
+            restored_models: List[str] = []
+            restored_spill: Dict[str, Any] = {}
+            if remembered:
+                restored_models = list(remembered.get("models") or [])
+                restored_spill = dict(remembered.get("spill_by_model") or {})
+                if restored_models:
+                    logger.warning(
+                        "register: restoring %d remembered designation(s) for "
+                        "returning worker %s (%s): %s", len(restored_models),
+                        name or wid, wid, restored_models)
             worker = {
                 "id": wid,
                 "name": name or wid,
                 "url": url,
                 "role": role or "worker",
                 "gpus": gpus or [],
-                "models": sorted(set(models or [])),
+                "models": sorted(set(models or []) | set(restored_models)),
+                "spill_by_model": restored_spill,
                 "pkg_version": pkg_version,
                 "rpc_endpoint": rpc_endpoint,
                 "free_ram": free_ram,
@@ -692,6 +754,7 @@ class WorkerStore:
                     by_model[model_key] = spill
                 else:
                     by_model.pop(model_key, None)
+            _remember_assignments(worker)   # 4b: designations survive row loss
             return _public_view(worker)
 
     def unassign_model(self, worker_id: str, model_key: str) -> Optional[Dict[str, Any]]:
@@ -701,6 +764,7 @@ class WorkerStore:
                 return None
             worker["models"] = sorted(set(worker.get("models", [])) - {model_key})
             worker.get("spill_by_model", {}).pop(model_key, None)
+            _remember_assignments(worker)   # 4b: an explicit unassign IS forgotten
             return _public_view(worker)
 
     def spill_for(self, worker_id: str, model_key: str) -> Dict[str, Any]:

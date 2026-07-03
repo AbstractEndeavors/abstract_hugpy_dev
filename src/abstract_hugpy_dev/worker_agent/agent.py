@@ -1157,10 +1157,14 @@ def _sync_assignment(state: "WorkerState", worker: dict) -> None:
                 # so the heartbeat can report it (the panel polls heartbeats).
                 frac = (done / total) if total else 0.0
                 with state._provision_lock:
-                    state._provision_progress[mk] = {
-                        "done_bytes": done, "total_bytes": total or 0,
-                        "frac": round(frac, 4),
-                    }
+                    entry = state._provision_progress.setdefault(mk, {})
+                    entry.update(done_bytes=done, total_bytes=total or 0,
+                                 frac=round(frac, 4))
+                    # Provenance (item 4): _provision_now streams a "source=…"
+                    # pseudo-filename when it picks central vs HF — keep it on
+                    # the entry so the console can attribute the pull.
+                    if isinstance(fname, str) and fname.startswith("source="):
+                        entry["source"] = fname[len("source="):]
             try:
                 from .provision import ensure_model_present, model_is_local
                 if not model_is_local(mk):

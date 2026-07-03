@@ -196,6 +196,32 @@ def download_dict_models() -> None:
 
 
 
+def _fp16_ignore_patterns(repo_id: str) -> "list[str] | None":
+    """Item 4 variant filter: for a DIFFUSERS pipeline repo whose weights ship
+    fp16 twins (``x.fp16.safetensors`` beside ``x.safetensors``), return
+    ignore_patterns that skip the full-precision twins and the alt runtimes
+    (onnx/openvino/flax) — sdxl-turbo drops from 55GB to ~7GB. Returns None
+    (no filtering) for non-diffusers repos or repos without fp16 variants, so
+    a model that only ships full precision still downloads completely."""
+    from huggingface_hub import HfApi
+    files = set(HfApi().list_repo_files(repo_id))
+    if "model_index.json" not in files:
+        return None                      # not a diffusers pipeline — untouched
+    twins = [f for f in files
+             if f.endswith(".safetensors") and ".fp16." not in f
+             and f.replace(".safetensors", ".fp16.safetensors") in files]
+    if not twins:
+        return None                      # no fp16 variant — pull everything
+    ignore = sorted(twins)
+    # Alt runtimes ride along in these repos and are never used by our loader.
+    ignore += ["*.onnx", "*.onnx_data", "*.msgpack", "*openvino*", "*.ckpt"]
+    # .bin twins of safetensors weights (legacy format duplicates).
+    ignore += [f for f in files
+               if f.endswith(".bin")
+               and f.replace(".bin", ".safetensors") in files]
+    return ignore
+
+
 def ensure_model(key: str, root: str = DEFAULT_ROOT) -> str:
     cfg = get_model_config(key)
 
@@ -233,6 +259,20 @@ def ensure_model(key: str, root: str = DEFAULT_ROOT) -> str:
         # Single-file model (GGUF quants live N-per-repo): pull just that file,
         # mirroring download_one's llama_cpp branch — never the whole repo.
         download_kwargs["allow_patterns"] = [cfg.filename]
+    else:
+        # Daylight item 4: diffusers pipelines often ship EVERY precision +
+        # runtime (sdxl-turbo: a 55GB repo whose fp16 pipeline is ~7GB). When
+        # the repo IS a diffusers pipeline and fp16 twins exist, skip the
+        # full-precision twins and the alt runtimes. Introspection failure ->
+        # full snapshot (correct, just big) — never a broken model.
+        try:
+            ignore = _fp16_ignore_patterns(repo_id)
+            if ignore:
+                download_kwargs["ignore_patterns"] = ignore
+                print(f"  fp16 variant filter: skipping {len(ignore)} "
+                      f"full-precision/alt-runtime pattern(s)")
+        except Exception:
+            pass
     try:
         snapshot_download(**download_kwargs)
 

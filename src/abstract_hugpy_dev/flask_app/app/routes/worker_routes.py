@@ -502,11 +502,40 @@ def enroll_tokens_revoke(token_id):
     return jsonify({"revoked": True, "id": token_id})
 
 
+def _central_missing_reason(model_key: str) -> str | None:
+    """Daylight item 4 invariant: workers pull FROM CENTRAL. Return why central
+    can't provide this model's files, or None when it can (present on disk)."""
+    try:
+        from ....imports import route_destination
+        from ....imports.config.main import get_model_config, model_looks_downloaded
+        cfg = get_model_config(model_key)
+        path = route_destination(cfg.to_dict() if hasattr(cfg, "to_dict") else dict(
+            hub_id=getattr(cfg, "hub_id", None), framework=getattr(cfg, "framework", None),
+            tasks=getattr(cfg, "tasks", None), primary_task=getattr(cfg, "primary_task", None),
+            filename=getattr(cfg, "filename", None), include=getattr(cfg, "include", None),
+            name=getattr(cfg, "name", None), folder=getattr(cfg, "folder", None)))
+        if not os.path.isdir(path):
+            return "no model directory"
+        if not model_looks_downloaded(path, cfg):
+            return "directory present but files incomplete"
+        return None
+    except Exception as exc:  # noqa: BLE001 — resolution failure = can't provide
+        return f"{type(exc).__name__}: {exc}"
+
+
 @worker_bp.route("/llm/workers/<worker_id>/assign", methods=["POST"])
 def workers_assign(worker_id):
     body = AssignRequest(**(request.get_json(silent=True) or {}))
     if body.model_key not in get_models_dict(dict_return=True):
         abort(404, description="Unknown model key.")
+    # Item 4 guard: a model can't be designated unless central itself holds the
+    # files — otherwise the worker silently pulls ~50GB from HF at internet
+    # speed (the 2026-07-03 sdxl-turbo saga). Clear 409 with the fix.
+    missing = _central_missing_reason(body.model_key)
+    if missing:
+        return jsonify({"error": f"central does not have '{body.model_key}' on "
+                        f"disk ({missing}) — download it on the Models tab first; "
+                        "workers provision from central"}), 409
     worker = assign_model(worker_id, body.model_key, spill=body.spill)
     if worker is None:
         abort(404, description="Unknown worker id.")
@@ -777,6 +806,12 @@ def workers_load(worker_id):
     redownload = bool(raw.get("redownload"))
     if body.model_key not in get_models_dict(dict_return=True):
         abort(404, description="Unknown model key.")
+    # Item 4 guard — same invariant as /assign: central must hold the files.
+    missing = _central_missing_reason(body.model_key)
+    if missing:
+        return jsonify({"error": f"central does not have '{body.model_key}' on "
+                        f"disk ({missing}) — download it on the Models tab first; "
+                        "workers provision from central"}), 409
     worker = get_worker(worker_id)
     if worker is None:
         abort(404, description="Unknown worker id.")

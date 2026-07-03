@@ -186,6 +186,17 @@ def model_looks_downloaded(path: str, cfg: Optional[ModelConfig] = None) -> bool
         return True
 
     if not config_exists(path):
+        # Diffusers PIPELINE dirs have model_index.json (not config.json) and
+        # nest their weights per-component. Without this branch every diffusers
+        # model read as "not downloaded" on every agent restart → the
+        # 2026-07-03 provisioning storm (op re-pulling ~150GB it already had).
+        if exists(os.path.join(path, "model_index.json")):
+            weights = list(get_glob(path, "*.safetensors", recursive=True))
+            if not weights:
+                weights = list(get_glob(path, "*.bin", recursive=True))
+            if not weights:
+                return False
+            return all(st_size(f) > 1024 * 1024 for f in weights)
         return False
 
     safetensor_files = list(get_glob(path,"*.safetensors"))
