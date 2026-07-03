@@ -71,6 +71,19 @@ MODELS = {
         "tasks": ["feature-extraction", "sentence-similarity", "keyword-extraction"],
         "primary_task": "feature-extraction", "port": None,
     },
+    # ComfyUI-backed staple (engine slice B, 2026-07-03): `filename` names the
+    # checkpoint inside the WORKER's own ComfyUI models/checkpoints — hugpy
+    # holds no files for comfy rows. Routes to whichever worker advertises
+    # supports_comfy AND is assigned this model.
+    "comfy-dreamshaper-8": {
+        "model_max_length": 77, "include": None, "name": "comfy-dreamshaper-8",
+        "framework": "comfy", "hub_id": "Lykon/DreamShaper",
+        "filename": "DreamShaper_8_pruned.safetensors",
+        "folder": "comfy/DreamShaper",
+        "tasks": ["text-to-image", "image-to-image"],
+        "primary_task": "text-to-image", "port": None,
+    },
+
     "sd-turbo": {
         "model_max_length": 77, "include": None, "name": "sd-turbo",
         "framework": "transformers", "hub_id": "stabilityai/sd-turbo", "filename": None,
