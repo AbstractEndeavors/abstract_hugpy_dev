@@ -1208,6 +1208,21 @@ def _kick_provision(state: "WorkerState", model_key: str) -> None:
                         entry["source"] = fname[len("source="):]
             try:
                 from .provision import ensure_model_present, model_is_local
+                # ComfyUI-backed rows: everything is symlinks — already-
+                # loadable / link-from-layout / pull-then-link. ComfyUI owns
+                # its own residency, so no runner preload either.
+                try:
+                    from .provision import (ensure_comfy_checkpoint,
+                                            ensure_model_registered)
+                    from .imports import get_model_config
+                    _ck = ensure_model_registered(mk, state.central_url) or mk
+                    if getattr(get_model_config(_ck), "framework", None) == "comfy":
+                        ok = ensure_comfy_checkpoint(_ck, state.central_url)
+                        logger.info("comfy checkpoint for %s: %s", mk,
+                                    "ready" if ok else "NOT available")
+                        return
+                except Exception:  # noqa: BLE001 — fall through to normal flow
+                    pass
                 # Hardening: model_is_local RAISES for a key this worker's
                 # registry hasn't learned yet — that must trigger the pull
                 # (which starts with ensure_model_registered), not abort it.

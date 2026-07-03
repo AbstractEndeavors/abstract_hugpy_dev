@@ -214,6 +214,57 @@ def ensure_model_registered(model_key: str, central_url: str | None) -> str | No
     return None
 
 
+def _comfy_checkpoints_dir() -> str:
+    """Where THIS box's ComfyUI loads checkpoints from. Override with
+    COMFY_CHECKPOINTS_DIR; default matches the standard install."""
+    return os.environ.get("COMFY_CHECKPOINTS_DIR") or os.path.expanduser(
+        "~/ComfyUI/models/checkpoints")
+
+
+def ensure_comfy_checkpoint(model_key: str, central_url: str | None) -> bool:
+    """Comfy provisioning: the checkpoint must end up INSIDE ComfyUI's
+    models/checkpoints — everything is symlinks, never copies.
+
+      1. already in ComfyUI's dir            -> done (operator hand-placed)
+      2. present in the hugpy model layout   -> symlink it in
+      3. neither -> pull from central via the NORMAL file machinery (central
+         symlinks its /checkpoints store into the manifest layout), then
+         symlink into ComfyUI's dir.
+    """
+    try:
+        model_key = ensure_model_registered(model_key, central_url) or model_key
+        from .imports import get_model_config
+        cfg = get_model_config(model_key)
+        filename = getattr(cfg, "filename", None)
+        if not filename:
+            return False
+        dest = os.path.join(_comfy_checkpoints_dir(), filename)
+        if os.path.exists(dest):
+            return True
+        # in the hugpy layout already?
+        from .imports import route_destination
+        src_dir = route_destination({
+            "hub_id": getattr(cfg, "hub_id", None), "framework": "comfy",
+            "primary_task": getattr(cfg, "primary_task", None),
+            "name": getattr(cfg, "name", None),
+            "folder": getattr(cfg, "folder", None), "filename": filename})
+        src = os.path.join(src_dir, filename)
+        if not os.path.isfile(src) and central_url:
+            logger.info("comfy checkpoint %s missing locally — pulling from "
+                        "central", filename)
+            if not ensure_model_present(model_key, central_url):
+                return False
+        if os.path.isfile(src):
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            os.symlink(os.path.realpath(src), dest)
+            logger.info("comfy checkpoint linked: %s -> %s", dest, src)
+            return True
+        return False
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("ensure_comfy_checkpoint(%s) failed: %s", model_key, exc)
+        return False
+
+
 def model_is_local(model_key: str) -> bool:
     """True if the model already looks downloaded under the worker's storage."""
     try:
@@ -221,6 +272,14 @@ def model_is_local(model_key: str) -> bool:
             get_model_config, model_looks_downloaded, get_model_path,
         )
         cfg = get_model_config(model_key)
+        # Comfy rows: "local" means the checkpoint is loadable by THIS box's
+        # ComfyUI (its own dir counts — operator hand-placed files included).
+        if getattr(cfg, "framework", None) == "comfy":
+            filename = getattr(cfg, "filename", "") or ""
+            if filename and os.path.exists(
+                    os.path.join(_comfy_checkpoints_dir(), filename)):
+                return True
+            return bool(model_looks_downloaded(get_model_path(model_key), cfg))
         return bool(model_looks_downloaded(get_model_path(model_key), cfg))
     except Exception:
         return False
