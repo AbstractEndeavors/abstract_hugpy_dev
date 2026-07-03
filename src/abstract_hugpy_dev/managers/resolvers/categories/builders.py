@@ -357,6 +357,10 @@ def _build_vision_analysis_request(kwargs: Dict[str, Any], model_key: str) -> "V
 # ---------------------------------------------------------------------------
 
 MODEL_REQUEST_BUILDERS: Dict[Tuple[str, str], Callable[[Dict[str, Any], str], BaseModel]] = {
+    # ComfyUI engine reuses the imagegen request shapes verbatim (same
+    # precedent as Img2ImgRunner) — no comfy-specific builders needed.
+    ("comfy", "text-to-image"):                       _build_imagegen_request,
+    ("comfy", "image-to-image"):                      _build_img2img_request,
     ("transformers", "text-generation"):              _build_chat_request,
     ("llama_cpp",    "text-generation"):              _build_chat_request,
     ("transformers", "image-text-to-text"):           _build_vision_request,

@@ -1452,6 +1452,16 @@ def _comfy_status() -> dict:
                     out["version"] = sysinfo["comfyui_version"]
             except Exception:  # noqa: BLE001 — version is decoration
                 pass
+            # Advertise loadable checkpoints — registry rows' `filename`
+            # designations come from this list (slice B).
+            try:
+                oi = httpx.get(url + "/object_info/CheckpointLoaderSimple",
+                               timeout=3.0).json()
+                ckpts = oi["CheckpointLoaderSimple"]["input"]["required"]["ckpt_name"][0]
+                if isinstance(ckpts, list):
+                    out["checkpoints"] = ckpts[:50]
+            except Exception:  # noqa: BLE001 — list is best-effort
+                pass
     except Exception:  # noqa: BLE001 — not installed / not running
         pass
     _COMFY_CACHE.update(at=now, value=out)

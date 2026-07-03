@@ -156,6 +156,13 @@ def model_looks_downloaded(path: str, cfg: Optional[ModelConfig] = None) -> bool
       - transformers model dirs
       - GGUF model dirs for llama.cpp
     """
+    # ComfyUI-backed models hold NO files in hugpy storage — the checkpoint
+    # lives inside the worker's own ComfyUI install (models/checkpoints).
+    # "Downloaded" is therefore trivially true; presence is the worker's
+    # supports_comfy + checkpoint list, not a directory here.
+    if cfg and getattr(cfg, "framework", None) == "comfy":
+        return True
+
     if not exists(path) or not is_dir(path):
         return False
 

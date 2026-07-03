@@ -516,6 +516,10 @@ def _central_missing_reason(model_key: str) -> str | None:
         from ....imports import route_destination
         from ....imports.config.main import get_model_config, model_looks_downloaded
         cfg = get_model_config(model_key)
+        # ComfyUI-backed rows: the checkpoint lives in the WORKER's ComfyUI
+        # install; central holds no files by design — nothing to guard.
+        if getattr(cfg, "framework", None) == "comfy":
+            return None
         path = route_destination(cfg.to_dict() if hasattr(cfg, "to_dict") else dict(
             hub_id=getattr(cfg, "hub_id", None), framework=getattr(cfg, "framework", None),
             tasks=getattr(cfg, "tasks", None), primary_task=getattr(cfg, "primary_task", None),

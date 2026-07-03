@@ -8,6 +8,7 @@ from ...whisper_model import WhisperRunner, TranscribeRequest
 
 from ...embed import FeatureExtractionRunner, EmbedRequest
 from ...imagegen import ImageGenRunner, Img2ImgRunner, ImageGenRequest
+from ...comfy import ComfyRunner
 from ...keywords import KeywordRunner, KeywordTaskRequest
 from ...vision_analysis import (
     VisionAnalysisRequest,

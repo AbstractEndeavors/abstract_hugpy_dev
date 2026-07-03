@@ -33,6 +33,9 @@ RUNNER_PAIRS = {
     ("transformers", "text-summarization"), ("transformers", "text2text-generation"),
     ("transformers", "feature-extraction"), ("transformers", "sentence-similarity"),
     ("transformers", "text-to-image"), ("transformers", "image-to-image"),
+    # ComfyUI engine rows (slice B) — the checkpoint lives in the WORKER's own
+    # ComfyUI install; hugpy holds no files for these.
+    ("comfy", "text-to-image"), ("comfy", "image-to-image"),
     ("transformers", "keyword-extraction"),
     ("transformers", "depth-estimation"), ("transformers", "object-detection"),
     ("transformers", "image-classification"), ("transformers", "image-segmentation"),
