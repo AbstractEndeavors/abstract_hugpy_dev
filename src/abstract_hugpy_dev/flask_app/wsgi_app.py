@@ -66,15 +66,18 @@ def _mount_ui(app, dist_dir: str) -> None:
         target = os.path.join(dist_dir, asset)
         if asset and os.path.isfile(target):
             return send_from_directory(dist_dir, asset)
-        # The media-intelligence arm is a separate SPA shipped at media/ inside
-        # the same dist (console_dist/media/*). Its assets are real files (served
-        # above); its deep links (/media, /media/foo) must fall back to the arm's
-        # OWN index.html, not the console SPA's — mirrors the webpack devServer
-        # historyApiFallback rewrite that keeps the dev path working.
-        if (asset == "media" or asset.startswith("media/")) and os.path.isfile(
-            os.path.join(dist_dir, "media", "index.html")
-        ):
-            return send_from_directory(os.path.join(dist_dir, "media"), "index.html")
+        # Standalone arms (media-intelligence, video-intelligence) are separate
+        # SPAs shipped at <arm>/ inside the same dist (console_dist/<arm>/*).
+        # Their assets are real files (served above); their deep links (/media,
+        # /video/foo) must fall back to the arm's OWN index.html, not the console
+        # SPA's — mirrors the webpack devServer historyApiFallback rewrite that
+        # keeps the dev path working. Guarded by isfile, so an arm that isn't
+        # shipped in this dist changes nothing.
+        for arm in ("media", "video"):
+            if (asset == arm or asset.startswith(arm + "/")) and os.path.isfile(
+                os.path.join(dist_dir, arm, "index.html")
+            ):
+                return send_from_directory(os.path.join(dist_dir, arm), "index.html")
         return send_from_directory(dist_dir, "index.html")
 
 

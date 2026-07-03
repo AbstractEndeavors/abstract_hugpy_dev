@@ -329,8 +329,24 @@ async def execute_chat_stream(*args, cancel_event=None, **kwargs):
             elif etype == "done":
                 finish = getattr(event, "finish_reason", None) or "stop"
             elif etype == "error":
-                yield ErrorEvent(request_id=rid,
-                                 message=getattr(event, "message", None) or "run failed")
+                # A CONTINUATION pass that dies after the answer already streamed
+                # shouldn't turn a delivered answer into "[Error: ...]" in the
+                # chat. This happens for real: a rambling model (e.g. a
+                # text-encoder repack that never stops thinking) auto-continues
+                # until the engine overruns its context and the server aborts the
+                # stream mid-body. End gracefully with what we have; only a
+                # FIRST-pass error (nothing delivered) is surfaced as an error.
+                if is_cont and full_text.strip():
+                    logger.warning(
+                        "continuation pass %s failed (%s); ending %s gracefully "
+                        "with %d chars already streamed", attempt + 1,
+                        getattr(event, "message", None) or "run failed",
+                        rid, len(full_text))
+                    yield DoneEvent(request_id=rid, input_tokens=0,
+                                    output_chunks=1, finish_reason="stop")
+                else:
+                    yield ErrorEvent(request_id=rid,
+                                     message=getattr(event, "message", None) or "run failed")
                 errored = True
                 break
             else:

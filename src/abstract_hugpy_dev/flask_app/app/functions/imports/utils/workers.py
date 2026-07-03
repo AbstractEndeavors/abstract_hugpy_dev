@@ -489,7 +489,20 @@ class WorkerStore:
             if gpus is not None:
                 worker["gpus"] = gpus
             if loaded_models is not None:
-                worker["loaded_models"] = loaded_models
+                # TRUTHFUL residency: the agent's loaded_models only covers its
+                # in-process dispatch cache — a model resident in a SLOT child
+                # (llama_cpp.server / llama-server it spawned or adopted) is
+                # invisible to it, so the console showed "Serving, nothing
+                # loaded" while GBs sat on the GPU, and the warm reconcile
+                # would re-probe already-warm models. Union in what the slots
+                # report about themselves.
+                merged = list(loaded_models)
+                for s in (slots if slots is not None
+                          else worker.get("slots") or []):
+                    mk = (s or {}).get("model_key")
+                    if mk and s.get("healthy") and mk not in merged:
+                        merged.append(mk)
+                worker["loaded_models"] = merged
             if provisioning is not None:
                 worker["provisioning"] = provisioning
             if provision_progress is not None:
@@ -697,6 +710,24 @@ class WorkerStore:
             # looks "offline" is often still serviceable. The stream proxy fails
             # fast to local if the worker is genuinely unreachable.
             candidates = self.workers_for_model(model_key, online_only=False, pool=pool)
+        if not candidates and (pool or "").strip():
+            # PHANTOM-POOL RESCUE: a pool restriction only means something when the
+            # pool exists. If NO registered worker carries this pool tag at all
+            # (e.g. a client still sending the old default pool="ml" on a fleet
+            # that never tagged one), honoring it would silently strand the request
+            # on central-local even though a general worker serves the model. That
+            # is the exact bug the un-pooled client default fixed — cover stale
+            # clients here too. A pool with members but none available keeps the
+            # reservation semantics: no crossover, local fallback.
+            want_pool = pool.strip()
+            pool_exists = any((w.get("pool") or "").strip() == want_pool
+                              for w in self.all())
+            if not pool_exists:
+                import logging as _logging
+                _logging.getLogger(__name__).info(
+                    "pool %r has no registered workers; treating request "
+                    "for %s as general (un-pooled)", want_pool, model_key)
+                return self.pick_for_model(model_key, pool=None)
         if not candidates:
             return None
 

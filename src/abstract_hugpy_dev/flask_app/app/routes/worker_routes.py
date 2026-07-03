@@ -50,6 +50,63 @@ from ..functions.imports.utils.enrollment_tokens import (
 worker_bp, logger = get_bp("worker_bp", __name__)
 
 
+# ── assigned = ready: background warm + heartbeat reconcile ─────────────────
+# An operator's assignment is a READINESS contract, not a routing hint: a model
+# designated to a worker is loaded there proactively — assign kicks a warm, and
+# every heartbeat re-converges assigned-vs-loaded (covers worker reboots, agent
+# restarts and evictions) — so the first real request never pays a multi-GB
+# lazy load. Best-effort and rate-limited: a model that doesn't fit simply
+# fails its probe on the worker (reported honestly there) and is retried only
+# after the cooldown; probes run SEQUENTIALLY per worker so two multi-GB loads
+# never race for the same VRAM.
+import time as _time
+import threading as _threading
+
+_WARM_COOLDOWN_S = float(os.environ.get("HUGPY_WARM_COOLDOWN_S", "600"))
+_warm_last: dict = {}          # (worker_id, model_key) -> monotonic ts
+_warm_busy: set = set()        # worker_ids with a warm thread in flight
+_warm_lock = _threading.Lock()
+
+
+def _kick_warm(worker, model_keys, source: str) -> list:
+    """Probe the given models on the worker in ONE background thread.
+
+    Returns the models actually scheduled (cooldown/busy-filtered). Safe to
+    call from any request: never blocks, never raises."""
+    import httpx
+    wid = (worker or {}).get("id") or ""
+    base = ((worker or {}).get("url") or "").rstrip("/")
+    if not wid or not base:
+        return []
+    now = _time.monotonic()
+    with _warm_lock:
+        if wid in _warm_busy:
+            return []
+        due = [mk for mk in model_keys
+               if now - _warm_last.get((wid, mk), 0.0) >= _WARM_COOLDOWN_S]
+        if not due:
+            return []
+        for mk in due:
+            _warm_last[(wid, mk)] = now
+        _warm_busy.add(wid)
+    logger.info("warming %s on worker %s (%s)", due, wid[:8], source)
+
+    def _run():
+        try:
+            for mk in due:
+                try:
+                    httpx.post(base + "/probe/" + mk, timeout=900.0)
+                except Exception:
+                    pass   # best-effort; the next reconcile retries post-cooldown
+        finally:
+            with _warm_lock:
+                _warm_busy.discard(wid)
+
+    _threading.Thread(target=_run, name=f"warm-{source}-{wid[:8]}",
+                      daemon=True).start()
+    return due
+
+
 def _bearer_token() -> str | None:
     """Extract a Bearer token from the Authorization header (worker enrollment)."""
     auth = request.headers.get("Authorization", "")
@@ -322,6 +379,17 @@ def workers_heartbeat(worker_id):
     if worker.get("admission") == "blocked":
         # Persistent eviction: 403 stops the agent instead of letting it limp on.
         abort(403, description="Worker is blocked by the operator.")
+    # Designated = ready: re-converge assigned-vs-loaded on every beat. A cold
+    # assigned model (worker rebooted, agent restarted, weights evicted) gets a
+    # background warm — rate-limited by _WARM_COOLDOWN_S so an un-fittable
+    # model doesn't probe-spin.
+    try:
+        cold = [mk for mk in (worker.get("models") or [])
+                if mk not in set(worker.get("loaded_models") or [])]
+        if cold:
+            _kick_warm(worker, cold, "reconcile")
+    except Exception:
+        pass  # readiness convergence must never fail a heartbeat
     # Advertise the target version every beat, so a worker converges within one
     # heartbeat of central's required version changing.
     worker["required_pkg_version"] = required_pkg_version()
@@ -424,6 +492,9 @@ def workers_assign(worker_id):
     worker = assign_model(worker_id, body.model_key, spill=body.spill)
     if worker is None:
         abort(404, description="Unknown worker id.")
+    # Designated = ready: load it on the worker NOW (background), don't wait
+    # for the first inference to pay the lazy load.
+    _kick_warm(worker, [body.model_key], "assign")
     return jsonify(worker)
 
 

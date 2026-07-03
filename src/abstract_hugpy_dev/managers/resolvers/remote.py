@@ -263,16 +263,23 @@ async def _worker_run_once(worker: dict, payload: dict, result_type, request_id:
 
     Tolerant of a worker that returns the slim {ok,text,finish_reason} shape by
     filling request_id/model_key defaults before validation.
-    """
-    from abstract_apis import postRequest
 
-    data = await asyncio.to_thread(
-        postRequest,
-        url=worker["url"],
-        endpoint="infer",
-        data=payload,
-        timeout=3600,
-    )
+    Plain httpx like _worker_stream — BYTE-FAITHFUL on purpose. The previous
+    abstract_apis transport recursively json-parsed every string field of the
+    reply (load_inner_json), so any model answer that happened to be valid JSON
+    ("{}", "42", "true", a JSON-formatted reply, …) mutated text:str into a
+    dict/int/bool, failed result_type validation here, and silently re-ran the
+    whole request on central — a phantom local fallback that looked random
+    because it depended on what the model said.
+    """
+    import httpx
+
+    url = worker["url"].rstrip("/") + "/infer"
+    timeout = httpx.Timeout(3600.0, connect=4.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(url, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
     if isinstance(data, dict):
         data.setdefault("request_id", request_id)
         data.setdefault("model_key", model_key)
@@ -297,15 +304,17 @@ def make_peer_runner(peer, framework: str, task: str):
             self.model_key = cfg.model_key
 
         async def run(self, req):
-            from abstract_apis import postRequest
+            # httpx, byte-faithful — see _worker_run_once: abstract_apis'
+            # load_inner_json re-parses string fields and corrupts JSON-shaped
+            # model replies, failing validation.
+            import httpx
             payload = {"delegated": True, "task": task, **req.model_dump()}
-            data = await asyncio.to_thread(
-                postRequest,
-                url=peer.base_url,
-                endpoint="api/llm/execute",
-                data=payload,
-                timeout=self.cfg.timeout_s or 3600,
-            )
+            url = peer.base_url.rstrip("/") + "/api/llm/execute"
+            timeout = httpx.Timeout(float(self.cfg.timeout_s or 3600), connect=4.0)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(url, json=payload)
+                resp.raise_for_status()
+                data = resp.json()
             return self.result_type.model_validate(data)
 
     return PeerRunner

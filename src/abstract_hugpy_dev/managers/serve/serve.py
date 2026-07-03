@@ -87,8 +87,17 @@ DEFAULT_LLAMA_NGL = int(get_env_value("DEFAULT_LLAMA_NGL") or -1)
 # who genuinely wants a pinned local unit sets serve_mode=systemd per model, and
 # DEFAULT_SERVE_MODE=<mode> (env) still overrides globally.
 from ..._platform import IS_LINUX as _IS_LINUX
+def _clean_mode_value(value) -> str:
+    """Sanitize a serve-mode string from env/config: strip an inline
+    ``# comment`` and surrounding whitespace, lowercase. An .env line like
+    ``DEFAULT_SERVE_MODE=systemd   # one unit per model`` otherwise reaches
+    ServeMode() verbatim and every serve-spec build raises ValueError
+    (observed breaking GET /llm/serving fleet-wide on the op worker)."""
+    return str(value or "").split("#", 1)[0].strip().lower()
+
+
 def _default_serve_mode() -> str:
-    explicit = get_env_value("DEFAULT_SERVE_MODE")
+    explicit = _clean_mode_value(get_env_value("DEFAULT_SERVE_MODE"))
     if explicit:
         return explicit
     return "swap"
@@ -196,7 +205,7 @@ def _resolve_mode(cfg, extra=None) -> ServeMode:
     if getattr(cfg, "framework", None) != "llama_cpp":
         return ServeMode.OFF
     extra = extra if extra is not None else (getattr(cfg, "extra", {}) or {})
-    explicit = extra.get("serve_mode")
+    explicit = _clean_mode_value(extra.get("serve_mode"))
     # systemd no longer falls back to off for a missing port — _resolve_port
     # auto-assigns a deterministic one.
     mode = ServeMode(explicit) if explicit else ServeMode(DEFAULT_SERVE_MODE)
