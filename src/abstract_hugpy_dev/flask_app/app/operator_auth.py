@@ -85,9 +85,11 @@ _SENSITIVE = [
     # F4 settings: reads stay open (UIs render from them); writes are the
     # console's authoritative control plane (CON-08) -> operator-only.
     ({"POST", "PUT", "DELETE"},  re.compile(r"^/settings/.+$")),
-    # Worker ops (CON-05/06, UTIL-02): restart / module update / pip install
-    # are privileged executor actions on a worker — operator-only, audited.
-    ({"POST"},                   re.compile(r"^/llm/workers/[^/]+/(restart|update|pip)$")),
+    # Worker ops (CON-05/06, UTIL-02): restart / module update / pip install /
+    # serving-config are privileged executor actions on a worker —
+    # operator-only, audited. (config added 2026-07-03: it re-execs the agent
+    # and rewrites its runtime settings — same privilege tier as update.)
+    ({"POST"},                   re.compile(r"^/llm/workers/[^/]+/(restart|update|pip|config)$")),
 ]
 
 _SESSION_CACHE: dict[str, tuple[bool, float]] = {}
