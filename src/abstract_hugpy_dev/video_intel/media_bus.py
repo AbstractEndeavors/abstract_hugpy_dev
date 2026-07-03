@@ -277,10 +277,13 @@ def run_claimed(job_id: str, worker_token: str) -> Optional[JobResult]:
             # not our claim — refuse to write (single writer invariant)
             return None
 
-        # transition to running (gated on our claim_token)
+        # transition to running (gated on our claim_token). The status guard
+        # keeps a concurrent cancel visible: a job flipped to 'cancelling'
+        # between claim and here must NOT be overwritten back to 'running'
+        # (the runners poll is_cancelling between frames).
         conn.execute(
             "UPDATE media_jobs SET status='running', updated=? "
-            "WHERE job_id=? AND claim_token=?",
+            "WHERE job_id=? AND claim_token=? AND status='claimed'",
             (time.time(), job_id, worker_token),
         )
     finally:
@@ -310,7 +313,15 @@ def run_claimed(job_id: str, worker_token: str) -> Optional[JobResult]:
         )
 
     # ---- write the terminal state ONCE (single writer via claim_token) ----
-    status = "done" if result.ok else "failed"
+    # A runner that honored a cancel returns error.code='cancelled' — record
+    # that as its own terminal status so the console can tell "you stopped it"
+    # from "it broke".
+    if result.ok:
+        status = "done"
+    elif result.error is not None and getattr(result.error, "code", None) == "cancelled":
+        status = "cancelled"
+    else:
+        status = "failed"
     result_json = serialize_result(result)
     conn = _connect()
     try:
@@ -322,6 +333,61 @@ def run_claimed(job_id: str, worker_token: str) -> Optional[JobResult]:
     finally:
         conn.close()
     return result
+
+
+def cancel(job_id: str) -> dict:
+    """Cooperative cancel. queued → 'cancelled' outright (claim() only picks
+    'queued', so it never runs); claimed/running → 'cancelling', a flag the
+    frame-loop runners poll via is_cancelling() and honor between frames
+    (mid-frame inference is never interrupted); terminal states are untouched.
+    Returns {"job_id", "status", "cancelled": bool} — cancelled=False means
+    there was nothing to stop (unknown id or already terminal)."""
+    _ensure_db()
+    from .result_schema import JobError, JobResult as _JR
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT status FROM media_jobs WHERE job_id=?", (job_id,),
+        ).fetchone()
+        if row is None:
+            return {"job_id": job_id, "status": None, "cancelled": False}
+        status = row[0]
+        if status == "queued":
+            result_json = serialize_result(_JR(
+                job_id=job_id, ok=False,
+                error=JobError(code="cancelled",
+                               message="cancelled before it started",
+                               retryable=False)))
+            conn.execute(
+                "UPDATE media_jobs SET status='cancelled', result_json=?, "
+                "updated=? WHERE job_id=? AND status='queued'",
+                (result_json, time.time(), job_id),
+            )
+            return {"job_id": job_id, "status": "cancelled", "cancelled": True}
+        if status in ("claimed", "running"):
+            conn.execute(
+                "UPDATE media_jobs SET status='cancelling', updated=? "
+                "WHERE job_id=? AND status IN ('claimed','running')",
+                (time.time(), job_id),
+            )
+            return {"job_id": job_id, "status": "cancelling", "cancelled": True}
+        return {"job_id": job_id, "status": status, "cancelled": False}
+    finally:
+        conn.close()
+
+
+def is_cancelling(job_id: str) -> bool:
+    """True while a cancel is pending for a claimed/running job — polled by the
+    frame-loop runners between frames."""
+    _ensure_db()
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT status FROM media_jobs WHERE job_id=?", (job_id,),
+        ).fetchone()
+        return bool(row) and row[0] == "cancelling"
+    finally:
+        conn.close()
 
 
 def work_once(worker_token: Optional[str] = None) -> Optional[str]:

@@ -219,6 +219,55 @@ class Img2ImgRunner:
             # on cpu, move the whole pipe to the resolved device.
             cuda = torch.cuda.is_available()
             dtype = torch.float16 if cuda else torch.float32
+
+            # ---- fit ladder (cuda only) -------------------------------------
+            # Weights far bigger than free VRAM (Qwen-Image-Edit: ~55GB bf16 vs
+            # a 24GB card) can still serve: quantize ON LOAD to bnb 4-bit
+            # (~4.5x smaller — the 20B transformer lands ~11GB) and let
+            # cpu-offload spill the rest to host RAM. Opt out / force via
+            # HUGPY_IMG2IMG_QUANTIZE = "auto" (default) | "always" | "never".
+            quant_config = None
+            if cuda:
+                mode = (os.environ.get("HUGPY_IMG2IMG_QUANTIZE") or "auto").lower()
+                weight_bytes = 0
+                for root, _dirs, files in os.walk(model_dir):
+                    for fn in files:
+                        if fn.endswith((".safetensors", ".bin")):
+                            try:
+                                weight_bytes += os.path.getsize(os.path.join(root, fn))
+                            except OSError:
+                                pass
+                free_vram = torch.cuda.mem_get_info()[0]
+                need_quant = (mode == "always" or
+                              (mode == "auto" and weight_bytes > free_vram * 0.85))
+                if need_quant and mode != "never":
+                    try:
+                        import bitsandbytes  # noqa: F401 — availability probe
+                        from diffusers import PipelineQuantizationConfig
+                        quant_config = PipelineQuantizationConfig(
+                            quant_backend="bitsandbytes_4bit",
+                            quant_kwargs={
+                                "load_in_4bit": True,
+                                "bnb_4bit_quant_type": "nf4",
+                                "bnb_4bit_compute_dtype": torch.bfloat16,
+                            },
+                            components_to_quantize=["transformer", "text_encoder"],
+                        )
+                        logger.warning(
+                            "Img2ImgRunner: model=%s weights ~%.1fGB vs %.1fGB free "
+                            "VRAM — loading in bnb 4-bit (nf4) to fit",
+                            self.model_key, weight_bytes / 1e9, free_vram / 1e9,
+                        )
+                    except Exception as exc:  # noqa: BLE001 — no bnb/API: plain load
+                        logger.warning(
+                            "Img2ImgRunner: wanted 4-bit load for %s but the "
+                            "quantization stack is unavailable (%s) — plain load "
+                            "may OOM", self.model_key, exc,
+                        )
+                        quant_config = None
+            load_kwargs: Dict[str, Any] = {"torch_dtype": dtype}
+            if quant_config is not None:
+                load_kwargs["quantization_config"] = quant_config
             # AutoPipelineForImage2Image only maps the classic families (SD /
             # SDXL / flux1 …); natively image-conditioned EDIT pipelines
             # (QwenImageEditPlusPipeline, Flux2KleinPipeline, …) are absent from
@@ -229,7 +278,7 @@ class Img2ImgRunner:
             fallback = False
             try:
                 pipe = AutoPipelineForImage2Image.from_pretrained(
-                    model_dir, torch_dtype=dtype,
+                    model_dir, **load_kwargs,
                 )
             except ValueError as exc:
                 logger.info(
@@ -237,16 +286,21 @@ class Img2ImgRunner:
                     "model=%s (%s); falling back to the concrete pipeline class",
                     self.model_key, exc,
                 )
-                pipe = DiffusionPipeline.from_pretrained(model_dir, torch_dtype=dtype)
+                pipe = DiffusionPipeline.from_pretrained(model_dir, **load_kwargs)
                 fallback = True
-            if cuda and fallback:
+            if cuda and (fallback or quant_config is not None):
                 # Edit pipelines are typically far larger than the classic SD
-                # families — component-wise CPU offload lets them run within a
-                # single consumer GPU's VRAM instead of OOMing at .to("cuda").
+                # families — component-wise CPU offload spills non-active
+                # components to host RAM so a single consumer GPU serves them
+                # instead of OOMing at .to("cuda"). (bnb-quantized components
+                # are already device-placed; offload handles the rest.)
                 try:
                     pipe.enable_model_cpu_offload()
                 except Exception:
-                    pipe = pipe.to("cuda")
+                    try:
+                        pipe = pipe.to("cuda")
+                    except Exception:
+                        pass  # quantized components may already sit on device
             else:
                 pipe = pipe.to("cuda" if cuda else "cpu")
 

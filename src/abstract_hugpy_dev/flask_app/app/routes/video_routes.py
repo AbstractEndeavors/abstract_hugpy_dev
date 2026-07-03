@@ -285,6 +285,17 @@ def video_job_status(job_id):
 
 
 # --------------------------------------------------------------------------- #
+# 3b) POST /video/jobs/<job_id>/cancel — cooperative cancel
+# --------------------------------------------------------------------------- #
+@video_bp.route("/video/jobs/<job_id>/cancel", methods=["POST"])
+def video_job_cancel(job_id):
+    # queued jobs die outright; a running scene stops BETWEEN frames (mid-frame
+    # inference is never interrupted). Idempotent — cancelling a terminal or
+    # unknown job reports cancelled=False.
+    return jsonify(media_bus.cancel(job_id)), 200
+
+
+# --------------------------------------------------------------------------- #
 # 4) GET /video/media?handle=<abspath> — serve raw bytes for a MediaRef uri
 # --------------------------------------------------------------------------- #
 @video_bp.route("/video/media", methods=["GET"])

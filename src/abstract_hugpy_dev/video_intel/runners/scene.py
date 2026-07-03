@@ -222,6 +222,14 @@ def run_generate_scene(spec: GenerateSceneSpec, job_id: str) -> JobResult:
         )
         prev_output = start_frame   # chain: previous frame's OUTPUT feeds the next
         for i in range(spec.n_frames):
+            # Cooperative cancel — honored BETWEEN frames (mid-frame inference
+            # is never interrupted). The console's Cancel sets 'cancelling'.
+            from ..media_bus import is_cancelling
+            if is_cancelling(job_id):
+                return JobResult(job_id, ok=False, error=JobError(
+                    code="cancelled",
+                    message=f"cancelled after {i} of {spec.n_frames} frame(s)",
+                    retryable=False))
             # chain:    frame 0 = base prompt; frame i>0 = base + motion step i.
             # parallel: every frame = base + motion step i (all off the start frame).
             include_motion = bool(spec.motion) and (spec.chain is False or i > 0)
@@ -265,6 +273,13 @@ def run_generate_scene(spec: GenerateSceneSpec, job_id: str) -> JobResult:
             job_id, spec.model_id, spec.n_frames,
         )
         for i in range(spec.n_frames):
+            # Cooperative cancel — same seam as the img2img path above.
+            from ..media_bus import is_cancelling
+            if is_cancelling(job_id):
+                return JobResult(job_id, ok=False, error=JobError(
+                    code="cancelled",
+                    message=f"cancelled after {i} of {spec.n_frames} frame(s)",
+                    retryable=False))
             # ---- per-frame prompt schedule (v1): positional tag + optional motion ----
             prompt = base_prompt + f", frame {i + 1} of {spec.n_frames}"
             if spec.motion:
