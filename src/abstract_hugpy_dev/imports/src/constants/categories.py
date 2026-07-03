@@ -12,7 +12,14 @@ HF_TASK_TO_TASKS = {
     "feature-extraction": ["feature-extraction", "sentence-similarity", "keyword-extraction"],
     "sentence-similarity": ["feature-extraction", "sentence-similarity", "keyword-extraction"],
     "text-to-image": ["text-to-image"],
-    "image-to-image": ["image-to-image"],
+    # NOTE: "image-to-image" is deliberately NOT in the discovery vocabulary.
+    # sd-turbo is the ONLY supported img2img model (advertised via its curated
+    # tasks list at go-live — see models_config.py step-6). Omitting it here keeps
+    # model DISCOVERY from auto-advertising externally-downloaded
+    # pipeline_tag=image-to-image models (e.g. flux / Qwen-Image-Edit) as servable
+    # img2img before they are vetted. The ("transformers","image-to-image")
+    # RUNNER_PAIRS entry below is REQUIRED and stays (it prevents sd-turbo being
+    # dropped by derive_model_config_row when step-6 is flipped).
     # Vision-analysis family — HF pipeline tags map 1:1.
     "depth-estimation": ["depth-estimation"],
     "object-detection": ["object-detection"],
