@@ -329,8 +329,33 @@ class Slot:
         except Exception:
             return False
 
+    def _self_heal(self):
+        """Clear a WEDGED claim: child dead but model_key still set.
+
+        Without this the slot reports model_key + healthy=False FOREVER — the
+        console renders that as a permanent "loading" pill and endpoint_for
+        waits its full timeout on a corpse. (Observed 2026-07-03: slot 1's
+        reload died and flux showed "loading" indefinitely while chats were
+        actually served in-process.) Non-blocking lock: a load() mid-flight
+        also has model_key set with the child coming up — its own failure
+        path cleans up, so never race it."""
+        if self.model_key is None or self._child_alive():
+            return
+        if not self.lock.acquire(blocking=False):
+            return
+        try:
+            if self.model_key is not None and not self._child_alive():
+                logger.warning("slot %s: child died while claiming %s — "
+                               "clearing the stale claim", SLOT_ID, self.model_key)
+                self.model_key = self.ngl = self.ctx = None
+                self.threads = self.cpus = self.gpu = self.expected_bytes = None
+                self.proc = None
+        finally:
+            self.lock.release()
+
     def status(self) -> dict:
         from ..spill import free_vram_bytes
+        self._self_heal()
         return {
             "slot_id": SLOT_ID,
             "control_port": SLOT_PORT,

@@ -7,6 +7,11 @@ from .app import routes as routes
 from .app.routes.worker_routes import worker_bp
 from .app.routes.phone_brick_routes import phone_brick_bp
 from .app.routes.discord_routes import discord_bp
+from .app.routes.video_routes import video_bp
+
+# Video Intelligence worker daemon is started ONCE per process at app init
+# (guarded below). Module-level so re-entrant app creation can't spawn a second.
+_VIDEO_DAEMON_STARTED = False
 
 
 class ApiPrefixMiddleware:
@@ -134,6 +139,17 @@ def get_hugpy_flask(name=None,allowed_origins=None,debug=False):
     except (ValueError, AssertionError):
         pass
 
+    # Same /api dual-mount for the Video Intelligence routes. The public path is
+    # dev.hugpy.ai/api/video/...; host nginx strips /api before the VM, so the
+    # bare /video/... mount (auto-discovered via routes/__init__) serves the
+    # proxied path, and this second mount makes direct-to-gunicorn /api/video/...
+    # resolve identically (mirrors worker_bp). The original /video/... mount is
+    # untouched.
+    try:
+        app.register_blueprint(video_bp, url_prefix="/api", name="video_bp_api")
+    except (ValueError, AssertionError):
+        pass
+
     # Optional: mount the media_intelligence HTTP bridge at /media/analyze.
     #
     # The chat's media-intelligence path (ui mediaIntelligence.ts -> tryServerBridge)
@@ -215,4 +231,22 @@ def get_hugpy_flask(name=None,allowed_origins=None,debug=False):
     except Exception as _exc:
         import logging as _logging
         _logging.getLogger(__name__).error("comms bus wiring failed: %s", _exc)
+
+    # Start the Video Intelligence job worker daemon ONCE per process. Each of
+    # the gunicorn worker processes starts one; the bus's atomic cross-process
+    # claim guarantees exactly one daemon runs any given job — that's intended.
+    # Guarded by a module-level boolean (no double-start on re-entrant app
+    # creation) AND wrapped in try/except so a failure here logs and can NEVER
+    # break app creation or the existing surfaces.
+    global _VIDEO_DAEMON_STARTED
+    if not _VIDEO_DAEMON_STARTED:
+        try:
+            from abstract_hugpy_dev.video_intel import media_bus as _media_bus
+            _media_bus.start_worker_daemon()
+            _VIDEO_DAEMON_STARTED = True
+        except Exception as _exc:
+            import logging as _logging
+            _logging.getLogger(__name__).error(
+                "video_intel worker daemon start failed: %s", _exc
+            )
     return app
