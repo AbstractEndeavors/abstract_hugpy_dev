@@ -805,9 +805,24 @@ def build_app(state: "WorkerState") -> Flask:
     @app.route("/infer", methods=["POST"])
     def infer():
         payload = request.get_json(silent=True) or {}
-        _apply_spill(payload.pop("spill", None))
-        _ensure_present(payload, state.central_url)
-        return jsonify(_run_once(payload))
+        # Errors as DATA, never a raw Flask 500: the raw error page hides the
+        # worker-side traceback from central entirely (2026-07-03: three
+        # opaque delegation failures in one day were undiagnosable from
+        # central). A 500 with a JSON body rides back through the delegating
+        # runner's error path, so the console shows the REAL cause.
+        try:
+            _apply_spill(payload.pop("spill", None))
+            _ensure_present(payload, state.central_url)
+            return jsonify(_run_once(payload))
+        except Exception as exc:  # noqa: BLE001
+            import traceback
+            tb = traceback.format_exc()
+            logger.error("infer failed: %s", tb)
+            return jsonify({
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+                "traceback_tail": tb[-1500:],
+            }), 500
 
     @app.route("/infer/stream", methods=["POST"])
     def infer_stream():
