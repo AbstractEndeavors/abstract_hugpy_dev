@@ -271,7 +271,7 @@ def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None,
         if cpus:
             logger.info("slot %s: cpu pin %r ignored in llama_cpp.server mode",
                         SLOT_ID, cpus)
-    return argv, ngl, ctx, threads, cpus
+    return argv, ngl, ctx, threads, cpus, ("binary" if server_bin else "python")
 
 
 class Slot:
@@ -289,6 +289,13 @@ class Slot:
         self.loaded_at = 0.0
         self.last_used = 0.0
         self.lock = threading.Lock()
+        # llama_cpp.server (python child) cannot take CONCURRENT streaming
+        # requests — overlapping streams kill BOTH with an incomplete chunked
+        # read (observed 2026-07-02: the media console's chat + side-calls).
+        # The proxy serializes streams through this gate for python children;
+        # the C++ llama-server handles parallel slots natively and skips it.
+        self.child_kind = None
+        self.stream_gate = threading.Semaphore(1)
         self.child_base = f"http://127.0.0.1:{SLOT_CHILD_PORT}"
 
     # -- health ------------------------------------------------------------
@@ -343,7 +350,8 @@ class Slot:
                 return self.status()
 
             self._kill()
-            argv, self.ngl, self.ctx, self.threads, self.cpus = _build_cmd(
+            (argv, self.ngl, self.ctx, self.threads, self.cpus,
+             self.child_kind) = _build_cmd(
                 model_key, n_gpu_layers, ctx, threads, cpus, path=path,
                 gpu_mem_gib=gpu_mem_gib, cpu_mem_gib=cpu_mem_gib)
             # per-load GPU pin overrides the slot's MAIN_GPU default
@@ -449,11 +457,23 @@ def build_app():
         headers = {k: v for k, v in request.headers
                    if k.lower() not in ("host", "content-length")}
 
-        client = httpx.Client(timeout=None)
-        upstream = client.send(
-            client.build_request(request.method, url, content=body, headers=headers),
-            stream=True,
-        )
+        # Serialize python-child requests end-to-end (see stream_gate note):
+        # the gate is held for the WHOLE response lifetime and released in the
+        # generator's finally, so an overlapping caller waits instead of
+        # crashing both streams.
+        gated = (slot.child_kind == "python")
+        if gated:
+            slot.stream_gate.acquire()
+        try:
+            client = httpx.Client(timeout=None)
+            upstream = client.send(
+                client.build_request(request.method, url, content=body, headers=headers),
+                stream=True,
+            )
+        except Exception:
+            if gated:
+                slot.stream_gate.release()
+            raise
 
         def generate():
             try:
@@ -462,6 +482,8 @@ def build_app():
             finally:
                 upstream.close()
                 client.close()
+                if gated:
+                    slot.stream_gate.release()
 
         return Response(generate(), status=upstream.status_code,
                         content_type=upstream.headers.get("content-type", "application/json"))
