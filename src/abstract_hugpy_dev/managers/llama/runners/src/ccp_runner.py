@@ -56,34 +56,74 @@ class LlamaCppRunner(LlamaCppBaseRunner):
 ##        self.port: int = cfg[model_key]
 ##        self.base_url = f"{self.llama_host}:{self.port}"
 
+    def _refresh_endpoint(self) -> bool:
+        """Re-resolve the serving endpoint after a stale-slot failure.
+
+        This runner instance is CACHED by dispatch, so its base_url can
+        outlive the slot it points at (the slot self-heals/unloads/TTLs the
+        model, the agent restarts, …) — the proxy then 503s "no model
+        loaded" forever while the cached instance keeps knocking. serve
+        resolution is authoritative and side-effecting (it loads the model
+        into a free slot and waits healthy), so one refresh + retry turns a
+        permanently-broken cached runner into a slow first request."""
+        try:
+            base = serve_endpoint(self.model_key)
+        except Exception:
+            return False
+        if not base or base.rstrip("/") == self.base_url:
+            return False
+        self.base_url = base.rstrip("/")
+        self.served_model = serve_model_name(self.model_key)
+        return True
+
     async def _iter_stream(self, messages, max_tokens, temp, top_p):
         payload = {"messages": messages, "max_tokens": max_tokens,
                    "temperature": temp, "top_p": top_p, "stream": True}
-        async with httpx.AsyncClient(timeout=None) as client:
-            async with client.stream("POST", f"{self.base_url}/v1/chat/completions",
-                                     json=payload) as response:
-                response.raise_for_status()
-                async for line in response.aiter_lines():
-                    if not line or line.strip() == "[DONE]":
+        for attempt in (1, 2):
+            try:
+                async with httpx.AsyncClient(timeout=None) as client:
+                    async with client.stream("POST", f"{self.base_url}/v1/chat/completions",
+                                             json=payload) as response:
+                        response.raise_for_status()
+                        async for line in response.aiter_lines():
+                            if not line or line.strip() == "[DONE]":
+                                continue
+                            line = line.removeprefix("data: ")
+                            try:
+                                data = json.loads(line)
+                                choice = data["choices"][0]
+                                text = (choice.get("delta") or {}).get("content") or ""
+                                fr   = choice.get("finish_reason")
+                            except Exception:
+                                text, fr = "", None
+                            yield text, fr
+                return
+            except (httpx.HTTPStatusError, httpx.ConnectError) as exc:
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                if attempt == 1 and (status in (502, 503) or isinstance(exc, httpx.ConnectError)):
+                    # Stale cached endpoint (slot unloaded/agent restarted):
+                    # re-resolve — serve_endpoint reloads the model — and retry once.
+                    if self._refresh_endpoint():
                         continue
-                    line = line.removeprefix("data: ")
-                    try:
-                        data = json.loads(line)
-                        choice = data["choices"][0]
-                        text = (choice.get("delta") or {}).get("content") or ""
-                        fr   = choice.get("finish_reason")
-                    except Exception:
-                        text, fr = "", None
-                    yield text, fr
+                raise
     def _chat_complete(self, messages, max_tokens, temp, top_p, stop):
         payload = {"messages": messages, "max_tokens": max_tokens,
                    "temperature": temp, "top_p": top_p, "stream": False}
         if stop:
             payload["stop"] = stop
-        with httpx.Client(timeout=DEFAULT_HTTP_TIMEOUT) as client:
-            r = client.post(f"{self.base_url}/v1/chat/completions", json=payload)
-            r.raise_for_status()
-            data = r.json()
+        for attempt in (1, 2):
+            try:
+                with httpx.Client(timeout=DEFAULT_HTTP_TIMEOUT) as client:
+                    r = client.post(f"{self.base_url}/v1/chat/completions", json=payload)
+                    r.raise_for_status()
+                    data = r.json()
+                break
+            except (httpx.HTTPStatusError, httpx.ConnectError) as exc:
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                if attempt == 1 and (status in (502, 503) or isinstance(exc, httpx.ConnectError)):
+                    if self._refresh_endpoint():   # stale cached endpoint — see _iter_stream
+                        continue
+                raise
         choice = data["choices"][0]
         return choice["message"]["content"] or "", choice.get("finish_reason") or "stop"
 

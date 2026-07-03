@@ -27,6 +27,7 @@ from uuid import uuid4
 
 from abstract_hugpy_dev.imports.src.constants.constants import DEFAULT_ROOT
 
+from .audio_schema import make_audio_extract
 from .crop_schema import CropSpec, SpatialRegion, TemporalRegion, make_crop
 from .frame_schema import make_frame_extract
 from .gen_schema import GenPromptPart, make_generate_image
@@ -85,6 +86,13 @@ def _frame_extract_from_dict(d: dict):
     )
 
 
+def _audio_extract_from_dict(d: dict):
+    """Rebuild an AudioExtractSpec from its asdict() form, through the validating
+    factories (make_media_ref + make_audio_extract)."""
+    source = make_media_ref(**d["source"])
+    return make_audio_extract(source=source, fmt=d["fmt"])
+
+
 def _generate_image_from_dict(d: dict):
     """Rebuild a GenerateImageSpec from its asdict() form, through the validating
     factories. Each part's media (if any) round-trips via make_media_ref."""
@@ -109,6 +117,7 @@ def _generate_image_from_dict(d: dict):
 SPEC_DESERIALIZERS: Dict[str, Callable[[dict], object]] = {
     "crop": _crop_from_dict,
     "frame_extract": _frame_extract_from_dict,
+    "audio_extract": _audio_extract_from_dict,
     "generate_image": _generate_image_from_dict,
 }
 

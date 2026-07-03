@@ -67,6 +67,44 @@ def run_generate_image(spec: GenerateImageSpec, job_id: str) -> JobResult:
     # that images were present. image2image is a future model flag.
     _ = image_paths  # collected for a future image-conditioning seam
 
+    # ---- GPU-worker guard (2026-07-03 central-meltdown fix) ----
+    # DelegatingRunner runs LOCAL unconditionally when the worker provider
+    # returns no live worker (the HUGPY_LOCAL_FALLBACK gate only covers
+    # selected-then-failed). During the worker's warm-up window that loaded a
+    # multi-GB diffusion model onto central's CPU inside gunicorn (13 GB RSS,
+    # box-wide timeouts). Policy here mirrors the plane's own: when a fleet
+    # EXISTS (provider registered) but no live worker serves this model,
+    # refuse with retryable data instead of melting central. A standalone
+    # single-box deploy (no provider registered) keeps local generation — that
+    # posture is the product. Override with HUGPY_VIDEOGEN_LOCAL=always.
+    try:
+        from abstract_hugpy_dev.managers.resolvers.remote import get_worker_provider
+        provider = get_worker_provider()
+    except ImportError:
+        provider = None
+    if provider is not None:
+        try:
+            try:
+                live_worker = provider(spec.model_id, None)
+            except TypeError:   # provider may predate the pool arg
+                live_worker = provider(spec.model_id)
+        except Exception:
+            live_worker = None  # a broken provider must not crash the runner
+        if live_worker is None and (
+            os.environ.get("HUGPY_VIDEOGEN_LOCAL", "").strip().lower()
+            not in ("always", "1", "true", "yes", "on")
+        ):
+            return JobResult(job_id, ok=False, error=JobError(
+                code="no_live_gpu_worker",
+                message=(
+                    f"no live GPU worker is serving {spec.model_id!r} (worker "
+                    "offline or still warming); refusing local CPU generation "
+                    "on central. Retry shortly, or set HUGPY_VIDEOGEN_LOCAL="
+                    "always to permit in-process generation."
+                ),
+                retryable=True,
+            ))
+
     # ---- build kwargs; leave `pool` UNSET (routing note in the docstring) ----
     kwargs = dict(
         task="text-to-image",

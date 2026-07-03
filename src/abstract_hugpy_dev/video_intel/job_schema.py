@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Tuple, Type
 
+from .audio_schema import AudioExtractSpec
 from .crop_schema import CropSpec
 from .frame_schema import FrameExtractSpec
 from .gen_schema import GenerateImageSpec
@@ -23,18 +24,12 @@ class JobSpec:
     timeout_s: int
 
 
-# Registry, not globals. Phase 1/2 registers ONLY "crop".
-#
-# Phase 4+ appends the remaining jobs once their spec types exist — registering
-# them now would import names that don't exist yet and break this module:
-#   "frame_extract": JobSpec("frame_extract", FrameExtractSpec,
-#                            ("ffmpeg", "frame_extract"), "media", 600),
-#   "audio_extract": JobSpec("audio_extract", AudioExtractSpec,
-#                            ("ffmpeg", "audio_extract"), "media", 300),
-#   "generate_image": JobSpec("generate_image", GenerateImageSpec,
-#                            ("diffusers", "generate_image"), "gpu", 900),
+# Registry, not globals. Phase 1/2 registered "crop"; Phase 4 landed
+# frame_extract + generate_image; Phase 5 landed audio_extract. Every job's
+# spec type must exist as an import above before it can be registered here.
 JOB_REGISTRY = {
     "crop": JobSpec("crop", CropSpec, ("ffmpeg", "crop"), "media", 300),  # runner branches spatial/temporal
     "frame_extract": JobSpec("frame_extract", FrameExtractSpec, ("ffmpeg", "frame_extract"), "media", 600),
+    "audio_extract": JobSpec("audio_extract", AudioExtractSpec, ("ffmpeg", "audio_extract"), "media", 300),
     "generate_image": JobSpec("generate_image", GenerateImageSpec, ("diffusers", "generate_image"), "gpu", 900),
 }

@@ -1,17 +1,22 @@
 ### routes/video_routes.py
 """HTTP surface (Phase 3a) for the Video Intelligence crop feature.
 
-Four additive, all-JSON routes over the already-verified headless backbone
+Additive, all-JSON routes over the already-verified headless backbone
 (`abstract_hugpy_dev.video_intel`). This module only translates HTTP <-> the
 backbone; every invariant (metadata resolution, axis validity, single-writer
 job state) lives in the backbone and is reused here, never re-implemented.
 
 Frozen contract (a frontend is being built to the same contract in parallel):
-    POST /video/ingest        {"path": "<abspath under /uploads>"} -> MediaRef
-    POST /video/jobs/crop     {"source": <MediaRef>, "spatial"?, "temporal"?}
-                              -> {"job_id": ...}
-    GET  /video/jobs/<job_id> -> {"job_id","status","result"}
-    GET  /video/media?handle= -> raw file bytes (source image OR crop result)
+    POST /video/ingest              {"path": "<abspath under /uploads>"} -> MediaRef
+    POST /video/jobs/crop           {"source": <MediaRef>, "spatial"?, "temporal"?}
+                                    -> {"job_id": ...}
+    POST /video/jobs/frame_extract  {"source": <MediaRef>, "fps", "quality", "fmt", ...}
+                                    -> {"job_id": ...}
+    POST /video/jobs/audio_extract  {"source": <MediaRef>, "fmt"?: "wav"}
+                                    -> {"job_id": ...}
+    POST /video/jobs/generate_image {"parts": [...], "model_id", ...} -> {"job_id": ...}
+    GET  /video/jobs/<job_id>       -> {"job_id","status","result"}
+    GET  /video/media?handle=       -> raw file bytes (source image OR job result)
 
 Mirrors upload_routes' blueprint idiom: `get_bp(...)` mints the Blueprint (the
 same shared helper the other *_bp modules use, re-exported through
@@ -41,6 +46,7 @@ from abstract_hugpy_dev.video_intel.crop_schema import (
     make_crop,
 )
 from abstract_hugpy_dev.video_intel.frame_schema import make_frame_extract
+from abstract_hugpy_dev.video_intel.audio_schema import make_audio_extract
 from abstract_hugpy_dev.video_intel.gen_schema import (
     GenPromptPart,
     make_generate_image,
@@ -141,6 +147,27 @@ def video_frame_extract():
     except (ValueError, TypeError) as exc:  # bad fields / axis combo = 400
         return jsonify({"error": str(exc)}), 400
     job_id = media_bus.enqueue("frame_extract", spec)
+    return jsonify({"job_id": job_id}), 200
+
+
+# --------------------------------------------------------------------------- #
+# 2b') POST /video/jobs/audio_extract — validate + enqueue an audio-extract job
+# --------------------------------------------------------------------------- #
+@video_bp.route("/video/jobs/audio_extract", methods=["POST"])
+def video_audio_extract():
+    body = request.get_json(silent=True) or {}
+    source_d = body.get("source")
+    if not isinstance(source_d, dict):
+        return jsonify({"error": "missing or invalid 'source' MediaRef"}), 400
+    try:
+        source = make_media_ref(**source_d)
+        spec = make_audio_extract(
+            source=source,
+            fmt=body.get("fmt", "wav"),
+        )
+    except (ValueError, TypeError) as exc:  # bad fields / non-video source = 400
+        return jsonify({"error": str(exc)}), 400
+    job_id = media_bus.enqueue("audio_extract", spec)
     return jsonify({"job_id": job_id}), 200
 
 

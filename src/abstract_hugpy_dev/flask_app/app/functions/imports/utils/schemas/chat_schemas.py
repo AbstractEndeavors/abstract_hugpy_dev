@@ -34,6 +34,19 @@ class ChatBody(BaseModel):
     # ALWAYS overwritten there — never trusted from the client body.
     principal: Optional[str] = None
 
+    @field_validator("channel", "request_id", "transport", mode="before")
+    @classmethod
+    def _stringify_scalar_ids(cls, v):
+        """Tolerant reader for id-ish fields: the Discord bot sends `channel`
+        as a raw snowflake INT (1522465972311818300) and pydantic v2 does not
+        coerce int→str — every bot chat 500'd on validation. Attribution ids
+        are opaque strings to us; accept any scalar and stringify it."""
+        if v is None or isinstance(v, str):
+            return v
+        if isinstance(v, (int, float)):
+            return str(int(v))
+        return str(v)
+
     @model_validator(mode="after")
     def _require_one_input(self):
         if not self.prompt and not self.messages:
