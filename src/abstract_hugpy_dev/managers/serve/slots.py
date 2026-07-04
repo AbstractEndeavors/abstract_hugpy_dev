@@ -24,6 +24,17 @@ logger = logging.getLogger("abstract_hugpy_dev.slots")
 
 _LOGGED_COUNT = False
 
+# Tiers-v2 eviction policy hook: a callable mk -> bool ("is this model
+# on-demand, i.e. may it be bumped from its slot for a caller?"). Registered
+# by the WORKER agent from its runtime settings; None (e.g. bare central)
+# keeps the historical behavior: all-busy -> None -> swap fallback.
+_EVICTION_POLICY = None
+
+
+def set_eviction_policy(fn) -> None:
+    global _EVICTION_POLICY
+    _EVICTION_POLICY = fn
+
 
 def _slot_count() -> int:
     global _LOGGED_COUNT
@@ -136,7 +147,36 @@ class SlotPool:
                     raise RuntimeError(f"slot load failed: {resp['error']}")
                 return resp.get("endpoint") or s["_control"]
 
-        # 3. everything busy
+        # 3. everything busy — tiers-v2 promotion: bump the LRU *idle*
+        #    occupant whose model is itself on-demand (policy hook). Never a
+        #    busy slot, never a serving/pinned model (the policy returns False
+        #    for those), never for a model already handled above.
+        if _EVICTION_POLICY is not None:
+            candidates = [s for s in statuses
+                          if s.get("model_key") and s.get("healthy")
+                          and not s.get("busy")
+                          and s.get("model_key") != model_key]
+            try:
+                candidates = [s for s in candidates
+                              if _EVICTION_POLICY(s["model_key"])]
+            except Exception:  # noqa: BLE001 — a broken policy must not crash serving
+                candidates = []
+            candidates.sort(key=lambda s: s.get("last_used") or 0)
+            for victim in candidates:
+                logger.info(
+                    "slot promotion: evicting idle on-demand %s from %s to "
+                    "load %s", victim["model_key"], victim["_control"], model_key)
+                try:
+                    self.unload(victim["_control"])
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("promotion evict failed on %s: %s",
+                                   victim["_control"], exc)
+                    continue
+                body = {"model_key": model_key, **(opts or {})}
+                resp = _post(victim["_control"] + "/load", body, load_timeout)
+                if isinstance(resp, dict) and resp.get("error"):
+                    raise RuntimeError(f"slot load failed: {resp['error']}")
+                return resp.get("endpoint") or victim["_control"]
         return None
 
     def load(self, model_key: str, control_url: str, *, timeout: float = 900.0) -> dict:

@@ -995,18 +995,40 @@ def build_app(state: "WorkerState") -> Flask:
                     "message": 'residency must be {"<model_key>": "warm"|"on-demand"|null}'}}), 400
             merged = dict(settings.get("residency") or {})
             for mk, mode in body["residency"].items():
-                if mode in (None, ""):
+                if mode in (None, "", "serving", "warm"):
+                    # serving IS the default — storing it would be noise; a
+                    # null/serving write clears any on-demand override.
                     merged.pop(mk, None)
-                elif mode in ("warm", "on-demand"):
+                elif mode == "on-demand":
                     merged[mk] = mode
                 else:
                     return jsonify({"ok": False, "error": {
                         "code": "BadValue",
-                        "message": f"residency[{mk!r}] must be 'warm', 'on-demand' or null"}}), 400
+                        "message": f"residency[{mk!r}] must be 'serving', 'on-demand' or null"}}), 400
             if merged:
                 settings["residency"] = merged
             else:
                 settings.pop("residency", None)
+        if "pinned" in body:
+            # Files-axis pin (tiers v2): {"model": true|null}. Deep-merged.
+            if not isinstance(body["pinned"], dict):
+                return jsonify({"ok": False, "error": {
+                    "code": "BadValue",
+                    "message": 'pinned must be {"<model_key>": true|null}'}}), 400
+            pmerged = dict(settings.get("pinned") or {})
+            for mk, val in body["pinned"].items():
+                if val in (None, False, ""):
+                    pmerged.pop(mk, None)
+                elif val is True:
+                    pmerged[mk] = True
+                else:
+                    return jsonify({"ok": False, "error": {
+                        "code": "BadValue",
+                        "message": f"pinned[{mk!r}] must be true or null"}}), 400
+            if pmerged:
+                settings["pinned"] = pmerged
+            else:
+                settings.pop("pinned", None)
         _save_settings(args, settings)
         logger.info("ops/config: persisted %s — re-exec to apply", settings)
         from .._platform.procutil import reexec
@@ -1281,6 +1303,11 @@ def _models_local(state: "WorkerState") -> list[str]:
     now = time.time()
     if now - _MODELS_LOCAL_CACHE["at"] < 60.0:
         return _MODELS_LOCAL_CACHE["value"]
+    if not state.assigned_models:
+        # Startup window: the assignment list arrives with the FIRST heartbeat
+        # response — caching an empty walk here made the console show
+        # everything '✗ missing' for ~60s after any restart. Don't cache.
+        return []
     out: list[str] = []
     try:
         from .provision import model_is_local
@@ -1373,15 +1400,25 @@ def _update_state_path(args) -> str:
 # shows truth.
 
 _SETTINGS_KEYS = {"slot_count", "residency", "on_demand_ttl_s",
-                  "reconcile_interval_s"}   # widen key by key
+                  "reconcile_interval_s", "pinned"}   # widen key by key
 _SETTINGS_SOURCE: dict = {}              # key -> "settings" | "env" | "default"
 _RUNTIME_SETTINGS: dict = {}             # the loaded settings, for live readers
 
 
 def _residency(model_key: str) -> str:
-    """Per-model residency policy: "warm" (assigned=ready preload, the
-    default) or "on-demand" (never preloaded; TTL-evicted after idle)."""
-    return (_RUNTIME_SETTINGS.get("residency") or {}).get(model_key, "warm")
+    """Per-model residency policy (tiers v2): "serving" (dedicated residency,
+    the default — holds its slot/process seat) or "on-demand" (loads on call;
+    TTL-yields when idle). "warm" is the legacy name for serving.
+    """
+    val = (_RUNTIME_SETTINGS.get("residency") or {}).get(model_key, "serving")
+    return "serving" if val in ("warm", "serving") else val
+
+
+def _pinned(model_key: str) -> bool:
+    """Files-axis pin (tiers v2): operator bookkeeping — these files LIVE on
+    this box: never reaped, survive unassign. (Enforced by the reaper when it
+    ships; advertised in the heartbeat config meanwhile.)"""
+    return bool((_RUNTIME_SETTINGS.get("pinned") or {}).get(model_key))
 
 
 def _settings_path(args) -> str:
@@ -1437,6 +1474,8 @@ def _effective_config() -> dict:
            "on_demand_ttl_s": int(_RUNTIME_SETTINGS.get("on_demand_ttl_s", 900))}
     if _RUNTIME_SETTINGS.get("residency"):
         out["residency"] = dict(_RUNTIME_SETTINGS["residency"])
+    if _RUNTIME_SETTINGS.get("pinned"):
+        out["pinned"] = dict(_RUNTIME_SETTINGS["pinned"])
     return out
 
 
@@ -1527,6 +1566,29 @@ def _residency_sweep_loop() -> None:
                         evict(mk)
                     except Exception as exc:  # noqa: BLE001
                         logger.warning("residency evict of %s failed: %s", mk, exc)
+            # Slot tier (tiers v2): idle on-demand SLOT occupants yield their
+            # seat the same way — busy slots and serving models never touched.
+            try:
+                from ..managers.serve.slots import SlotPool, slots_enabled
+                if slots_enabled():
+                    pool = SlotPool()
+                    for st in pool.statuses():
+                        mk = st.get("model_key")
+                        if (not mk or st.get("busy")
+                                or _residency(mk) != "on-demand"):
+                            continue
+                        idle = now - (st.get("last_used") or started_at)
+                        if idle > ttl:
+                            logger.info("residency sweep: slot %s yields %s "
+                                        "(on-demand, idle %.0fs > ttl %ds)",
+                                        st.get("_control"), mk, idle, ttl)
+                            try:
+                                pool.unload(st["_control"])
+                            except Exception as exc:  # noqa: BLE001
+                                logger.warning("slot yield of %s failed: %s",
+                                               mk, exc)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("slot residency pass failed: %s", exc)
         except Exception as exc:  # noqa: BLE001 — the sweep must never die
             logger.warning("residency sweep iteration failed: %s", exc)
 
@@ -1881,6 +1943,14 @@ def main(argv: list[str] | None = None) -> int:
     # Operator runtime settings (console-set) project onto the env FIRST, so
     # the slot supervisor + every other reader sees them; drop-ins lose loudly.
     _apply_settings_env(args)
+
+    # Tiers v2: the slot pool may bump idle ON-DEMAND occupants for callers;
+    # serving/pinned models are never evictable (policy returns False).
+    try:
+        from ..managers.serve.slots import set_eviction_policy
+        set_eviction_policy(lambda mk: _residency(mk) == "on-demand")
+    except Exception as _exc:  # noqa: BLE001
+        logger.warning("slot eviction policy not registered: %s", _exc)
 
     # Worker-local slot pool (SLOT_COUNT; settings > env > default).
     _supervise_slots()
