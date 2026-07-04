@@ -1063,10 +1063,21 @@ def model_file(model_key):
     if not rel:
         abort(400, description="Missing ?path=")
 
-    # Resolve and confine: the final real path must stay inside dest.
-    target = os.path.realpath(os.path.join(dest, rel))
+    # Confine LEXICALLY first (catches ../ and absolute paths WITHOUT following
+    # a symlink at the target — comfy checkpoints in the model dir ARE symlinks
+    # into the shared /checkpoints store, and realpath-first falsely 403'd them,
+    # breaking every comfy per-file transfer).
+    target = os.path.normpath(os.path.join(dest, rel))
     if target != dest and not target.startswith(dest + os.sep):
         abort(403, description="Path escapes model directory.")
+    # Then follow the link, but ONLY within the model storage root — a stray
+    # symlink to /etc/passwd still 403s.
+    real = os.path.realpath(target)
+    from ....imports.src.constants.constants import DEFAULT_ROOT as _DR
+    root_real = os.path.realpath(_DR)
+    if real != target and not (real == root_real or real.startswith(root_real + os.sep)):
+        abort(403, description="Symlink escapes the model storage root.")
+    target = real
     if not os.path.isfile(target):
         abort(404, description="No such file.")
 
@@ -1171,12 +1182,24 @@ def model_archive(model_key):
     _model, dest = _model_dir_or_404(model_key)
 
     # Deterministic file list (same walk as the manifest), newest layout intact.
+    # Symlinked members (comfy checkpoints -> /checkpoints store) are packed as
+    # their REAL bytes: tar.add on a symlink stores a link member by default,
+    # which the worker-side extractor (0.1.129+) rightly refuses. Dereference
+    # here — but only links that stay within the model storage root.
+    from ....imports.src.constants.constants import DEFAULT_ROOT as _DR
+    _root_real = os.path.realpath(_DR)
     entries = []
     for root, _dirs, names in os.walk(dest):
         for name in sorted(names):
             full = os.path.join(root, name)
-            if os.path.isfile(full):
-                entries.append((full, os.path.relpath(full, dest)))
+            if not os.path.isfile(full):   # follows links: target must exist
+                continue
+            real = os.path.realpath(full)
+            if real != full and not (real == _root_real or real.startswith(_root_real + os.sep)):
+                logger.warning("archive %s: skipping %s (link escapes storage root)",
+                               model_key, name)
+                continue
+            entries.append((real, os.path.relpath(full, dest)))
 
     def generate():
         r_fd, w_fd = os.pipe()
