@@ -912,9 +912,28 @@ def fetch_archive_from_central(central_url: str, model_key: str, progress=None) 
     # mode "r|" = sequential streaming read, matching central's "w|" writer.
     with resp, tarfile.open(fileobj=reader, mode="r|") as tar:
         for member in tar:
-            target = os.path.realpath(os.path.join(dest, member.name))
+            # LEXICAL containment check (normpath, NOT realpath). realpath
+            # follows an EXISTING symlink already sitting at the target — and
+            # comfy checkpoints ARE symlinks — so a prior link made realpath
+            # resolve outside dest and false-flagged safe bare filenames like
+            # 'model.safetensors' as "unsafe path", blocking every comfy pull
+            # and driving the reconcile storm. normpath catches real traversal
+            # ('..'/absolute) without chasing a link at the destination.
+            target = os.path.normpath(os.path.join(dest_real, member.name))
             if target != dest_real and not target.startswith(dest_real + os.sep):
                 raise RuntimeError(f"unsafe path in archive member: {member.name!r}")
+            # A symlink/hardlink/device MEMBER *inside* the tar is the genuine
+            # traversal threat (central packs only regular files + dirs).
+            if member.issym() or member.islnk():
+                raise RuntimeError(f"refusing non-regular archive member: {member.name!r}")
+            # A symlink already at the target (a prior comfy link) must be
+            # removed first, or tar.extract writes THROUGH it to its
+            # outside-dest target. Replace it with the real bytes.
+            if os.path.islink(target) or os.path.isfile(target):
+                try:
+                    os.unlink(target)
+                except OSError:
+                    pass
             tar.extract(member, dest)
 
     if progress:
