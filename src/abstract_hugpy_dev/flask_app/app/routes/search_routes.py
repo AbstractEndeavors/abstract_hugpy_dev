@@ -129,3 +129,142 @@ def hf_spec():
     )
 
     return jsonify({"spec": spec.model_dump(), "options": options.model_dump()})
+
+
+# ── Civitai — the checkpoint habitat, wired to the comfy drop-a-file flow ────
+# Search is anonymous (their public API); DOWNLOAD streams the single-file
+# checkpoint straight into <root>/checkpoints, where the registry sweep
+# self-registers it as a comfy-<slug> model on the next read. Some files
+# require a Civitai account token: set CIVITAI_API_TOKEN in the env (d-env).
+
+_CIVITAI = "https://civitai.com/api/v1"
+_CIVITAI_DL: dict = {}   # filename -> {done_bytes, total_bytes, status, error?}
+
+
+def _checkpoints_dir() -> str:
+    from ...imports.src.constants.constants import DEFAULT_ROOT
+    d = os.path.join(DEFAULT_ROOT, "checkpoints")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+@search_bp.route("/civitai/search", methods=["GET"])
+def civitai_search():
+    """Proxy Civitai model search into rows the console table can render."""
+    import httpx
+    params = {
+        "types": "Checkpoint",
+        "limit": max(1, min(int(request.args.get("limit", 20)), 50)),
+        "sort": request.args.get("sort") or "Highest Rated",
+        "nsfw": "false",
+    }
+    q = (request.args.get("query") or "").strip()
+    if q:
+        params["query"] = q
+    base = (request.args.get("base") or "").strip()
+    if base:
+        params["baseModels"] = base
+    try:
+        r = httpx.get(_CIVITAI + "/models", params=params, timeout=20.0)
+        r.raise_for_status()
+        payload = r.json()
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"civitai search failed: {exc}"}), 502
+
+    rows = []
+    for it in payload.get("items", []):
+        v = (it.get("modelVersions") or [{}])[0]
+        f = next((x for x in (v.get("files") or [])
+                  if str(x.get("name", "")).endswith((".safetensors", ".ckpt"))
+                  and (x.get("type") == "Model" or x.get("type") is None)), None)
+        if not f or not f.get("downloadUrl"):
+            continue
+        stats = it.get("stats") or {}
+        rows.append({
+            "civitai_id": it.get("id"),
+            "name": it.get("name"),
+            "base_model": v.get("baseModel"),
+            "version": v.get("name"),
+            "filename": f.get("name"),
+            "total_bytes": int((f.get("sizeKB") or 0) * 1024),
+            "downloads": stats.get("downloadCount"),
+            "likes": stats.get("thumbsUpCount"),
+            "published": (v.get("publishedAt") or it.get("createdAt") or "")[:10],
+            "download_url": f.get("downloadUrl"),
+            "page_url": f"https://civitai.com/models/{it.get('id')}",
+            # comfy-compat hint: our vanilla template speaks SD1.x/2.x/SDXL.
+            "comfy_ready": str(v.get("baseModel") or "").startswith(("SD 1", "SD 2", "SDXL")),
+        })
+    return jsonify(rows)
+
+
+@search_bp.route("/civitai/download", methods=["POST"])
+def civitai_download():
+    """Stream ONE checkpoint into <root>/checkpoints (background). The comfy
+    sweep registers it automatically once the file lands — the whole install
+    is this download. Operator-gated (writes to central storage)."""
+    import threading
+    body = request.get_json(silent=True) or {}
+    url = str(body.get("download_url") or "").strip()
+    filename = os.path.basename(str(body.get("filename") or "").strip())
+    if not url.startswith("https://civitai.com/"):
+        return jsonify({"error": "download_url must be a civitai.com URL"}), 400
+    if not filename.endswith((".safetensors", ".ckpt")):
+        return jsonify({"error": "filename must end in .safetensors/.ckpt"}), 400
+    dest = os.path.join(_checkpoints_dir(), filename)
+    if os.path.exists(dest):
+        return jsonify({"ok": True, "already": True, "filename": filename})
+    if _CIVITAI_DL.get(filename, {}).get("status") == "downloading":
+        return jsonify({"ok": True, "already": False, "filename": filename,
+                        "note": "download already in progress"})
+
+    free = _free_bytes()
+    want = int(body.get("total_bytes") or 0)
+    if free is not None and want and free < want * 1.1:
+        return jsonify({"error": f"not enough space: needs ~{want/1e9:.1f}GB, "
+                        f"{free/1e9:.1f}GB free on central"}), 409
+
+    def _pull():
+        import httpx
+        tmp = dest + ".part"
+        headers = {}
+        token = os.getenv("CIVITAI_API_TOKEN")
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        st = _CIVITAI_DL[filename] = {"done_bytes": 0, "total_bytes": want,
+                                      "status": "downloading"}
+        try:
+            with httpx.stream("GET", url, headers=headers, timeout=60.0,
+                              follow_redirects=True) as r:
+                if r.status_code in (401, 403):
+                    raise PermissionError(
+                        "civitai requires an account token for this file — set "
+                        "CIVITAI_API_TOKEN in d-env/env and restart")
+                r.raise_for_status()
+                st["total_bytes"] = int(r.headers.get("content-length") or want or 0)
+                with open(tmp, "wb") as fh:
+                    for chunk in r.iter_bytes(chunk_size=1 << 20):
+                        fh.write(chunk)
+                        st["done_bytes"] += len(chunk)
+            os.replace(tmp, dest)
+            st["status"] = "done"
+            logger.info("civitai: %s landed in /checkpoints — the sweep "
+                        "registers it on the next registry read", filename)
+        except Exception as exc:  # noqa: BLE001
+            st["status"] = "failed"
+            st["error"] = f"{type(exc).__name__}: {exc}"
+            logger.warning("civitai download of %s failed: %s", filename, exc)
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+    threading.Thread(target=_pull, daemon=True).start()
+    return jsonify({"ok": True, "started": True, "filename": filename,
+                    "note": "lands in /checkpoints; registers automatically"})
+
+
+@search_bp.route("/civitai/downloads", methods=["GET"])
+def civitai_downloads():
+    """Live progress for in-flight civitai pulls (the UI polls this)."""
+    return jsonify(_CIVITAI_DL)
