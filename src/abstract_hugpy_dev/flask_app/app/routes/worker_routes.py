@@ -254,6 +254,9 @@ class HeartbeatRequest(BaseModel):
     role: str | None = None
     rpc_endpoint: str | None = None
     free_ram: int | None = None
+    # Free/total bytes of the worker's model-root volume — the assign/load
+    # preflight refuses pulls that won't fit (disk-aware allocation).
+    disk: dict | None = None
     engine: dict | None = None
     pool: str | None = None
     caps: dict | None = None
@@ -388,6 +391,7 @@ def workers_heartbeat(worker_id):
         role=body.role,
         rpc_endpoint=body.rpc_endpoint,
         free_ram=body.free_ram,
+        disk=body.disk,
         engine=body.engine,
         pool=body.pool,
         caps=body.caps,
@@ -533,6 +537,37 @@ def _central_missing_reason(model_key: str) -> str | None:
         return f"{type(exc).__name__}: {exc}"
 
 
+def _disk_preflight_reason(worker: dict, model_key: str) -> str | None:
+    """Disk-aware allocation: a designation triggers a pull onto the worker's
+    model-root volume — refuse EARLY (clear 409) when it won't fit, instead of
+    failing mid-pull with a full disk. None = fits / already local / unknown
+    (older agents don't report disk — never block on absent telemetry)."""
+    if model_key in (worker.get("models_local") or []):
+        return None                          # files already there — no pull
+    free = ((worker.get("disk") or {}).get("free_bytes"))
+    if not free:
+        return None                          # no disk telemetry — don't block
+    try:
+        from ....managers.dispatch.dispatch import _dir_size_detail
+        from ....imports import route_destination
+        from ....imports.config.main import get_model_config
+        cfg = get_model_config(model_key)
+        need = (_dir_size_detail(route_destination(
+            cfg.to_dict() if hasattr(cfg, "to_dict") else {
+                "hub_id": getattr(cfg, "hub_id", None),
+                "framework": getattr(cfg, "framework", None),
+                "primary_task": getattr(cfg, "primary_task", None),
+                "name": getattr(cfg, "name", None),
+                "folder": getattr(cfg, "folder", None),
+                "filename": getattr(cfg, "filename", None)})) or {}).get("model_bytes")
+    except Exception:  # noqa: BLE001 — unsizable: don't block
+        return None
+    if need and free < need * 1.1:           # 10% headroom for temp/partial files
+        return (f"needs ~{need/1e9:.1f}GB but the worker's model volume has "
+                f"only {free/1e9:.1f}GB free")
+    return None
+
+
 @worker_bp.route("/llm/workers/<worker_id>/assign", methods=["POST"])
 def workers_assign(worker_id):
     body = AssignRequest(**(request.get_json(silent=True) or {}))
@@ -546,6 +581,14 @@ def workers_assign(worker_id):
         return jsonify({"error": f"central does not have '{body.model_key}' on "
                         f"disk ({missing}) — download it on the Models tab first; "
                         "workers provision from central"}), 409
+    # Disk-aware allocation: refuse a pull the worker's disk can't hold.
+    _w = get_worker(worker_id)
+    if _w is not None:
+        disk_no = _disk_preflight_reason(_w, body.model_key)
+        if disk_no:
+            return jsonify({"error": f"'{body.model_key}' won't fit on "
+                            f"{_w.get('name') or worker_id}: {disk_no} — free "
+                            "space or pick another worker"}), 409
     worker = assign_model(worker_id, body.model_key, spill=body.spill)
     if worker is None:
         abort(404, description="Unknown worker id.")
@@ -825,6 +868,13 @@ def workers_load(worker_id):
     worker = get_worker(worker_id)
     if worker is None:
         abort(404, description="Unknown worker id.")
+    # Disk-aware allocation — refuse a pull the worker's model volume can't
+    # hold (force does NOT bypass this: a full disk mid-pull helps nobody).
+    disk_no = _disk_preflight_reason(worker, body.model_key)
+    if disk_no:
+        return jsonify({"error": f"'{body.model_key}' won't fit on "
+                        f"{worker.get('name') or worker_id}: {disk_no} — free "
+                        "space or pick another worker"}), 409
 
     verdict = _worker_fit(body.model_key, worker)
     if verdict.get("fit") is False and not force:

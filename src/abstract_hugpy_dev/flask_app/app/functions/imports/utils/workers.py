@@ -599,6 +599,7 @@ class WorkerStore:
         role: Optional[str] = None,
         rpc_endpoint: Optional[str] = None,
         free_ram: Optional[int] = None,
+        disk: Optional[Dict[str, Any]] = None,
         engine: Optional[Dict[str, Any]] = None,
         pool: Optional[str] = None,
         caps: Optional[Dict[str, Any]] = None,
@@ -651,6 +652,8 @@ class WorkerStore:
                 worker["rpc_endpoint"] = rpc_endpoint
             if free_ram is not None:
                 worker["free_ram"] = free_ram
+            if disk is not None:
+                worker["disk"] = disk   # model-root volume free/total (preflight)
             if engine is not None:
                 worker["engine"] = engine
             if env is not None:

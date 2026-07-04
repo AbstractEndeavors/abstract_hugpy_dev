@@ -1440,6 +1440,20 @@ def _effective_config() -> dict:
     return out
 
 
+def _disk_status() -> dict:
+    """Free/total bytes of the volume holding this worker's MODEL ROOT — the
+    disk a designation's pull lands on. Central's assign/load preflight uses
+    this so a model that won't fit is refused early (409), not mid-pull."""
+    try:
+        import shutil
+        from ..imports.src.constants.constants import DEFAULT_ROOT
+        root = DEFAULT_ROOT if os.path.isdir(DEFAULT_ROOT) else os.path.expanduser("~")
+        u = shutil.disk_usage(root)
+        return {"root": root, "free_bytes": u.free, "total_bytes": u.total}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 # ── ComfyUI presence (slice A of the comfy engine) ──────────────────────────
 # The operator installs ComfyUI on the box (own service/venv); the agent
 # ADOPTS it: probe the local instance and advertise `comfy` in the heartbeat
@@ -1646,6 +1660,7 @@ def _heartbeat_loop(client: CentralClient, state: WorkerState, args) -> None:
                     "role": state.role,
                     "rpc_endpoint": state.rpc_endpoint,
                     "free_ram": _free_ram_bytes(),
+                    "disk": _disk_status(),
                     "engine": llama_cpp_cuda_status(),
                     "pool": os.environ.get("WORKER_POOL", ""),
                     "caps": _local_caps(),
