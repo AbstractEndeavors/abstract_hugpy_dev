@@ -142,7 +142,7 @@ _CIVITAI_DL: dict = {}   # filename -> {done_bytes, total_bytes, status, error?}
 
 
 def _checkpoints_dir() -> str:
-    from ...imports.src.constants.constants import DEFAULT_ROOT
+    from ....imports.src.constants.constants import DEFAULT_ROOT
     d = os.path.join(DEFAULT_ROOT, "checkpoints")
     os.makedirs(d, exist_ok=True)
     return d
