@@ -714,6 +714,18 @@ def workers_config(worker_id):
                             timeout=15.0, action="config")
 
 
+@worker_bp.route("/llm/workers/<worker_id>/reap", methods=["POST"])
+def workers_reap(worker_id):
+    """Tiers-v2 slice 4: reclaim a worker's disk. The bookend to unassign —
+    delete local files of models that are on disk but no longer needed.
+    Body: {"dry_run": true} previews (default); {"all": true} or
+    {"model_keys":[...]} reclaims. The worker re-proves every guard
+    (assigned/loaded/pinned/comfy) at delete time. Operator-gated + audited."""
+    return _relay_worker_op(worker_id, "/reap",
+                            request.get_json(silent=True) or {},
+                            timeout=120.0, action="reap")
+
+
 @worker_bp.route("/llm/workers/<worker_id>/update", methods=["POST"])
 def workers_update(worker_id):
     """CON-05: trigger the worker's module self-update NOW (same converge

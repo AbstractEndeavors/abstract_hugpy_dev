@@ -778,6 +778,140 @@ def _loading_model_keys() -> list[str]:
         return []
 
 
+def _path_bytes(path: str) -> int:
+    """On-disk bytes of a model path, NOT following symlinks (a symlinked comfy
+    checkpoint or shared file costs this box ~nothing to keep)."""
+    try:
+        if not path or not os.path.exists(path):
+            return 0
+        if os.path.islink(path):
+            return 0
+        if os.path.isfile(path):
+            return os.path.getsize(path)
+        total = 0
+        for root, dirs, files in os.walk(path):
+            for f in files:
+                fp = os.path.join(root, f)
+                try:
+                    if not os.path.islink(fp):
+                        total += os.path.getsize(fp)
+                except OSError:
+                    pass
+        return total
+    except OSError:
+        return 0
+
+
+def _reap_scan(state: "WorkerState") -> dict:
+    """The reaper's read-only survey: which local model files are RECLAIMABLE
+    (on disk, but not assigned / loaded / loading / pinned), and which are
+    PROTECTED (and why). Never touches comfy rows — those are symlinks into the
+    operator's ComfyUI, not this worker's downloads.
+
+    This is advisory: /reap re-checks every guard at delete time, because state
+    (an assign, a load, a pull) can change between preview and reclaim.
+    """
+    try:
+        from .imports import get_models_dict, get_model_config, get_model_path
+        from .provision import model_is_local
+    except Exception as exc:  # noqa: BLE001
+        return {"reclaimable": [], "protected": [], "error": str(exc)}
+
+    assigned = set(state.assigned_models or [])
+    loaded = set(loaded_model_keys())
+    loading = set(_loading_model_keys())
+
+    reclaimable, protected = [], []
+    try:
+        keys = list(get_models_dict().keys())
+    except Exception as exc:  # noqa: BLE001
+        return {"reclaimable": [], "protected": [], "error": str(exc)}
+
+    for mk in keys:
+        try:
+            cfg = get_model_config(mk)
+        except Exception:
+            continue
+        if getattr(cfg, "framework", None) == "comfy":
+            continue  # symlinks / operator-owned — reaper stays clear
+        try:
+            if not model_is_local(mk):
+                continue
+        except Exception:
+            continue
+        path = ""
+        try:
+            path = get_model_path(mk) or ""
+        except Exception:
+            path = ""
+        size = _path_bytes(path)
+        if _pinned(mk):
+            protected.append({"model_key": mk, "bytes": size, "why": "pinned"})
+        elif mk in assigned:
+            protected.append({"model_key": mk, "bytes": size, "why": "assigned"})
+        elif mk in loaded or mk in loading:
+            protected.append({"model_key": mk, "bytes": size, "why": "loaded"})
+        else:
+            reclaimable.append({"model_key": mk, "bytes": size, "path": path})
+
+    reclaimable.sort(key=lambda r: r["bytes"], reverse=True)
+    return {
+        "reclaimable": reclaimable,
+        "protected": protected,
+        "reclaimable_bytes": sum(r["bytes"] for r in reclaimable),
+    }
+
+
+def _reap_reclaim(state: "WorkerState", model_keys: list[str]) -> dict:
+    """Delete the local files of the named models — but ONLY after re-proving,
+    per key, that it is still reclaimable (not assigned/loaded/loading/pinned,
+    not comfy). The guard is re-run here, not trusted from a stale preview."""
+    from .imports import get_model_config, get_model_path
+    from .provision import model_is_local, wipe_model
+
+    assigned = set(state.assigned_models or [])
+    loaded = set(loaded_model_keys())
+    loading = set(_loading_model_keys())
+
+    results = []
+    for mk in model_keys:
+        try:
+            cfg = get_model_config(mk)
+        except Exception:
+            results.append({"model_key": mk, "ok": False, "reason": "unknown model"})
+            continue
+        if getattr(cfg, "framework", None) == "comfy":
+            results.append({"model_key": mk, "ok": False, "reason": "comfy (symlink/operator files) — never reaped"})
+            continue
+        if _pinned(mk):
+            results.append({"model_key": mk, "ok": False, "reason": "pinned"})
+            continue
+        if mk in assigned:
+            results.append({"model_key": mk, "ok": False, "reason": "assigned"})
+            continue
+        if mk in loaded or mk in loading:
+            results.append({"model_key": mk, "ok": False, "reason": "loaded/loading"})
+            continue
+        try:
+            if not model_is_local(mk):
+                results.append({"model_key": mk, "ok": False, "reason": "no local files"})
+                continue
+        except Exception:
+            results.append({"model_key": mk, "ok": False, "reason": "locality check failed"})
+            continue
+        try:
+            freed = _path_bytes(get_model_path(mk) or "")
+        except Exception:
+            freed = 0
+        gone = wipe_model(mk)  # jailed against root/home/short paths
+        _MODELS_LOCAL_CACHE["at"] = 0.0  # force a fresh local walk next beat
+        results.append({"model_key": mk, "ok": bool(gone),
+                        "freed_bytes": freed if gone else 0,
+                        "reason": "" if gone else "delete refused/failed (path jail?)"})
+    return {"ok": True, "results": results,
+            "freed_bytes": sum(r.get("freed_bytes", 0) for r in results)}
+
+
 def _spill_describe() -> dict:
     try:
         #from abstract_hugpy_dev.managers.spill import describe
@@ -1101,6 +1235,34 @@ def build_app(state: "WorkerState") -> Flask:
                             "loaded_models": loaded_model_keys()})
         except Exception as exc:
             return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 500
+
+    @app.route("/reap", methods=["POST"])
+    def reap():
+        """Disk reclaim (tiers-v2 slice 4). The bookend to unassign: delete the
+        local files of models that are on disk but no longer needed.
+
+        Body:
+          {"dry_run": true}          -> PREVIEW only (default): what would be
+                                        freed + what's protected and why.
+          {"all": true}             -> reclaim every reclaimable model.
+          {"model_keys": ["a","b"]} -> reclaim just these (still guard-checked).
+
+        Guards (re-proven at delete time): never assigned, loaded/loading,
+        pinned, or comfy (operator symlinks). Deletes are jailed by wipe_model
+        against root/home/short paths.
+        """
+        body = request.get_json(silent=True) or {}
+        scan = _reap_scan(state)
+        if body.get("dry_run") or (not body.get("all") and not body.get("model_keys")):
+            return jsonify({"ok": True, "dry_run": True, **scan})
+        if body.get("all"):
+            targets = [r["model_key"] for r in scan.get("reclaimable", [])]
+        else:
+            targets = [str(k) for k in (body.get("model_keys") or [])]
+        if not targets:
+            return jsonify({"ok": True, "results": [], "freed_bytes": 0,
+                            "note": "nothing reclaimable"})
+        return jsonify(_reap_reclaim(state, targets))
 
     return app
 

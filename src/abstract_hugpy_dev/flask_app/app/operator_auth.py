@@ -89,7 +89,7 @@ _SENSITIVE = [
     # serving-config are privileged executor actions on a worker —
     # operator-only, audited. (config added 2026-07-03: it re-execs the agent
     # and rewrites its runtime settings — same privilege tier as update.)
-    ({"POST"},                   re.compile(r"^/llm/workers/[^/]+/(restart|update|pip|config)$")),
+    ({"POST"},                   re.compile(r"^/llm/workers/[^/]+/(restart|update|pip|config|reap)$")),
     # Civitai checkpoint download — writes multi-GB files into central's
     # /checkpoints store (which self-registers models) — operator-only.
     ({"POST"},                   re.compile(r"^/civitai/download$")),
