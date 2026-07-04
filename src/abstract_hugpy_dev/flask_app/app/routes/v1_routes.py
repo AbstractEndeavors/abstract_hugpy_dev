@@ -80,6 +80,10 @@ def v1_models():
             "owned_by": "hugpy",
             "hub_id": model.get("hub_id"),
             "task": model.get("primary_task") or model.get("task"),
+            # FULL capability list — `task` (primary) alone hid secondary
+            # capabilities from every task-filtered UI (e.g. a dual
+            # text-to-image + image-to-image model looked t2i-only).
+            "tasks": model.get("tasks") or ([model.get("primary_task")] if model.get("primary_task") else []),
             "context_length": model.get("model_max_length"),
             "media_default": (key == media_default),
         })
