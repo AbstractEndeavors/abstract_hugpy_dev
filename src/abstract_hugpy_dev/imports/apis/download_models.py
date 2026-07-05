@@ -108,7 +108,7 @@ def download_one(model: dict[str, Any],root: str=None,model_key=None, dry_run: b
     os.makedirs(destination, exist_ok=True)
 
     # GGUF / single-file
-    if framework == "llama_cpp":
+    if framework == "gguf":
         if filename:
             hf_hub_download(
                 repo_id=repo_id,

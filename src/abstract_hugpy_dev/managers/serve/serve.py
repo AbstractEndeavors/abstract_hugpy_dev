@@ -202,7 +202,7 @@ def _resolve_port(model_key, cfg) -> int:
 
 
 def _resolve_mode(cfg, extra=None) -> ServeMode:
-    if getattr(cfg, "framework", None) != "llama_cpp":
+    if getattr(cfg, "framework", None) != "gguf":
         return ServeMode.OFF
     extra = extra if extra is not None else (getattr(cfg, "extra", {}) or {})
     explicit = _clean_mode_value(extra.get("serve_mode"))

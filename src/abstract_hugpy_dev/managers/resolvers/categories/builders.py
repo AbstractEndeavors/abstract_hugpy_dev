@@ -362,11 +362,11 @@ MODEL_REQUEST_BUILDERS: Dict[Tuple[str, str], Callable[[Dict[str, Any], str], Ba
     ("comfy", "text-to-image"):                       _build_imagegen_request,
     ("comfy", "image-to-image"):                      _build_img2img_request,
     ("transformers", "text-generation"):              _build_chat_request,
-    ("llama_cpp",    "text-generation"):              _build_chat_request,
+    ("gguf",         "text-generation"):              _build_chat_request,
     ("transformers", "image-text-to-text"):           _build_vision_request,
     # GGUF vision rides the chat path: the image stays on ChatRequest.file and
     # the runner attaches it as an image_url part for the multimodal handler.
-    ("llama_cpp",    "image-text-to-text"):           _build_vision_chat_request,
+    ("gguf",         "image-text-to-text"):           _build_vision_chat_request,
     ("transformers", "automatic-speech-recognition"): _build_whisper_request,
     ("transformers", "text-summarization"):                _build_summarize_request,
     ("transformers", "text2text-generation"):         _build_summarize_request,

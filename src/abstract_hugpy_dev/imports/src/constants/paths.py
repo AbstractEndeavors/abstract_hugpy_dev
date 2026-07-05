@@ -22,7 +22,7 @@ def split_hub_id(hub_id: str) -> tuple[str, str | None]:
 def runtime_folder(framework: str, hub_id: str, include: Any = None, filename: str | None = None) -> str:
     framework = framework.lower().strip()
 
-    if framework == "llama_cpp":
+    if framework == "gguf":
         return "gguf"
 
     if filename and filename.lower().endswith(".gguf"):

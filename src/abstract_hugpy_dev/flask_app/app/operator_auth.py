@@ -76,6 +76,12 @@ _SENSITIVE = [
     ({"DELETE"},                 re.compile(r"^/discord/bridges/[^/]+$")),
     ({"POST"},                   re.compile(r"^/discord/bridges/[^/]+/(send|keeper-reply|approve|reject)$")),
     ({"GET"},                    re.compile(r"^/discord/bridges/[^/]+/messages$")),
+    # Comms sessions: minting/listing/revoking the scoped bearer tokens is
+    # operator-only. The /discord/session/<token>/… verbs are deliberately NOT
+    # here — the session token IS their credential (same rationale as
+    # principal tokens below).
+    ({"GET", "POST"},            re.compile(r"^/discord/sessions$")),
+    ({"DELETE"},                 re.compile(r"^/discord/sessions/[^/]+$")),
     # F2 principals: minting identities/tokens is operator-only. The
     # /auth/discord-link handshake and /auth/whoami stay open — the principal
     # token IS their credential.
@@ -93,6 +99,9 @@ _SENSITIVE = [
     # Civitai checkpoint download — writes multi-GB files into central's
     # /checkpoints store (which self-registers models) — operator-only.
     ({"POST"},                   re.compile(r"^/civitai/download$")),
+    # Disk discovery sweep — rebuilds the discovery report (walks the whole
+    # model tree + hub enrichment); the GET state poll stays open.
+    ({"POST"},                   re.compile(r"^/models/discover$")),
 ]
 
 _SESSION_CACHE: dict[str, tuple[bool, float]] = {}

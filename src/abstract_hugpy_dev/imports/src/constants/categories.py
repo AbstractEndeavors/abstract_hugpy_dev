@@ -27,8 +27,8 @@ HF_TASK_TO_TASKS = {
     "image-segmentation": ["image-segmentation"],
 }
 RUNNER_PAIRS = {
-    ("transformers", "text-generation"), ("llama_cpp", "text-generation"),
-    ("transformers", "image-text-to-text"), ("llama_cpp", "image-text-to-text"),
+    ("transformers", "text-generation"), ("gguf", "text-generation"),
+    ("transformers", "image-text-to-text"), ("gguf", "image-text-to-text"),
     ("transformers", "automatic-speech-recognition"),
     ("transformers", "text-summarization"), ("transformers", "text2text-generation"),
     ("transformers", "feature-extraction"), ("transformers", "sentence-similarity"),

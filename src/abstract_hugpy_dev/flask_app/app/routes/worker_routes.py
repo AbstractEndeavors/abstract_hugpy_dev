@@ -601,6 +601,16 @@ def workers_assign(worker_id):
 @worker_bp.route("/llm/workers/<worker_id>/unassign", methods=["POST"])
 def workers_unassign(worker_id):
     body = AssignRequest(**(request.get_json(silent=True) or {}))
+    # Tiers v3 (operator decision 2026-07-05): 📌 pin = PERMANENT ATTRIBUTION
+    # of the model to this worker, so a pinned designation cannot be removed
+    # — unpin first. The pin lives in the agent's own settings and rides back
+    # in every heartbeat's `config`, so the registry row is the truth here.
+    _w = get_worker(worker_id)
+    if _w is not None and ((_w.get("config") or {}).get("pinned") or {}).get(body.model_key):
+        return jsonify({"ok": False, "error": {
+            "code": "Pinned",
+            "message": (f"{body.model_key} is pinned to "
+                        f"{_w.get('name') or worker_id} — unpin first")}}), 409
     worker = unassign_model(worker_id, body.model_key)
     if worker is None:
         abort(404, description="Unknown worker id.")
@@ -670,10 +680,21 @@ def workers_unload(worker_id):
 
 
 def _relay_worker_op(worker_id: str, op_path: str, body: dict,
-                     timeout: float, action: str) -> "tuple":
+                     timeout: float, action: str,
+                     retry_on_connect: bool = False) -> "tuple":
     """CON-05/06 + UTIL-02 relay: forward a privileged op to the worker's
     control agent and return its TYPED result verbatim (F3.4: errors are
-    data, not exceptions). Operator-gated in _SENSITIVE; every call audited."""
+    data, not exceptions). Operator-gated in _SENSITIVE; every call audited.
+
+    retry_on_connect (config-style ops only): a /ops/config POST is ACKed and
+    then the agent re-execs ~0.5s later, so a second config click during the
+    ~5s blip hits a dead socket — which used to come back as a bare 502
+    ("pin is broken"). For those ops a connect-class failure gets ONE retry
+    after a 3s pause; if that also can't connect, the answer is an honest
+    503 "agent is restarting" instead of the generic 502. Every other op
+    keeps the historical single-shot behavior exactly."""
+    import time as _time
+
     import httpx
     from .comms_routes import audit
 
@@ -683,13 +704,32 @@ def _relay_worker_op(worker_id: str, op_path: str, body: dict,
     audit(f"worker.{action}", {"worker_id": worker_id,
                                "worker": worker.get("name"), "body": body})
     url = (worker.get("url") or "").rstrip("/") + op_path
-    try:
-        r = httpx.post(url, json=body, timeout=timeout)
-        return jsonify(r.json()), r.status_code
-    except Exception as exc:
+
+    def _fail(exc):
         return jsonify({"ok": False,
                         "error": {"code": type(exc).__name__,
                                   "message": str(exc)}}), 502
+
+    _connect_errors = (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadError)
+    try:
+        r = httpx.post(url, json=body, timeout=timeout)
+        return jsonify(r.json()), r.status_code
+    except _connect_errors as exc:
+        if not retry_on_connect:
+            return _fail(exc)
+        _time.sleep(3.0)
+        try:
+            r = httpx.post(url, json=body, timeout=timeout)
+            return jsonify(r.json()), r.status_code
+        except _connect_errors:
+            return jsonify({"ok": False, "error": {
+                "code": "AgentRestarting",
+                "message": ("worker agent is restarting to apply a previous "
+                            "change — retry in a few seconds")}}), 503
+        except Exception as exc2:  # noqa: BLE001 — non-connect retry failure
+            return _fail(exc2)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(exc)
 
 
 @worker_bp.route("/llm/workers/<worker_id>/restart", methods=["POST"])
@@ -711,7 +751,8 @@ def workers_config(worker_id):
     effective values, so the row shows truth."""
     return _relay_worker_op(worker_id, "/ops/config",
                             request.get_json(silent=True) or {},
-                            timeout=15.0, action="config")
+                            timeout=15.0, action="config",
+                            retry_on_connect=True)
 
 
 @worker_bp.route("/llm/workers/<worker_id>/reap", methods=["POST"])
@@ -1453,7 +1494,13 @@ def slots_load():
     # optional per-load compute knobs (blank/omitted = autofit/default)
     opts = {k: body[k] for k in ("n_gpu_layers", "ctx", "threads", "cpus", "gpu")
             if body.get(k) not in (None, "")}
-    endpoint = SlotPool().endpoint_for(body["model_key"], opts=opts)
+    try:
+        endpoint = SlotPool().endpoint_for(body["model_key"], opts=opts)
+    except RuntimeError as exc:
+        # Scheduler refusals are DATA (e.g. "all slots are static-locked",
+        # slot-agent preflight reasons) — a 409 with the reason, not a raw 500.
+        return jsonify({"loaded": False, "reason": str(exc),
+                        "slots": SlotPool().overview()}), 409
     if endpoint is None:
         return jsonify({"loaded": False, "reason": "all slots busy",
                         "slots": SlotPool().overview()}), 409

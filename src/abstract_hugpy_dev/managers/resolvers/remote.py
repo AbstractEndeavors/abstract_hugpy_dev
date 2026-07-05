@@ -286,13 +286,55 @@ async def _worker_run_once(worker: dict, payload: dict, result_type, request_id:
     timeout = httpx.Timeout(3600.0, connect=4.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
         resp = await client.post(url, json=payload)
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            # The agent ships failures AS DATA (ok:false + error + traceback
+            # tail) alongside the 4xx/5xx status; a bare raise_for_status()
+            # discarded that body and reduced the console to "Server error
+            # '500 …'" with no cause. Surface the worker's own reason — the
+            # caller (DelegatingRunner) stamps the worker name onto it.
+            detail = ""
+            try:
+                detail = str((resp.json() or {}).get("error") or "")
+            except ValueError:
+                pass
+            if detail:
+                raise RuntimeError(f"HTTP {resp.status_code}: {detail}")
+            resp.raise_for_status()
         data = resp.json()
     if isinstance(data, dict):
         data.setdefault("request_id", request_id)
         data.setdefault("model_key", model_key)
         data.setdefault("ok", True)
-    return result_type.model_validate(data)
+    return _stamp_worker_error(result_type.model_validate(data), worker)
+
+
+def _stamp_worker_error(result, worker: dict):
+    """Attribution at the source for errors-as-data.
+
+    A worker that fails with a TYPED {ok: false, error: …} result (HTTP 200 —
+    the dispatch plane's errors-as-data contract) used to flow through the
+    relay anonymously, so the console showed raw cause frames ("frame 0:
+    ModuleNotFoundError: No module named 'torch'") with no hint of WHICH box
+    blew up (2026-07-05: ae's torch-less venv). Prefix worker name+id onto the
+    error text so every downstream surface (chat, scene frames, job errors)
+    carries the attribution."""
+    err = getattr(result, "error", None)
+    if getattr(result, "ok", True) and not err:
+        return result                          # success — nothing to stamp
+    if not isinstance(err, str) or not err or err.startswith("on worker "):
+        return result                          # nothing stampable / already stamped
+    wname = worker.get("name") or worker.get("id") or "worker"
+    wid = worker.get("id") or ""
+    label = f"{wname} ({wid})" if wid and wid != wname else wname
+    stamped = f"on worker {label}: {err}"
+    try:
+        return result.model_copy(update={"error": stamped})
+    except Exception:  # noqa: BLE001 — attribution must never break a result
+        try:
+            result.error = stamped
+        except Exception:  # noqa: BLE001
+            pass
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -472,7 +514,7 @@ def make_delegating_runner(framework: str, task: str):
                                 # surfaced instead (see _local_fallback_allowed).
                                 if produced_tokens:
                                     yield ErrorEvent(request_id=req.request_id,
-                                                     message=f"worker stream interrupted: {ev.message}")
+                                                     message=f"worker {wname}: stream interrupted: {ev.message}")
                                     return
                                 if not _local_fallback_allowed():
                                     yield ErrorEvent(
@@ -507,7 +549,7 @@ def make_delegating_runner(framework: str, task: str):
                         if produced_tokens:
                             # Stream already started — don't replay it locally.
                             yield ErrorEvent(request_id=req.request_id,
-                                             message=f"worker stream interrupted: {exc}")
+                                             message=f"worker {wname}: stream interrupted: {exc}")
                             return
                         if not _local_fallback_allowed():
                             yield ErrorEvent(

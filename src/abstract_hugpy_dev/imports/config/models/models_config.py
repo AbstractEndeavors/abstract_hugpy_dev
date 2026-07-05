@@ -30,7 +30,7 @@ logger = get_logFile(__name__)
 MODELS = {
     "Qwen2.5-3B-Instruct-GGUF": {
         "model_max_length": 32768, "include": None, "name": "Qwen2.5-3B-Instruct-GGUF",
-        "framework": "llama_cpp", "hub_id": "Qwen/Qwen2.5-3B-Instruct-GGUF",
+        "framework": "gguf", "hub_id": "Qwen/Qwen2.5-3B-Instruct-GGUF",
         "filename": "qwen2.5-3b-instruct-q4_k_m.gguf",
         "folder": "Qwen/Qwen2.5-3B-Instruct-GGUF", "tasks": ["text-generation"],
         "primary_task": "text-generation", "port": None,
@@ -46,7 +46,7 @@ MODELS = {
         "include": ["Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf",
                     "mmproj-Qwen2.5-VL-3B-Instruct-f16.gguf"],
         "name": "Qwen2.5-VL-3B-Instruct-GGUF",
-        "framework": "llama_cpp", "hub_id": "ggml-org/Qwen2.5-VL-3B-Instruct-GGUF",
+        "framework": "gguf", "hub_id": "ggml-org/Qwen2.5-VL-3B-Instruct-GGUF",
         "filename": "Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf",
         "folder": "ggml-org/Qwen2.5-VL-3B-Instruct-GGUF",
         "tasks": ["image-text-to-text", "text-generation"],
@@ -185,7 +185,7 @@ def _safe_path_part(value):
 
 def _runtime_folder(framework, hub_id, include=None, filename=None):
     framework = (framework or "").lower().strip()
-    if framework == "llama_cpp": return "gguf"
+    if framework == "gguf": return "gguf"
     if filename and filename.lower().endswith(".gguf"): return "gguf"
     if include:
         pats = include if isinstance(include, list) else [include]
@@ -210,18 +210,20 @@ def _resolve_folder(row, framework, task, hub_id, filename, include):
         return f.strip("/")
     return _routed_folder(framework, task, hub_id, filename, include) or hub_id
 def _derive_framework(name, hub_id, row):
+    # HF-canonical vocabulary (operator directive 2026-07-05): "gguf" is HF
+    # Hub's library tag for GGUF repos — "llama_cpp" is retired as a value.
     if row.get("framework"):
         return row["framework"]
     blob = f"{name} {hub_id}".lower()
     tags = [t.lower() for t in (row.get("tags") or [])]
-    return "llama_cpp" if ("gguf" in blob or "gguf" in tags) else "transformers"
+    return "gguf" if ("gguf" in blob or "gguf" in tags) else "transformers"
 
 
 def _derive_tasks(framework, row):
     tasks = row.get("tasks")
     if tasks:
         return tasks if isinstance(tasks, list) else [tasks]
-    if framework == "llama_cpp":
+    if framework == "gguf":
         # Vision GGUFs (a VL model + its mmproj sidecar) ride the chat path but
         # MUST advertise image-text-to-text, or they're dropped from that task
         # ("has no runner") and only ever answer text. Detect by model_type or a
@@ -621,14 +623,22 @@ def get_models_dict(models_dict_path=None, dict_return=False, return_dict=False,
     step so a hidden "ghost" row never shows in any listing."""
     dict_return = dict_return or return_dict
     report = discovery if discovery is not None else _load_discovery_report(models_dict_path)
-    merged, dropped = merge_discovery_into_models(report)
 
-    # Comfy checkpoint sweep — drop a file in <root>/checkpoints, get a model.
+    # Comfy checkpoint sweep FIRST, so its rows join the dedupe BASE of the
+    # merge. The sweep's own layout dirs (models/misc/text-to-image/comfy/…)
+    # are walked by discovery too; when sweep rows were appended AFTER the
+    # merge, that discovered copy (hub comfy/<stem>) had nothing to merge
+    # into and survived as a SECOND row — with default framework/task when
+    # enrichment came up empty (the 2026-07-05 sd-turbo/sd-xl-turbo phantom
+    # rows). In the base, same-hub discovery merges into the sweep row.
+    base = {k: dict(v) for k, v in MODELS.items()}
     try:
-        for k, v in _sweep_comfy_checkpoints(merged).items():
-            merged.setdefault(k, v)
+        for k, v in _sweep_comfy_checkpoints(base).items():
+            base.setdefault(k, v)
     except Exception as exc:  # noqa: BLE001 — the sweep must never break the registry
         logger.warning("comfy checkpoint sweep failed: %s", exc)
+
+    merged, dropped = merge_discovery_into_models(report, base=base)
 
     for model_key, why in dropped:
         logger.info("registry: dropped %s (%s)", model_key, why)

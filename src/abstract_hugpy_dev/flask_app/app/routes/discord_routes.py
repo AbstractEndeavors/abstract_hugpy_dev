@@ -42,6 +42,10 @@ from ..functions.imports.utils.discord_bindings import (
     append_bridge_message,
     get_bridge_messages,
     update_bridge_message,
+    add_session,
+    list_sessions,
+    revoke_session,
+    session_by_token,
 )
 import asyncio
 import inspect
@@ -412,3 +416,117 @@ def discord_bridge_reject(bridge_id):
     if not msg:
         abort(404, description="Unknown message id.")
     return jsonify(msg)
+
+
+# ── comms sessions: scoped bearer endpoints for terminal agents ────────────
+# The operator mints a session bound to one channel (POST /discord/sessions —
+# operator-gated) and hands the returned token to a terminal/agent session.
+# The holder gets exactly two verbs on /discord/session/<token>/…: read the
+# channel transcript and send into the channel. Revocable, optionally
+# expiring, and the store only keeps the token's sha256. NOTE: the token
+# rides in the URL path for paste-ability — it will appear in front-proxy
+# access logs, which are operator-controlled here; rotate via revoke+mint.
+
+class SessionMintRequest(BaseModel):
+    channel_id: str
+    label: str | None = None
+    ttl_hours: float | None = None
+    author: str | None = None
+
+
+# Discord hard-caps a message at 2000 chars; refuse instead of letting the
+# bot's delivery fail silently later.
+_SESSION_MSG_LIMIT = 1900
+
+
+@discord_bp.route("/discord/sessions", methods=["POST"])   # operator-gated
+def discord_sessions_mint():
+    body = SessionMintRequest(**(request.get_json(silent=True) or {}))
+    # Inbound needs the channel bridged; reuse the existing bridge or create a
+    # pure relay (keeper brain — never auto-generates a model reply).
+    bridge = bridge_for_channel(body.channel_id)
+    if not bridge:
+        bridge = add_bridge(channel_id=body.channel_id, brain="keeper",
+                            keeper_target=f"session:{(body.label or '').strip() or 'terminal'}")
+    try:
+        token, session = add_session(channel_id=body.channel_id,
+                                     label=body.label or "",
+                                     ttl_hours=body.ttl_hours,
+                                     author=body.author)
+    except ValueError as exc:
+        abort(400, description=str(exc))
+    return jsonify({"token": token,           # shown exactly once
+                    "session": session,
+                    "bridge_id": bridge["id"],
+                    "endpoint": f"/discord/session/{token}"}), 201
+
+
+@discord_bp.route("/discord/sessions", methods=["GET"])    # operator-gated
+def discord_sessions_list():
+    return jsonify({"sessions": list_sessions()})
+
+
+@discord_bp.route("/discord/sessions/<session_id>", methods=["DELETE"])  # operator-gated
+def discord_sessions_revoke(session_id):
+    if not revoke_session(session_id):
+        abort(404, description="Unknown or already-revoked session id.")
+    return jsonify({"ok": True, "id": session_id})
+
+
+def _session_or_404(token: str) -> dict:
+    s = session_by_token(token)
+    if not s:
+        abort(404)  # bad, revoked and expired are indistinguishable — no oracle
+    return s
+
+
+@discord_bp.route("/discord/session/<token>", methods=["GET"])
+def discord_session_info(token):
+    """Self-describing so the endpoint alone is enough to hand to an agent."""
+    s = _session_or_404(token)
+    chans = (get_channels() or {}).get("channels") or []
+    name = next((c.get("name") for c in chans
+                 if str(c.get("id")) == str(s["channel_id"])), None)
+    return jsonify({
+        "channel_id": s["channel_id"],
+        "channel": name,
+        "label": s.get("label") or "",
+        "bridged": bool(bridge_for_channel(s["channel_id"])),
+        "usage": {
+            "poll": "GET …/messages?since=<ts float from last message> → {\"messages\":[…]}",
+            "send": f"POST …/send {{\"content\":\"…\"}} (≤{_SESSION_MSG_LIMIT} chars) → bot delivers within ~8s",
+        },
+    })
+
+
+@discord_bp.route("/discord/session/<token>/messages", methods=["GET"])
+def discord_session_messages(token):
+    s = _session_or_404(token)
+    bridge = bridge_for_channel(s["channel_id"])
+    if not bridge:
+        return jsonify({"messages": [],
+                        "warning": "channel bridge removed — inbound relay is off"})
+    try:
+        since = float(request.args.get("since", "0") or 0)
+    except ValueError:
+        since = 0.0
+    return jsonify({"messages": get_bridge_messages(bridge["id"], since)})
+
+
+@discord_bp.route("/discord/session/<token>/send", methods=["POST"])
+def discord_session_send(token):
+    s = _session_or_404(token)
+    body = request.get_json(silent=True) or {}
+    content = (body.get("content") or "").strip()
+    if not content:
+        abort(400, description="content is required.")
+    if len(content) > _SESSION_MSG_LIMIT:
+        abort(413, description=f"content exceeds {_SESSION_MSG_LIMIT} chars — split it.")
+    author = (body.get("author") or s.get("author") or s.get("label") or "session").strip()
+    bridge = bridge_for_channel(s["channel_id"])
+    msg = None
+    if bridge:  # record in the transcript so other session holders see it
+        msg = append_bridge_message(bridge["id"], direction="out", source="session",
+                                    content=content, author=author)
+    enqueue_outbound(content=content, channel_id=s["channel_id"])
+    return jsonify({"ok": True, "message": msg}), 201

@@ -280,7 +280,7 @@ def infer_framework(directory: str) -> Optional[str]:
     has_ext = lambda ext: any(f.endswith(ext) for f in files)
 
     if has_ext(".gguf") or has_ext(".GGUF"):
-        return "llama_cpp"
+        return "gguf"
     if has_ext(".safetensors") or has_ext(".bin"):
         return "transformers"
     if has_ext(".onnx"):

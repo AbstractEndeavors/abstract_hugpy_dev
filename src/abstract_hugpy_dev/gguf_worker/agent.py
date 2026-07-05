@@ -335,7 +335,7 @@ class ModelStore:
             return existing
         manifest = self.client.model_manifest(model_key)
         framework = manifest.get("framework")
-        if framework and framework != "llama_cpp":
+        if framework and framework != "gguf":
             raise RuntimeError(
                 f"{model_key} is framework={framework!r}; this worker serves GGUF only")
         ggufs = [f for f in manifest.get("files", [])

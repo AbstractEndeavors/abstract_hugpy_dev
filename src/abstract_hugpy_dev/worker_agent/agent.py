@@ -965,6 +965,10 @@ def build_app(state: "WorkerState") -> Flask:
                 "ok": False,
                 "error": f"{type(exc).__name__}: {exc}",
                 "traceback_tail": tb[-1500:],
+                # Attribution at the source: direct API consumers (and any
+                # relay that keeps the body) see WHICH box failed without
+                # having to know who they called.
+                "worker": {"id": state.worker_id, "name": state.name},
             }), 500
 
     @app.route("/infer/stream", methods=["POST"])
@@ -1121,24 +1125,26 @@ def build_app(state: "WorkerState") -> Flask:
                         "code": "BadValue", "message": f"{_tkey} must be 60..86400"}}), 400
                 settings[_tkey] = tval
         if "residency" in body:
-            # DEEP-MERGE per model key: {"model": "warm"|"on-demand"|null}.
-            # null (or "") removes the override, restoring the warm default.
+            # DEEP-MERGE per model key: {"model": "static"|null}. The default
+            # tier is ON-DEMAND and is represented by NO stored entry — null,
+            # "", "on-demand" itself, or the legacy synonyms "serving"/"warm"
+            # all clear the override. "static" is the only stored value.
             if not isinstance(body["residency"], dict):
                 return jsonify({"ok": False, "error": {
                     "code": "BadValue",
-                    "message": 'residency must be {"<model_key>": "warm"|"on-demand"|null}'}}), 400
+                    "message": 'residency must be {"<model_key>": "static"|null} — null/"on-demand" (or legacy "serving"/"warm") restores the on-demand default'}}), 400
             merged = dict(settings.get("residency") or {})
             for mk, mode in body["residency"].items():
-                if mode in (None, "", "serving", "warm"):
-                    # serving IS the default — storing it would be noise; a
-                    # null/serving write clears any on-demand override.
+                if mode in (None, "", "on-demand", "serving", "warm"):
+                    # on-demand IS the default — storing it would be noise;
+                    # any of these writes clears the override.
                     merged.pop(mk, None)
-                elif mode == "on-demand":
+                elif mode == "static":
                     merged[mk] = mode
                 else:
                     return jsonify({"ok": False, "error": {
                         "code": "BadValue",
-                        "message": f"residency[{mk!r}] must be 'serving', 'on-demand' or null"}}), 400
+                        "message": f"residency[{mk!r}] must be 'static' or null — on-demand is the default ('on-demand'/'serving'/'warm' also clear the override)"}}), 400
             if merged:
                 settings["residency"] = merged
             else:
@@ -1355,14 +1361,30 @@ def _sync_assignment(state: "WorkerState", worker: dict) -> None:
     """
     if not isinstance(worker, dict):
         return
-    models = worker.get("models") or []
-    if models == state.assigned_models:
+    if "models" not in worker:
+        # No authoritative assignment list in this response — adopt nothing,
+        # and above all don't treat it as "everything unassigned" below.
         return
+    models = worker.get("models") or []
+    changed = models != state.assigned_models
     state.assigned_models = list(models)
+    # Tiers v3 lazy cleanup: with central's authoritative list in hand, drop
+    # residency overrides (static OR on-demand) for models no longer assigned
+    # — unless pinned (📌 = permanent attribution). Runs every heartbeat, so
+    # it also catches unassigns that happened while this agent was down.
+    try:
+        _prune_stale_residency(state)
+    except Exception as exc:  # noqa: BLE001 — cleanup must not break adoption
+        logger.warning("residency prune failed: %s", exc)
+    if not changed:
+        return
     logger.info("assignment updated: serving %s", models or "(nothing)")
 
     for model_key in models:
         _kick_provision(state, model_key)
+    # Slice 9: already-local models can be seated right now — don't wait for
+    # the maintenance tick. Background thread: fills block on slot loads.
+    threading.Thread(target=_fill_empty_slots, args=(state,), daemon=True).start()
 
 
 def _kick_provision(state: "WorkerState", model_key: str) -> None:
@@ -1418,23 +1440,36 @@ def _kick_provision(state: "WorkerState", model_key: str) -> None:
                     logger.info("pre-provisioning assigned model %s…", mk)
                     ensure_model_present(mk, state.central_url, progress=_prog)
                     logger.info("pre-provisioned %s", mk)
-                # Preload / "dedicate": eagerly WARM the model (build+cache the
-                # runner so it stays resident) ahead of the first request — so a
-                # dedicated/pooled worker answers with no cold-load latency.
-                # Default ON when this worker has a pool; force with WORKER_PRELOAD.
+                # Warm-up policy (v3 final semantics):
+                #   * slots box — seat assignment is the SLOT-FILLER's job
+                #     (slice 9, static-first): no in-process preload here, so
+                #     nothing double-loads. Files just landed — kick a fill.
+                #   * no slots — static always eager-warms in-process; other
+                #     models (default on-demand) warm only behind the
+                #     WORKER_PRELOAD/WORKER_POOL gate and TTL-yield when idle.
                 _preload = os.environ.get(
                     "WORKER_PRELOAD",
                     "1" if os.environ.get("WORKER_POOL", "").strip() else "0",
                 ).strip().lower() in ("1", "true", "yes", "on")
-                if _preload and _residency(mk) == "on-demand":
-                    # Residency policy (item 3): the operator marked this model
-                    # on-demand — never preload; it loads on first request and
-                    # the TTL sweep evicts it after idle.
-                    logger.info("preload SKIPPED for %s (residency: on-demand)", mk)
-                elif _preload:
+                _res = _residency(mk)
+                _has_slots = False
+                try:
+                    from ..managers.serve.slots import slots_enabled
+                    _has_slots = slots_enabled()
+                except Exception:  # noqa: BLE001
+                    pass
+                if _has_slots:
+                    try:
+                        _fill_empty_slots(state)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("post-provision slot fill failed: %s", exc)
+                elif _preload or _res == "static":
+                    # STATIC is always-on: eager-warm regardless of the
+                    # preload gate — it must never wait for a first request.
                     try:
                         from abstract_hugpy_dev.managers.dispatch.dispatch import runner_for
-                        logger.info("preloading (warming) %s…", mk)
+                        logger.info("preloading (warming) %s…%s", mk,
+                                    " [static — forced]" if (_res == "static" and not _preload) else "")
                         runner_for(model_key=mk)   # builds + caches -> resident
                         logger.info("preloaded %s (resident)", mk)
                     except Exception as exc:
@@ -1568,19 +1603,66 @@ _RUNTIME_SETTINGS: dict = {}             # the loaded settings, for live readers
 
 
 def _residency(model_key: str) -> str:
-    """Per-model residency policy (tiers v2): "serving" (dedicated residency,
-    the default — holds its slot/process seat) or "on-demand" (loads on call;
-    TTL-yields when idle). "warm" is the legacy name for serving.
+    """Per-model residency POLICY (v3 final semantics, operator-locked
+    2026-07-05). Exactly TWO tiers:
+
+      * "on-demand" — the DEFAULT (no stored entry): loads on call; holds a
+        slot seat until another model needs it (promotion) — slot occupants
+        never TTL-yield; idle IN-PROCESS residents do (frees RAM on
+        slot-less boxes). "serving"/"warm" are accepted legacy write-
+        synonyms for this default; stored legacy entries read as it too.
+      * "static" — the only stored override: locked seat, never swapped out
+        or yielded, eager-warmed; permanent when combined with 📌 pin.
+
+    "Serving" is purely a STATE (a model in a slot), never a policy.
     """
-    val = (_RUNTIME_SETTINGS.get("residency") or {}).get(model_key, "serving")
-    return "serving" if val in ("warm", "serving") else val
+    val = (_RUNTIME_SETTINGS.get("residency") or {}).get(model_key)
+    return "static" if val == "static" else "on-demand"
 
 
 def _pinned(model_key: str) -> bool:
-    """Files-axis pin (tiers v2): operator bookkeeping — these files LIVE on
-    this box: never reaped, survive unassign. (Enforced by the reaper when it
-    ships; advertised in the heartbeat config meanwhile.)"""
+    """📌 pin (tiers v3 semantics, operator-locked 2026-07-05): PERMANENT
+    ATTRIBUTION of the model to this worker — central refuses unassign while
+    pinned, files are never reaped, and residency overrides survive. (Reaper
+    enforcement pending; advertised in the heartbeat config meanwhile.)"""
     return bool((_RUNTIME_SETTINGS.get("pinned") or {}).get(model_key))
+
+
+def _prune_stale_residency(state: "WorkerState") -> None:
+    """Tiers v3 lazy cleanup: residency overrides are ASSIGNMENT-scoped unless
+    pinned. 🔒 static (and ⏲ on-demand) last while the model stays assigned;
+    📌 pin makes the attribution permanent, so pinned overrides survive.
+
+    Drops overrides for models absent from state.assigned_models (the list
+    adopted from central's authoritative register/heartbeat response) unless
+    pinned. Updates the LIVE settings and persists the file — no re-exec:
+    _residency()/the sweep/the slot policy all read _RUNTIME_SETTINGS live."""
+    args = getattr(state, "args", None)
+    if args is None:                       # startup window before main() wires it
+        return
+    res = _RUNTIME_SETTINGS.get("residency") or {}
+    if not res:
+        return
+    assigned = set(state.assigned_models)
+    stale = [mk for mk in res if mk not in assigned and not _pinned(mk)]
+    if not stale:
+        return
+    for mk in stale:
+        logger.info("residency override %r for %s dropped — model unassigned "
+                    "and not pinned (static ends at unassign)", res.get(mk), mk)
+    settings = _load_settings(args)
+    kept = {k: v for k, v in (settings.get("residency") or {}).items()
+            if k not in stale}
+    if kept:
+        settings["residency"] = kept
+    else:
+        settings.pop("residency", None)
+    _save_settings(args, settings)
+    live = {k: v for k, v in res.items() if k not in stale}
+    if live:
+        _RUNTIME_SETTINGS["residency"] = live
+    else:
+        _RUNTIME_SETTINGS.pop("residency", None)
 
 
 def _settings_path(args) -> str:
@@ -1698,60 +1780,122 @@ def _comfy_status() -> dict:
     return out
 
 
-def _residency_sweep_loop() -> None:
-    """Evict idle on-demand models (item 3 residency policy).
+def _slot_occupants() -> set:
+    """Model keys currently seated in this worker's slot pool (empty set when
+    slots are disabled/unreachable — callers treat unknown as unoccupied)."""
+    try:
+        from ..managers.serve.slots import SlotPool, slots_enabled
+        if not slots_enabled():
+            return set()
+        return {s.get("model_key") for s in SlotPool().statuses()
+                if s.get("model_key")}
+    except Exception as exc:  # noqa: BLE001 — telemetry, never fatal
+        logger.warning("slot occupancy lookup failed: %s", exc)
+        return set()
 
-    Every 60s: any LOADED model whose residency is "on-demand" and whose last
-    request is older than on_demand_ttl_s gets evicted (dispatch.evict cascades
-    to the llama singleton, so the VRAM/RAM actually frees). Warm models are
-    never touched — assigned=ready stays the default contract."""
+
+def _residency_sweep_once(started_at: float) -> None:
+    """One pass of the TTL sweep (factored out of the loop so it's testable).
+
+    v3 final semantics: the sweep applies ONLY to IN-PROCESS residents. The
+    default policy is on-demand, so any non-static in-process model idle
+    longer than on_demand_ttl_s is evicted (dispatch.evict cascades to the
+    llama singleton — RAM/VRAM actually frees; the op-style slot-less box
+    keeps this behavior). SLOT occupants are EXEMPT: slots stay filled
+    (slice 9) and a seat changes hands only via LRU promotion or explicit
+    unload. Static never yields anywhere."""
+    ttl = int(_RUNTIME_SETTINGS.get("on_demand_ttl_s", 900))
+    from ..managers.dispatch.dispatch import (
+        last_used_snapshot, evict)
+    seated = _slot_occupants()
+    last_used = last_used_snapshot()
+    now = time.time()
+    for mk in loaded_model_keys():
+        if _residency(mk) == "static" or mk in seated:
+            continue
+        idle = now - last_used.get(mk, started_at)
+        if idle > ttl:
+            logger.info("residency sweep: evicting %s (on-demand in-process, "
+                        "idle %.0fs > ttl %ds)", mk, idle, ttl)
+            try:
+                evict(mk)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("residency evict of %s failed: %s", mk, exc)
+
+
+_SLOT_FILL_LOCK = threading.Lock()
+
+
+def _fill_empty_slots(state: "WorkerState") -> None:
+    """Slice 9: empty slots never sit idle while assigned models exist.
+
+    Runs on startup, after assignment adoption/provisioning, and every
+    maintenance tick. Preference order: STATIC first (they must hold seats
+    anyway — this subsumes the old static eager-warm on slots boxes), then
+    most-recently-used, then any assigned. Candidates must have their files
+    local (provisioning re-kicks the fill when a pull lands) and be GGUF
+    rows (slots host llama.cpp server children only).
+
+    Each load rides runner_for -> get_llama_runner -> SlotPool.endpoint_for —
+    the exact path a live request takes, so per-model opts/ctx resolution,
+    same-model reuse and the static-lock guard all apply for free, and each
+    load seats itself in an idle slot (never promotes: we only start as many
+    loads as there are empty seats). Single-flight."""
+    if not _SLOT_FILL_LOCK.acquire(blocking=False):
+        return                                   # a fill pass is already running
+    try:
+        from ..managers.serve.slots import SlotPool, slots_enabled
+        if not slots_enabled():
+            return
+        statuses = SlotPool().statuses()
+        empties = [s for s in statuses
+                   if "error" not in s and not s.get("model_key")]
+        if not empties:
+            return
+        occupied = {s["model_key"] for s in statuses if s.get("model_key")}
+        local = set(_models_local(state))
+
+        def _framework(mk):
+            try:
+                from .imports import get_model_config
+                return getattr(get_model_config(mk), "framework", None)
+            except Exception:  # noqa: BLE001 — unknown row: not seatable
+                return None
+
+        candidates = [mk for mk in state.assigned_models
+                      if mk not in occupied and mk in local
+                      and _framework(mk) == "gguf"]
+        if not candidates:
+            return
+        from ..managers.dispatch.dispatch import last_used_snapshot
+        last_used = last_used_snapshot()
+        candidates.sort(key=lambda mk: (0 if _residency(mk) == "static" else 1,
+                                        -last_used.get(mk, 0.0)))
+        for mk in candidates[:len(empties)]:
+            try:
+                logger.info("slot fill: seating %s (%s) in an empty slot",
+                            mk, _residency(mk))
+                from abstract_hugpy_dev.managers.dispatch.dispatch import runner_for
+                runner_for(model_key=mk)         # seats itself via endpoint_for
+            except Exception as exc:  # noqa: BLE001 — one seat must not block the rest
+                logger.warning("slot fill for %s failed: %s", mk, exc)
+    finally:
+        _SLOT_FILL_LOCK.release()
+
+
+def _residency_sweep_loop(state: "WorkerState") -> None:
+    """Residency maintenance every 60s: fill empty slots (slice 9), then
+    TTL-yield idle in-process on-demand residents."""
     started_at = time.time()
     while True:
         time.sleep(60.0)
         try:
-            res_map = _RUNTIME_SETTINGS.get("residency") or {}
-            if not res_map:
-                continue
-            ttl = int(_RUNTIME_SETTINGS.get("on_demand_ttl_s", 900))
-            from ..managers.dispatch.dispatch import (
-                last_used_snapshot, evict)
-            last_used = last_used_snapshot()
-            now = time.time()
-            for mk in loaded_model_keys():
-                if _residency(mk) != "on-demand":
-                    continue
-                idle = now - last_used.get(mk, started_at)
-                if idle > ttl:
-                    logger.info("residency sweep: evicting %s (on-demand, "
-                                "idle %.0fs > ttl %ds)", mk, idle, ttl)
-                    try:
-                        evict(mk)
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning("residency evict of %s failed: %s", mk, exc)
-            # Slot tier (tiers v2): idle on-demand SLOT occupants yield their
-            # seat the same way — busy slots and serving models never touched.
-            try:
-                from ..managers.serve.slots import SlotPool, slots_enabled
-                if slots_enabled():
-                    pool = SlotPool()
-                    for st in pool.statuses():
-                        mk = st.get("model_key")
-                        if (not mk or st.get("busy")
-                                or _residency(mk) != "on-demand"):
-                            continue
-                        idle = now - (st.get("last_used") or started_at)
-                        if idle > ttl:
-                            logger.info("residency sweep: slot %s yields %s "
-                                        "(on-demand, idle %.0fs > ttl %ds)",
-                                        st.get("_control"), mk, idle, ttl)
-                            try:
-                                pool.unload(st["_control"])
-                            except Exception as exc:  # noqa: BLE001
-                                logger.warning("slot yield of %s failed: %s",
-                                               mk, exc)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("slot residency pass failed: %s", exc)
-        except Exception as exc:  # noqa: BLE001 — the sweep must never die
+            _fill_empty_slots(state)
+        except Exception as exc:  # noqa: BLE001 — the loop must never die
+            logger.warning("slot fill pass failed: %s", exc)
+        try:
+            _residency_sweep_once(started_at)
+        except Exception as exc:  # noqa: BLE001 — the loop must never die
             logger.warning("residency sweep iteration failed: %s", exc)
 
 
@@ -2106,11 +2250,17 @@ def main(argv: list[str] | None = None) -> int:
     # the slot supervisor + every other reader sees them; drop-ins lose loudly.
     _apply_settings_env(args)
 
-    # Tiers v2: the slot pool may bump idle ON-DEMAND occupants for callers;
-    # serving/pinned models are never evictable (policy returns False).
+    # v3 final semantics: on-demand is the DEFAULT tier, so every occupant
+    # except a static one may be bumped (LRU promotion) when another model
+    # needs a seat — exactly the intent of "slots stay filled, seats change
+    # hands on demand". The residency lookup lets the scheduler tell an
+    # all-STATIC pool apart from a merely-busy one and fail loads with a
+    # clear error instead of evicting.
     try:
-        from ..managers.serve.slots import set_eviction_policy
+        from ..managers.serve.slots import (set_eviction_policy,
+                                            set_residency_lookup)
         set_eviction_policy(lambda mk: _residency(mk) == "on-demand")
+        set_residency_lookup(_residency)
     except Exception as _exc:  # noqa: BLE001
         logger.warning("slot eviction policy not registered: %s", _exc)
 
@@ -2149,8 +2299,11 @@ def main(argv: list[str] | None = None) -> int:
     hb = threading.Thread(target=_heartbeat_loop, args=(client, state, args), daemon=True)
     hb.start()
 
-    # Residency policy sweep (item 3): evicts idle on-demand models.
-    threading.Thread(target=_residency_sweep_loop, daemon=True).start()
+    # Residency maintenance (v3): fills empty slots (slice 9) + TTL-yields
+    # idle IN-PROCESS on-demand residents. First fill lands sooner than the
+    # loop's first 60s tick so a restarted agent's slots don't sit empty.
+    threading.Thread(target=_residency_sweep_loop, args=(state,), daemon=True).start()
+    threading.Timer(20.0, lambda: _fill_empty_slots(state)).start()
 
     # UTIL-08 reconcile: failed pulls converge instead of drifting forever.
     threading.Thread(target=_reconcile_loop, args=(state,), daemon=True).start()

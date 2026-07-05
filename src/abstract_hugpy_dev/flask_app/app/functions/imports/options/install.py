@@ -20,7 +20,7 @@ def _gguf_options(files, free_bytes):
         total = sum(g.size for g in group if g.size) or None
         common = dict(
             id=f"gguf:{label}",
-            framework="llama_cpp",
+            framework="gguf",
             total_bytes=total,
             fits_disk=(None if total is None or free_bytes is None
                        else total < free_bytes),

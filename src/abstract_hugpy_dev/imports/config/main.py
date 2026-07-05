@@ -168,7 +168,7 @@ def model_looks_downloaded(path: str, cfg: Optional[ModelConfig] = None) -> bool
     if not exists(path) or not is_dir(path):
         return False
 
-    if cfg and cfg.framework == "llama_cpp":
+    if cfg and cfg.framework == "gguf":
         gguf = get_gguf_file(path, cfg)
         if not (gguf and exists(gguf) and st_size(gguf) > 1024 * 1024):
             return False
@@ -244,7 +244,7 @@ def resolve_model_source(key: str) -> str:
             f"MODEL_{key.upper()}={env_override} was set but path does not exist"
         )
 
-    if cfg.framework == "llama_cpp":
+    if cfg.framework == "gguf":
         if not model_looks_downloaded(local, cfg):
             return cfg.hub_id
 

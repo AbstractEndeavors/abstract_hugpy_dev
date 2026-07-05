@@ -168,6 +168,56 @@ def resolve_local_tokenizer(directory: str, hub_id: str) -> dict:
     return {}
 
 
+def resolve_hugpy_marker(directory: str, hub_id: str) -> dict:
+    """The hugpy.json stamp is the DECLARED identity — authoritative. Without
+    this resolver, a stamped dir with no config.json (e.g. the comfy sweep's
+    layout dirs, GGUF single-file dirs) enriched to nothing and the registry
+    minted a row with DEFAULT framework/task (the sd-turbo phantom rows)."""
+    from ..src.constants.hugpy_marker import read_hugpy_marker
+    marker = read_hugpy_marker(directory) or {}
+    tasks = marker.get("tasks")
+    if tasks is not None and not isinstance(tasks, list):
+        tasks = [tasks]
+    return {k: v for k, v in {
+        "name":         marker.get("name"),
+        "framework":    marker.get("framework"),
+        "tasks":        tasks,
+        "primary_task": marker.get("primary_task"),
+    }.items() if v is not None}
+
+
+# Storage families that imply a framework. "misc" implies nothing — comfy and
+# every other odd runtime shares it, so only the task segment is trusted there.
+_LAYOUT_FAMILY_FRAMEWORK = {"gguf": "gguf", "transformers": "transformers"}
+
+
+def resolve_layout_path(directory: str, hub_id: str) -> dict:
+    """Last-resort attribution from the routed storage layout itself:
+    MODELS_HOME/<family>/<task>/<owner>/<repo>. The path was WRITTEN from the
+    model's real attribution at download/route time, so it beats guessing
+    defaults — but it runs LAST, after marker/config/tokenizer/hub."""
+    try:
+        rel = os.path.relpath(directory, MODELS_HOME)
+    except ValueError:
+        return {}
+    parts = rel.split(os.sep)
+    if rel.startswith("..") or len(parts) < 3:
+        return {}
+    family, task = parts[0], parts[1]
+    from ..src.constants.categories import HF_TASK_TO_TASKS, RUNNER_PAIRS
+    known_tasks = {t for _fw, t in RUNNER_PAIRS}
+    for _hf, _ts in HF_TASK_TO_TASKS.items():
+        known_tasks.add(_hf); known_tasks.update(_ts)
+    out: dict = {}
+    if task in known_tasks:
+        out["tasks"] = [task]
+        out["primary_task"] = task
+    fw = _LAYOUT_FAMILY_FRAMEWORK.get(family)
+    if fw:
+        out["framework"] = fw
+    return out
+
+
 def resolve_hub_model_info(directory: str, hub_id: str, api: HfApi) -> dict:
     # Skip ids that aren't owner/repo — the HF validator raises on these,
     # and a malformed id can't resolve anything anyway.
@@ -213,13 +263,18 @@ ResolverFn = Callable[[str, str], dict]
 
 def build_resolver_chain(*, api: Optional[HfApi] = None,
                          use_hub: bool = True) -> List[Tuple[str, ResolverFn]]:
+    # Order = priority (first non-None wins): declared identity (hugpy.json)
+    # beats disk contents beats the Hub; the routed-path layout is the floor —
+    # anything is better than minting default framework/task attribution.
     chain: List[Tuple[str, ResolverFn]] = [
+        ("hugpy_marker",    resolve_hugpy_marker),
         ("local_config",    resolve_local_config),
         ("local_tokenizer", resolve_local_tokenizer),
     ]
     if use_hub:
         hub_api = api or HfApi()
         chain.append(("hub_model_info", lambda d, h: resolve_hub_model_info(d, h, hub_api)))
+    chain.append(("layout_path", resolve_layout_path))
     return chain
 
 
@@ -308,7 +363,10 @@ def discover_models(save_json: bool = True, verbose: bool = True, use_hub: bool 
         meta, meta_sources = enrich(directory, hub_id, chain)
 
         row = meta.to_dict()
-        row["name"] = name                                     # display name stays bare
+        # Declared name (hugpy.json) wins; the bare basename is the fallback —
+        # a marker-stamped "comfy-sd-turbo" must not degrade to "sd-turbo" and
+        # collide with the staple's display name.
+        row["name"] = row.get("name") or name
         row["dir"] = directory                                  # absolute, ground truth
         try:
             row["folder"] = os.path.relpath(directory, MODELS_HOME)   # MODELS_HOME-relative
@@ -345,5 +403,23 @@ def discover_models(save_json: bool = True, verbose: bool = True, use_hub: bool 
         discovered[key] = row
 
     if save_json:
+        # Shrink guard: a walk taken while the storage mount is degraded finds
+        # a fraction of the catalog; saving that would "disappear" models whose
+        # files still exist (2026-07-04: report collapsed to 2 entries vs 108
+        # dirs on disk). Keep the outgoing report as .prev whenever this walk
+        # found less than half of what the last one did — recovery is then a
+        # re-walk on healthy disk (POST /models/discover) or restoring .prev.
+        try:
+            import json as _json, shutil as _shutil
+            with open(MODELS_DISCOVERY_PATH, "r", encoding="utf-8") as _fh:
+                _prior = _json.load(_fh)
+            if len(_prior) > 4 and len(discovered) < 0.5 * len(_prior):
+                _shutil.copy2(MODELS_DISCOVERY_PATH, MODELS_DISCOVERY_PATH + ".prev")
+                print(f"[discover] WARNING: walk found {len(discovered)} models "
+                      f"but the prior report had {len(_prior)} — storage mount "
+                      f"degraded? Prior report kept at "
+                      f"{MODELS_DISCOVERY_PATH}.prev")
+        except (OSError, ValueError):
+            pass
         safe_dump_to_file(data=discovered, file_path=MODELS_DISCOVERY_PATH)
     return discovered

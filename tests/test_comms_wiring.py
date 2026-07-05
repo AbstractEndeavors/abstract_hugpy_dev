@@ -98,6 +98,13 @@ _pr.principal_store._path = _os.path.join(_tmp, "principals.json")
 _se.settings_store._path = _os.path.join(_tmp, "settings.json")
 _se.settings_store._cache = None
 
+# Settings WRITES are operator-gated (operator_auth._SENSITIVE ^/settings/.+$),
+# and the bare test env resolves to the fail-closed external mode. This section
+# tests the settings API, not the gate — run it in the documented self-hosted
+# "open" mode (permissive while no operator token is set).
+_os.environ["HUGPY_AUTH_MODE"] = "open"
+_os.environ.pop("HUGPY_OPERATOR_TOKEN", None)
+
 # F4 settings control API
 r = c.post("/settings/discord.channels/42", json={"value": {"respond": "all"}})
 check("settings write 200", r.status_code == 200)

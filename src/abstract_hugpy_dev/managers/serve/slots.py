@@ -30,10 +30,22 @@ _LOGGED_COUNT = False
 # keeps the historical behavior: all-busy -> None -> swap fallback.
 _EVICTION_POLICY = None
 
+# Tiers-v3 residency lookup hook: a callable mk -> "serving"|"on-demand"|
+# "static". Registered by the WORKER agent (its _residency). Lets the
+# scheduler tell a merely-busy pool ("return None, swap handles it") from a
+# STATIC-LOCKED pool, where every seat is immovable and the load must fail
+# with a clear error instead. None (bare central) skips the check.
+_RESIDENCY_LOOKUP = None
+
 
 def set_eviction_policy(fn) -> None:
     global _EVICTION_POLICY
     _EVICTION_POLICY = fn
+
+
+def set_residency_lookup(fn) -> None:
+    global _RESIDENCY_LOOKUP
+    _RESIDENCY_LOOKUP = fn
 
 
 def _slot_count() -> int:
@@ -149,8 +161,10 @@ class SlotPool:
 
         # 3. everything busy — tiers-v2 promotion: bump the LRU *idle*
         #    occupant whose model is itself on-demand (policy hook). Never a
-        #    busy slot, never a serving/pinned model (the policy returns False
-        #    for those), never for a model already handled above.
+        #    busy slot, never a serving/static/pinned model (the policy
+        #    returns False for those), never for a model already handled
+        #    above. STATIC occupants are immovable by construction: the
+        #    worker's policy answers True only for on-demand.
         if _EVICTION_POLICY is not None:
             candidates = [s for s in statuses
                           if s.get("model_key") and s.get("healthy")
@@ -177,6 +191,25 @@ class SlotPool:
                 if isinstance(resp, dict) and resp.get("error"):
                     raise RuntimeError(f"slot load failed: {resp['error']}")
                 return resp.get("endpoint") or victim["_control"]
+
+        # Static-lock check (tiers v3): when EVERY slot's occupant is static
+        # (locked to its seat — never swapped out), returning None would lie
+        # ("busy, try swap") about a pool that can never free a seat. Fail the
+        # load with a clear, actionable error instead. A merely-busy pool
+        # (any serving/on-demand/unknown occupant, or a down slot) keeps the
+        # historical None -> swap/in-process fallback.
+        if _RESIDENCY_LOOKUP is not None and statuses:
+            occupants = [s.get("model_key") for s in statuses]
+            if all(occupants):
+                try:
+                    all_static = all(_RESIDENCY_LOOKUP(mk) == "static"
+                                     for mk in occupants)
+                except Exception:  # noqa: BLE001 — a broken lookup must not crash serving
+                    all_static = False
+                if all_static:
+                    raise RuntimeError(
+                        f"all slots are static-locked — cannot seat {model_key}; "
+                        "unlock a static model or raise the slot count")
         return None
 
     def load(self, model_key: str, control_url: str, *, timeout: float = 900.0) -> dict:

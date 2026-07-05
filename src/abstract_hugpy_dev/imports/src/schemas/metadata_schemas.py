@@ -14,6 +14,15 @@ class ModelMetadata:
     """One row of everything we know. All Optional — partial fills are valid."""
     hub_id:                     Optional[str]       = None
 
+    # declared identity — from the hugpy.json marker (authoritative) or the
+    # storage-path layout (models/<family>/<task>/…). Carrying these here is
+    # what stops discovery minting rows with DEFAULT task/framework for dirs
+    # whose truth is already on disk (the 2026-07-05 sd-turbo phantoms).
+    name:                       Optional[str]       = None
+    framework:                  Optional[str]       = None
+    tasks:                      Optional[List[str]] = None
+    primary_task:               Optional[str]       = None
+
     # task / framework
     pipeline_tag:               Optional[str]       = None
     library_name:               Optional[str]       = None

@@ -1,7 +1,7 @@
 from .imports import *
 class Runtime(str, Enum):
     transformers = "transformers"
-    llama_cpp = "llama_cpp"
+    gguf = "gguf"                 # HF Hub's library tag for GGUF repos
     dataset = "dataset"
     unknown = "unknown"
 

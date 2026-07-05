@@ -37,7 +37,7 @@ def acquire(hub_id, path, *, gguf_filename=None):
                        "unserveable (download kept, won't serve)",
                        hub_id, framework, primary_task)
 
-    if framework == "llama_cpp" and not gguf_filename:  # picks the canonical shard
+    if framework == "gguf" and not gguf_filename:  # picks the canonical shard
         gguf_filename = extract_gguf_filename(get_guffs_in_dir(path), path)
 
     overlay = safe_load_from_json(MODELS_DICT_PATH) or {}

@@ -1,9 +1,12 @@
+import threading
+import time as _time
+
 from ..functions import *
 # Registry prune (hide a not-installed "ghost" model) + media-chat allow-flag.
 # Explicit imports so they work regardless of the functions star-export.
 from ....imports.config.models.models_config import (
     prune_model, set_model_media, media_state,
-    media_default_state, set_media_default,
+    media_default_state, set_media_default, refresh_registry,
 )
 
 llm_bp, logger = get_bp("llm_bp", __name__)
@@ -44,6 +47,87 @@ def list_models():
         output.append(model)
 
     return jsonify(output)
+
+
+# ── Disk discovery (the console's "Discover models" button) ───────────────
+# The discovery report (MODELS_DISCOVERY_PATH) is the persisted half of the
+# registry; a walk taken while the storage mount was degraded can shrink it,
+# so models "disappear" from /models while their files still sit on disk
+# (observed 2026-07-04: report at 2 entries vs 108 model dirs). Nothing
+# re-walks at runtime — download completion only re-READS the report — so
+# this route is the recovery path. The walk enriches from hub metadata and
+# can take minutes, hence the background thread + poll shape: POST to start,
+# GET for state, re-fetch /models when running goes false.
+#
+# State lives in a FILE next to the discovery report, not a module global:
+# the API runs gunicorn --workers 3, so per-process state answers the poll
+# wrong 2/3 of the time (the comms-mirror lesson). A stale "running" left by
+# a killed worker expires via _DISCOVER_STALE_S.
+_discover_lock = threading.Lock()
+_DISCOVER_STALE_S = 30 * 60
+
+
+def _discover_state_path() -> str:
+    from ....imports.src.constants.constants import MODELS_DISCOVERY_PATH
+    return str(MODELS_DISCOVERY_PATH) + ".state.json"
+
+
+def _read_discover_state() -> dict:
+    state = {"running": False, "started_at": None, "finished_at": None,
+             "found": None, "error": None}
+    try:
+        with open(_discover_state_path(), "r", encoding="utf-8") as fh:
+            state.update(json.load(fh))
+    except (OSError, ValueError):
+        pass
+    # Self-heal: a worker that died mid-sweep leaves running=true forever.
+    if state.get("running") and state.get("started_at") and \
+            _time.time() - state["started_at"] > _DISCOVER_STALE_S:
+        state.update(running=False,
+                     error="sweep did not finish (worker restarted?)")
+    return state
+
+
+def _write_discover_state(state: dict) -> None:
+    path = _discover_state_path()
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(state, fh)
+    os.replace(tmp, path)
+
+
+def _run_discovery(state: dict):
+    try:
+        refresh_registry(run_discovery=True)   # walk + save report + in-place update
+        state["found"] = len(get_models_dict(dict_return=True))
+    except Exception as exc:  # noqa: BLE001 — state must always resolve
+        logger.warning("model discovery sweep failed: %s", exc)
+        state["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        state.update(running=False, finished_at=_time.time())
+        try:
+            _write_discover_state(state)
+        except OSError as exc:
+            logger.warning("could not persist discovery state: %s", exc)
+
+
+@llm_bp.route("/models/discover", methods=["POST"])
+def discover_models_start():
+    with _discover_lock:
+        state = _read_discover_state()
+        if state["running"]:
+            return jsonify({**state, "started": False}), 409
+        state.update(running=True, started_at=_time.time(),
+                     finished_at=None, found=None, error=None)
+        _write_discover_state(state)
+    threading.Thread(target=_run_discovery, args=(state,),
+                     name="models-discover", daemon=True).start()
+    return jsonify({**state, "started": True}), 202
+
+
+@llm_bp.route("/models/discover", methods=["GET"])
+def discover_models_state():
+    return jsonify(_read_discover_state())
 
 
 @llm_bp.route("/models/<model_key>", methods=["GET"])

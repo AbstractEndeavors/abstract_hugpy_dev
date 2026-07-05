@@ -14,13 +14,16 @@ Two consumers:
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
+import secrets
 import threading
 import time
 import uuid
 from contextlib import contextmanager
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     import fcntl  # POSIX advisory file locks — cross-process coordination.
@@ -87,7 +90,8 @@ class DiscordBindingStore:
     @staticmethod
     def _empty() -> Dict[str, Any]:
         return {"bindings": [], "outbox": [], "channels": [], "channels_at": 0,
-                "users": [], "users_at": 0, "bridges": [], "bridge_msgs": {}}
+                "users": [], "users_at": 0, "bridges": [], "bridge_msgs": {},
+                "sessions": []}
 
     def _read_unlocked(self, fh=None) -> Dict[str, Any]:
         """Parse the bindings doc. A non-empty but unparseable file is CORRUPTION:
@@ -120,6 +124,7 @@ class DiscordBindingStore:
             data.setdefault("users_at", 0)
             data.setdefault("bridges", [])
             data.setdefault("bridge_msgs", {})
+            data.setdefault("sessions", [])
             return data
         except ValueError as exc:
             import logging as _logging
@@ -424,6 +429,83 @@ class DiscordBindingStore:
                     return dict(m)
         return None
 
+    # -- comms sessions (scoped bearer tokens for terminal agents) -----------
+    # A session is the "drop this into a terminal/agent chat" credential: its
+    # holder can read one channel's bridge transcript and send into that
+    # channel — nothing else on the API. Only the sha256 of the token is
+    # stored, so the registry file never contains a usable secret.
+    _SESSION_TOKEN_BYTES = 32
+
+    def add_session(self, *, channel_id, label: str = "",
+                    ttl_hours: Optional[float] = None,
+                    author: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
+        """Mint a session; returns (raw_token, public_view). The raw token is
+        shown exactly once — it is not recoverable from the store."""
+        channel_id = _norm_id(channel_id)
+        if channel_id is None:
+            raise ValueError("a session needs a channel_id")
+        token = secrets.token_urlsafe(self._SESSION_TOKEN_BYTES)
+        session = {
+            "id": uuid.uuid4().hex,
+            "channel_id": channel_id,
+            "label": (label or "").strip(),
+            "author": (author or "").strip() or None,
+            "token_sha256": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+            "created_at": time.time(),
+            "expires_at": (time.time() + float(ttl_hours) * 3600.0) if ttl_hours else None,
+            "revoked": False,
+            "last_used": None,
+        }
+        with self._transaction() as doc:
+            doc.setdefault("sessions", []).append(session)
+        return token, _public_session(session)
+
+    def list_sessions(self) -> List[Dict[str, Any]]:
+        return [_public_session(s) for s in self._load().get("sessions", [])]
+
+    def revoke_session(self, session_id: str) -> bool:
+        with self._transaction() as doc:
+            for s in doc.get("sessions", []):
+                if s.get("id") == session_id and not s.get("revoked"):
+                    s["revoked"] = True
+                    return True
+        return False
+
+    def session_by_token(self, token: str) -> Optional[Dict[str, Any]]:
+        """Presented bearer token -> live session dict, or None (bad, revoked
+        or expired — indistinguishable to the caller, no oracle). last_used is
+        stamped at most once a minute so polling stays read-mostly."""
+        if not token:
+            return None
+        digest = hashlib.sha256(str(token).encode("utf-8")).hexdigest()
+        now = time.time()
+        for s in self._load().get("sessions", []):
+            if not hmac.compare_digest(s.get("token_sha256") or "", digest):
+                continue
+            if s.get("revoked") or (s.get("expires_at") and now > s["expires_at"]):
+                return None
+            if (s.get("last_used") or 0) < now - 60.0:
+                with self._transaction() as doc:
+                    for t in doc.get("sessions", []):
+                        if t.get("id") == s.get("id"):
+                            t["last_used"] = now
+            return dict(s)
+        return None
+
+
+def _public_session(s: Dict[str, Any]) -> Dict[str, Any]:
+    """Everything about a session except the token digest."""
+    return {
+        "id": s.get("id"),
+        "channel_id": s.get("channel_id"),
+        "label": s.get("label") or "",
+        "author": s.get("author"),
+        "created_at": s.get("created_at"),
+        "expires_at": s.get("expires_at"),
+        "revoked": s.get("revoked", False),
+        "last_used": s.get("last_used"),
+    }
+
 
 discord_store = DiscordBindingStore()
 
@@ -502,3 +584,19 @@ def get_bridge_messages(bridge_id: str, since: float = 0.0) -> List[Dict[str, An
 
 def update_bridge_message(bridge_id: str, msg_id: str, **kwargs) -> Optional[Dict[str, Any]]:
     return discord_store.update_message(bridge_id, msg_id, **kwargs)
+
+
+def add_session(**kwargs) -> Tuple[str, Dict[str, Any]]:
+    return discord_store.add_session(**kwargs)
+
+
+def list_sessions() -> List[Dict[str, Any]]:
+    return discord_store.list_sessions()
+
+
+def revoke_session(session_id: str) -> bool:
+    return discord_store.revoke_session(session_id)
+
+
+def session_by_token(token: str) -> Optional[Dict[str, Any]]:
+    return discord_store.session_by_token(token)
