@@ -1,4 +1,5 @@
 import os
+import logging
 from ..standalone_utils import get_env_value
 from typing import Literal, Optional
 from .imports import make_list,HfApi,re,safe_dump_to_file
@@ -43,21 +44,81 @@ def _resolve_default_root():
 
 DEFAULT_ROOT = _resolve_default_root()
 
-MODELS_HOME = MODELS_DIR =  get_env_value("MODELS_HOME") or os.path.join(DEFAULT_ROOT,"models")
 
-UPLOADS_HOME = CHAT_UPLOAD_DIR =  get_env_value("UPLOADS_HOME") or os.path.join(DEFAULT_ROOT,"uploads")
+def _root_is_usable(path: str) -> bool:
+    """True only if *path* can be created AND actually written to.
 
-PROJECTS_HOME = PROJECTS_DIR =  get_env_value("PROJECTS_HOME") or os.path.join(DEFAULT_ROOT,"projects")
+    ``os.makedirs`` catches the PermissionError case (an unwritable parent like
+    ``/opt/flaskapps``); the create+unlink probe catches filesystems where
+    ``os.access`` lies (root-squash NFS, euid=0). Cheap, local, no network — this
+    runs once at import. Mirrors ``_platform.paths._usable`` but with a real
+    write probe because an env-supplied root that can't be written is the exact
+    failure we're guarding against."""
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError:
+        return False
+    probe = os.path.join(path, ".hugpy_write_test")
+    try:
+        with open(probe, "w"):
+            pass
+        os.unlink(probe)
+        return True
+    except OSError:
+        try:
+            os.unlink(probe)
+        except OSError:
+            pass
+        return False
+
+
+def _env_root_or_default(env_key: str, default_path: str) -> str:
+    """Resolve a storage root from *env_key*, falling back to *default_path* when
+    the env value points somewhere we cannot actually write.
+
+    Root cause (worker boxes, 2026-07-05): a stale ``~/.env`` carried
+    ``MODELS_HOME`` / ``DEFAULT_ROOT`` etc. pointing at an unwritable legacy path
+    (``/opt/flaskapps``, a dead ``/mnt/llm_storage`` mount). Provisioning then
+    died with PermissionError forever and the models_local scan looked in the
+    wrong place. An env-supplied root that can't be created + written is a
+    misconfiguration, not a destination: warn LOUDLY naming the offending var and
+    value, and use the platform default (derived from the already-validated
+    DEFAULT_ROOT) instead of carrying the poisoned path forward.
+
+    Unset env -> default, no probe: the default is under DEFAULT_ROOT, which
+    ``_platform.paths.models_root()`` already validated. Env set + usable -> the
+    env value UNCHANGED, so central and every correctly-configured box behave
+    exactly as before (the reported /mnt/llm_storage on central IS writable and
+    passes)."""
+    value = get_env_value(env_key)
+    if not value:
+        return default_path
+    if _root_is_usable(value):
+        return value
+    logging.getLogger("abstract_hugpy").warning(
+        "%s=%r is not writable (cannot create/write there); IGNORING it and "
+        "falling back to %s. Fix or remove this env var — it is usually a stale "
+        "~/.env carrying a legacy/dead storage root onto this box.",
+        env_key, value, default_path,
+    )
+    return default_path
+
+
+MODELS_HOME = MODELS_DIR =  _env_root_or_default("MODELS_HOME", os.path.join(DEFAULT_ROOT,"models"))
+
+UPLOADS_HOME = CHAT_UPLOAD_DIR =  _env_root_or_default("UPLOADS_HOME", os.path.join(DEFAULT_ROOT,"uploads"))
+
+PROJECTS_HOME = PROJECTS_DIR =  _env_root_or_default("PROJECTS_HOME", os.path.join(DEFAULT_ROOT,"projects"))
 
 PROJECTS_PLACEMENT_PATH = get_env_value("PROJECTS_PLACEMENT_PATH") or os.path.join(PROJECTS_HOME,"placement.json")
 
-DATASETS_HOME = DATASETS_DIR =  get_env_value("DATASETS_HOME") or os.path.join(DEFAULT_ROOT,"datasets")
+DATASETS_HOME = DATASETS_DIR =  _env_root_or_default("DATASETS_HOME", os.path.join(DEFAULT_ROOT,"datasets"))
 
 MODELS_DISCOVERY_PATH = get_env_value("MODELS_DISCOVERY_PATH") or os.path.join(PROJECTS_HOME,"model_discovery.json")
 
 MODELS_DICT_PATH = get_env_value("MODELS_DICT_PATH") or os.path.join(PROJECTS_HOME,"model_manifest.json")
 
-HF_CACHE = get_env_value("HF_CACHE") or os.path.join(MODELS_HOME,"cache")
+HF_CACHE = _env_root_or_default("HF_CACHE", os.path.join(MODELS_HOME,"cache"))
 
 HF_HOME = get_env_value("HF_HOME") or os.path.join(HF_CACHE,"huggingface")
 

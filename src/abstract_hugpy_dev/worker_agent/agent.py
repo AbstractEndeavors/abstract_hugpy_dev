@@ -75,14 +75,81 @@ def detect_gpus() -> list[dict]:
     return _detect_gpus()
 
 
+def safe_import_torch():
+    """Import ``torch``, healing a partially-initialized module first.
+
+    WHY THIS EXISTS (worker ae, 2026-07-05): when this process imports a
+    CUDA-built ``llama_cpp`` *before* its first ``import torch``, torch's native
+    init trips a circular import and aborts mid-way —
+    ``partially initialized module 'torch' has no attribute 'library'``. Python
+    then caches that broken half-module in ``sys.modules``, so EVERY later
+    ``import torch`` in this process (vision/frame extraction, sd-turbo, whisper)
+    hands back the same stale wreck for the process's entire life. One bad import
+    ordering silently poisons every torch task on the box until restart. Confirmed
+    minimal repro: ``python -c "import torch"`` works; ``python -c "import
+    llama_cpp, torch"`` reproduces the abort.
+
+    The durable fix is ordering — import torch before any llama_cpp (see
+    :func:`_prime_torch_before_llama`). This helper is the recovery net for a
+    race we missed: it (a) returns torch straight from cache when it is already
+    fully initialized; (b) otherwise tries a normal import; (c) if the import
+    raised OR yielded a half-initialized module (missing ``torch.library``),
+    evicts ``torch`` and every ``torch.*`` submodule from ``sys.modules`` and
+    retries the import exactly ONCE from a clean slate, logging loudly. A
+    still-broken torch (or a genuinely absent one) re-raises so the caller's
+    error path reports it.
+    """
+    import importlib
+
+    def _partial(mod) -> bool:
+        # A fully-initialized torch always exposes ``torch.library``; its absence
+        # is the fingerprint of the circular-import abort described above.
+        return mod is not None and not hasattr(mod, "library")
+
+    cached = sys.modules.get("torch")
+    if cached is not None and not _partial(cached):
+        return cached  # already fully imported — pure cache hit, no work
+
+    first_error = None
+    if cached is None:
+        try:
+            import torch
+            if not _partial(torch):
+                return torch
+        except Exception as exc:  # noqa: BLE001
+            first_error = exc
+
+    # We reach here only when torch is poisoned: the import raised, or the cached
+    # / freshly-imported module is half-initialized. Evict the whole torch.*
+    # subtree so the retry re-runs torch's init from scratch.
+    stale = [name for name in list(sys.modules)
+             if name == "torch" or name.startswith("torch.")]
+    for name in stale:
+        del sys.modules[name]
+    logger.warning(
+        "safe_import_torch: torch was %s%s — purged %d torch.* module(s) from "
+        "sys.modules and retrying import ONCE. This is the llama_cpp/torch CUDA "
+        "collision: torch MUST be imported before llama_cpp in this process.",
+        "un-importable" if first_error is not None else "partially initialized",
+        f" ({type(first_error).__name__}: {first_error})" if first_error else "",
+        len(stale),
+    )
+    importlib.invalidate_caches()
+    import torch  # single clean retry; propagates if it still can't init
+    return torch
+
+
 def torch_cuda_status() -> dict:
     """Whether *torch* can actually use CUDA — distinct from nvidia-smi seeing a
     card. Inference runs on the GPU only when ``torch.cuda.is_available()`` is
     True; a CPU-only torch build (or a torch/CUDA-driver mismatch) leaves a
     perfectly good GPU unused. Surfaced in /health so this is diagnosable.
+
+    Goes through :func:`safe_import_torch` so a torch half-poisoned by an earlier
+    llama_cpp import is healed here instead of reporting a phantom "no CUDA".
     """
     try:
-        import torch
+        torch = safe_import_torch()
         available = bool(torch.cuda.is_available())
         return {
             "available": available,
@@ -95,54 +162,137 @@ def torch_cuda_status() -> dict:
         return {"available": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
-def _llama_cpp_supports_vision() -> bool:
-    """Whether this worker's llama.cpp can actually decode images (mtmd).
-
-    True when a multimodal chat handler is importable — the same capability the
-    in-process vision runner needs to load an mmproj projector. Central reads this
-    (engine.supports_vision) and ONLY routes image turns to workers that report it,
-    so an older text-only build is never handed an image to guess at. Without this
-    field a worker is treated as text-only and every vision turn falls back to the
-    central's local engine — even when the worker has the VL model loaded.
-    """
+# The llama.cpp capability probe runs in a SUBPROCESS (see llama_cpp_cuda_status)
+# so the agent process NEVER imports llama_cpp merely to report engine status.
+# A CUDA-built llama_cpp imported into this process breaks every later
+# ``import torch`` for the process's life (see safe_import_torch), and this probe
+# used to fire on every heartbeat — the single most likely way to poison the box.
+# The child prints one JSON object describing the engine; the parent parses it.
+_LLAMA_PROBE_CODE = r"""
+import json, sys
+out = {"installed": False}
+try:
+    import llama_cpp
+    out["installed"] = True
+    out["version"] = getattr(llama_cpp, "__version__", None)
+    try:
+        out["supports_gpu_offload"] = bool(llama_cpp.llama_supports_gpu_offload())
+    except Exception:
+        out["supports_gpu_offload"] = None
+    # supports_vision: a multimodal chat handler (or mtmd) is importable — the
+    # same capability the in-process vision runner needs to load an mmproj. Central
+    # reads this (engine.supports_vision) and ONLY routes image turns to workers
+    # that report it, so an older text-only build is never handed an image.
+    supports_vision = False
     try:
         from llama_cpp import llama_chat_format as _cf
         for _name in ("Qwen25VLChatHandler", "Llava16ChatHandler",
                       "Llava15ChatHandler", "MiniCPMv26ChatHandler",
                       "MoondreamChatHandler"):
             if hasattr(_cf, _name):
-                return True
+                supports_vision = True
+                break
     except Exception:
         pass
-    try:
-        import llama_cpp.mtmd_cpp  # noqa: F401
-        return True
-    except Exception:
-        return False
+    if not supports_vision:
+        try:
+            import llama_cpp.mtmd_cpp  # noqa: F401
+            supports_vision = True
+        except Exception:
+            supports_vision = False
+    out["supports_vision"] = supports_vision
+except Exception as exc:
+    out = {"installed": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+sys.stdout.write(json.dumps(out))
+"""
+
+# Engine build is immutable for a process's life, so the first successful probe
+# is cached: no python subprocess (which imports CUDA llama_cpp) spawns on every
+# 15s heartbeat / /health hit. A not-installed result is intentionally NOT cached
+# — /ops/pip can install the engine at runtime and the next probe must see it.
+_LLAMA_PROBE_CACHE: dict | None = None
+_LLAMA_PROBE_TIMEOUT = 60.0
 
 
 def llama_cpp_cuda_status() -> dict:
-    """Whether *llama.cpp* (GGUF backend) was built with GPU offload support.
+    """Whether *llama.cpp* (GGUF backend) was built with GPU offload support, and
+    whether it can decode images (mtmd) — probed in a SUBPROCESS.
 
     ``n_gpu_layers`` is silently ignored when llama-cpp-python is the CPU-only
     wheel, so a GGUF model runs entirely on CPU even though autofit picked GPU
-    layers. ``llama_supports_gpu_offload()`` is the definitive build check.
+    layers; ``llama_supports_gpu_offload()`` is the definitive build check. The
+    import runs in a child interpreter (never this process) because a CUDA-built
+    llama_cpp imported here poisons every later ``import torch`` — see
+    :func:`safe_import_torch` and ``_LLAMA_PROBE_CODE``.
+    """
+    global _LLAMA_PROBE_CACHE
+    if _LLAMA_PROBE_CACHE is not None:
+        return _LLAMA_PROBE_CACHE
+    result = _probe_llama_cpp_subprocess()
+    if result.get("installed"):
+        _LLAMA_PROBE_CACHE = result
+    return result
+
+
+def _probe_llama_cpp_subprocess() -> dict:
+    """Run the llama_cpp probe in a child interpreter and parse its JSON stdout.
+
+    Every failure mode (no python, timeout, crash, garbage output) degrades to an
+    ``installed: False`` dict carrying an ``error`` string — the same shape the
+    old in-process except path produced, so callers and heartbeats are unchanged.
     """
     try:
-        import llama_cpp
-        supports = None
-        try:
-            supports = bool(llama_cpp.llama_supports_gpu_offload())
-        except Exception:
-            pass
-        return {
-            "installed": True,
-            "version": getattr(llama_cpp, "__version__", None),
-            "supports_gpu_offload": supports,
-            "supports_vision": _llama_cpp_supports_vision(),
-        }
+        proc = subprocess.run(
+            [sys.executable, "-c", _LLAMA_PROBE_CODE],
+            capture_output=True, text=True, timeout=_LLAMA_PROBE_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return {"installed": False,
+                "error": f"TimeoutExpired: llama_cpp probe exceeded "
+                         f"{_LLAMA_PROBE_TIMEOUT:.0f}s"}
     except Exception as exc:  # noqa: BLE001
         return {"installed": False, "error": f"{type(exc).__name__}: {exc}"}
+    out = (proc.stdout or "").strip()
+    if not out:
+        tail = (proc.stderr or "").strip()[-300:]
+        return {"installed": False,
+                "error": f"llama_cpp probe produced no output "
+                         f"(rc={proc.returncode}): {tail}"}
+    try:
+        return json.loads(out)
+    except Exception as exc:  # noqa: BLE001
+        return {"installed": False,
+                "error": f"llama_cpp probe output unparseable "
+                         f"({type(exc).__name__}): {out[:300]}"}
+
+
+def _prime_torch_before_llama() -> None:
+    """Import torch NOW — before this process can import llama_cpp — when torch is
+    installed on this box.
+
+    The agent's in-process GGUF fallback (``execute_prompt`` -> python_runner ->
+    ``from llama_cpp import Llama``) and the console's torch tasks (vision,
+    sd-turbo, whisper) race to be the first native import. If llama_cpp wins, the
+    first ``import torch`` aborts mid-init and stays broken for the process's life
+    (see :func:`safe_import_torch`). Importing torch first makes it a complete,
+    cached module every later import simply reuses — the ordering fix. Best-effort
+    and silent when torch isn't installed (CPU/text-only boxes); a torch that
+    genuinely can't import is reported per-request by the torch paths, not here.
+    """
+    try:
+        import importlib.util
+        if importlib.util.find_spec("torch") is None:
+            return  # no torch on this box — nothing to prime, stay quiet
+    except Exception:  # noqa: BLE001
+        return
+    try:
+        safe_import_torch()
+        logger.info("primed torch ahead of any llama_cpp import "
+                    "(llama_cpp/torch CUDA-collision guard)")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("torch priming skipped (%s: %s); torch paths will report "
+                       "per-request if it truly can't import",
+                       type(exc).__name__, exc)
 
 
 def _safe_int(value) -> int | None:
@@ -2194,6 +2344,14 @@ def main(argv: list[str] | None = None) -> int:
     # A worker runs vision models on its own GPU in-process; it has no separate
     # vision server to POST to. Force in-process unless the operator overrode it.
     os.environ.setdefault("HUGPY_VISION_INPROCESS", "1")
+
+    # Torch-first import guard (Bug D): pull torch into sys.modules NOW, before
+    # anything in this process can import llama_cpp (the in-process GGUF fallback
+    # or a stray probe). A CUDA-built llama_cpp imported first aborts torch's init
+    # and leaves a broken half-module cached for the whole process — poisoning
+    # every later vision/sd-turbo/whisper request. Priming here makes torch a
+    # complete cached module the rest of the run reuses. No-op without torch.
+    _prime_torch_before_llama()
 
     # Only advertise a URL when the operator set one explicitly. Otherwise leave
     # it to central, which derives the reachable address from the request source
