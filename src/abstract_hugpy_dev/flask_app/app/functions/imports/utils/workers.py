@@ -179,6 +179,7 @@ def _public_view(worker: Dict[str, Any]) -> Dict[str, Any]:
     return {
         **worker,
         **_vram_summary(worker),
+        **_ram_summary(worker),
         "status": "online" if _is_online(worker) else "offline",
         "admission": worker.get("admission", "approved"),
     }
@@ -308,6 +309,26 @@ def _vram_summary(worker: Dict[str, Any]) -> Dict[str, Any]:
         "vram_free": vram_free,
         "vram_used": vram_used,
     }
+
+
+def _ram_summary(worker: Dict[str, Any]) -> Dict[str, Any]:
+    """Flat RAM rollup — the CPU-tier mirror of _vram_summary.
+
+    ``ram_total`` is the box's RAW installed memory (MemTotal, reported by the
+    agent). ``ram_used`` is derived as ``ram_total - free_ram`` — but note
+    free_ram is reserve-adjusted AND HUGPY_RAM_MAX_GIB-capped, so this reads as
+    "used incl. reserve/headroom", NOT pure model RSS (the console labels it so).
+    None where unknown (never fabricated — mirrors _vram_summary's discipline);
+    clamped to >=0 so reserve accounting can't yield a negative width.
+    """
+    ram_total = worker.get("ram_total")
+    free_ram = worker.get("free_ram")
+    ram_used = (
+        max(0, ram_total - free_ram)
+        if (ram_total is not None and free_ram is not None)
+        else None
+    )
+    return {"ram_total": ram_total, "ram_used": ram_used}
 
 
 def _match_keys(model_key: str) -> set:
@@ -479,6 +500,7 @@ class WorkerStore:
         pkg_version: Optional[str] = None,
         rpc_endpoint: Optional[str] = None,
         free_ram: Optional[int] = None,
+        ram_total: Optional[int] = None,
         engine: Optional[Dict[str, Any]] = None,
         pool: Optional[str] = None,
         caps: Optional[Dict[str, Any]] = None,
@@ -521,6 +543,8 @@ class WorkerStore:
                     existing["rpc_endpoint"] = rpc_endpoint
                 if free_ram is not None:
                     existing["free_ram"] = free_ram
+                if ram_total is not None:
+                    existing["ram_total"] = ram_total
                 if engine is not None:
                     existing["engine"] = engine
                 if caps is not None:
@@ -565,6 +589,7 @@ class WorkerStore:
                 "pkg_version": pkg_version,
                 "rpc_endpoint": rpc_endpoint,
                 "free_ram": free_ram,
+                "ram_total": ram_total,
                 "engine": engine,
                 "caps": caps,
                 # Runtime-env capability: {"tier": "stable"|"edge"|..., versions}.
@@ -599,6 +624,7 @@ class WorkerStore:
         role: Optional[str] = None,
         rpc_endpoint: Optional[str] = None,
         free_ram: Optional[int] = None,
+        ram_total: Optional[int] = None,
         disk: Optional[Dict[str, Any]] = None,
         engine: Optional[Dict[str, Any]] = None,
         pool: Optional[str] = None,
@@ -653,6 +679,8 @@ class WorkerStore:
                 worker["rpc_endpoint"] = rpc_endpoint
             if free_ram is not None:
                 worker["free_ram"] = free_ram
+            if ram_total is not None:
+                worker["ram_total"] = ram_total
             if disk is not None:
                 worker["disk"] = disk   # model-root volume free/total (preflight)
             if engine is not None:

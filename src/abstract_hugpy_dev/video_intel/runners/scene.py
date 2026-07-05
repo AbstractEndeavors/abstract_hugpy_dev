@@ -268,6 +268,36 @@ def run_generate_scene(spec: GenerateSceneSpec, job_id: str) -> JobResult:
     # Runner-applied default when None (LOCKED CONTRACT): 0.45.
     strength = spec.strength if spec.strength is not None else 0.45
 
+    # ---- init-image size gate (2026-07-05) ----
+    # A degenerate init (a thumbnail attached instead of the full image) sails
+    # all the way into the worker's VAE and dies as an opaque ComfyUI error
+    # ("Kernel size can't be greater than actual input size" — a 16px image is
+    # a 2x2 latent). Refuse it HERE with the real dimensions so the caller
+    # knows what was actually attached. 64px floor: below that no SD-class
+    # pipeline produces anything but noise anyway.
+    _MIN_INIT_PX = 64
+    if start_frame is not None:
+        try:
+            from PIL import Image as _PILImage
+            with _PILImage.open(start_frame) as _im:
+                _w, _h = _im.size
+        except Exception as exc:  # unreadable init is the same honest failure
+            return JobResult(job_id, ok=False, error=JobError(
+                code="init_image_unreadable",
+                message=f"start-frame image could not be read ({type(exc).__name__}: {exc})",
+                retryable=False,
+            ))
+        if min(_w, _h) < _MIN_INIT_PX:
+            return JobResult(job_id, ok=False, error=JobError(
+                code="init_image_too_small",
+                message=(f"start-frame image is {_w}x{_h}px — too small for "
+                         f"image-to-image (minimum {_MIN_INIT_PX}px on the short "
+                         f"side). The FIRST image part is used as the init frame; "
+                         f"a thumbnail may have been attached instead of the full "
+                         f"image."),
+                retryable=False,
+            ))
+
     # A start-frame image REQUIRES a servable img2img pair. Image-generation
     # models advertise image-to-image (config layer — models_config
     # ._augment_img2img), so this passes for them; a model that genuinely can't

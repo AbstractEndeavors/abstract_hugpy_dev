@@ -315,6 +315,30 @@ def _free_ram_bytes() -> int | None:
         return None
 
 
+def _ram_total_bytes() -> int | None:
+    """RAW physical RAM (MemTotal) in bytes — the pool-budget denominator.
+
+    Unlike _free_ram_bytes (reserve-adjusted + RAM_MAX-capped so central plans
+    against budgetable RAM), this is the box's total installed memory, so the
+    console can render used-vs-total. Best-effort, mirroring
+    _platform/hardware.free_ram_bytes: psutil first, then /proc/meminfo, else
+    None (never fabricated)."""
+    try:
+        import psutil
+        return int(psutil.virtual_memory().total)
+    except Exception:
+        pass
+    if sys.platform.startswith("linux"):
+        try:
+            with open("/proc/meminfo", "r", encoding="utf-8") as fh:
+                for line in fh:
+                    if line.startswith("MemTotal:"):
+                        return int(line.split()[1]) * 1024
+        except Exception:
+            pass
+    return None
+
+
 def _spawn_rpc_server(args):
     """Launch llama.cpp's rpc-server so this box lends its GPU to a shard pool.
 
@@ -2228,6 +2252,7 @@ def _heartbeat_loop(client: CentralClient, state: WorkerState, args) -> None:
                     "role": state.role,
                     "rpc_endpoint": state.rpc_endpoint,
                     "free_ram": _free_ram_bytes(),
+                    "ram_total": _ram_total_bytes(),
                     "disk": _disk_status(),
                     "engine": llama_cpp_cuda_status(),
                     "pool": os.environ.get("WORKER_POOL", ""),
@@ -2269,6 +2294,7 @@ def _register(client: CentralClient, state: WorkerState, args) -> None:
         "role": state.role,
         "rpc_endpoint": state.rpc_endpoint,
         "free_ram": _free_ram_bytes(),
+        "ram_total": _ram_total_bytes(),
         "models": models or None,
         "worker_id": state.worker_id,
         "pkg_version": _installed_pkg_version(args.pkg_name),

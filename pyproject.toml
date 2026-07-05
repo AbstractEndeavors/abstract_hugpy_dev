@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "abstract_hugpy_dev"
-version = "0.1.135"
+version = "0.1.136"
 description = "Self-hosted LLM console: model registry & downloads, streaming chat, OpenAI-compatible /v1 API with on-site keys, GPU worker fleet with cross-machine RPC sharding"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -97,7 +97,7 @@ finetune = ["peft"]
 # Media-intelligence amenities (the /ml/* tools) — each its own opt-in so the
 # base / phone install stays lean. (vision rides [engine]+mmproj; embeddings &
 # similarity ride [embed]; summarize rides [transformers].)
-keywords = ["keybert"]            # keyword-extraction
+keywords = ["keybert", "spacy"]            # keyword-extraction; spacy backend needs a model download too (see note)
 audio = ["openai-whisper"]        # automatic-speech-recognition (transcribe)
 # text-to-image AND image-to-image. Floors proven 2026-07-03: edit pipelines
 # (Flux2KleinPipeline, QwenImageEditPlusPipeline) need diffusers>=0.39 +
@@ -110,6 +110,8 @@ imagegen = ["diffusers>=0.39", "accelerate", "transformers>=5.12",
 extract = ["python-docx", "beautifulsoup4", "brotli", "zstandard"]  # brotli/zstandard: decode br/zstd-encoded pages (/ml/fetch) — else garbage text
 # Umbrella: the full server-side media toolset in one opt-in.
 media = ["abstract_hugpy_dev[keywords,audio,imagegen,extract,vision,embed,transformers]"]
+# Bridge to the standalone Abstract media-intelligence pipeline (opt-in, external dist).
+media-bridge = ["media_intelligence"]      # Abstract media-intelligence pipeline; PyPI dist = media-intelligence (0.1.2), import pkg = media_intelligence
 # Discord UI arm (`hugpy bot`): drives a hugpy central over HTTP. discord.py is
 # POSIX/Windows-portable; python-dotenv loads the bot's .env (token/settings).
 bot = ["discord.py", "python-dotenv"]
@@ -126,6 +128,15 @@ server = [
 # Everything (the full desktop/server install). Self-reference must use the real
 # distribution name, not the legacy "hugpy".
 all = ["abstract_hugpy_dev[server,vision,ocr,web,transformers,embed,finetune,keywords,audio,imagegen,extract]"]
+
+# Box-level one-shot install sets ("meta-profiles"): a single extra that expands
+# to every leaf dep a worker box needs, so enrolling a fresh box is ONE `pip
+# install`. Self-referential like [llama]/[media]/[server]/[all]; setuptools emits
+# the underscore name and pip normalizes it to abstract-hugpy-dev when matching.
+# CPU transformers box: full text/vision/audio/keyword/extract stack, no GPU-only pieces.
+cpu-worker = ["abstract_hugpy_dev[engine,transformers,embed,audio,keywords,extract,vision,native,validate]"]
+# GPU box: everything cpu-worker has PLUS image generation, fine-tuning, and richer GPU probing.
+gpu-worker = ["abstract_hugpy_dev[engine,transformers,embed,audio,keywords,extract,vision,native,validate,imagegen,finetune,gpu]"]
 
 [project.urls]
 Homepage = "https://hugpy.ai"

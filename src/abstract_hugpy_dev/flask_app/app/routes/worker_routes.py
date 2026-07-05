@@ -156,6 +156,9 @@ class RegisterRequest(BaseModel):
     # available RAM for the allocator's CPU tier.
     rpc_endpoint: str | None = None
     free_ram: int | None = None
+    # RAW physical RAM (MemTotal) in bytes — the pool-budget denominator, unlike
+    # reserve-adjusted free_ram. None from older agents that don't report it.
+    ram_total: int | None = None
     # Inference-engine capability snapshot, e.g. {"installed": bool, "version":
     # str, "supports_gpu_offload": bool}. Lets central skip a worker that can't
     # actually serve (no engine) instead of routing a request that will fail.
@@ -254,6 +257,8 @@ class HeartbeatRequest(BaseModel):
     role: str | None = None
     rpc_endpoint: str | None = None
     free_ram: int | None = None
+    # RAW physical RAM (MemTotal) in bytes — see RegisterRequest.ram_total.
+    ram_total: int | None = None
     # Free/total bytes of the worker's model-root volume — the assign/load
     # preflight refuses pulls that won't fit (disk-aware allocation).
     disk: dict | None = None
@@ -330,6 +335,7 @@ def workers_register():
         pkg_version=body.pkg_version,
         rpc_endpoint=body.rpc_endpoint,
         free_ram=body.free_ram,
+        ram_total=body.ram_total,
         engine=body.engine,
         pool=body.pool,
         caps=body.caps,
@@ -397,6 +403,7 @@ def workers_heartbeat(worker_id):
         role=body.role,
         rpc_endpoint=body.rpc_endpoint,
         free_ram=body.free_ram,
+        ram_total=body.ram_total,
         disk=body.disk,
         engine=body.engine,
         pool=body.pool,
