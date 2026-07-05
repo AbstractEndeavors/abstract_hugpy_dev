@@ -11,21 +11,24 @@ Isolation (mirrors prior video_intel self-tests / deploy memory):
     rely on the DB repoint for isolation — synth artifacts live under the REAL
     DEFAULT_ROOT (so media_store.ingest's storage jail accepts them).
 
-Two img2img sections (NEITHER commits the HELD step-6 advertisement flip to
-disk — Part B applies it IN-PROCESS only, to the live MODEL_REGISTRY object):
+Two img2img sections exercise BOTH directions of img2img_available:
 
-  Part A (rails, headless-tolerant): enqueue a scene spec WITH a start-frame
-    image part + chain=True and drain it. Because sd-turbo does NOT advertise
-    image-to-image (step 6 held), the runner must return the retryable
-    `image_to_image_unavailable` JobError — proving the HONEST-failure path
-    (never a silent fall back to text-to-image).
+  Part A (honest-failure rails, headless-tolerant): enqueue a scene spec WITH a
+    start-frame image part + chain=True for a model that GENUINELY cannot do
+    image-to-image — a text LLM. A text model advertises no image task, so the
+    config widening that grants img2img to image-generation checkpoints never
+    touches it. The runner must return the retryable `image_to_image_unavailable`
+    JobError — proving the HONEST-failure path (never a silent fall back to
+    text-to-image).
 
-  Part B (real CPU coverage): apply the step-6 flip in-process (add
-    "image-to-image" to sd-turbo's registry tasks), set HUGPY_VIDEOGEN_LOCAL=
-    always, synth a tiny 256x256 init PNG, and call the managers plane directly
-    with task="image-to-image". Assert a real GeneratedImage with non-trivial
-    bytes. GATED: if sd-turbo weights aren't locally loadable, SKIP with a LOUD
-    note (the deploy agent reports it) rather than failing the self-test.
+  Part B (real CPU coverage): sd-turbo is an SD-family diffusers checkpoint, so
+    the config layer advertises image-to-image for it (models_config
+    ._derive_tasks -> _augment_img2img). Assert img2img_available("sd-turbo") is
+    True, set HUGPY_VIDEOGEN_LOCAL=always, synth a tiny 256x256 init PNG, and call
+    the managers plane directly with task="image-to-image". Assert a real
+    GeneratedImage with non-trivial bytes. GATED: if sd-turbo weights aren't
+    locally loadable, SKIP with a LOUD note (the deploy agent reports it) rather
+    than failing the self-test.
 """
 from __future__ import annotations
 
@@ -38,6 +41,11 @@ from uuid import uuid4
 
 from abstract_hugpy_dev._platform.binaries import resolve_bin
 from abstract_hugpy_dev.imports.src.constants.constants import DEFAULT_ROOT
+
+# The honest-failure fixture (Part A): a model that GENUINELY cannot serve
+# image-to-image. A text LLM advertises no image task, so the img2img config
+# widening never grants it the capability — keep this a non-image model.
+_INCAPABLE_MODEL = "Qwen2.5-3B-Instruct-GGUF"
 
 
 # --------------------------------------------------------------------------- #
@@ -81,10 +89,11 @@ def _synth_root():
 # Part A — honest-failure rails through the bus (no flip applied)
 # --------------------------------------------------------------------------- #
 def part_a_honest_failure() -> bool:
-    print("\n=== Part A: img2img honest-failure rails (step 6 HELD) ===")
+    print("\n=== Part A: img2img honest-failure rails (genuinely-incapable model) ===")
     from abstract_hugpy_dev.video_intel import media_store
     from abstract_hugpy_dev.video_intel.gen_schema import image_part, text_part
     from abstract_hugpy_dev.video_intel.scene_schema import make_generate_scene
+    from abstract_hugpy_dev.video_intel.runners._img2img import img2img_available
 
     media_bus = private_bus_db()
 
@@ -93,9 +102,18 @@ def part_a_honest_failure() -> bool:
     start_ref = media_store.ingest(init_png)
     print(f"[A] ingested start frame: kind={start_ref.kind} {start_ref.width}x{start_ref.height}")
 
+    # Precondition: the fixture must be a model that TRULY cannot do img2img, so
+    # the honest-failure path is genuinely exercised (not masked by the config
+    # widening, which only grants img2img to image-generation checkpoints).
+    if img2img_available(_INCAPABLE_MODEL):
+        print(f"[A] FAIL: fixture {_INCAPABLE_MODEL!r} unexpectedly advertises "
+              f"img2img — pick a genuinely-incapable (non-image) model")
+        return False
+    print(f"[A] fixture {_INCAPABLE_MODEL!r} img2img_available=False (truly unavailable)")
+
     spec = make_generate_scene(
         parts=(text_part("a serene landscape, slowly panning"), image_part(start_ref)),
-        model_id="sd-turbo",
+        model_id=_INCAPABLE_MODEL,
         width=256, height=256, steps=2, guidance=0.0,
         n_frames=3, fps=8, assemble=False,
         motion="camera pans right, step {i} of {n}",
@@ -109,12 +127,12 @@ def part_a_honest_failure() -> bool:
     result = view.get("result") or {}
     err = result.get("error") or {}
     if view["status"] == "done":
-        # A live worker somehow served it — accept the valid done shape too.
+        # A genuinely-incapable model must NEVER produce img2img output; a done
+        # here means the image_to_image_unavailable guard did not fire — a FAIL.
         outs = result.get("outputs") or []
-        ok = len(outs) >= 1
-        print(f"[A] unexpectedly DONE with {len(outs)} output(s) (a live img2img "
-              f"server must be present); accepting valid shape: {ok}")
-        return ok
+        print(f"[A] FAIL: incapable model {_INCAPABLE_MODEL!r} unexpectedly DONE "
+              f"with {len(outs)} output(s) (honest-failure guard did not fire)")
+        return False
     ok = (
         view["status"] == "failed"
         and err.get("code") == "image_to_image_unavailable"
@@ -129,13 +147,17 @@ def part_a_honest_failure() -> bool:
 # --------------------------------------------------------------------------- #
 # Part B — real CPU img2img proof (in-process flip; guarded/skippable)
 # --------------------------------------------------------------------------- #
-def _apply_step6_flip_in_process() -> bool:
-    """Add 'image-to-image' to sd-turbo's LIVE registry tasks (in-process only —
-    never written to models_config.py). Returns True if the flip is now active."""
+def _ensure_sd_turbo_img2img() -> bool:
+    """Ensure sd-turbo advertises 'image-to-image'. Normally a NO-OP: sd-turbo is
+    an SD-family diffusers checkpoint, so the config layer already grants it
+    image-to-image (models_config._augment_img2img). Kept as an idempotent safety
+    net so Part B's CPU proof still runs even if that staple ever changes — any
+    append is in-process only (never written to models_config.py). Returns True if
+    sd-turbo advertises image-to-image."""
     from abstract_hugpy_dev.imports.config.models.models_config import MODEL_REGISTRY
     cfg = MODEL_REGISTRY.get("sd-turbo")
     if cfg is None:
-        print("[B] sd-turbo not in MODEL_REGISTRY; cannot flip")
+        print("[B] sd-turbo not in MODEL_REGISTRY")
         return False
     if "image-to-image" not in cfg.tasks:
         # cfg is a frozen dataclass, but .tasks is a mutable list — appending to
@@ -146,17 +168,17 @@ def _apply_step6_flip_in_process() -> bool:
 
 def part_b_cpu_proof() -> str:
     """Returns 'pass', 'fail', or 'skip'."""
-    print("\n=== Part B: real CPU img2img proof (in-process step-6 flip) ===")
-    if not _apply_step6_flip_in_process():
-        print("[B] FAIL: could not apply in-process flip")
+    print("\n=== Part B: real CPU img2img proof (sd-turbo advertises img2img) ===")
+    if not _ensure_sd_turbo_img2img():
+        print("[B] FAIL: sd-turbo does not advertise image-to-image")
         return "fail"
     os.environ["HUGPY_VIDEOGEN_LOCAL"] = "always"
 
     from abstract_hugpy_dev.video_intel.runners._img2img import img2img_available
     if not img2img_available("sd-turbo"):
-        print("[B] FAIL: img2img_available('sd-turbo') False AFTER flip")
+        print("[B] FAIL: img2img_available('sd-turbo') False despite advertisement")
         return "fail"
-    print("[B] img2img_available('sd-turbo') = True (flip active)")
+    print("[B] img2img_available('sd-turbo') = True")
 
     synth_dir = _synth_root()
     init_png = synth_png(os.path.join(synth_dir, "init.png"), 256, 256, "blue")

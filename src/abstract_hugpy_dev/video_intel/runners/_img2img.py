@@ -11,10 +11,12 @@ True iff BOTH:
       resolve for (model_id, task="image-to-image") would succeed. `resolve()`
       raises when the model's cfg.tasks does not list the task.
 
-Because the sd-turbo advertisement flip (models_config.py step 6) is HELD, on
-LIVE central (b) fails -> this returns FALSE -> honest "not available on the
-fleet". A local/selftest run that applies the flip in-process (adds
-"image-to-image" to sd-turbo's cfg.tasks) makes (b) pass -> True.
+(b) is SERVABLE when the model's cfg.tasks lists "image-to-image". The config
+layer now advertises image-to-image for every image-generation checkpoint
+(SD/SDXL/flux-class diffusers, comfy SD-lineage checkpoints — see
+models_config._augment_img2img), so image models return True here, while a
+genuinely-incapable model (a text LLM, whisper, embeddings, …) returns the honest
+FALSE -> "not available on the fleet".
 
 Import is LAZY inside the function (mirrors the runners' discipline): merely
 importing this module never couples to the health of the managers/dispatch plane.
@@ -46,8 +48,9 @@ def img2img_available(model_id: str) -> bool:
         return False
 
     # (b) servable for this model — resolve_model_key validates the model
-    # advertises the task (task in cfg.tasks). Step 6 held => sd-turbo does not
-    # advertise it => this raises => False (honest failure on live central).
+    # advertises the task (task in cfg.tasks). Image-generation checkpoints now
+    # advertise image-to-image (models_config._augment_img2img); a model that
+    # genuinely can't (text LLM, whisper, embeddings, …) raises here => False.
     try:
         from abstract_hugpy_dev.managers.resolvers.model_resolver import resolve_model_key
         resolve_model_key(model_key=model_id, task="image-to-image")

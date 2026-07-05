@@ -219,7 +219,31 @@ def _derive_framework(name, hub_id, row):
     return "gguf" if ("gguf" in blob or "gguf" in tags) else "transformers"
 
 
-def _derive_tasks(framework, row):
+def _augment_img2img(framework, tasks):
+    """Advertise image-to-image for models that inherently support it.
+
+    Operator ruling (2026-07-05): primary_task / pipeline_tag is NOT a definitive
+    capability marker. A generative-IMAGE checkpoint — an SD/SDXL/flux-class
+    diffusers model or a comfy SD-lineage checkpoint — serves image-to-image from
+    the SAME weights it serves text-to-image with (AutoPipelineForImage2Image /
+    the comfy image-conditioned graph). So whenever a model on an img2img-capable
+    framework (transformers / comfy — derived in IMG2IMG_CAPABLE_FRAMEWORKS) lists
+    text-to-image, it also gets image-to-image.
+
+    Conservative by construction: it ONLY widens models that already generate
+    images (text-to-image present). Text LLMs, VL chat, whisper, embeddings and
+    the vision-analysis family never carry text-to-image, so none of them gain
+    img2img. Idempotent — a model that already lists image-to-image (sd-turbo, the
+    swept comfy checkpoints, native edit models) is returned unchanged.
+    """
+    if ("text-to-image" in tasks
+            and framework in IMG2IMG_CAPABLE_FRAMEWORKS
+            and "image-to-image" not in tasks):
+        return [*tasks, "image-to-image"]               # new list — never mutate the row's
+    return tasks
+
+
+def _base_tasks(framework, row):
     tasks = row.get("tasks")
     if tasks:
         return tasks if isinstance(tasks, list) else [tasks]
@@ -242,6 +266,12 @@ def _derive_tasks(framework, row):
     if m in _ASR:     return ["automatic-speech-recognition"]
     if m in _VISION:  return ["image-text-to-text", "text-generation"]
     return ["text-generation"]                          # conservative floor
+
+
+def _derive_tasks(framework, row):
+    """A row's servable task list. Base derivation (curated/discovery vocabulary),
+    then the img2img capability widening (see _augment_img2img)."""
+    return _augment_img2img(framework, _base_tasks(framework, row))
 
 
 def derive_model_config_row(name, row):

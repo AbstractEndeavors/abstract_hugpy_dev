@@ -711,12 +711,60 @@ def _loaded_detail() -> dict:
 
 def _slot_statuses() -> list | None:
     try:
-        from ..managers.serve.slots import SlotPool, slots_enabled
-        if not slots_enabled():
-            return None
-        return SlotPool().statuses()
+        from ..managers.serve.slots import SlotPool, _slot_count
+        n = _slot_count()
+        if n <= 0:
+            # Effective slot count 0 -> report NO slots as an explicit empty
+            # list (not None), so central overwrites and CLEARS any stale
+            # phantom rows a prior config left behind. Fixes the zero-slot box
+            # (e.g. a transformers-only CPU worker) that advertised 2
+            # unreachable seats it never actually ran.
+            return []
+        # Never report more rows than the effective slot count.
+        return SlotPool().statuses()[:n]
     except Exception:
         return None
+
+
+def _allocations(slot_statuses: "list | None" = None) -> list:
+    """Unified, engine-agnostic view of every resource allocation on this
+    worker — one entry per SLOT-seated model and one per in-RAM (in-process)
+    resident model. A slot is a resource allocation to a model regardless of
+    engine, so GGUF slot occupants and transformers models held in the agent's
+    OWN process are reported side by side. This is a NEW field parallel to (not
+    a replacement for) loaded_models/slots, so old central/UI keep working.
+
+    ``slot_statuses`` may be passed in to avoid a second slot round-trip when
+    the heartbeat already computed it."""
+    out: list = []
+    seen: set = set()
+    rows = slot_statuses if slot_statuses is not None else _slot_statuses()
+    for s in (rows or []):
+        mk = (s or {}).get("model_key")
+        if not mk:
+            continue                       # empty seats aren't allocations
+        seen.add(mk)
+        out.append({
+            "kind": "slot", "model_key": mk,
+            "slot_id": s.get("slot_id"), "healthy": s.get("healthy"),
+            "busy": s.get("busy"), "endpoint": s.get("endpoint"),
+            "rss_bytes": s.get("rss_bytes"),
+            "n_gpu_layers": s.get("n_gpu_layers"), "ctx": s.get("ctx"),
+        })
+    detail = _loaded_detail()
+    for mk in loaded_model_keys():
+        if mk in seen:
+            continue                       # already counted as a slot allocation
+        d = detail.get(mk) or {}
+        out.append({
+            "kind": "ram", "model_key": mk,
+            "model_bytes": d.get("model_bytes"),
+            "weight_bytes": d.get("weight_bytes"),
+            "gpu_pct": d.get("gpu_pct"),
+            "n_gpu_layers": d.get("n_gpu_layers"),
+            "total_layers": d.get("total_layers"),
+        })
+    return out
 
 
 # Live slot children, module-global so the self-update path can terminate
@@ -2162,6 +2210,8 @@ def _heartbeat_loop(client: CentralClient, state: WorkerState, args) -> None:
     while True:
         time.sleep(args.heartbeat)
         try:
+            # Compute slot statuses ONCE — the unified allocations view reuses it.
+            _slots = _slot_statuses()
             worker = client.heartbeat(
                 state.worker_id,
                 {
@@ -2186,7 +2236,8 @@ def _heartbeat_loop(client: CentralClient, state: WorkerState, args) -> None:
                     "config": _effective_config(),
                     "comfy": _comfy_status(),
                     "loaded_detail": _loaded_detail(),
-                    "slots": _slot_statuses(),
+                    "slots": _slots,
+                    "allocations": _allocations(_slots),
                 },
             )
             # Adopt any assignment change made in the UI + pre-provision it.

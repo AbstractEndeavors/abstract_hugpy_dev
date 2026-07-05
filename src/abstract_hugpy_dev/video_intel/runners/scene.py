@@ -268,9 +268,11 @@ def run_generate_scene(spec: GenerateSceneSpec, job_id: str) -> JobResult:
     # Runner-applied default when None (LOCKED CONTRACT): 0.45.
     strength = spec.strength if spec.strength is not None else 0.45
 
-    # A start-frame image REQUIRES a servable img2img pair. The sd-turbo
-    # advertisement flip is HELD, so on live central this is FALSE -> honest,
-    # retryable failure. NEVER silently fall back to text-to-image.
+    # A start-frame image REQUIRES a servable img2img pair. Image-generation
+    # models advertise image-to-image (config layer — models_config
+    # ._augment_img2img), so this passes for them; a model that genuinely can't
+    # serve img2img yields an honest, retryable failure. NEVER silently fall back
+    # to text-to-image.
     if start_frame is not None and not img2img_available(spec.model_id):
         logger.info(
             "scene %s: start-frame image present but image-to-image is not "

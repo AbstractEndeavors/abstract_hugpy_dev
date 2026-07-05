@@ -12,14 +12,19 @@ HF_TASK_TO_TASKS = {
     "feature-extraction": ["feature-extraction", "sentence-similarity", "keyword-extraction"],
     "sentence-similarity": ["feature-extraction", "sentence-similarity", "keyword-extraction"],
     "text-to-image": ["text-to-image"],
-    # NOTE: "image-to-image" is deliberately NOT in the discovery vocabulary.
-    # sd-turbo is the ONLY supported img2img model (advertised via its curated
-    # tasks list at go-live — see models_config.py step-6). Omitting it here keeps
-    # model DISCOVERY from auto-advertising externally-downloaded
-    # pipeline_tag=image-to-image models (e.g. flux / Qwen-Image-Edit) as servable
-    # img2img before they are vetted. The ("transformers","image-to-image")
-    # RUNNER_PAIRS entry below is REQUIRED and stays (it prevents sd-turbo being
-    # dropped by derive_model_config_row when step-6 is flipped).
+    # NOTE: "image-to-image" is intentionally NOT a DISCOVERY pipeline_tag key.
+    # A raw HF pipeline_tag=image-to-image (native EDIT models like
+    # Qwen-Image-Edit) is still not auto-advertised from that tag alone. Instead,
+    # img2img capability is DERIVED at the config layer
+    # (models_config._derive_tasks): any image-GENERATION checkpoint — an
+    # SD/SDXL/flux-class diffusers model or a comfy SD-lineage checkpoint — serves
+    # image-to-image from the SAME weights it serves text-to-image with
+    # (AutoPipelineForImage2Image / the comfy image-conditioned graph), so it
+    # gains "image-to-image" whenever it advertises "text-to-image". (Operator
+    # ruling 2026-07-05: primary_task / pipeline_tag is NOT a definitive capability
+    # marker — plenty of models do img2img without saying so.) The
+    # ("transformers","image-to-image") / ("comfy","image-to-image") RUNNER_PAIRS
+    # entries below back that derivation.
     # Vision-analysis family — HF pipeline tags map 1:1.
     "depth-estimation": ["depth-estimation"],
     "object-detection": ["object-detection"],
@@ -40,6 +45,16 @@ RUNNER_PAIRS = {
     ("transformers", "depth-estimation"), ("transformers", "object-detection"),
     ("transformers", "image-classification"), ("transformers", "image-segmentation"),
 }
+
+# Frameworks whose ("<framework>","image-to-image") runner+builder pair is wired
+# above. DERIVED from RUNNER_PAIRS so it can't drift (same discipline as
+# frameworks.KNOWN_TASKS_REGISTRY). A generative-image checkpoint on one of these
+# frameworks serves img2img from the SAME weights it serves text-to-image with,
+# so models_config._derive_tasks advertises "image-to-image" for it whenever it
+# advertises "text-to-image". Today this is {"transformers", "comfy"}.
+IMG2IMG_CAPABLE_FRAMEWORKS: frozenset = frozenset(
+    framework for (framework, task) in RUNNER_PAIRS if task == "image-to-image"
+)
 MEDIA_DEFAULTS: Dict[str, str] = {
     "document": DEFAULT_CHAT_MODEL,
     "code":     DEFAULT_CHAT_MODEL,

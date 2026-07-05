@@ -68,10 +68,11 @@ def run_generate_image(spec: GenerateImageSpec, job_id: str) -> JobResult:
         ))
 
     # ---- image-conditioning seam: use the FIRST image part as an init image via
-    # img2img — but ONLY when img2img is servable on the fleet. The sd-turbo
-    # advertisement flip is HELD, so on live central this is unavailable; we then
-    # DO NOT regress the existing "image ignored, text-to-image runs" flow — we
-    # still generate from the text and log LOUDLY. image2image is the model flag.
+    # img2img — but ONLY when img2img is servable on the fleet. Image-generation
+    # models advertise image-to-image (config layer — models_config
+    # ._augment_img2img); if the selected model can't serve img2img we DO NOT
+    # regress the existing "image ignored, text-to-image runs" flow — we still
+    # generate from the text and log LOUDLY.
     start_frame = image_paths[0] if image_paths else None
     strength = spec.strength if spec.strength is not None else 0.45   # documented default
     use_img2img = start_frame is not None and img2img_available(spec.model_id)

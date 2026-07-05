@@ -608,6 +608,7 @@ class WorkerStore:
         comfy: Optional[Dict[str, Any]] = None,
         loaded_detail: Optional[Dict[str, Any]] = None,
         slots: Optional[List[Dict[str, Any]]] = None,
+        allocations: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Mark a worker alive and refresh its live GPU / loaded-model stats."""
         with self._transaction() as workers:
@@ -666,6 +667,10 @@ class WorkerStore:
                 worker["loaded_detail"] = loaded_detail
             if slots is not None:
                 worker["slots"] = slots
+            if allocations is not None:
+                # Unified engine-agnostic allocation view (slot-seated + in-RAM
+                # residents). Stored verbatim; _public_view spreads it through.
+                worker["allocations"] = allocations
             if caps is not None:
                 worker["caps"] = caps
                 # Worker-side config is the hard ceiling: if its caps tightened

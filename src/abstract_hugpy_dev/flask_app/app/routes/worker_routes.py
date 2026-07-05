@@ -273,6 +273,12 @@ class HeartbeatRequest(BaseModel):
     # This worker's OWN slot pool statuses (agent-supervised llama_cpp.server
     # children) — rendered in its Compute-tab row like central's slots.
     slots: list | None = None
+    # Unified, engine-agnostic resource-allocation view: one entry per
+    # slot-seated model and one per in-RAM (in-process) resident model
+    # ({kind: "slot"|"ram", model_key, ...}). A NEW field parallel to
+    # slots/loaded_models — the console renders the worker card from it when
+    # present, and falls back to slots+loaded_models for older agents.
+    allocations: list | None = None
 
 
 class AssignRequest(BaseModel):
@@ -400,6 +406,7 @@ def workers_heartbeat(worker_id):
         comfy=body.comfy,
         loaded_detail=body.loaded_detail,
         slots=body.slots,
+        allocations=body.allocations,
     )
     if worker is None:
         # The agent thinks it's registered but central forgot it (restart,
@@ -753,6 +760,75 @@ def workers_config(worker_id):
                             request.get_json(silent=True) or {},
                             timeout=15.0, action="config",
                             retry_on_connect=True)
+
+
+def _relay_pin_all(worker_id, pin: bool):
+    """Pin (pin=True) or unpin (pin=False) EVERY model currently designated to
+    this worker, reusing the SAME code path the single-model pin uses.
+
+    The single pin (UI togglePin → workers_config) is one /ops/config POST with
+    ``{"pinned": {model_key: true|null}}``; the worker agent's /ops/config
+    ITERATES that map and applies it as one atomic settings-write + one re-exec.
+    So the whole-worker action is that exact relay with EVERY key in the dict
+    instead of one — no duplicated pin logic, and one agent restart rather than
+    one per model (which would stack restarts and spuriously fail later pins).
+
+    Returns a Flask (json, 200): per-model ``results`` ({model_key: "ok"|error
+    message}), summary ``counts`` and the relay's ``restarting`` flag. Resilient
+    by design — a relay failure marks every model errored and STILL returns the
+    full map (never a bare 5xx that would abort the caller before it sees which
+    models were affected)."""
+    worker = get_worker(worker_id)
+    if worker is None:
+        abort(404, description="Unknown worker id.")
+    keys = list(worker.get("models") or [])
+    action = "pin_all" if pin else "unpin_all"
+    if not keys:
+        return jsonify({"ok": True, "pinned": pin, "results": {},
+                        "counts": {"ok": 0, "error": 0, "total": 0},
+                        "restarting": False,
+                        "note": "no models are designated to this worker"})
+    # Same payload shape as the single pin (workers_config), just every key.
+    payload = {"pinned": {mk: (True if pin else None) for mk in keys}}
+    resp, status = _relay_worker_op(worker_id, "/ops/config", payload,
+                                    timeout=15.0, action=action,
+                                    retry_on_connect=True)
+    data = resp.get_json(silent=True) or {}
+    ok = (200 <= status < 300) and data.get("ok", True) is not False
+    if ok:
+        results = {mk: "ok" for mk in keys}
+        counts = {"ok": len(keys), "error": 0, "total": len(keys)}
+    else:
+        err = data.get("error")
+        msg = ((err.get("message") if isinstance(err, dict) else err)
+               or data.get("reason") or f"config relay failed (HTTP {status})")
+        results = {mk: msg for mk in keys}
+        counts = {"ok": 0, "error": len(keys), "total": len(keys)}
+    out = {"ok": ok, "pinned": pin, "results": results, "counts": counts,
+           "restarting": bool(data.get("restarting"))}
+    if not ok and data.get("error"):
+        out["error"] = data["error"]      # let the UI's fetchJson surface it too
+    # Always 200: the structured body (ok + counts) carries success/failure, so
+    # the caller sees the per-model map even when the underlying relay failed.
+    return jsonify(out)
+
+
+@worker_bp.route("/llm/workers/<worker_id>/pin-all", methods=["POST"])
+def workers_pin_all(worker_id):
+    """Tiers v3 bulk action: 📌 pin EVERY model currently designated to this
+    worker, in ONE settings-write via the single-pin relay (see _relay_pin_all).
+    Sticky by design — each pinned model then refuses unassign (409 'unpin
+    first') until /unpin-all (or a per-model unpin) reverses it. Operator-gated
+    + audited like every other /ops/config relay."""
+    return _relay_pin_all(worker_id, pin=True)
+
+
+@worker_bp.route("/llm/workers/<worker_id>/unpin-all", methods=["POST"])
+def workers_unpin_all(worker_id):
+    """Inverse of /pin-all — the undo. Unpins EVERY model designated to this
+    worker in one /ops/config write (a `pinned` map of nulls), same relay/code
+    path; afterward the models can be unassigned again."""
+    return _relay_pin_all(worker_id, pin=False)
 
 
 @worker_bp.route("/llm/workers/<worker_id>/reap", methods=["POST"])
