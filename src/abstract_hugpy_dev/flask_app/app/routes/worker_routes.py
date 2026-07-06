@@ -766,6 +766,18 @@ def workers_restart(worker_id):
                             timeout=15.0, action="restart")
 
 
+@worker_bp.route("/llm/workers/<worker_id>/free-ram", methods=["POST"])
+def workers_free_ram(worker_id):
+    """Non-destructive host-RAM reclaim: relay to the worker agent's
+    /ops/free-ram, which runs gc + malloc_trim(0) + torch.empty_cache() to hand
+    glibc's orphaned allocator arena back to the OS WITHOUT evicting any model
+    (after a free glibc keeps the pages pooled, so RSS stays pinned otherwise).
+    Returns the worker JSON verbatim; loaded models are left untouched."""
+    return _relay_worker_op(worker_id, "/ops/free-ram",
+                            request.get_json(silent=True) or {},
+                            timeout=30.0, action="free-ram")
+
+
 @worker_bp.route("/llm/workers/<worker_id>/config", methods=["POST"])
 def workers_config(worker_id):
     """Daylight item 3: set a worker's serving config from the console — e.g.

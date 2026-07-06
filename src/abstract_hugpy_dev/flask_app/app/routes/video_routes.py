@@ -15,6 +15,12 @@ Frozen contract (a frontend is being built to the same contract in parallel):
     POST /video/jobs/audio_extract  {"source": <MediaRef>, "fmt"?: "wav"}
                                     -> {"job_id": ...}
     POST /video/jobs/generate_image {"parts": [...], "model_id", ...} -> {"job_id": ...}
+    GET  /video/presets             -> {"presets": [ {"id","name","description",
+                                    "mode","model_key","defaults":{...},
+                                    "recommended"} ]}
+    POST /video/presets/<id>/apply  -> auto-pick a GPU worker + assign + warm the
+                                    preset's model -> {"ok","worker","model_key",
+                                    "mode","defaults":{...},"warming"}
     GET  /video/jobs/<job_id>       -> {"job_id","status","result"}
     GET  /video/media?handle=       -> raw file bytes (source image OR job result)
 
@@ -272,6 +278,136 @@ def video_generate_scene():
 
     job_id = media_bus.enqueue("generate_scene", resolved)
     return jsonify({"job_id": job_id}), 200
+
+
+# --------------------------------------------------------------------------- #
+# 2e) GET /video/presets — curated "ideal default loads" for scene generation
+# --------------------------------------------------------------------------- #
+# Thin idiom (mirrors prompt_routes' GET /prompt/tasks): import the static
+# registry, dump it as JSON. No side effects — a preset is just a named bundle
+# of a model_key + coherence mode + per-frame defaults the UI pre-fills.
+@video_bp.route("/video/presets", methods=["GET"])
+def video_presets():
+    from abstract_hugpy_dev.video_intel.presets import available_presets
+    return jsonify({"presets": [p.to_dict() for p in available_presets()]}), 200
+
+
+# --------------------------------------------------------------------------- #
+# GPU-worker auto-pick — reuses the worker registry helpers (workers_for_model /
+# _has_usable_gpu / _worker_fit) that the /llm/workers/<id>/assign path uses, so
+# a preset lands on the same class of worker an operator would pick by hand.
+# --------------------------------------------------------------------------- #
+def _pick_gpu_worker(model_key):
+    """Choose an online, approved, GPU-capable worker to warm ``model_key`` on.
+
+    Preference order (best first): a worker that already carries the model
+    (assigned or loaded — no reload), then one where it fits VRAM outright, then
+    any where it at least fits (VRAM+RAM), then the most free VRAM. Returns None
+    when no GPU worker is eligible (the caller maps that to a 409 NoGpuWorker).
+    """
+    from ..functions.imports.utils.workers import (
+        worker_store, _has_usable_gpu, _engine_unusable,
+    )
+    from .worker_routes import _worker_fit
+
+    # Workers already serving this model (assigned OR loaded), stale beats ok —
+    # reusing one avoids a multi-GB reload. online_only=False so a briefly-stale
+    # assignee still counts as "already has it".
+    warm_ids = {w["id"] for w in
+                worker_store.workers_for_model(model_key, online_only=False)}
+
+    eligible = []
+    for w in worker_store.all():
+        # Same admission/engine/liveness gates workers_for_model applies, plus a
+        # hard GPU requirement (a preset's "recommended: gpu" is load-bearing).
+        if w.get("admission") != "approved":
+            continue
+        if _engine_unusable(w):
+            continue
+        if w.get("status") != "online":
+            continue
+        if not _has_usable_gpu(w):
+            continue
+        eligible.append(w)
+    if not eligible:
+        return None
+
+    def _rank(w):
+        fit = _worker_fit(model_key, w)   # fit/gpu_resident None for unsizable models
+        return (
+            0 if w["id"] in warm_ids else 1,
+            0 if fit.get("gpu_resident") else 1,
+            0 if fit.get("fit") is not False else 1,
+            -(fit.get("vram_free") or 0),
+            w.get("id", ""),
+        )
+
+    eligible.sort(key=_rank)
+    return eligible[0]
+
+
+# --------------------------------------------------------------------------- #
+# 2f) POST /video/presets/<preset_id>/apply — validate + auto-pick a GPU worker,
+#     assign + background-warm the model, return the gen defaults for the UI.
+#     Guards mirror workers_assign: catalog membership (404) + central-holds-
+#     files (409); adds preset-exists (404) and no-GPU-worker (409) on top.
+# --------------------------------------------------------------------------- #
+@video_bp.route("/video/presets/<preset_id>/apply", methods=["POST"])
+def video_preset_apply(preset_id):
+    from abstract_hugpy_dev.video_intel.presets import get_preset
+
+    preset = get_preset(preset_id)
+    if preset is None:
+        return jsonify({"ok": False, "error": {
+            "code": "UnknownPreset",
+            "message": f"no video preset {preset_id!r}"}}), 404
+
+    model_key = preset.model_key
+
+    # Catalog membership — same source (get_models_dict) workers_assign checks.
+    from abstract_hugpy_dev.imports.config.models.models_config import get_models_dict
+    if model_key not in get_models_dict(dict_return=True):
+        return jsonify({"ok": False, "error": {
+            "code": "UnknownModel",
+            "message": f"preset model {model_key!r} is not in the catalog"}}), 404
+
+    # Item-4 invariant: central must hold the files, or the worker silently pulls
+    # from HF at internet speed. Reuse the exact guard workers_assign uses.
+    from .worker_routes import _central_missing_reason, _kick_warm
+    missing = _central_missing_reason(model_key)
+    if missing:
+        return jsonify({"ok": False, "error": {
+            "code": "CentralMissing",
+            "message": (f"central does not have {model_key!r} on disk ({missing}) "
+                        "— download it on the Models tab first; workers provision "
+                        "from central")}}), 409
+
+    # Auto-pick a GPU-capable worker (presets are "recommended: gpu").
+    worker = _pick_gpu_worker(model_key)
+    if worker is None:
+        return jsonify({"ok": False, "error": {
+            "code": "NoGpuWorker",
+            "message": ("no online GPU-capable worker is available to warm this "
+                        "preset — bring a GPU worker online or assign manually")}}), 409
+
+    # Designate = ready: assign then background-warm (never wait on the load).
+    from ..functions.imports.utils.workers import assign_model
+    assigned = assign_model(worker["id"], model_key)
+    if assigned is None:
+        # Raced: the worker vanished between pick and assign.
+        return jsonify({"ok": False, "error": {
+            "code": "NoGpuWorker",
+            "message": "the selected worker is no longer available — retry"}}), 409
+    _kick_warm(assigned, [model_key], "video-preset")
+
+    return jsonify({
+        "ok": True,
+        "worker": {"name": assigned.get("name"), "id": assigned.get("id")},
+        "model_key": model_key,
+        "mode": preset.mode,
+        "defaults": preset.defaults(),
+        "warming": True,
+    }), 200
 
 
 # --------------------------------------------------------------------------- #

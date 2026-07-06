@@ -383,6 +383,26 @@ class Img2ImgRunner:
                 self.model_key, model_dir, "cuda" if cuda else "cpu",
                 type(pipe).__name__, " (cpu-offload)" if cuda and fallback else "",
             )
+            # A ~55 GB fp16/bf16 load churns a large transient host arena
+            # (staging buffers + the pre-offload copy). Now that the pipe is
+            # placed, drop those references and hand the arena (and torch's CUDA
+            # cache) back to the OS so RSS doesn't stay pinned at the load's
+            # high-water mark. Inline — NOT worker_agent.agent._trim_host_ram —
+            # to avoid cross-module coupling; mirrors this file's evict idiom
+            # (~85-93) plus malloc_trim (glibc/Linux-only, so best-effort).
+            import gc
+            gc.collect()
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:  # noqa: BLE001 — no torch/cuda: nothing to release
+                pass
+            try:
+                import ctypes
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except Exception:  # noqa: BLE001 — non-glibc/musl: no malloc_trim
+                pass
             self._PIPELINES[self.model_key] = pipe
             return pipe
 

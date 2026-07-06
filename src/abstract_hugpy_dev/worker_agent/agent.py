@@ -315,6 +315,52 @@ def _free_ram_bytes() -> int | None:
         return None
 
 
+def _trim_host_ram() -> None:
+    """Return orphaned host RAM to the OS WITHOUT evicting any model.
+
+    After a model's weights are freed, glibc keeps the freed pages in its
+    per-arena free-list, so RSS stays pinned (ae observed at 0 free / 128 GB
+    used with nothing loaded). gc.collect() drops Python-side references,
+    malloc_trim(0) hands the arena's top free chunks back to the kernel, and
+    torch.cuda.empty_cache() releases torch's cached CUDA blocks. Every step is
+    best-effort — malloc_trim is glibc/Linux-only (musl/other libc lack it), so
+    the whole thing stays defensive. Mirrors the imagegen evict idiom
+    (managers/imagegen/imagegen_runner.py ~85-93) plus the malloc_trim."""
+    import gc
+    gc.collect()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:  # noqa: BLE001 — non-glibc/musl: no malloc_trim, skip
+        pass
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:  # noqa: BLE001 — no torch/cuda: nothing to release
+        pass
+
+
+def _agent_rss_bytes() -> int | None:
+    """Resident RAM (bytes) of THIS agent process — for the free-ram deltas.
+
+    NOT the slot child's ``rss_bytes`` in the heartbeat (a different process):
+    reads VmRSS via the same /proc helper the slot agent uses, psutil fallback.
+    Best-effort (None, never fabricated)."""
+    try:
+        from ..managers.serve.slot_agent import _proc_rss_bytes
+        rss = _proc_rss_bytes(os.getpid())
+        if rss is not None:
+            return rss
+    except Exception:
+        pass
+    try:
+        import psutil
+        return int(psutil.Process().memory_info().rss)
+    except Exception:
+        return None
+
+
 def _ram_total_bytes() -> int | None:
     """RAW physical RAM (MemTotal) in bytes — the pool-budget denominator.
 
@@ -1704,6 +1750,31 @@ def build_app(state: "WorkerState") -> Flask:
         return jsonify({"ok": True, "restarting": True,
                         "worker_id": state.worker_id})
 
+    @app.route("/ops/free-ram", methods=["POST"])
+    def ops_free_ram():
+        # NON-destructive host-RAM reclaim: return glibc's orphaned allocator
+        # arena (and torch's CUDA cache) to the OS WITHOUT evicting any model.
+        # After a model is freed malloc keeps the pages pooled so RSS stays
+        # pinned (ae observed at 0 free / 128 GB used, nothing loaded);
+        # malloc_trim(0) hands them back. loaded_models is reported UNCHANGED —
+        # Unload is the destructive path; this one never touches residency.
+        ram_before = _free_ram_bytes()
+        rss_before = _agent_rss_bytes()
+        _trim_host_ram()
+        ram_after = _free_ram_bytes()
+        rss_after = _agent_rss_bytes()
+        ram_freed = (ram_after - ram_before) if (
+            ram_before is not None and ram_after is not None) else None
+        return jsonify({
+            "ok": True,
+            "ram_free_before": ram_before,
+            "ram_free_after": ram_after,
+            "ram_freed": ram_freed,
+            "rss_before": rss_before,
+            "rss_after": rss_after,
+            "loaded_models": loaded_model_keys(),
+        })
+
     @app.route("/ops/update", methods=["POST"])
     def ops_update():
         # CON-05 on demand: same converge path as the heartbeat handshake
@@ -1896,6 +1967,7 @@ def build_app(state: "WorkerState") -> Flask:
         body = request.get_json(silent=True) or {}
         model_key = body.get("model_key")
         before = _free_vram_bytes()
+        ram_before = _free_ram_bytes()
         err = None
         try:
             from ..managers.dispatch import evict as _evict, clear as _clear
@@ -1906,8 +1978,16 @@ def build_app(state: "WorkerState") -> Flask:
                 evicted = True
         except Exception as exc:
             evicted, err = False, f"{type(exc).__name__}: {exc}"
+        # The evict/clear above drops references, but glibc keeps the freed
+        # weights' host arena pooled (RSS stays pinned) — trim hands it, and
+        # torch's CUDA cache, back to the OS so this destructive path returns
+        # host RAM too, not just VRAM.
+        _trim_host_ram()
         after = _free_vram_bytes()
+        ram_after = _free_ram_bytes()
         freed = (after - before) if (before is not None and after is not None) else None
+        ram_freed = (ram_after - ram_before) if (
+            ram_before is not None and ram_after is not None) else None
         return jsonify({
             "ok": err is None,
             "evicted": evicted,
@@ -1916,6 +1996,9 @@ def build_app(state: "WorkerState") -> Flask:
             "vram_free_before": before,
             "vram_free_after": after,
             "freed": freed,
+            "ram_free_before": ram_before,
+            "ram_free_after": ram_after,
+            "ram_freed": ram_freed,
             "loaded_models": loaded_model_keys(),
         })
 

@@ -99,7 +99,10 @@ _SENSITIVE = [
     # worker_routes._relay_pin_all) — same privilege tier as config.
     # reap-approve = operator-approved eviction of cold local models (drives the
     # same guarded reaper as /reap, with a central intersection second guard).
-    ({"POST"},                   re.compile(r"^/llm/workers/[^/]+/(restart|update|pip|config|reap|reap-approve|pin-all|unpin-all)$")),
+    # free-ram = non-destructive host-RAM reclaim (gc + malloc_trim + CUDA
+    # empty_cache on the worker); it runs a privileged executor op on the box,
+    # so it sits in the same operator-only tier as the other worker ops.
+    ({"POST"},                   re.compile(r"^/llm/workers/[^/]+/(restart|update|pip|config|reap|reap-approve|pin-all|unpin-all|free-ram)$")),
     # Civitai checkpoint download — writes multi-GB files into central's
     # /checkpoints store (which self-registers models) — operator-only.
     ({"POST"},                   re.compile(r"^/civitai/download$")),
