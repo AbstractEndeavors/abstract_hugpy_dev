@@ -28,7 +28,7 @@ from pydantic import BaseModel, Field
 from flask import request, jsonify, abort, send_file, Response
 
 from .imports import *
-from ....managers.serve.overrides import get_override, set_override, available_gguf_files, all_overrides
+from ....managers.serve.overrides import get_override, set_override, available_gguf_files, all_overrides, gguf_variants_detail
 # Serving/slot drivers: imported at module scope (the route handlers below call
 # these by bare name). They are not on the functions star re-export chain.
 from ....managers.serve.serve import (
@@ -1570,11 +1570,54 @@ def _gguf_choices(model_key):
     return avail, selected
 
 
+def _gguf_detail(model_key):
+    """Per-variant sizes + the effective (resolved) quant for the serving editor,
+    so the variant dropdown can label each option with its size and mark the one
+    that actually loads. Best-effort — {} for a non-GGUF or absent dir.
+
+    Resolves the dir via route_destination (the authoritative install path the
+    manifest records) so it matches /models — a discovered model's cfg.folder can
+    be stale and point at a near-empty stub dir."""
+    try:
+        from abstract_hugpy_dev.imports.config.main import get_model_path, get_model_config
+        cfg = None
+        try:
+            cfg = get_model_config(model_key)
+        except Exception:  # noqa: BLE001
+            cfg = None
+        model_dir = None
+        try:
+            from abstract_hugpy_dev.imports.src.constants.paths import route_destination
+            d = cfg.to_dict() if (cfg is not None and hasattr(cfg, "to_dict")) \
+                else (cfg if isinstance(cfg, dict) else {})
+            dest = route_destination(d) if d else None
+            if dest and os.path.isdir(dest):
+                model_dir = dest
+        except Exception:  # noqa: BLE001
+            model_dir = None
+        if not model_dir:
+            model_dir = get_model_path(model_key)
+        return gguf_variants_detail(model_key, model_dir, cfg) or {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _with_gguf(row, model_key):
+    """Attach the variant choices + sizes to a serving row (shared by GET/POST)."""
+    row["available_gguf"], row["gguf_file"] = _gguf_choices(model_key)
+    d = _gguf_detail(model_key)
+    row["available_gguf_detail"] = d.get("variants") or []
+    row["effective_gguf"] = d.get("effective_gguf")
+    row["effective_bytes"] = d.get("effective_bytes")
+    row["mmproj_bytes"] = d.get("mmproj_bytes")
+    return row
+
+
 @worker_bp.route("/llm/serving/<model_key>", methods=["GET"])
 def serving_get(model_key):
     row = spec_row(serve_spec_for(model_key))
     row["override"] = get_override(model_key)
-    row["available_gguf"], row["gguf_file"] = _gguf_choices(model_key)
+    _with_gguf(row, model_key)
     return jsonify(row)
 
 
@@ -1586,7 +1629,7 @@ def serving_set(model_key):
 
     row = spec_row(serve_spec_for(model_key))
     row["override"] = get_override(model_key)
-    row["available_gguf"], row["gguf_file"] = _gguf_choices(model_key)
+    _with_gguf(row, model_key)
     if do_apply:
         row["apply"] = _apply_serving(model_key)
     else:

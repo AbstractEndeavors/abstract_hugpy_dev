@@ -31,6 +31,37 @@ def peers():
     return jsonify(list_peers())
 
 
+def _annotate_gguf_size(model: dict, mk: str) -> None:
+    """For a GGUF model, attach the EFFECTIVE-quant size — the single quant that
+    actually serves (operator ``gguf_file`` override → ``cfg.filename`` → auto),
+    plus its mmproj projector — so the console shows the model's real size instead
+    of the whole-directory / whole-repo sum (a GGUF repo holds many quants; only
+    one is served). No-op for transformers models and for GGUF dirs not downloaded
+    here. Model-level + worker-agnostic, so the Models tab AND the worker-card
+    strip both read this one number (same /models feed)."""
+    fw = (model.get("framework") or "").lower()
+    if fw not in ("gguf", "llama_cpp"):
+        return
+    try:
+        from ....managers.serve.overrides import gguf_variants_detail
+        from ....imports.config.main import get_model_config, get_model_path
+        model_dir = model.get("destination") or get_model_path(mk)
+        try:
+            cfg = get_model_config(mk)
+        except Exception:  # noqa: BLE001
+            cfg = None
+        d = gguf_variants_detail(mk, model_dir, cfg)
+    except Exception:  # noqa: BLE001 — never break the models list over sizing
+        d = {}
+    if not d:
+        return
+    if d.get("effective_bytes"):
+        model["effective_bytes"] = d["effective_bytes"]
+    model["effective_gguf"] = d.get("effective_gguf")
+    model["gguf_variants"] = d.get("variants") or []
+    model["mmproj_bytes"] = d.get("mmproj_bytes")
+
+
 @llm_bp.route("/models", methods=["GET"])
 def list_models():
     manifest = get_models_dict(dict_return=True)
@@ -44,6 +75,8 @@ def list_models():
         # Whether this model is THE preselected default for the media chat.
         # Exactly one model carries media_default=True (or none, if unset).
         model["media_default"] = (mk == media_default)
+        # GGUF: the model's real size = the one quant that serves, not the dir sum.
+        _annotate_gguf_size(model, mk)
         output.append(model)
 
     return jsonify(output)

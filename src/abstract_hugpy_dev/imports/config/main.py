@@ -206,6 +206,15 @@ def model_looks_downloaded(path: str, cfg: Optional[ModelConfig] = None) -> bool
             if not weights:
                 return False
             return all(st_size(f) > 1024 * 1024 for f in weights)
+        # Custom / non-HF model repos carry real weights but NO config.json or
+        # model_index.json — e.g. Resemble Chatterbox TTS ships named
+        # ``*.safetensors``/``*.pt`` (s3gen, t3_cfg, ve, …) + tokenizer.json only.
+        # A dir holding real (multi-MB, not an LFS pointer) safetensors weights
+        # IS downloaded; don't flag a fully-present custom model "incomplete"
+        # just for lacking an HF config.json (the >1 MiB floor rejects pointers).
+        weights = list(get_glob(path, "*.safetensors")) or list(get_glob(path, "*.bin"))
+        if weights and all(st_size(f) > 1024 * 1024 for f in weights):
+            return True
         return False
 
     safetensor_files = list(get_glob(path,"*.safetensors"))

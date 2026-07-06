@@ -1098,7 +1098,15 @@ def _reap_scan(state: "WorkerState") -> dict:
 
     reclaimable, protected = [], []
     try:
-        keys = list(get_models_dict().keys())
+        # Enumerate the UNION, not just get_models_dict(): on a WORKER that dict is
+        # the built-in staples + comfy sweep + on-disk discovery report and NEVER
+        # includes MODEL_REGISTRY, so models held purely by CENTRAL ASSIGNMENT
+        # (discovered rows — a designated gguf like flux2) were surveyed as ABSENT,
+        # dropping tens of GB from the storage report though they're on disk, in
+        # models_local, and slot-seated. Fold in assigned + loaded + loading; the
+        # loop below skips any key that isn't model_is_local, so this only ADDS
+        # on-disk models the staple-only dict missed.
+        keys = set(get_models_dict().keys()) | assigned | loaded | loading
     except Exception as exc:  # noqa: BLE001
         return {"reclaimable": [], "protected": [], "error": str(exc)}
 

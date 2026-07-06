@@ -274,6 +274,42 @@ def _derive_tasks(framework, row):
     return _augment_img2img(framework, _base_tasks(framework, row))
 
 
+def _correct_gguf_vision(framework, tasks, row):
+    """A GGUF is vision (image-text-to-text) ONLY if it actually ships an mmproj
+    projector. HF pipeline_tag and the storage-layout task folder are unreliable
+    (operator ruling 2026-07-05) — a TEXT gguf mis-tagged/mis-routed under
+    image-text-to-text has no projector, so `model_looks_downloaded` demands an
+    mmproj it never had and the model reads 'incomplete' (and can't be allocated).
+    Content-authoritative: DOWNGRADE to text only when we can SEE the dir and it
+    has no projector — never fight a not-yet-downloaded vision model we can't
+    inspect, and never touch a genuine vision gguf (mmproj on disk / in include)."""
+    if framework != "gguf" or "image-text-to-text" not in tasks:
+        return tasks
+    # Intrinsic vision signal (VL name / vision model_type) — same test as
+    # _base_tasks. A real VL gguf stays vision even without the projector on disk;
+    # model_looks_downloaded then flags it 'incomplete' (fetch the mmproj) rather
+    # than silently serving a vision model as blind text. We only STRIP vision
+    # when the label came PURELY from the path / HF pipeline_tag (no intrinsic
+    # signal) AND no projector is declared or present.
+    _blob = " ".join(str(row.get(k) or "") for k in ("hub_id", "folder", "filename", "name")).lower()
+    if (row.get("model_type") or "").lower() in _VISION or any(
+            s in _blob for s in ("-vl-", "-vl.", "vl-instruct", "qwen2.5-vl", "qwen2_5_vl")):
+        return tasks                                    # intrinsically vision
+    inc = row.get("include") or []
+    _dir = row.get("dir")
+    try:
+        from ...src.utils import is_mmproj_file, find_mmproj
+        declares = any(is_mmproj_file(x) for x in inc)
+        has_on_disk = bool(_dir and find_mmproj(_dir))
+    except Exception:  # noqa: BLE001 — can't inspect → leave the task untouched
+        return tasks
+    if declares or has_on_disk:
+        return tasks                                    # genuine vision gguf
+    if _dir:                                            # inspectable + no projector → text
+        return [t for t in tasks if t != "image-text-to-text"] or ["text-generation"]
+    return tasks                                        # not on disk, no declared mmproj
+
+
 def derive_model_config_row(name, row):
     """One discovery/manifest row -> ModelConfig-ready dict, or (None, reason)."""
     hub_id = _clean_repo_id(row.get("hub_id") or row.get("folder") or name)
@@ -290,6 +326,7 @@ def derive_model_config_row(name, row):
 
     framework = _derive_framework(name, hub_id, row)
     tasks = _derive_tasks(framework, row)
+    tasks = _correct_gguf_vision(framework, tasks, row)   # mmproj-authoritative, not pipeline_tag/path
     primary = row.get("primary_task") if row.get("primary_task") in tasks else tasks[0]
     no_runner = [t for t in tasks if (framework, t) not in RUNNER_PAIRS]
     on_disk = bool(row.get("dir"))

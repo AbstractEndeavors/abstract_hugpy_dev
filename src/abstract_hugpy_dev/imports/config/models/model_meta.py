@@ -82,12 +82,22 @@ def dir_size_bytes(path: Optional[str]) -> Optional[int]:
 
 
 def _model_dir(cfg: Any) -> Optional[str]:
-    """Absolute model directory from a ModelConfig(-ish) object or dict."""
-    folder = None
-    if isinstance(cfg, dict):
-        folder = cfg.get("folder")
-    else:
-        folder = getattr(cfg, "folder", None)
+    """Absolute model directory from a ModelConfig(-ish) object or dict.
+
+    Prefer the ROUTED install destination (route_destination) — the same path the
+    manifest records and the weights-presence check uses — because a discovered
+    model's ``cfg.folder`` can be stale and resolve to a near-empty dir (which made
+    the GGUF size read as a tiny stub instead of the real quant). Fall back to
+    MODELS_HOME/folder only when the routed dir doesn't exist on disk."""
+    d = cfg if isinstance(cfg, dict) else (cfg.to_dict() if hasattr(cfg, "to_dict") else {})
+    try:
+        from ...src.constants.paths import route_destination
+        dest = route_destination(d)
+        if dest and os.path.isdir(dest):
+            return dest
+    except Exception:
+        pass
+    folder = d.get("folder") if isinstance(d, dict) else getattr(cfg, "folder", None)
     if not folder:
         return None
     if os.path.isabs(folder):
@@ -143,11 +153,29 @@ def model_meta(cfg: Any, *, vram_bytes: Optional[int] = None) -> dict:
     filename = d.get("filename")
     ctx_max = d.get("model_max_length")
     framework = d.get("framework") or ""
-    size = dir_size_bytes(_model_dir(d))
-    return {
+    model_dir = _model_dir(d)
+    dir_bytes = dir_size_bytes(model_dir)          # whole dir (every file/variant)
+
+    # A GGUF repo often holds several quantizations but only ONE serves, so the
+    # dir sum badly overstates "the model" — and it flowed straight into the VRAM
+    # recommendation. Resolve the single effective quant (+ its mmproj) exactly as
+    # the runner will, honoring the operator's gguf_file choice, and size by that.
+    size = dir_bytes
+    gguf = {}
+    if str(framework).lower() in ("gguf", "llama_cpp") and model_dir:
+        try:
+            from ....managers.serve.overrides import gguf_variants_detail
+            gguf = gguf_variants_detail(d.get("model_key") or "", model_dir, cfg) or {}
+        except Exception:  # noqa: BLE001 — best-effort; keep the dir size
+            gguf = {}
+        if gguf.get("effective_bytes"):
+            size = gguf["effective_bytes"]
+
+    out = {
         "model_key": d.get("model_key"),
-        "size_bytes": size,
-        "quant": parse_quant(filename),
+        "size_bytes": size,                        # effective quant for GGUF
+        "dir_bytes": dir_bytes,                     # whole-dir footprint (all variants)
+        "quant": parse_quant(gguf.get("effective_gguf") or filename),
         "params_b": parse_params_b(name, hub_id, filename),
         "ctx_max": ctx_max,
         "framework": framework,
@@ -155,3 +183,8 @@ def model_meta(cfg: Any, *, vram_bytes: Optional[int] = None) -> dict:
             size_bytes=size, ctx_max=ctx_max, framework=framework,
             vram_bytes=vram_bytes),
     }
+    if gguf:
+        out["effective_gguf"] = gguf.get("effective_gguf")
+        out["gguf_variants"] = gguf.get("variants") or []
+        out["mmproj_bytes"] = gguf.get("mmproj_bytes")
+    return out

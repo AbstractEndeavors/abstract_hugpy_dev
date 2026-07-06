@@ -29,6 +29,22 @@ def _model_is_vision(model_key: str) -> bool:
     return "image-text-to-text" in (getattr(cfg, "tasks", None) or [])
 
 
+def _reinline_reasoning(content, reasoning):
+    """Recent llama-server (``--jinja`` on + ``--reasoning auto``, the default in
+    builds since ~mid-2026) EXTRACTS a reasoning model's ``<think>…</think>`` into
+    ``message.reasoning_content`` and STRIPS it from ``content`` — so a client that
+    reads only ``content`` (as this runner did) silently loses the whole thought,
+    and ``content`` is even empty when a reply is cut off mid-reasoning. Re-inline
+    the reasoning as ``<think>…</think>`` so it surfaces downstream exactly as it
+    did before the engine started splitting it, without double-wrapping when a
+    server (older, or ``--reasoning-format none``) already inlined it."""
+    content = content or ""
+    reasoning = reasoning or ""
+    if reasoning and "<think>" not in content:
+        return f"<think>{reasoning}</think>{content}"
+    return content
+
+
 class LlamaCppRunner(LlamaCppBaseRunner):
     def __init__(self, model_key: str, *, env_path: Optional[str] = None,
                  base_url: Optional[str] = None):
@@ -89,6 +105,7 @@ class LlamaCppRunner(LlamaCppBaseRunner):
                     async with client.stream("POST", f"{self.base_url}/v1/chat/completions",
                                              json=payload) as response:
                         response.raise_for_status()
+                        in_reasoning = False
                         async for line in response.aiter_lines():
                             if not line or line.strip() == "[DONE]":
                                 continue
@@ -96,8 +113,28 @@ class LlamaCppRunner(LlamaCppBaseRunner):
                             try:
                                 data = json.loads(line)
                                 choice = data["choices"][0]
-                                text = (choice.get("delta") or {}).get("content") or ""
-                                fr   = choice.get("finish_reason")
+                                delta = choice.get("delta") or {}
+                                fr    = choice.get("finish_reason")
+                                # Re-inline the engine-extracted reasoning stream as
+                                # <think>…</think>: open on the first reasoning delta,
+                                # close when content begins (or at finish) — so a
+                                # reasoning model streams its thoughts as it used to.
+                                rc = delta.get("reasoning_content") or ""
+                                ct = delta.get("content") or ""
+                                text = ""
+                                if rc:
+                                    if not in_reasoning:
+                                        text += "<think>"
+                                        in_reasoning = True
+                                    text += rc
+                                if ct:
+                                    if in_reasoning:
+                                        text += "</think>"
+                                        in_reasoning = False
+                                    text += ct
+                                if fr and in_reasoning:
+                                    text += "</think>"
+                                    in_reasoning = False
                             except Exception:
                                 text, fr = "", None
                             yield text, fr
@@ -129,7 +166,9 @@ class LlamaCppRunner(LlamaCppBaseRunner):
                         continue
                 raise
         choice = data["choices"][0]
-        return choice["message"]["content"] or "", choice.get("finish_reason") or "stop"
+        msg = choice.get("message") or {}
+        return (_reinline_reasoning(msg.get("content"), msg.get("reasoning_content")),
+                choice.get("finish_reason") or "stop")
 
     def _raw_complete(self, prompt, max_tokens, temp, top_p, stop, return_full_text):
         payload = {"prompt": prompt, "n_predict": max_tokens,
@@ -178,7 +217,8 @@ class LlamaCppRunner(LlamaCppBaseRunner):
                 data = response.json()
 
             choice = data["choices"][0]
-            text = choice["message"]["content"] or ""
+            msg = choice.get("message") or {}
+            text = _reinline_reasoning(msg.get("content"), msg.get("reasoning_content"))
             finish = choice.get("finish_reason") or "stop"
 
             return text, finish

@@ -99,6 +99,75 @@ def resolve_override_gguf(model_key: str, model_dir: str):
     return cand if os.path.isfile(cand) else None
 
 
+def _file_bytes(model_dir: str, fn: str) -> int:
+    try:
+        return int(os.path.getsize(os.path.join(model_dir, os.path.basename(str(fn)))))
+    except OSError:
+        return 0
+
+
+def _mmproj_bytes(model_dir: str) -> int:
+    """Total bytes of the mmproj projector(s) beside the model. A vision GGUF is
+    a PAIR (quant + mmproj-*.gguf), so the projector is part of what actually
+    loads — it belongs in the model's effective size even though it isn't a
+    servable variant on its own."""
+    try:
+        from ...imports.src.utils import is_mmproj_file
+    except Exception:  # noqa: BLE001
+        is_mmproj_file = lambda p: "mmproj" in os.path.basename(str(p)).lower()
+    total = 0
+    try:
+        for fn in os.listdir(model_dir):
+            if fn.lower().endswith(".gguf") and is_mmproj_file(fn):
+                total += _file_bytes(model_dir, fn)
+    except OSError:
+        pass
+    return total
+
+
+def gguf_variants_detail(model_key: str, model_dir: str, cfg=None) -> dict:
+    """Per-variant sizes + the EFFECTIVE (resolved) quant for a GGUF model.
+
+    A GGUF repo commonly holds several quantizations (Q4_K_M, Q5_K_M, Q8_0…) but
+    only ONE is served, so summing the whole directory badly overstates "the
+    model". This resolves the single quant the runner will actually load — exactly
+    as ``get_gguf_file`` does (operator ``gguf_file`` override → ``cfg.filename``
+    → deterministic auto-rank) — and reports its size plus each pickable variant's
+    size. Model-level and worker-agnostic (a ``.gguf`` is identical bytes on every
+    box), so the console reuses this one number wherever a GGUF's size is shown.
+
+    Returns ``{}`` for a dir with no servable .gguf (e.g. a transformers model or
+    a not-yet-downloaded repo), so callers fall back to their existing size.
+    """
+    names = _gguf_basenames(model_dir)              # servable variants (no mmproj)
+    if not names:
+        return {}
+    mmproj = _mmproj_bytes(model_dir)
+    eff = None
+    try:
+        from ...imports.config.main import get_gguf_file
+        prefer = (get_override(model_key) or {}).get("gguf_file") or None
+        p = get_gguf_file(model_dir, cfg, prefer=prefer)
+        eff = os.path.basename(p) if p else None
+    except Exception:  # noqa: BLE001 — resolution is best-effort
+        eff = None
+    if eff not in names:
+        eff = names[0] if len(names) == 1 else None
+    variants = [{"filename": n, "bytes": _file_bytes(model_dir, n),
+                 "is_effective": (n == eff)} for n in names]
+    eff_quant = next((v["bytes"] for v in variants if v["is_effective"]), 0)
+    return {
+        "variants": variants,                       # [{filename, bytes, is_effective}]
+        "mmproj_bytes": mmproj,
+        "effective_gguf": eff,
+        "effective_quant_bytes": eff_quant,
+        # What the model actually is on disk when served: the one quant + its
+        # projector (0 for text-only). None when the effective quant can't be
+        # resolved (multi-variant, no choice) — caller keeps its own size.
+        "effective_bytes": (eff_quant + mmproj) if eff_quant else None,
+    }
+
+
 def _coerce(field: str, value):
     if value is None or value == "":
         return None  # signals "clear this field"

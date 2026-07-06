@@ -43,14 +43,23 @@ def runtime_folder(framework: str, hub_id: str, include: Any = None, filename: s
 # ---------------------------------------------------------------------------
 def is_model_dir(directory: str) -> bool:
     """A model dir declares itself with a hugpy.json. Fall back to weight
-    markers for dirs not yet stamped (legacy / first-run before backfill)."""
+    markers for dirs not yet stamped (legacy / first-run before backfill).
+
+    ``model_index.json`` marks a diffusers PIPELINE root — the model itself,
+    whose weights live in per-component subdirs (text_encoder/, transformer/,
+    vae/, …). It MUST count as a model dir so the walk stops here (a leaf) and
+    never descends to register those components as phantom standalone models
+    (the bare `text_encoder`/`transformer` rows). Without this, an unstamped
+    pipeline (freshly downloaded, before its marker is backfilled) has no
+    top-level config.json/weights, so the walk fell through into its parts."""
     if os.path.isfile(os.path.join(directory, HUGPY_MARKER)):
         return True
     try:
         entries = os.listdir(directory)
     except (OSError, NotADirectoryError):
         return False
-    return any(e == "config.json" or e.lower().endswith((".gguf", ".safetensors"))
+    return any(e == "config.json" or e == "model_index.json"
+               or e.lower().endswith((".gguf", ".safetensors"))
                for e in entries)
 
 def get_model_dirs(models_home=None):
@@ -116,7 +125,31 @@ def resolve_task(model: dict) -> str:
     if tasks:
         return tasks[0] if isinstance(tasks, list) else tasks
     return model.get("task") or "misc"
+def _existing_sibling_task_dir(root: str, runtime: str, hub_path: str) -> str | None:
+    """Same runtime + hub_id under a DIFFERENT task folder — where a model's files
+    physically landed at download time, which can diverge from a later
+    content-corrected task (e.g. a text gguf mis-routed under image-text-to-text,
+    then re-derived to text-generation once we saw it has no mmproj). Returns the
+    first existing such dir, else None."""
+    base = os.path.join(root, "models", runtime)
+    try:
+        entries = os.listdir(base)
+    except OSError:
+        return None
+    for task_dir in entries:
+        cand = os.path.join(base, task_dir, hub_path)
+        if os.path.isdir(cand):
+            return cand
+    return None
+
+
 def route_destination(model: dict, root: str = DEFAULT_ROOT) -> str:
+    # An already-resolved on-disk dir (recorded by discovery) is authoritative: a
+    # model's task may have been content-corrected AWAY from the task folder its
+    # files physically sit in, so the real path beats a task reconstruction.
+    _dir = model.get("dir")
+    if _dir and os.path.isdir(_dir):
+        return _dir
     hub_id    = model.get("hub_id") or model.get("name") or model.get("folder") or ""
     framework = (model.get("framework") or "").strip()
     task      = resolve_task(model)
@@ -128,4 +161,10 @@ def route_destination(model: dict, root: str = DEFAULT_ROOT) -> str:
     runtime = runtime_folder(framework, hub_id,
                              include=model.get("include"),
                              filename=model.get("filename"))
-    return os.path.join(root, "models", runtime, safe_path_part(task), hub_path)
+    dest = os.path.join(root, "models", runtime, safe_path_part(task), hub_path)
+    if os.path.isdir(dest):
+        return dest
+    # Reconstructed path isn't there — the files may sit under the download-time
+    # task folder. Prefer an existing sibling over a path that doesn't exist; a
+    # genuinely new download has no sibling, so it correctly falls back to `dest`.
+    return _existing_sibling_task_dir(root, runtime, hub_path) or dest
