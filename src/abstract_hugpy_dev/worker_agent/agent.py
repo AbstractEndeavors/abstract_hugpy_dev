@@ -951,6 +951,26 @@ def _inprocess_gpu_bytes() -> dict:
     except Exception:
         pass
 
+    # 3. Transformers causal-LMs (DeepCoderChatRunner — DAN-Qwen3, DeepCoder, etc.)
+    #    DON'T hold their nn.Module on the runner in _INSTANCES: the runner keeps a
+    #    cfg and reaches the model lazily via a `coder` property → a SEPARATE
+    #    module-level `REGISTRY._instances` of DeepCoder objects. So vars(runner)
+    #    never sees the weights, which is why a static in-process transformers model
+    #    read device=None. Walk the already-BUILT instances directly (read
+    #    `_instances`, never `REGISTRY.get()`, so telemetry can't trigger a load);
+    #    each DeepCoder carries its model_key on `.cfg` and its weights on `.model`.
+    try:
+        from ..managers.generate.coder import REGISTRY as _DC_REGISTRY
+        insts = getattr(_DC_REGISTRY, "_instances", None)
+        if isinstance(insts, dict):
+            for dc in list(insts.values()):
+                mk = getattr(getattr(dc, "cfg", None), "model_key", None)
+                model = getattr(dc, "model", None)
+                if mk and model is not None:
+                    _add(mk, model)
+    except Exception:
+        pass
+
     # RECONCILIATION: sum(out[*].vram_bytes) is the worker python's model weights
     # on GPU. It runs a bit UNDER that process's nvidia-smi total
     # (_gpu_process_vram()[os.getpid()]) because the CUDA context (~tens of MiB)
@@ -2131,7 +2151,15 @@ def _kick_provision(state: "WorkerState", model_key: str) -> None:
                         from abstract_hugpy_dev.managers.dispatch.dispatch import runner_for
                         logger.info("preloading (warming) %s…%s", mk,
                                     " [static — forced]" if (_res == "static" and not _preload) else "")
-                        runner_for(model_key=mk)   # builds + caches -> resident
+                        runner = runner_for(model_key=mk)   # builds + caches the runner
+                        # runner_for only BUILDS the runner; lazy in-process runners
+                        # (transformers/DeepCoder) defer the weight load to first use,
+                        # so a warm that stops here leaves a hollow shell that holds
+                        # no VRAM/RAM yet still reads "loaded". static means LIVE in
+                        # the resources — force the weights resident now.
+                        _ensure = getattr(runner, "ensure_loaded", None)
+                        if callable(_ensure):
+                            _ensure()
                         logger.info("preloaded %s (resident)", mk)
                     except Exception as exc:
                         logger.warning("preload of %s failed: %s", mk, exc)

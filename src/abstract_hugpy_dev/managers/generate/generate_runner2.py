@@ -57,6 +57,14 @@ class DeepCoderChatRunner:
         """Resolve the underlying DeepCoder instance. Loads on first access."""
         return REGISTRY.get(self._cfg)
 
+    def ensure_loaded(self) -> None:
+        """Force the weights RESIDENT now — the load a first request would trigger.
+        Building this runner is lazy (see __init__), so a static/eager warm that
+        only calls runner_for() gets a hollow shell that occupies no VRAM/RAM and
+        reads as loaded-but-not-loaded. Static means 'live in the resources', so
+        the warm path calls this to actually materialize the model."""
+        _ = self.coder            # REGISTRY.get -> DeepCoder(...) -> _load_model
+
     # --- non-streaming -----------------------------------------------------
 
     async def run(self, req: ChatRequest) -> ChatResult:

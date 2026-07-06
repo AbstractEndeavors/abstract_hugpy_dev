@@ -62,6 +62,27 @@ def _annotate_gguf_size(model: dict, mk: str) -> None:
     model["mmproj_bytes"] = d.get("mmproj_bytes")
 
 
+def _annotate_size(model: dict, mk: str) -> None:
+    """Give EVERY model a ``size_bytes`` the picker can show in ANY disposition
+    (cold / idle / serving) — so choosing a model for static or on-demand
+    residency shows what it costs BEFORE you commit it. GGUF: the effective quant
+    that actually serves (already resolved into ``effective_bytes`` by
+    _annotate_gguf_size), never the all-quants dir sum. Everything else
+    (transformers / comfy): the on-disk directory footprint, mtime-cached so
+    /models stays cheap. ``None`` when the model isn't on disk."""
+    eff = model.get("effective_bytes")
+    if eff:
+        model["size_bytes"] = eff
+        return
+    try:
+        from ....imports.config.models.model_meta import dir_size_bytes
+        from ....imports.config.main import get_model_path
+        model_dir = model.get("destination") or get_model_path(mk)
+        model["size_bytes"] = dir_size_bytes(model_dir)
+    except Exception:  # noqa: BLE001 — never break the models list over sizing
+        model["size_bytes"] = None
+
+
 @llm_bp.route("/models", methods=["GET"])
 def list_models():
     manifest = get_models_dict(dict_return=True)
@@ -77,6 +98,9 @@ def list_models():
         model["media_default"] = (mk == media_default)
         # GGUF: the model's real size = the one quant that serves, not the dir sum.
         _annotate_gguf_size(model, mk)
+        # A size for EVERY model (cold/idle/serving) so the picker shows what
+        # you're committing when you pick a static / on-demand residency.
+        _annotate_size(model, mk)
         output.append(model)
 
     return jsonify(output)
