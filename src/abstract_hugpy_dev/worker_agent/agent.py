@@ -915,13 +915,26 @@ def _inprocess_gpu_bytes() -> dict:
         from ..managers.dispatch.dispatch import _INSTANCES, _INSTANCES_LOCK
         with _INSTANCES_LOCK:
             items = list(_INSTANCES.items())
-        for (mk, _task), runner in items:
+        for key, runner in items:
+            # The cache_key is usually (model_key, task), but some runners key on
+            # longer tuples (vision: (key,min,max,dtype); shard: (key,"__vision__",()))
+            # or a bare string. The old `for (mk,_task), runner in items` assumed
+            # 2-tuples, so ONE non-2-tuple key raised and the outer except silently
+            # zeroed EVERY model's VRAM. Extract model_key arity-agnostically and
+            # isolate each runner so one bad entry can't abort the whole walk.
             try:
+                mk = key[0] if isinstance(key, tuple) and key else key
                 attrs = list(vars(runner).values())
-            except TypeError:
-                attrs = []                      # runner has no __dict__
+            except Exception:
+                continue                        # no __dict__ / odd key → skip this one
             for v in attrs:
                 _add(mk, v)
+                # transformers Pipelines hold the nn.Module at `.model`, not as a
+                # direct attr — reach it so pipeline-wrapped models count too
+                # (_add ignores non-modules; storage-ptr dedup avoids double count).
+                inner = getattr(v, "model", None)
+                if inner is not None and inner is not v:
+                    _add(mk, inner)
     except Exception:
         pass
 
