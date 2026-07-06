@@ -1589,6 +1589,21 @@ def build_app(state: "WorkerState") -> Flask:
                 settings["pinned"] = pmerged
             else:
                 settings.pop("pinned", None)
+        if "comfy_url" in body:
+            # Adopted-ComfyUI base URL (probe + job submission read it as the
+            # COMFY_URL env). Settable here so central/console can point a worker
+            # at its ComfyUI without a systemd drop-in. null/"" clears it (falls
+            # back to env / the 127.0.0.1:8188 default).
+            cu = body["comfy_url"]
+            if cu in (None, ""):
+                settings.pop("comfy_url", None)
+            elif isinstance(cu, str) and _valid_comfy_url(cu):
+                settings["comfy_url"] = cu.strip().rstrip("/")
+            else:
+                return jsonify({"ok": False, "error": {
+                    "code": "BadValue",
+                    "message": "comfy_url must be an http(s) URL with a host "
+                               "(e.g. https://comfy.example.ai), or null"}}), 400
         _save_settings(args, settings)
         logger.info("ops/config: persisted %s — re-exec to apply", settings)
         from .._platform.procutil import reexec
@@ -2017,9 +2032,24 @@ def _update_state_path(args) -> str:
 # shows truth.
 
 _SETTINGS_KEYS = {"slot_count", "residency", "on_demand_ttl_s",
-                  "reconcile_interval_s", "pinned"}   # widen key by key
+                  "reconcile_interval_s", "pinned", "comfy_url"}   # widen key by key
 _SETTINGS_SOURCE: dict = {}              # key -> "settings" | "env" | "default"
 _RUNTIME_SETTINGS: dict = {}             # the loaded settings, for live readers
+_COMFY_URL_BASE_ENV = "_HUGPY_COMFY_URL_BASE"  # sentinel: the pre-projection
+# COMFY_URL (systemd drop-in / env / none), captured once and carried across
+# os.execv so clearing the setting reverts to the real base, never the last
+# projected value.
+
+
+def _valid_comfy_url(cu: str) -> bool:
+    """True for an http(s) URL that has a host — rejects scheme-only 'http://'
+    and accepts a case-insensitive scheme ('HTTP://host' is fine)."""
+    from urllib.parse import urlparse
+    try:
+        p = urlparse(cu.strip())
+    except Exception:  # noqa: BLE001 — unparseable string is not a URL
+        return False
+    return p.scheme.lower() in ("http", "https") and bool(p.netloc)
 
 
 def _residency(model_key: str) -> str:
@@ -2123,6 +2153,27 @@ def _apply_settings_env(args) -> dict:
     else:
         _SETTINGS_SOURCE["slot_count"] = (
             "env" if os.environ.get("SLOT_COUNT") not in (None, "") else "default")
+    # Capture the pre-projection COMFY_URL (drop-in / env / none) ONCE into a
+    # sentinel that survives os.execv, so a later clear reverts to the real base
+    # instead of leaking the last projected value (execv inherits the live
+    # environ; this function is the only projector, run once per boot).
+    if _COMFY_URL_BASE_ENV not in os.environ:
+        os.environ[_COMFY_URL_BASE_ENV] = os.environ.get("COMFY_URL", "")
+    _base = os.environ.get(_COMFY_URL_BASE_ENV, "")
+    if settings.get("comfy_url"):
+        # Settings win over any env/unit-drop-in COMFY_URL, mirroring slot_count.
+        os.environ["COMFY_URL"] = str(settings["comfy_url"])
+        _SETTINGS_SOURCE["comfy_url"] = "settings"
+        if _base and _base != os.environ["COMFY_URL"]:
+            logger.warning("settings override: COMFY_URL env/drop-in said %r but "
+                           "the operator's runtime settings say %r — settings win",
+                           _base, settings["comfy_url"])
+    elif _base:
+        os.environ["COMFY_URL"] = _base           # revert to the drop-in/env base
+        _SETTINGS_SOURCE["comfy_url"] = "env"
+    else:
+        os.environ.pop("COMFY_URL", None)         # no base -> 127.0.0.1:8188 default
+        _SETTINGS_SOURCE["comfy_url"] = "default"
     return settings
 
 
@@ -2140,6 +2191,9 @@ def _effective_config() -> dict:
         out["residency"] = dict(_RUNTIME_SETTINGS["residency"])
     if _RUNTIME_SETTINGS.get("pinned"):
         out["pinned"] = dict(_RUNTIME_SETTINGS["pinned"])
+    out["comfy_url"] = (os.environ.get("COMFY_URL")
+                        or "http://127.0.0.1:8188").rstrip("/")
+    out["comfy_url_source"] = _SETTINGS_SOURCE.get("comfy_url", "default")
     return out
 
 
@@ -2425,7 +2479,8 @@ def env_status() -> dict:
     info: dict = {"tier": tier or "stable", "python": platform.python_version()}
     try:
         from importlib.metadata import version
-        for pkg in ("llama-cpp-python", "transformers", "torch"):
+        for pkg in ("llama-cpp-python", "transformers", "torch",
+                    "diffusers", "accelerate", "bitsandbytes"):
             try:
                 info[pkg] = version(pkg)
             except Exception:  # noqa: BLE001 — absent package: simply unreported

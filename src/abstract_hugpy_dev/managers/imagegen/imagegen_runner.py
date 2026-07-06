@@ -42,6 +42,59 @@ def _generate_lock(model_key: str) -> threading.Lock:
         return lock
 
 
+def _evict_idle_pipelines(cache: Dict[str, Any], keep: str) -> list[str]:
+    """Free the VRAM held by cached pipelines other than ``keep``, skipping any
+    model that is mid-generation (its per-model generate lock is held — it gets
+    evicted on a later load instead). MUST be called while holding the caller's
+    ``_LOCK`` and BEFORE the new pipeline loads, so a model switch frees the old
+    model's VRAM before allocating the new one rather than transiently needing
+    both.
+
+    Without this the cache was UNBOUNDED: every distinct image model ever
+    generated stayed resident forever, so a 24 GB card filled with ~20 GB of
+    stale pipelines while central reported "0 models on GPU" (these live
+    in-process, not in a tracked slot). Bounds each runner's cache to the single
+    model in use (worst case one text2img + one img2img resident concurrently).
+
+    A victim is torn down ONLY while we hold its per-model generate lock, taken
+    non-blocking: if a thread is mid-generation with it (or about to be), the
+    acquire fails and we skip it (evicted on a later load). Non-blocking is what
+    keeps this deadlock-free — we already hold the cache _LOCK, and a generating
+    thread holds the generate lock then wants _LOCK, so a *blocking* acquire here
+    would be a classic ABBA. Holding the generate lock during teardown makes
+    remove_all_hooks()/del atomic against generation, so we never strip the
+    accelerate cpu-offload hooks off a pipeline another thread is calling."""
+    victims: list[str] = []
+    for k in list(cache):
+        if k == keep:
+            continue
+        gl = _generate_lock(k)
+        if not gl.acquire(blocking=False):
+            continue                       # mid-generation — leave it for later
+        try:
+            pipe = cache.pop(k, None)
+            try:
+                if hasattr(pipe, "remove_all_hooks"):
+                    pipe.remove_all_hooks()   # drop accelerate cpu-offload hooks
+            except Exception:  # noqa: BLE001 — best-effort teardown
+                pass
+            del pipe
+            victims.append(k)
+        finally:
+            gl.release()
+    if victims:
+        import gc
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001 — no torch/cuda: nothing to release
+            pass
+        logger.info("imagegen: evicted idle pipeline(s) to free VRAM: %s", victims)
+    return victims
+
+
 class ImageGenRunner:
     """Runner for diffusers text-to-image pipelines.
 
@@ -83,6 +136,8 @@ class ImageGenRunner:
                     "but are not installed. `pip install diffusers torch`."
                 ) from exc
 
+            # Free any idle prior pipeline BEFORE loading this one (bounds VRAM).
+            _evict_idle_pipelines(self._PIPELINES, self.model_key)
             model_dir = ensure_model(self.model_key)
             cuda = torch.cuda.is_available()
             pipe = AutoPipelineForText2Image.from_pretrained(
@@ -231,6 +286,8 @@ class Img2ImgRunner:
                     "but are not installed. `pip install diffusers torch`."
                 ) from exc
 
+            # Free any idle prior pipeline BEFORE loading this one (bounds VRAM).
+            _evict_idle_pipelines(self._PIPELINES, self.model_key)
             model_dir = ensure_model(self.model_key)
             # GPU guard block — VERBATIM from ImageGenRunner: fp16 on cuda, fp32
             # on cpu, move the whole pipe to the resolved device.
@@ -403,26 +460,29 @@ class Img2ImgRunner:
         # actually accepts (a **kwargs pipeline keeps everything) and log the
         # drops, instead of detonating on an unexpected-keyword TypeError.
         import inspect
-        pipe = self.pipeline
-        try:
-            sig = inspect.signature(pipe.__call__)
-            has_var_kw = any(p.kind is inspect.Parameter.VAR_KEYWORD
-                             for p in sig.parameters.values())
-            if not has_var_kw:
-                accepted = set(sig.parameters)
-                dropped = [k for k in call_kwargs if k not in accepted]
-                if dropped:
-                    logger.warning(
-                        "Img2ImgRunner: %s.__call__ does not accept %s — "
-                        "dropping for model=%s",
-                        type(pipe).__name__, dropped, self.model_key,
-                    )
-                    call_kwargs = {k: v for k, v in call_kwargs.items()
-                                   if k in accepted}
-        except (TypeError, ValueError):
-            pass  # unsignaturable callable — send as-is
-
+        # Resolve AND call the pipeline under the generate lock (mirrors
+        # ImageGenRunner): the eviction pass honours a held generate lock, so a
+        # concurrent load of a different model can't tear this pipeline down —
+        # or strip its cpu-offload hooks — between resolve and call.
         with _generate_lock(self.model_key):
+            pipe = self.pipeline
+            try:
+                sig = inspect.signature(pipe.__call__)
+                has_var_kw = any(p.kind is inspect.Parameter.VAR_KEYWORD
+                                 for p in sig.parameters.values())
+                if not has_var_kw:
+                    accepted = set(sig.parameters)
+                    dropped = [k for k in call_kwargs if k not in accepted]
+                    if dropped:
+                        logger.warning(
+                            "Img2ImgRunner: %s.__call__ does not accept %s — "
+                            "dropping for model=%s",
+                            type(pipe).__name__, dropped, self.model_key,
+                        )
+                        call_kwargs = {k: v for k, v in call_kwargs.items()
+                                       if k in accepted}
+            except (TypeError, ValueError):
+                pass  # unsignaturable callable — send as-is
             output = pipe(**call_kwargs)
 
         out_dir = os.path.join(UPLOADS_HOME, "generated")
