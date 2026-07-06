@@ -1984,7 +1984,15 @@ def _probe_model(model_key: str, state: "WorkerState") -> dict:
         ensure_model_present(canonical, state.central_url)
 
         #from abstract_hugpy_dev.managers.dispatch import runner_for
-        runner_for(model_key=canonical)  # builds + caches the runner (loads weights)
+        runner = runner_for(model_key=canonical)  # builds the runner WRAPPER
+        # runner_for only BUILDS the (lazy) wrapper; for GGUF/in-process runners
+        # the weight load + slot seat happen on first .runner access, so a bare
+        # build loads NOTHING — the probe would read vram_used=0 / fit=False and
+        # seat no slot (exactly the hollow shell that made this model unroutable).
+        # Force the underlying runner resident so the probe reflects reality.
+        _ensure = getattr(runner, "ensure_loaded", None)
+        if callable(_ensure):
+            _ensure()
 
         after = _free_vram_bytes()
         used = (before - after) if (before is not None and after is not None) else None
@@ -2625,7 +2633,15 @@ def _fill_empty_slots(state: "WorkerState") -> None:
                 logger.info("slot fill: seating %s (%s) in an empty slot",
                             mk, _residency(mk))
                 from abstract_hugpy_dev.managers.dispatch.dispatch import runner_for
-                runner_for(model_key=mk)         # seats itself via endpoint_for
+                runner = runner_for(model_key=mk)   # builds the LAZY wrapper only
+                # The seat happens on first .runner access (get_llama_runner ->
+                # _build_runner -> SlotPool.endpoint_for). Without forcing it the
+                # filler registered a hollow in-process shell and NEVER seated a
+                # slot — both slots stayed empty and chat 404'd on the empty slot
+                # endpoint. ensure_loaded() materialises the runner = the seat.
+                _ensure = getattr(runner, "ensure_loaded", None)
+                if callable(_ensure):
+                    _ensure()
             except Exception as exc:  # noqa: BLE001 — one seat must not block the rest
                 logger.warning("slot fill for %s failed: %s", mk, exc)
     finally:

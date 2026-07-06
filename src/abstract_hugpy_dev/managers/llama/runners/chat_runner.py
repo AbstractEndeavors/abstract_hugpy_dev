@@ -58,6 +58,18 @@ class LlamaCppChatRunner:
         # take seconds for a 14B model); subsequent accesses are dict lookups.
         return get_llama_runner(self.model_key)
 
+    def ensure_loaded(self):
+        """Force the underlying GGUF runner to MATERIALIZE now.
+
+        __init__ and runner_for() build only this lazy wrapper — the heavy
+        runner (which seats a llama-server slot via get_llama_runner ->
+        _build_runner -> SlotPool.endpoint_for, or loads in-process) is
+        resolved on first .runner access. Warm / slot-fill / probe paths call
+        this so the model actually becomes resident + slot-seated instead of a
+        hollow shell that still registers as "loaded". Idempotent — the heavy
+        runner is a per-model_key singleton (get_llama_runner cache)."""
+        return self.runner
+
     # --- non-streaming -----------------------------------------------------
 
     async def run(self, req) -> ChatResult:
