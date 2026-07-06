@@ -180,6 +180,12 @@ def _public_view(worker: Dict[str, Any]) -> Dict[str, Any]:
         **worker,
         **_vram_summary(worker),
         **_ram_summary(worker),
+        # Derived local-storage view + guarded LRU eviction proposal, recomputed
+        # on every read from already-stored fields (same pure-function pattern as
+        # the vram/ram summaries above; no daemon, no auto-fire — nothing deletes
+        # here). Overwrites the raw ``storage`` heartbeat field with the enriched
+        # console-facing shape (over_budget + proposed_evictions[]).
+        "storage": storage_proposal(worker),
         "status": "online" if _is_online(worker) else "offline",
         "admission": worker.get("admission", "approved"),
     }
@@ -329,6 +335,204 @@ def _ram_summary(worker: Dict[str, Any]) -> Dict[str, Any]:
         else None
     )
     return {"ram_total": ram_total, "ram_used": ram_used}
+
+
+def _disk_reserve_bytes() -> int:
+    """Free-space reserve (bytes) kept on a worker's MODEL-ROOT volume.
+
+    Below this reserve a worker is "over budget" and its COLD local models become
+    eviction candidates. Sized to comfortably exceed the largest single model
+    pull (~45 GiB per the model_cache header note) so a provision can always land
+    after one eviction. Override with ``HUGPY_WORKER_DISK_RESERVE_GIB`` (default
+    50). This is DISTINCT from ``HUGPY_MODEL_CACHE_MAX_GIB`` (=450, the separate
+    SSD hot-cache bound in managers/serve/model_cache.py) — do not conflate: this
+    reserve is on the model-root disk, not the SSD cache.
+    """
+    try:
+        gib = float(os.environ.get("HUGPY_WORKER_DISK_RESERVE_GIB", "50"))
+    except (TypeError, ValueError):
+        gib = 50.0
+    if gib < 0:
+        gib = 0.0
+    return int(gib * (1 << 30))
+
+
+def storage_proposal(worker: Dict[str, Any]) -> Dict[str, Any]:
+    """Derive a worker's local-STORAGE view + a guarded LRU eviction PROPOSAL.
+
+    A PURE read-time computation over already-stored heartbeat fields — no
+    daemon, no background loop, no persistent toggle, and it NEVER deletes
+    anything. It is spread into every worker read by ``_public_view`` (the
+    always-on storage monitoring depiction) and re-run by the ``/reap-approve``
+    route as its central second guard, so the console preview and the approval
+    share one source of truth.
+
+    Inputs (all raw worker-record fields):
+      - ``worker['storage']``   the worker-reported survey
+            ``{cache_used_bytes, disk_free, models:[{model_key, bytes, pinned,
+            loaded, loading, provisioning, assigned, protected, why}]}``.
+            ABSENT on a pre-feature agent -> a monitoring-only view with an empty
+            proposal (the worker must ship this field for the proposal to have a
+            per-model inventory).
+      - ``worker['disk']``      ``{free_bytes, total_bytes}`` of the model root.
+      - ``worker['model_last_picked']`` central LRU signal ``{model_key: epoch}``
+            stamped in ``pick_for_model``. A missing entry defaults to 0 (coldest
+            -> proposed for eviction first — exactly right for never-served
+            test-churn leftovers).
+      - ``worker['limits']['disk_cache_gib']`` optional explicit per-worker cap;
+            WINS over the free-disk reserve when set.
+      - ``worker['loaded_models']`` / ``['loading']`` / ``['provisioning']``
+            central slot-merged live truth — the redundant central guard that
+            closes the worker reaper's in-process-only loaded gap.
+      - ``worker['config']['residency']`` / ``['pinned']`` static/pin attribution.
+
+    Budget (two modes, cheap; explicit cap wins):
+      * explicit cap  -> over_budget ``cache_used > cap``;  need ``cache_used-cap``
+      * else reserve  -> over_budget ``disk_free < reserve``; need ``reserve-disk_free``
+
+    Proposal (mirrors ``model_cache.evict_for``): domain = RECLAIMABLE candidates
+    only (unprotected), sorted ASCENDING by ``last_picked`` (LRU oldest-first),
+    greedily accumulating bytes until ``need`` is covered — that subset (possibly
+    several models) is ``proposed_evictions``. The console renders it; it computes
+    nothing.
+    """
+    storage = worker.get("storage")
+    reported = isinstance(storage, dict)
+    disk = worker.get("disk") or {}
+
+    def _as_int(v):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
+    disk_free = None
+    if reported and storage.get("disk_free") is not None:
+        disk_free = _as_int(storage.get("disk_free"))
+    if disk_free is None and disk.get("free_bytes") is not None:
+        disk_free = _as_int(disk.get("free_bytes"))
+    disk_total = _as_int(disk.get("total_bytes"))
+
+    cache_used = _as_int(storage.get("cache_used_bytes")) if reported else None
+    last_picked_map = worker.get("model_last_picked") or {}
+    limits = worker.get("limits") or {}
+    cfg = worker.get("config") or {}
+    residency = cfg.get("residency") or {}
+    pinned_cfg = cfg.get("pinned") or {}
+    # Central slot-merged live truth — closes the reaper's in-process-only
+    # loaded_model_keys() gap (it misses slot occupants / answering models).
+    loaded_now = set(worker.get("loaded_models") or [])
+    loading_now = set(worker.get("loading") or [])
+    provisioning_now = set(worker.get("provisioning") or [])
+
+    reserve = _disk_reserve_bytes()
+
+    # ── budget: explicit per-worker cap wins over the free-disk reserve ──────
+    cap_gib = limits.get("disk_cache_gib")
+    budget_basis = "reserve"
+    budget = None
+    over_budget = False
+    need_bytes = 0
+    if cap_gib not in (None, ""):
+        cap_bytes = None
+        try:
+            cap_bytes = int(float(cap_gib) * (1 << 30))
+        except (TypeError, ValueError):
+            cap_bytes = None
+        if cap_bytes is not None:
+            budget_basis = "cap"
+            budget = cap_bytes
+            if cache_used is not None and cache_used > cap_bytes:
+                over_budget = True
+                need_bytes = cache_used - cap_bytes
+    if budget_basis == "reserve":
+        # Express the cache-ceiling budget so the console bar (cache_used vs
+        # budget) is consistent with the flag: over_budget <=> cache_used > budget
+        # <=> disk_free < reserve. need is the free-disk shortfall.
+        if disk_free is not None and cache_used is not None:
+            budget = cache_used + disk_free - reserve
+        if disk_free is not None and disk_free < reserve:
+            over_budget = True
+            need_bytes = reserve - disk_free
+
+    # ── per-model view + reclaimable candidate domain ───────────────────────
+    def _lp(mk):
+        v = last_picked_map.get(mk)
+        try:
+            return float(v) if v is not None else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    models_out: List[Dict[str, Any]] = []
+    candidates: List[tuple] = []   # (last_picked, bytes, model_key)
+    raw_models = storage.get("models") if reported else None
+    for m in (raw_models or []):
+        if not isinstance(m, dict) or not m.get("model_key"):
+            continue
+        mk = m["model_key"]
+        b = _as_int(m.get("bytes")) or 0
+        lp = _lp(mk)
+        # Central-final protection = worker's own flag OR any redundant central
+        # guard (slot-merged loaded/loading, provisioning, static, pin). A model
+        # is a candidate ONLY if unprotected on BOTH sides.
+        why = m.get("why") or ""
+        protected = bool(m.get("protected"))
+        if not protected:
+            if m.get("pinned") or pinned_cfg.get(mk):
+                protected, why = True, why or "pinned"
+            elif str(residency.get(mk) or "").lower() == "static":
+                protected, why = True, why or "static"
+            elif m.get("assigned"):
+                protected, why = True, why or "assigned"
+            elif mk in loaded_now or m.get("loaded"):
+                protected, why = True, why or "loaded"
+            elif mk in loading_now or m.get("loading"):
+                protected, why = True, why or "loading"
+            elif mk in provisioning_now or m.get("provisioning"):
+                protected, why = True, why or "provisioning"
+        models_out.append({
+            "model_key": mk,
+            "bytes": b,
+            "last_picked": lp or None,     # None = never served through central
+            "protected": protected,
+            "why": why,
+            "pinned": bool(m.get("pinned") or pinned_cfg.get(mk)),
+            "loaded": bool(m.get("loaded") or mk in loaded_now),
+            "loading": bool(m.get("loading") or mk in loading_now),
+            "provisioning": bool(m.get("provisioning") or mk in provisioning_now),
+            "assigned": bool(m.get("assigned")),
+        })
+        if not protected:
+            candidates.append((lp, b, mk))
+
+    proposed: List[Dict[str, Any]] = []
+    proposed_free = 0
+    if over_budget and need_bytes > 0 and candidates:
+        # LRU oldest-first (ascending last_picked); among equally-cold entries
+        # (e.g. never-served leftovers, all last_picked=0) evict the LARGEST
+        # first so the budget clears in the fewest deletes; stable key tiebreak.
+        candidates.sort(key=lambda c: (c[0], -c[1], c[2]))
+        for lp, b, mk in candidates:
+            if proposed_free >= need_bytes:
+                break
+            proposed.append({"model_key": mk, "bytes": b,
+                             "last_picked": lp or None})
+            proposed_free += b
+
+    return {
+        "reported": reported,
+        "cache_used_bytes": cache_used,
+        "disk_free": disk_free,
+        "disk_total": disk_total,
+        "reserve": reserve,
+        "budget": budget,
+        "budget_basis": budget_basis,
+        "over_budget": over_budget,
+        "need_bytes": need_bytes if over_budget else 0,
+        "proposed_free_bytes": proposed_free,
+        "proposed_evictions": proposed,
+        "models": models_out,
+    }
 
 
 def _match_keys(model_key: str) -> set:
@@ -635,6 +839,7 @@ class WorkerStore:
         loaded_detail: Optional[Dict[str, Any]] = None,
         slots: Optional[List[Dict[str, Any]]] = None,
         allocations: Optional[List[Dict[str, Any]]] = None,
+        storage: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Mark a worker alive and refresh its live GPU / loaded-model stats."""
         with self._transaction() as workers:
@@ -699,6 +904,13 @@ class WorkerStore:
                 # Unified engine-agnostic allocation view (slot-seated + in-RAM
                 # residents). Stored verbatim; _public_view spreads it through.
                 worker["allocations"] = allocations
+            if storage is not None:
+                # Worker-reported local-storage survey (per-model on-disk bytes +
+                # protection flags + cache_used_bytes). Stored verbatim; the
+                # over_budget flag + LRU eviction proposal are derived centrally
+                # in _public_view via storage_proposal (which overlays the fields
+                # the worker can't know: last_picked + the budget).
+                worker["storage"] = storage
             if caps is not None:
                 worker["caps"] = caps
                 # Worker-side config is the hard ceiling: if its caps tightened
@@ -716,7 +928,13 @@ class WorkerStore:
     # Operator-settable per-worker resource limits. Central may only TIGHTEN:
     # a worker's own configured caps (reported in its heartbeat as ``caps``)
     # are the hard ceiling, so every write is clamped against them.
-    _LIMIT_KEYS = ("ram_max_gib", "gpu_mem_gib", "threads")
+    #
+    # ``disk_cache_gib`` is the OPTIONAL explicit per-worker storage cap (GiB):
+    # when set it drives the over-budget flag off cache_used vs the cap (WINS over
+    # the free-disk reserve default in storage_proposal), and — unlike the others
+    # — has no worker-reported cap, so _clamp_limits passes it through unclamped.
+    # More robust than the free-disk reserve against non-model disk pressure.
+    _LIMIT_KEYS = ("ram_max_gib", "gpu_mem_gib", "threads", "disk_cache_gib")
 
     def set_limits(self, worker_id: str,
                    limits: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -811,6 +1029,11 @@ class WorkerStore:
                 return None
             worker["models"] = sorted(set(worker.get("models", [])) - {model_key})
             worker.get("spill_by_model", {}).pop(model_key, None)
+            # Hygiene: drop the per-model LRU stamp too, so the model_last_picked
+            # map doesn't grow unbounded with unassigned models. Harmless for the
+            # eviction proposal — a missing entry defaults to 0 (coldest), which
+            # is correct for a now-unassigned leftover.
+            worker.get("model_last_picked", {}).pop(model_key, None)
             _remember_assignments(worker)   # 4b: an explicit unassign IS forgotten
             return _public_view(worker)
 
@@ -828,6 +1051,16 @@ class WorkerStore:
 
     def all(self) -> List[Dict[str, Any]]:
         return [_public_view(w) for w in self._load().values()]
+
+    def storage_view(self, worker_id: str) -> Optional[Dict[str, Any]]:
+        """The derived storage view + LRU eviction proposal for one worker,
+        computed from its RAW record (NOT the _public_view output, whose
+        ``storage`` key is already the derived shape). This is the /reap-approve
+        route's second-guard recompute: it must read the raw worker-reported
+        ``storage`` survey to re-derive the CURRENT proposal at approve time.
+        ``None`` if the worker is unknown."""
+        worker = self._load().get(worker_id)
+        return storage_proposal(worker) if worker else None
 
     def workers_for_model(self, model_key: str, *, online_only: bool = True,
                           pool: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -958,7 +1191,17 @@ class WorkerStore:
         with self._transaction() as workers:
             stored = workers.get(chosen["id"])
             if stored is not None:
-                stored["last_picked"] = _now()
+                now = _now()
+                stored["last_picked"] = now
+                # Per-(worker,model) LRU signal for the storage eviction proposal.
+                # ``last_picked`` above is a SINGLE per-WORKER round-robin scalar,
+                # stamped on EVERY pick regardless of model — it spreads load, it
+                # can't key an LRU-per-model eviction. This map records the last
+                # time THIS model was routed to THIS worker (the authoritative
+                # "central served (worker, model)" event), so storage_proposal can
+                # sort candidates oldest-first; a model never served through
+                # central has no entry -> defaults to 0 -> proposed first.
+                stored.setdefault("model_last_picked", {})[model_key] = now
                 chosen = stored
         return _public_view(chosen)
 
@@ -1024,6 +1267,12 @@ def list_workers() -> List[Dict[str, Any]]:
 
 def get_worker(worker_id: str) -> Optional[Dict[str, Any]]:
     return worker_store.get(worker_id)
+
+
+def worker_storage_view(worker_id: str) -> Optional[Dict[str, Any]]:
+    """Freshly-recomputed storage view + eviction proposal for a worker (from its
+    RAW record). The /reap-approve route's central second guard. None if unknown."""
+    return worker_store.storage_view(worker_id)
 
 
 def pick_worker_for_model(model_key: str, pool: Optional[str] = None) -> Optional[Dict[str, Any]]:

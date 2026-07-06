@@ -1,0 +1,211 @@
+"""Central storage-budget + LRU eviction PROPOSAL (read-time) regression.
+
+Covers the central-only pieces of the storage-budget feature:
+  * storage_proposal(): budget modes (free-disk reserve default vs explicit
+    per-worker disk_cache_gib cap — cap WINS), the over_budget flag, and the
+    LRU-ordered greedy proposed_evictions[] (least-recently-picked first, cold
+    'never served' = last_picked 0 first, greedy until `need` covered).
+  * Guards: pinned / static / assigned / loaded / loading / provisioning are
+    NEVER proposed — worker-reported protected flag OR the central redundant
+    guard (slot-merged loaded_models/loading/provisioning, config residency/pin).
+  * _public_view spreads the derived `storage` sub-object.
+  * heartbeat() stores the worker-reported `storage` verbatim.
+  * pick_for_model() stamps the per-(worker,model) `model_last_picked` LRU key.
+  * unassign prunes the LRU stamp; set_limits accepts disk_cache_gib.
+  * storage_view() recomputes from the RAW record (the /reap-approve 2nd guard).
+
+Runs like the other tests here: venv/bin/python tests/test_storage_budget.py
+"""
+import os
+import sys
+import time
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+import importlib
+
+W = importlib.import_module(
+    "abstract_hugpy_dev.flask_app.app.functions.imports.utils.workers")
+
+GiB = 1 << 30
+ok = 0
+def check(name, cond):
+    global ok
+    assert cond, name
+    ok += 1
+    print(f"  ok - {name}")
+
+
+# Deterministic reserve (default is 50 GiB, but pin it so the env can't drift).
+os.environ["HUGPY_WORKER_DISK_RESERVE_GIB"] = "50"
+
+
+def _worker(**over):
+    w = {
+        "id": "w", "name": "w", "url": "http://w",
+        "disk": {"free_bytes": 10 * GiB, "total_bytes": 500 * GiB},
+        "model_last_picked": {"warm": 5000.0, "cold": 1000.0},
+        "loaded_models": [], "loading": [], "provisioning": [],
+        "config": {}, "limits": {},
+        "storage": {
+            "cache_used_bytes": 200 * GiB,
+            "disk_free": 10 * GiB,          # < 50 GiB reserve -> over budget
+            "models": [
+                {"model_key": "warm", "bytes": 30 * GiB, "protected": False},
+                {"model_key": "cold", "bytes": 30 * GiB, "protected": False},
+                {"model_key": "never", "bytes": 25 * GiB, "protected": False},
+                {"model_key": "pinnedm", "bytes": 100 * GiB,
+                 "protected": True, "why": "pinned"},
+                {"model_key": "assignedm", "bytes": 20 * GiB, "assigned": True},
+            ],
+        },
+    }
+    w.update(over)
+    return w
+
+
+# --- reserve mode: over budget, LRU greedy proposal --------------------------
+p = W.storage_proposal(_worker())
+check("reserve mode: budget_basis is reserve", p["budget_basis"] == "reserve")
+check("reserve mode: over_budget (disk_free 10 < reserve 50)", p["over_budget"] is True)
+check("reserve mode: need = reserve - disk_free = 40 GiB",
+      p["need_bytes"] == 40 * GiB)
+prop_keys = [e["model_key"] for e in p["proposed_evictions"]]
+check("LRU order: coldest (never-served last_picked=0) proposed first",
+      prop_keys[0] == "never")
+check("LRU order: next-oldest last_picked (cold@1000 before warm@5000) second",
+      prop_keys[1] == "cold")
+check("greedy stops once need is covered (never 25 + cold 30 >= 40 GiB)",
+      prop_keys == ["never", "cold"])
+check("proposed_free_bytes = sum of proposed (55 GiB)",
+      p["proposed_free_bytes"] == 55 * GiB)
+check("warm (most-recently-picked) is NOT proposed", "warm" not in prop_keys)
+check("pinned model is protected, never proposed",
+      "pinnedm" not in prop_keys)
+check("assigned model is protected, never proposed",
+      "assignedm" not in prop_keys)
+by = {m["model_key"]: m for m in p["models"]}
+check("pinned model carries protected+why in the per-model view",
+      by["pinnedm"]["protected"] and by["pinnedm"]["why"] == "pinned")
+check("assigned-flag model derived protected+why=assigned",
+      by["assignedm"]["protected"] and by["assignedm"]["why"] == "assigned")
+check("never-served model last_picked is None (no central stamp)",
+      by["never"]["last_picked"] is None)
+
+
+# --- explicit cap WINS over the free-disk reserve ----------------------------
+# disk_free 100 GiB is ABOVE the 50 GiB reserve (reserve mode would NOT trip),
+# but the 150 GiB cap is BELOW the 200 GiB cache_used -> cap-mode over budget.
+capw = _worker(limits={"disk_cache_gib": 150},
+               disk={"free_bytes": 100 * GiB, "total_bytes": 500 * GiB})
+capw["storage"]["disk_free"] = 100 * GiB
+pc = W.storage_proposal(capw)
+check("cap mode: budget_basis is cap", pc["budget_basis"] == "cap")
+check("cap mode: budget == cap bytes (150 GiB)", pc["budget"] == 150 * GiB)
+check("cap wins: over budget on cache_used>cap even though disk_free>reserve",
+      pc["over_budget"] is True and pc["need_bytes"] == 50 * GiB)
+cap_keys = [e["model_key"] for e in pc["proposed_evictions"]]
+check("cap mode: same LRU greedy (need 50 GiB -> never+cold)",
+      cap_keys == ["never", "cold"])
+
+
+# --- central redundant guard: slot-merged loaded/loading/provisioning --------
+guardw = _worker(loaded_models=["never"], loading=["cold"],
+                 provisioning=["warm"])
+pg = W.storage_proposal(guardw)
+check("central guard: nothing proposed when all candidates are live",
+      pg["proposed_evictions"] == [])
+bg = {m["model_key"]: m for m in pg["models"]}
+check("central guard: slot-merged loaded -> protected/why=loaded",
+      bg["never"]["protected"] and bg["never"]["why"] == "loaded")
+check("central guard: loading -> protected/why=loading",
+      bg["cold"]["protected"] and bg["cold"]["why"] == "loading")
+check("central guard: provisioning -> protected/why=provisioning",
+      bg["warm"]["protected"] and bg["warm"]["why"] == "provisioning")
+
+
+# --- central guard: config residency=static / pinned map ---------------------
+cfgw = _worker(config={"residency": {"never": "static"}, "pinned": {"cold": True}})
+pcfg = W.storage_proposal(cfgw)
+kcfg = [e["model_key"] for e in pcfg["proposed_evictions"]]
+check("config static excluded from proposal", "never" not in kcfg)
+check("config pinned excluded from proposal", "cold" not in kcfg)
+
+
+# --- under budget: no proposal ----------------------------------------------
+underw = _worker(disk={"free_bytes": 300 * GiB, "total_bytes": 500 * GiB})
+underw["storage"]["disk_free"] = 300 * GiB
+pu = W.storage_proposal(underw)
+check("under budget (disk_free 300 > reserve 50) -> not over_budget",
+      pu["over_budget"] is False)
+check("under budget -> empty proposal", pu["proposed_evictions"] == [])
+
+
+# --- pre-feature agent: no storage field -> monitoring-only, no proposal -----
+prew = {"id": "w", "disk": {"free_bytes": 5 * GiB, "total_bytes": 500 * GiB}}
+pp = W.storage_proposal(prew)
+check("no storage field -> reported False", pp["reported"] is False)
+check("no storage field -> empty proposal (no per-model inventory)",
+      pp["proposed_evictions"] == [])
+check("no storage field -> disk_free still read from worker['disk']",
+      pp["disk_free"] == 5 * GiB)
+
+
+# --- store integration: heartbeat stores storage, _public_view derives -------
+tmp = tempfile.mkdtemp(prefix="hugpy-storage-test-")
+store = W.WorkerStore(path=os.path.join(tmp, "workers.json"))
+store.register(name="box", url="http://box", worker_id="wid1", models=["m1"])
+store.set_admission("wid1", "approved")
+view = store.heartbeat(
+    "wid1",
+    disk={"free_bytes": 10 * GiB, "total_bytes": 500 * GiB},
+    storage={"cache_used_bytes": 200 * GiB, "disk_free": 10 * GiB,
+             "models": [{"model_key": "leftover", "bytes": 80 * GiB,
+                         "protected": False}]},
+)
+check("heartbeat return derives storage view", "storage" in view)
+check("_public_view: over_budget surfaced", view["storage"]["over_budget"] is True)
+check("_public_view: leftover proposed for eviction",
+      [e["model_key"] for e in view["storage"]["proposed_evictions"]] == ["leftover"])
+raw = store._load()["wid1"]
+check("heartbeat stored the raw storage survey verbatim",
+      raw["storage"]["cache_used_bytes"] == 200 * GiB)
+check("get() also derives the storage view",
+      store.get("wid1")["storage"]["over_budget"] is True)
+
+
+# --- pick_for_model stamps the per-(worker,model) LRU key --------------------
+before = store._load()["wid1"].get("model_last_picked", {})
+check("no per-model stamp before first pick", "m1" not in before)
+picked = store.pick_for_model("m1")
+check("pick_for_model returns the assigned+approved worker",
+      picked is not None and picked["id"] == "wid1")
+stamp = store._load()["wid1"]["model_last_picked"]
+check("pick_for_model stamped model_last_picked[m1]", "m1" in stamp)
+check("stamp is a fresh epoch", abs(stamp["m1"] - time.time()) < 30)
+check("per-WORKER last_picked also stamped (round-robin unchanged)",
+      "last_picked" in store._load()["wid1"])
+
+
+# --- storage_view: raw recompute (the /reap-approve second guard) ------------
+sv = store.storage_view("wid1")
+check("storage_view recomputes from RAW record",
+      [e["model_key"] for e in sv["proposed_evictions"]] == ["leftover"])
+check("storage_view(unknown) -> None", store.storage_view("nope") is None)
+# The module wrapper delegates to the module singleton worker_store (not this
+# test's instance); assert it is wired to that store and unknown ids -> None.
+check("worker_storage_view wrapper delegates to the singleton store",
+      W.worker_storage_view("definitely-not-a-real-worker-id") is None)
+
+
+# --- set_limits accepts disk_cache_gib; unassign prunes the LRU stamp --------
+lv = store.set_limits("wid1", {"disk_cache_gib": 120})
+check("set_limits accepts disk_cache_gib (float)",
+      lv["limits"]["disk_cache_gib"] == 120.0)
+store.unassign_model("wid1", "m1")
+check("unassign prunes model_last_picked[m1]",
+      "m1" not in store._load()["wid1"].get("model_last_picked", {}))
+
+print(f"\nall {ok} checks passed")

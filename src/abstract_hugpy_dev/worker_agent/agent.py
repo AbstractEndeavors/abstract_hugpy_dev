@@ -669,7 +669,13 @@ def _local_caps() -> dict:
         except ValueError:
             continue
     for key, env in (("ram_reserve_gib", "HUGPY_RAM_RESERVE_GIB"),
-                     ("vram_reserve_gib", "HUGPY_VRAM_RESERVE_GIB")):
+                     ("vram_reserve_gib", "HUGPY_VRAM_RESERVE_GIB"),
+                     # The box's stated STORAGE delegation: how much local disk it
+                     # gives the model cache. Reported as a cap so a central
+                     # disk_cache_gib limit is clamped to it (_clamp_limits) — the
+                     # worker's delegation wins, same rule as RAM. Absent → central
+                     # may set any disk_cache_gib (unclamped).
+                     ("disk_cache_gib", "HUGPY_DISK_CACHE_MAX_GIB")):
         raw = os.environ.get(env)
         if raw:
             try:
@@ -724,6 +730,26 @@ def _loaded_detail() -> dict:
     return detail
 
 
+# A resident counts as "serving" if it answered within this window; older ones
+# read as idle-resident. Wide enough to keep a warm model lit between bursts,
+# short enough that yesterday's test churn shows idle.
+_SERVING_WINDOW_S = 180.0
+
+
+def _model_framework(mk: str) -> "str | None":
+    """Framework for a model_key ('gguf'/'transformers'/'comfy'/…) or None.
+
+    Module-level so residency reporting can cheaply tell comfy rows apart from
+    real in-pool residents: a comfy checkpoint is served by the EXTERNAL,
+    adopted ComfyUI process (out-of-pool) — the worker holds only a thin client
+    runner with NO weights, so it must never be counted as an in-RAM resident."""
+    try:
+        from .imports import get_model_config
+        return getattr(get_model_config(mk), "framework", None)
+    except Exception:  # noqa: BLE001 — unknown row: treat as non-comfy
+        return None
+
+
 # ── worker-local slot pool (CON-02) ─────────────────────────────────────────
 # With SLOT_COUNT > 0 the agent supervises N slot_agent children — the same
 # slot machinery central runs, but agent-managed (rootless, no systemd units
@@ -776,9 +802,23 @@ def _allocations(slot_statuses: "list | None" = None) -> list:
             "n_gpu_layers": s.get("n_gpu_layers"), "ctx": s.get("ctx"),
         })
     detail = _loaded_detail()
+    try:
+        from ..managers.dispatch.dispatch import last_used_snapshot
+        last_used = last_used_snapshot() or {}
+    except Exception:
+        last_used = {}
+    now = time.time()
     for mk in loaded_model_keys():
         if mk in seen:
             continue                       # already counted as a slot allocation
+        if _model_framework(mk) == "comfy":
+            # ComfyUI checkpoints are served by the EXTERNAL, adopted ComfyUI
+            # process (out-of-pool): the worker instantiates only a thin client
+            # runner that holds NO weights. Counting them as in-RAM residents,
+            # sized by on-disk dir bytes, is exactly what made ae read "37
+            # serving / ~600 GB". They surface via the `comfy` heartbeat block,
+            # not as pool allocations.
+            continue
         d = detail.get(mk) or {}
         out.append({
             "kind": "ram", "model_key": mk,
@@ -787,6 +827,14 @@ def _allocations(slot_statuses: "list | None" = None) -> list:
             "gpu_pct": d.get("gpu_pct"),
             "n_gpu_layers": d.get("n_gpu_layers"),
             "total_layers": d.get("total_layers"),
+            # Idle-vs-serving: the console shows 🔥 only for genuinely-active
+            # residents (recently-used in-process), the rest as idle-resident —
+            # so a pool of test-churn leftovers never reads as "all serving".
+            # Computed worker-side (its own clock vs last_used) to dodge any
+            # client/central clock skew. last_used is epoch seconds (None=never).
+            "last_used": last_used.get(mk),
+            "serving": (last_used.get(mk) is not None
+                        and (now - last_used[mk]) < _SERVING_WINDOW_S),
         })
     return out
 
@@ -1035,12 +1083,17 @@ def _reap_scan(state: "WorkerState") -> dict:
     """
     try:
         from .imports import get_models_dict, get_model_config, get_model_path
-        from .provision import model_is_local
+        from .provision import model_is_local, _on_shared_model_store, _model_store_reapable
     except Exception as exc:  # noqa: BLE001
         return {"reclaimable": [], "protected": [], "error": str(exc)}
 
     assigned = set(state.assigned_models or [])
-    loaded = set(loaded_model_keys())
+    # HARDEN (reaper guard): fold in slot-seated / answering models.
+    # loaded_model_keys() is in-process only and MISSES models seated in the
+    # slot pool that are actively serving a request. Union _slot_occupants()
+    # so an approved reap can never delete a resident/answering model even if
+    # it slipped onto the approved list between preview and reclaim.
+    loaded = set(loaded_model_keys()) | _slot_occupants()
     loading = set(_loading_model_keys())
 
     reclaimable, protected = [], []
@@ -1067,6 +1120,18 @@ def _reap_scan(state: "WorkerState") -> dict:
         except Exception:
             path = ""
         size = _path_bytes(path)
+        # SAFE-BY-DEFAULT: a model is reapable only on a box that declared its
+        # store local & disposable AND is not shared/central. Everything else is
+        # PROTECTED here, so nothing on a shared/unconfigured box is ever proposed
+        # — the console still shows usage but offers no deletion. wipe_model
+        # re-checks the same gate at delete time.
+        rp = os.path.realpath(path) if path else ""
+        if not _model_store_reapable(rp):
+            why = ("shared/central storage — never reaped"
+                   if (not rp or _on_shared_model_store(rp))
+                   else "model store not marked reapable")
+            protected.append({"model_key": mk, "bytes": size, "why": why})
+            continue
         if _pinned(mk):
             protected.append({"model_key": mk, "bytes": size, "why": "pinned"})
         elif mk in assigned:
@@ -1092,8 +1157,23 @@ def _reap_reclaim(state: "WorkerState", model_keys: list[str]) -> dict:
     from .provision import model_is_local, wipe_model
 
     assigned = set(state.assigned_models or [])
-    loaded = set(loaded_model_keys())
+    # HARDEN (reaper guard): fold in slot-seated / answering models.
+    # loaded_model_keys() is in-process only and MISSES models seated in the
+    # slot pool that are actively serving a request. Union _slot_occupants()
+    # so an approved reap can never delete a resident/answering model even if
+    # it slipped onto the approved list between preview and reclaim. FAIL CLOSED:
+    # if the slot probe can't answer, refuse the whole reclaim rather than delete
+    # while blind to what's resident.
+    try:
+        slot_occ = _slot_occupants(strict=True)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "results": [],
+                "error": f"slot occupancy unknown ({exc}) — refusing to reap (fail-closed)"}
+    loaded = set(loaded_model_keys()) | slot_occ
     loading = set(_loading_model_keys())
+    # Models mid-provision (downloading from central/HF) — deleting under a live
+    # pull corrupts the fetch; guard explicitly instead of via assigned-coupling.
+    provisioning = set(getattr(state, "_provisioning", None) or [])
 
     results = []
     for mk in model_keys:
@@ -1111,8 +1191,11 @@ def _reap_reclaim(state: "WorkerState", model_keys: list[str]) -> dict:
         if mk in assigned:
             results.append({"model_key": mk, "ok": False, "reason": "assigned"})
             continue
+        if mk in provisioning:
+            results.append({"model_key": mk, "ok": False, "reason": "provisioning"})
+            continue
         if mk in loaded or mk in loading:
-            results.append({"model_key": mk, "ok": False, "reason": "loaded/loading"})
+            results.append({"model_key": mk, "ok": False, "reason": "loaded/serving/loading"})
             continue
         try:
             if not model_is_local(mk):
@@ -1132,6 +1215,113 @@ def _reap_reclaim(state: "WorkerState", model_keys: list[str]) -> dict:
                         "reason": "" if gone else "delete refused/failed (path jail?)"})
     return {"ok": True, "results": results,
             "freed_bytes": sum(r.get("freed_bytes", 0) for r in results)}
+
+
+# ── per-worker local-STORAGE survey (heartbeat) ─────────────────────────────
+# What model cache this box holds: total on-disk bytes, per-model sizes, and
+# which models are PROTECTED (and why). The worker reports the flags only IT can
+# know — loaded / slot-seated / loading / provisioning / assigned — plus sizes.
+# Central OVERLAYS the two facts the worker cannot know (per-(worker,model)
+# last_picked and the disk budget) and derives over_budget + eviction proposals
+# in _public_view. This is REUSED from the reaper's own _reap_scan so the
+# storage view can never disagree with what the reaper would actually delete.
+_STORAGE_CACHE: dict = {"at": 0.0, "value": None}
+
+
+def _storage_model_row(mk: str, size: int, loaded: set, loading: set,
+                       provisioning: set, assigned: set,
+                       why_hint: str = "") -> dict:
+    """One per-model row for the heartbeat storage view: bytes + every
+    protection flag + a human `why`. loaded is ALREADY answer-inclusive
+    (loaded_model_keys() ∪ _slot_occupants()) at the caller."""
+    is_pinned = _pinned(mk)
+    is_loaded = mk in loaded
+    is_loading = mk in loading
+    is_provisioning = mk in provisioning
+    is_assigned = mk in assigned
+    protected = (is_pinned or is_loaded or is_loading
+                 or is_provisioning or is_assigned)
+    # Precedence mirrors the reaper's guard order (pinned > assigned > loaded).
+    if is_pinned:
+        why = "pinned"
+    elif is_assigned:
+        why = "assigned"
+    elif is_loaded:
+        why = "loaded"
+    elif is_loading:
+        why = "loading"
+    elif is_provisioning:
+        why = "provisioning"
+    else:
+        why = why_hint or ""
+    return {
+        "model_key": mk,
+        "bytes": int(size or 0),
+        "pinned": is_pinned,
+        "loaded": is_loaded,
+        "loading": is_loading,
+        "provisioning": is_provisioning,
+        "assigned": is_assigned,
+        "protected": protected,
+        "why": why,
+    }
+
+
+def _worker_storage(state: "WorkerState") -> dict:
+    """Heartbeat STORAGE view for one worker (60s-cached — _reap_scan os.walks
+    every local model dir via _path_bytes; running that every beat would slow
+    heartbeats on boxes with many large models).
+
+    Shape:
+      { cache_used_bytes:int,  # sum of on-disk bytes of ALL local models
+                               # (reclaimable + protected); symlinks count 0
+        disk_free:int,         # = disk.free_bytes (kept for console convenience)
+        models:[ {model_key, bytes, pinned, loaded, loading, provisioning,
+                  assigned, protected, why} ] }
+
+    Comfy rows never appear (skipped by _reap_scan — operator symlinks), so they
+    neither inflate cache_used_bytes nor get proposed for eviction.
+    """
+    now = time.time()
+    cached = _STORAGE_CACHE["value"]
+    if cached is not None and now - _STORAGE_CACHE["at"] < 60.0:
+        return cached
+
+    scan = _reap_scan(state)
+    # Cheap set-membership truth (no disk walk) for the per-model flags. `loaded`
+    # is answer-inclusive: loaded_model_keys() misses slot occupants, so union
+    # _slot_occupants() to protect a model that is seated/answering.
+    loaded = set(loaded_model_keys()) | _slot_occupants()
+    loading = set(_loading_model_keys())
+    try:
+        provisioning = set(state._provisioning)
+    except Exception:  # noqa: BLE001
+        provisioning = set()
+    assigned = set(state.assigned_models or [])
+
+    models: list[dict] = []
+    cache_used = 0
+    for row in scan.get("reclaimable", []):
+        size = int(row.get("bytes", 0) or 0)
+        cache_used += size
+        models.append(_storage_model_row(row.get("model_key"), size, loaded,
+                                         loading, provisioning, assigned))
+    for row in scan.get("protected", []):
+        size = int(row.get("bytes", 0) or 0)
+        cache_used += size
+        models.append(_storage_model_row(row.get("model_key"), size, loaded,
+                                         loading, provisioning, assigned,
+                                         why_hint=row.get("why", "")))
+    models.sort(key=lambda m: m["bytes"], reverse=True)
+
+    disk = _disk_status()
+    out = {
+        "cache_used_bytes": cache_used,
+        "disk_free": int(disk.get("free_bytes", 0) or 0),
+        "models": models,
+    }
+    _STORAGE_CACHE.update(at=now, value=out)
+    return out
 
 
 def _spill_describe() -> dict:
@@ -2002,9 +2192,14 @@ def _comfy_status() -> dict:
     return out
 
 
-def _slot_occupants() -> set:
+def _slot_occupants(strict: bool = False) -> set:
     """Model keys currently seated in this worker's slot pool (empty set when
-    slots are disabled/unreachable — callers treat unknown as unoccupied)."""
+    slots are disabled/unreachable — callers treat unknown as unoccupied).
+
+    ``strict=True`` re-raises instead of swallowing a probe failure, so a caller
+    that must FAIL CLOSED (the reaper) can refuse to delete when it cannot prove
+    a model isn't a live slot occupant. The default stays fail-open for telemetry
+    callers (heartbeat/survey), where an empty set is harmless."""
     try:
         from ..managers.serve.slots import SlotPool, slots_enabled
         if not slots_enabled():
@@ -2013,6 +2208,8 @@ def _slot_occupants() -> set:
                 if s.get("model_key")}
     except Exception as exc:  # noqa: BLE001 — telemetry, never fatal
         logger.warning("slot occupancy lookup failed: %s", exc)
+        if strict:
+            raise
         return set()
 
 
@@ -2263,6 +2460,7 @@ def _heartbeat_loop(client: CentralClient, state: WorkerState, args) -> None:
                     "loaded_detail": _loaded_detail(),
                     "slots": _slots,
                     "allocations": _allocations(_slots),
+                    "storage": _worker_storage(state),
                 },
             )
             # Adopt any assignment change made in the UI + pre-provision it.

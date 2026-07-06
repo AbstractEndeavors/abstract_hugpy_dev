@@ -285,13 +285,58 @@ def model_is_local(model_key: str) -> bool:
         return False
 
 
+def _on_shared_model_store(rp: str) -> bool:
+    """True when `rp` lives on SHARED/central model storage — the canonical
+    catalog other fleet nodes read — so it must NEVER be deleted from here.
+
+    Operator invariant: "nothing should delete from the central drive." A box
+    that mounts the shared catalog (e.g. ae on the USB-C NAS) serves the fleet's
+    source-of-truth copies; a reap there would remove them for everyone. Two
+    independent signals, either one trips the guard (fail-safe):
+      1. ``HUGPY_SHARED_MODEL_STORE`` truthy — explicit per-box opt-out of ALL
+         deletes; set on every box whose model root is the shared/central volume.
+      2. A ``.hugpy-central-catalog`` sentinel at or above ``rp`` — the central
+         node drops it at MODELS_HOME root, so a shared mount auto-detects even
+         if the env flag was forgotten.
+    """
+    if os.environ.get("HUGPY_SHARED_MODEL_STORE", "").strip().lower() in ("1", "true", "yes", "on"):
+        return True
+    d = rp
+    for _ in range(64):                       # walk up to the mount root
+        try:
+            if os.path.exists(os.path.join(d, ".hugpy-central-catalog")):
+                return True
+        except OSError:
+            break
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return False
+
+
+def _model_store_reapable(rp: str) -> bool:
+    """SAFE-BY-DEFAULT gate for deleting a model file. Returns True ONLY when the
+    box has explicitly declared its model store LOCAL & disposable
+    (``HUGPY_MODEL_STORE_REAPABLE`` truthy) AND ``rp`` is not on shared/central
+    storage. Every other state — the flag unset, a shared-store flag, a central
+    sentinel — returns False, so an UNCONFIGURED or shared box never deletes a
+    model file. This makes "nothing deletes from the central drive" hold even
+    with zero per-box setup: reaping is opt-in, not opt-out."""
+    if _on_shared_model_store(rp):
+        return False
+    return os.environ.get("HUGPY_MODEL_STORE_REAPABLE", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def wipe_model(model_key: str) -> bool:
     """Delete the model's local files so the next provision re-downloads it.
 
     Used by the `redownload` path: a plain provision only fetches when the model
     is MISSING (see model_is_local), so refreshing a corrupt/stale copy requires
     removing it first. Returns True if the path is gone afterwards. Jailed against
-    obviously-wrong targets (root/home/short paths)."""
+    obviously-wrong targets (root/home/short paths) AND against shared/central
+    model storage — the operator invariant that no reap may touch the central
+    drive."""
     import os
     import shutil
     try:
@@ -304,6 +349,17 @@ def wipe_model(model_key: str) -> bool:
     rp = os.path.realpath(path)
     if len(rp) < 6 or rp in ("/", os.path.expanduser("~")):
         return False  # refuse a dangerous target
+    # HARD INVARIANT (single choke point for the reaper AND the redownload path):
+    # delete ONLY when the box declared its model store reapable AND the target is
+    # not shared/central; never follow a symlink to delete its (shared/operator-
+    # managed) target. Safe-by-default: unconfigured or shared boxes refuse.
+    if os.path.islink(path) or not _model_store_reapable(rp):
+        logger.warning(
+            "wipe_model REFUSED for %s (%s): model store not reapable / shared / "
+            "symlink — never deleted (set HUGPY_MODEL_STORE_REAPABLE=1 only on "
+            "boxes with local disposable model storage).",
+            model_key, rp)
+        return False
     try:
         if os.path.isdir(rp):
             shutil.rmtree(rp, ignore_errors=True)

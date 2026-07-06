@@ -40,7 +40,7 @@ from ....managers.serve.slots import SlotPool, slots_enabled, slot_install_steps
 # this doesn't depend on the re-export chain picking up the new names.
 from ..functions.imports.utils.workers import (
     required_pkg_version, pkg_index_dir, set_worker_admission, set_worker_pool,
-    set_worker_limits, enroll_required,
+    set_worker_limits, enroll_required, worker_storage_view,
 )
 from ..functions.imports.utils.enrollment_tokens import (
     create_enrollment_token, verify_enrollment_token,
@@ -284,6 +284,14 @@ class HeartbeatRequest(BaseModel):
     # slots/loaded_models — the console renders the worker card from it when
     # present, and falls back to slots+loaded_models for older agents.
     allocations: list | None = None
+    # Local-STORAGE survey (model-cache footprint on the model-root disk):
+    # {cache_used_bytes, disk_free, models:[{model_key, bytes, pinned, loaded,
+    # loading, provisioning, assigned, protected, why}]}. Central stores it
+    # verbatim and overlays last_picked + the budget to derive the over_budget
+    # flag + LRU eviction proposal in _public_view (storage_proposal). Absent on
+    # pre-feature agents -> the proposal has no per-model inventory (monitoring
+    # only). NB: model-root disk, DISTINCT from the SSD hot-cache.
+    storage: dict | None = None
 
 
 class AssignRequest(BaseModel):
@@ -414,6 +422,7 @@ def workers_heartbeat(worker_id):
         loaded_detail=body.loaded_detail,
         slots=body.slots,
         allocations=body.allocations,
+        storage=body.storage,
     )
     if worker is None:
         # The agent thinks it's registered but central forgot it (restart,
@@ -848,6 +857,91 @@ def workers_reap(worker_id):
     return _relay_worker_op(worker_id, "/reap",
                             request.get_json(silent=True) or {},
                             timeout=120.0, action="reap")
+
+
+@worker_bp.route("/llm/workers/<worker_id>/reap-approve", methods=["POST"])
+def workers_reap_approve(worker_id):
+    """Operator-approved, LRU-guarded eviction of COLD local models when a worker
+    is over its storage budget — the human-in-the-loop bookend to the read-only
+    proposal.
+
+    Flow: the console renders ``storage.over_budget`` + ``storage.proposed_evictions``
+    (computed read-side in _public_view/storage_proposal — a PURE, no-daemon,
+    no-auto-fire preview). The operator approves a subset. This route then, as
+    the CENTRAL SECOND GUARD:
+      (1) re-derives the CURRENT proposal from live state (worker_storage_view —
+          the same helper _public_view uses, off the RAW record), because state
+          may have changed since the render;
+      (2) INTERSECTS the approved keys with the freshly-proposed set, dropping
+          anything that since became loaded/assigned/pinned/provisioning or is no
+          longer proposed (over budget cleared);
+      (3) delegates the survivors to the SAME guarded reaper relay ``workers_reap``
+          uses (POST /reap) — where the worker's ``_reap_reclaim`` re-proves EVERY
+          guard per key at delete time and ``wipe_model`` is path-jailed.
+    NOTHING deletes except through this explicit, operator-gated, audited call;
+    there is no background monitoring and no auto-approval.
+
+    Body: ``{"model_keys": [...approved keys the console rendered...]}``.
+    Returns the reaper's typed result (freed_bytes + per-key results) plus the
+    central ``approved``/``reaped``/``dropped`` key sets so the console can show
+    both what the worker deleted-vs-skipped AND what central filtered pre-relay.
+    """
+    worker = get_worker(worker_id)
+    if worker is None:
+        abort(404, description="Unknown worker id.")
+    body = request.get_json(silent=True) or {}
+    approved = body.get("model_keys")
+    if not isinstance(approved, list) or not approved:
+        abort(400, description='body must include a non-empty {"model_keys": [...]}')
+    approved_keys = [str(k) for k in approved if k]
+
+    # (1)+(2) recompute + intersect — defense-in-depth against a render->approve
+    # race. The proposal is derived from the RAW record (not the public view).
+    proposal = worker_storage_view(worker_id) or {}
+    ev_by_key = {e["model_key"]: e
+                 for e in (proposal.get("proposed_evictions") or [])}
+    intersected = [k for k in approved_keys if k in ev_by_key]
+    dropped = [k for k in approved_keys if k not in ev_by_key]
+
+    # Audit the approved eviction with per-model bytes + last_picked (the exact
+    # {model_key, bytes, last_picked} rows the console rendered), plus what the
+    # central intersection dropped.
+    from .comms_routes import audit
+    approved_evictions = [ev_by_key[k] for k in intersected]
+    audit("worker.reap-approve", {
+        "worker_id": worker_id, "worker": worker.get("name"),
+        "approved": approved_keys, "dropped": dropped,
+        "evictions": approved_evictions,
+        "freed_estimate_bytes": sum(e.get("bytes") or 0
+                                    for e in approved_evictions),
+    })
+
+    if not intersected:
+        # Everything approved has since become protected or is no longer over
+        # budget. Report it as data (not a 5xx) so the console explains the drop.
+        return jsonify({
+            "ok": True, "freed_bytes": 0, "results": [],
+            "approved": approved_keys, "reaped": [], "dropped": dropped,
+            "note": ("approved models are no longer eligible for reaping "
+                     "(loaded/assigned/pinned/provisioning, or the worker is back "
+                     "under budget) — nothing deleted"),
+        })
+
+    # (3) delegate to the SAME guarded reaper relay; the worker re-proves every
+    # guard per key at delete time (the single delete path — never trusts a
+    # preview). _relay_worker_op audits worker.reap-approve too.
+    resp, status = _relay_worker_op(
+        worker_id, "/reap", {"model_keys": intersected},
+        timeout=120.0, action="reap-approve")
+    # Fold the central intersection outcome into the reaper's typed result so the
+    # console shows deleted-vs-skipped AND anything central dropped pre-relay.
+    data = resp.get_json(silent=True)
+    if isinstance(data, dict):
+        data.setdefault("approved", approved_keys)
+        data["reaped"] = intersected
+        data["dropped"] = dropped
+        return jsonify(data), status
+    return resp, status
 
 
 @worker_bp.route("/llm/workers/<worker_id>/update", methods=["POST"])
