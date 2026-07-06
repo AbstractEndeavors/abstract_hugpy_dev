@@ -2139,28 +2139,35 @@ def _kick_provision(state: "WorkerState", model_key: str) -> None:
                     _has_slots = slots_enabled()
                 except Exception:  # noqa: BLE001
                     pass
+                # Slot boxes: seat slot-eligible (GGUF) models — static-first.
                 if _has_slots:
                     try:
                         _fill_empty_slots(state)
                     except Exception as exc:  # noqa: BLE001
                         logger.warning("post-provision slot fill failed: %s", exc)
-                elif _preload or _res == "static":
-                    # STATIC is always-on: eager-warm regardless of the
-                    # preload gate — it must never wait for a first request.
+                # In-process warm for static (always) or preload models the slot
+                # filler does NOT seat — transformers/vision/in-process GGUF. This
+                # used to be an `elif _has_slots`, so a STATIC TRANSFORMERS model on
+                # a slots box (ae/computron) never loaded: the filler only seats
+                # GGUF and this branch was skipped, leaving a hollow shell at 0 VRAM.
+                # Warm here whenever the model is not already a live slot occupant
+                # (so a seated GGUF model is never double-loaded).
+                if _preload or _res == "static":
                     try:
                         from abstract_hugpy_dev.managers.dispatch.dispatch import runner_for
-                        logger.info("preloading (warming) %s…%s", mk,
-                                    " [static — forced]" if (_res == "static" and not _preload) else "")
-                        runner = runner_for(model_key=mk)   # builds + caches the runner
-                        # runner_for only BUILDS the runner; lazy in-process runners
-                        # (transformers/DeepCoder) defer the weight load to first use,
-                        # so a warm that stops here leaves a hollow shell that holds
-                        # no VRAM/RAM yet still reads "loaded". static means LIVE in
-                        # the resources — force the weights resident now.
-                        _ensure = getattr(runner, "ensure_loaded", None)
-                        if callable(_ensure):
-                            _ensure()
-                        logger.info("preloaded %s (resident)", mk)
+                        if mk not in _slot_occupants():
+                            logger.info("preloading (warming) %s…%s", mk,
+                                        " [static — forced]" if (_res == "static" and not _preload) else "")
+                            runner = runner_for(model_key=mk)   # builds + caches the runner
+                            # runner_for only BUILDS the runner; lazy in-process
+                            # runners (transformers/DeepCoder) defer the weight load
+                            # to first use, so stopping here leaves a hollow shell at
+                            # 0 VRAM/RAM that still reads "loaded". static means LIVE
+                            # in the resources — force the weights resident now.
+                            _ensure = getattr(runner, "ensure_loaded", None)
+                            if callable(_ensure):
+                                _ensure()
+                            logger.info("preloaded %s (resident)", mk)
                     except Exception as exc:
                         logger.warning("preload of %s failed: %s", mk, exc)
             except Exception as exc:
