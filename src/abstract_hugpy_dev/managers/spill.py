@@ -199,7 +199,22 @@ def autofit_gpu_layers(model_path: str,
         if gpu_gib is not None:
             cap = int(gpu_gib * 2**30)
             free_vram = min(free_vram, cap) if free_vram else cap
-    if not free_vram:                       # no GPU / unknown -> CPU only
+    if not free_vram:
+        # Fail OPEN, not closed. free_vram is unknown here, but if the box HAS a
+        # GPU (detect_gpus finds a card even when the free-VRAM probe on the
+        # primary index came back None — e.g. the slot supervisor whose
+        # torch/nvidia-smi view differs from the agent's) an offload-capable
+        # llama.cpp must put every layer on the GPU, not drop the model to CPU.
+        # Only a genuinely GPU-less host stays on CPU (0). Gate on detect_gpus()
+        # (hardware truth) rather than importing llama_cpp here — a CUDA
+        # llama_cpp import would poison a later torch import in the in-process
+        # (agent/central) caller of autofit.
+        try:
+            from .._platform.hardware import detect_gpus
+            if detect_gpus():
+                return -1
+        except Exception:
+            pass
         return 0
 
     try:

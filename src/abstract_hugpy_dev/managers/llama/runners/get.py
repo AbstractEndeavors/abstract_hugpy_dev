@@ -92,6 +92,21 @@ def loaded_runner_detail() -> dict:
     return out
 
 
+def slot_backed_model_keys() -> "set[str]":
+    """model_keys whose cached runner is an HTTP proxy (LlamaCppRunner with a
+    base_url and no in-process ``llm`` handle) — a slot child or shard-lead
+    server, NOT weights resident in this process. Callers use this to keep a
+    slot-served model from ALSO being reported as an in-process resident (the
+    kind='ram'/'loaded' double-count that flaps with the slot 'serving' row).
+    Reads the already-built cache directly, so it never triggers a load."""
+    with _LLAMA_LOCK:
+        items = list(_LLAMA_INSTANCES.items())
+    return {
+        key for key, r in items
+        if getattr(r, "base_url", None) and getattr(r, "llm", None) is None
+    }
+
+
 def get_llama_runner(model_key: str) -> "LlamaCppBaseRunner":
     """Get-or-build the singleton runner for a model_key.
 
@@ -183,6 +198,21 @@ def _build_runner(model_key: str) -> "LlamaCppBaseRunner":
                         if v:
                             opts = opts or {}
                             opts[key] = v
+                    # An EXPLICIT GPU-layer designation (console 'Max GPU' = -1,
+                    # 'CPU only' = off) must ride to the slot too: the slot is a
+                    # separate process that never sees the agent's
+                    # HUGPY_N_GPU_LAYERS, and its _build_cmd autofits (fail-closed
+                    # to 0/CPU when it can't read the card), so without this a
+                    # 'max GPU' GGUF silently serves on CPU. 'auto' is NOT shipped
+                    # so slots keep autofitting from the VRAM free at seat time
+                    # (slot 2 takes what slot 1 left).
+                    _ngl = (_os.environ.get("HUGPY_N_GPU_LAYERS") or "").strip().lower()
+                    if _ngl and _ngl != "auto":
+                        try:
+                            opts = opts or {}
+                            opts["n_gpu_layers"] = 0 if _ngl in ("off", "cpu", "none") else int(_ngl)
+                        except ValueError:
+                            pass
                 except Exception:
                     opts = None
                 sep = SlotPool().endpoint_for(model_key, opts=opts)

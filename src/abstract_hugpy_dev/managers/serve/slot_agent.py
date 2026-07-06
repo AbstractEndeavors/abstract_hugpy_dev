@@ -267,7 +267,9 @@ def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None,
         except (TypeError, ValueError):
             pass
 
-    if auto <= 0:
+    if ngl <= 0:                             # effective ngl, not raw autofit —
+        # an explicit n_gpu_layers=-1 ("max GPU") that overrode a broken auto=0
+        # is GPU-resident and must skip the CPU-RAM refusal below.
         need = _total_gguf_bytes(path)
         avail = _mem_available_bytes()
         if avail:

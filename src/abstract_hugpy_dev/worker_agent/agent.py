@@ -1279,8 +1279,23 @@ def _stream_sync(payload: dict, request_id: str | None = None):
 def loaded_model_keys() -> list[str]:
     try:
         from ..managers.dispatch import loaded_model_keys as _loaded
-
-        return sorted({mk for (mk, _task) in _loaded()})
+        keys = {mk for (mk, _task) in _loaded()}
+        # De-dup slot-vs-in-process: a GGUF model seated in a slot leaves a
+        # HOLLOW LlamaCppChatRunner in dispatch _INSTANCES whose underlying
+        # runner is an HTTP proxy to the slot child (no weights in THIS
+        # process). Reporting it as an in-process ('ram'/'loaded') resident is
+        # what makes a slot-served model ALSO read 'loaded' and FLAP with its
+        # slot 'serving' row. Prefer the slot — report only genuine in-process
+        # residents. Slot occupants stay protected via the _slot_occupants()
+        # unions at the storage/residency callers and appear as slot rows in
+        # allocations. Discriminating on runner TYPE (not the transient per-beat
+        # slot snapshot) removes the flap entirely.
+        try:
+            from ..managers.llama.runners.get import slot_backed_model_keys
+            keys -= slot_backed_model_keys()
+        except Exception:
+            pass
+        return sorted(keys)
     except Exception:
         return []
 
@@ -1745,6 +1760,15 @@ def build_app(state: "WorkerState") -> Flask:
         except Exception as exc:
             return jsonify({"ok": False, "error": {
                 "code": type(exc).__name__, "message": str(exc)}}), 502
+        # A llama-cpp-python (re)install changes the engine's GPU-offload
+        # capability, but _LLAMA_PROBE_CACHE memoizes the FIRST probe for the
+        # whole process life — so /health + heartbeat caps would keep reporting
+        # the OLD build's supports_gpu_offload until a full re-exec (/ops/pip
+        # never re-execs; /ops/update does). Invalidate the cache so the next
+        # probe reflects the freshly-installed build honestly.
+        if rc == 0 and "llama" in pkg.lower():
+            global _LLAMA_PROBE_CACHE
+            _LLAMA_PROBE_CACHE = None
         return (jsonify({"ok": rc == 0, "package": pkg, "rc": rc,
                          "output_tail": tail}), 200 if rc == 0 else 502)
 
