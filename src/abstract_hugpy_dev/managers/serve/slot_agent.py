@@ -426,6 +426,12 @@ class Slot:
             "last_used": self.last_used,
             "free_vram_bytes": free_vram_bytes(),
             "rss_bytes": _proc_rss_bytes(self.proc.pid) if self._child_alive() else 0,
+            # The child llama-server/llama_cpp.server PID: this is the process
+            # that actually HOLDS the model's VRAM (the slot supervisor python
+            # only carries a ~tens-of-MiB CUDA context). The worker agent joins
+            # this against nvidia-smi's per-process accounting to report the
+            # slot occupant's REAL VRAM (its type/ngl guess is not ground truth).
+            "child_pid": self.proc.pid if self._child_alive() else None,
             "expected_bytes": self.expected_bytes,
         }
 

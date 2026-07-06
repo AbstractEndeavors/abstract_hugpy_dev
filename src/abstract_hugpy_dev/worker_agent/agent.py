@@ -776,6 +776,186 @@ def _slot_statuses() -> list | None:
         return None
 
 
+# ── REAL per-process GPU VRAM (nvidia-smi) ──────────────────────────────────
+# Type/ngl-based inference was WRONG: a transformers/vision model loads onto
+# CUDA but reports n_gpu_layers=null, so the console mislabeled it "host RAM —
+# not in VRAM". Ground truth is nvidia-smi's PER-PROCESS accounting, joined with
+# what THIS worker knows it launched (slot child PIDs) or holds (in-process
+# torch models). Everything here degrades to null on a box with no GPU / no
+# nvidia-smi, so such a worker behaves exactly as before.
+
+_MIB = 1024 * 1024
+# nvidia-smi is polled at most once per this window and shared across every
+# allocation in a heartbeat — never spawned per model.
+_GPU_PROC_TTL_S = 8.0
+_GPU_PROC_CACHE: dict = {"at": 0.0, "value": {}}
+
+
+def _gpu_process_vram() -> dict:
+    """``{pid: {"name": str, "mib": int}}`` from nvidia-smi's per-process compute
+    accounting. Cached ~heartbeat cadence so it runs ONCE per beat, not per model.
+
+    Degrades to ``{}`` (→ callers keep today's behavior) when nvidia-smi is
+    absent (no GPU / non-CUDA host), errors, or reports "[N/A]"/"[Not Supported]"
+    for a row (no per-process accounting)."""
+    now = time.time()
+    if now - _GPU_PROC_CACHE["at"] < _GPU_PROC_TTL_S:
+        return _GPU_PROC_CACHE["value"]
+    out: dict = {}
+    try:
+        proc = subprocess.run(
+            ["nvidia-smi",
+             "--query-compute-apps=pid,process_name,used_gpu_memory",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5)
+        if proc.returncode == 0:
+            for line in proc.stdout.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) < 3:
+                    continue
+                pid_s, name, mem_s = parts[0], parts[1], parts[-1]
+                if not pid_s.isdigit():
+                    continue
+                try:
+                    mib = int(float(mem_s))     # "[N/A]"/"[Not Supported]" → skip row
+                except ValueError:
+                    continue
+                out[int(pid_s)] = {"name": name, "mib": mib}
+    except (FileNotFoundError, OSError, subprocess.SubprocessError):
+        out = {}                                # no GPU / no nvidia-smi → today's behavior
+    _GPU_PROC_CACHE.update(at=now, value=out)
+    return out
+
+
+def _comfy_process_vram(gpu_procs: "dict | None" = None) -> "int | None":
+    """Real VRAM (bytes) of the adopted, EXTERNAL ComfyUI process — from
+    nvidia-smi, never from on-disk checkpoint bytes (that all-checkpoints sizing
+    is exactly the "37 serving / ~600 GB" bug the 0.1.137 guard fixed). Sums any
+    compute proc whose name marks it ComfyUI. ``None`` when nvidia-smi reports no
+    such proc (not running / on CPU / no per-proc accounting)."""
+    procs = gpu_procs if gpu_procs is not None else _gpu_process_vram()
+    mib = 0
+    hit = False
+    for info in procs.values():
+        if "comfyui" in (info.get("name") or "").lower():
+            mib += int(info.get("mib") or 0)
+            hit = True
+    return mib * _MIB if hit else None
+
+
+def _inprocess_gpu_bytes() -> dict:
+    """``{model_key: {"vram_bytes": int, "device": 'cuda'|'cpu'|None}}`` for every
+    in-process torch model THIS worker holds — the piece that makes a CUDA-
+    resident transformers/vision model stop reading as host RAM.
+
+    The worker python is ONE nvidia-smi process (e.g. ae's 3622 MiB lump holding
+    many in-process models at once); torch is the only tool that can split that
+    lump per-model. For each model we sum its parameter+buffer bytes that live on
+    a cuda device (deduped by storage pointer, so a module shared across two
+    task-variants counts once). ``{}`` when torch is missing.
+
+    Reads only ALREADY-materialized state — instance ``__dict__`` and the class-
+    level pipeline caches — never a lazy property, so this telemetry pass can
+    never trigger a model load."""
+    try:
+        import torch
+    except Exception:
+        return {}
+
+    seen_ptrs: set = set()
+
+    def _obj_bytes(obj) -> tuple:
+        """(cuda_bytes, cpu_bytes) for a torch nn.Module or a diffusers pipeline
+        (walked via its ``.components`` sub-models). Non-torch → (0, 0)."""
+        cuda = cpu = 0
+        comps = getattr(obj, "components", None)     # diffusers pipeline
+        if isinstance(comps, dict):
+            for c in comps.values():
+                cc, pc = _obj_bytes(c)
+                cuda += cc
+                cpu += pc
+            return cuda, cpu
+        if not isinstance(obj, torch.nn.Module):
+            return 0, 0
+        try:
+            tensors = list(obj.parameters()) + list(obj.buffers())
+        except Exception:
+            return 0, 0
+        for t in tensors:
+            try:
+                ptr = t.data_ptr()
+            except Exception:
+                continue
+            if ptr in seen_ptrs:
+                continue
+            seen_ptrs.add(ptr)
+            try:
+                nbytes = t.numel() * t.element_size()
+            except Exception:
+                continue
+            if getattr(t, "is_cuda", False):
+                cuda += nbytes
+            else:
+                cpu += nbytes
+        return cuda, cpu
+
+    objs_by_key: dict = {}
+
+    def _add(mk, v) -> None:
+        if isinstance(v, torch.nn.Module) or isinstance(
+                getattr(v, "components", None), dict):
+            objs_by_key.setdefault(mk, []).append(v)
+
+    # 1. In-process runner wrappers (transformers/vision/etc.) — the model is an
+    #    instance attribute (e.g. vision_coder.self.model, coder.self.model).
+    try:
+        from ..managers.dispatch.dispatch import _INSTANCES, _INSTANCES_LOCK
+        with _INSTANCES_LOCK:
+            items = list(_INSTANCES.items())
+        for (mk, _task), runner in items:
+            try:
+                attrs = list(vars(runner).values())
+            except TypeError:
+                attrs = []                      # runner has no __dict__
+            for v in attrs:
+                _add(mk, v)
+    except Exception:
+        pass
+
+    # 2. Diffusers pipelines live in a CLASS-level singleton keyed by model_key,
+    #    not on the runner instance — reach them there.
+    try:
+        from ..managers.imagegen import imagegen_runner as _ig
+        for clsname in ("ImageGenRunner", "Img2ImgRunner"):
+            cls = getattr(_ig, clsname, None)
+            cache = getattr(cls, "_PIPELINES", None)
+            if isinstance(cache, dict):
+                for mk, pipe in list(cache.items()):
+                    _add(mk, pipe)
+    except Exception:
+        pass
+
+    # RECONCILIATION: sum(out[*].vram_bytes) is the worker python's model weights
+    # on GPU. It runs a bit UNDER that process's nvidia-smi total
+    # (_gpu_process_vram()[os.getpid()]) because the CUDA context (~tens of MiB)
+    # plus activation/workspace/KV-cache scratch are NOT parameters. That residual
+    # is real driver overhead — left as-is, never smeared onto a model, so a
+    # model's vram_bytes stays its honest weight footprint.
+    out: dict = {}
+    for mk, objs in objs_by_key.items():
+        cuda = cpu = 0
+        for o in objs:
+            cc, pc = _obj_bytes(o)
+            cuda += cc
+            cpu += pc
+        device = "cuda" if cuda > 0 else ("cpu" if cpu > 0 else None)
+        out[mk] = {"vram_bytes": cuda, "device": device}
+    return out
+
+
 def _allocations(slot_statuses: "list | None" = None) -> list:
     """Unified, engine-agnostic view of every resource allocation on this
     worker — one entry per SLOT-seated model and one per in-RAM (in-process)
@@ -784,24 +964,49 @@ def _allocations(slot_statuses: "list | None" = None) -> list:
     OWN process are reported side by side. This is a NEW field parallel to (not
     a replacement for) loaded_models/slots, so old central/UI keep working.
 
+    Each entry carries the REAL GPU residency the console consumes:
+      ``vram_bytes`` (int bytes | null) — actual VRAM the model occupies now.
+      ``device``     ('cuda' | 'cpu' | null) — the device the weights live on.
+    SLOT rows join nvidia-smi against the slot's child_pid (exact per-model);
+    RAM rows split the worker python's nvidia-smi lump per-model via torch. Both
+    are null on a box with no GPU / no nvidia-smi — identical to today. VRAM is
+    NEVER written into model_bytes/weight_bytes (those stay on-disk *size*).
+
     ``slot_statuses`` may be passed in to avoid a second slot round-trip when
     the heartbeat already computed it."""
     out: list = []
     seen: set = set()
+    gpu_procs = _gpu_process_vram()            # {} when no GPU / no nvidia-smi
     rows = slot_statuses if slot_statuses is not None else _slot_statuses()
     for s in (rows or []):
         mk = (s or {}).get("model_key")
         if not mk:
             continue                       # empty seats aren't allocations
         seen.add(mk)
+        # Join nvidia-smi on the slot's llama-server CHILD pid (the process that
+        # actually holds the weights). Absent child_pid (old slot build) or empty
+        # gpu_procs (no nvidia-smi) → null, exactly today's shape.
+        vram_bytes = None
+        device = None
+        if gpu_procs:
+            cp = s.get("child_pid")
+            info = gpu_procs.get(cp) if cp is not None else None
+            if info is not None:
+                vram_bytes = int(info["mib"]) * _MIB
+                device = "cuda" if vram_bytes > 0 else "cpu"
+            elif cp is not None:
+                # Child is alive but not a GPU compute app → CPU-resident (ngl=0).
+                vram_bytes, device = 0, "cpu"
         out.append({
             "kind": "slot", "model_key": mk,
             "slot_id": s.get("slot_id"), "healthy": s.get("healthy"),
             "busy": s.get("busy"), "endpoint": s.get("endpoint"),
             "rss_bytes": s.get("rss_bytes"),
             "n_gpu_layers": s.get("n_gpu_layers"), "ctx": s.get("ctx"),
+            "vram_bytes": vram_bytes, "device": device,
         })
     detail = _loaded_detail()
+    inproc = _inprocess_gpu_bytes()            # {} when torch missing
     try:
         from ..managers.dispatch.dispatch import last_used_snapshot
         last_used = last_used_snapshot() or {}
@@ -820,6 +1025,7 @@ def _allocations(slot_statuses: "list | None" = None) -> list:
             # not as pool allocations.
             continue
         d = detail.get(mk) or {}
+        ip = inproc.get(mk) or {}
         out.append({
             "kind": "ram", "model_key": mk,
             "model_bytes": d.get("model_bytes"),
@@ -827,6 +1033,13 @@ def _allocations(slot_statuses: "list | None" = None) -> list:
             "gpu_pct": d.get("gpu_pct"),
             "n_gpu_layers": d.get("n_gpu_layers"),
             "total_layers": d.get("total_layers"),
+            # REAL GPU residency from torch introspection: a cuda-resident
+            # transformers/vision model reports vram_bytes>0 + device='cuda' and
+            # stops reading as host RAM. None when torch can't see it (e.g. an
+            # in-process GGUF Llama handle, not a torch module — its GPU share is
+            # still described by n_gpu_layers/gpu_pct above).
+            "vram_bytes": ip.get("vram_bytes"),
+            "device": ip.get("device"),
             # Idle-vs-serving: the console shows 🔥 only for genuinely-active
             # residents (recently-used in-process), the rest as idle-resident —
             # so a pool of test-churn leftovers never reads as "all serving".
@@ -2221,36 +2434,43 @@ _COMFY_CACHE: dict = {"at": 0.0, "value": {"available": False}}
 
 
 def _comfy_status() -> dict:
-    """Probe the local ComfyUI (60s cache): {"available", "url", "version"?}."""
+    """Probe the local ComfyUI (60s cache): {"available", "url", "version"?,
+    "vram_bytes"}. ``vram_bytes`` is ComfyUI's REAL GPU footprint from nvidia-smi
+    (per-process), or null — never on-disk checkpoint bytes (the 0.1.137 guard)."""
     now = time.time()
     if now - _COMFY_CACHE["at"] < 60.0:
-        return _COMFY_CACHE["value"]
-    url = (os.environ.get("COMFY_URL") or "http://127.0.0.1:8188").rstrip("/")
-    out: dict = {"available": False, "url": url}
-    try:
-        import httpx
-        r = httpx.get(url + "/system_stats", timeout=2.0)
-        if r.status_code == 200:
-            out["available"] = True
-            try:
-                sysinfo = (r.json() or {}).get("system") or {}
-                if sysinfo.get("comfyui_version"):
-                    out["version"] = sysinfo["comfyui_version"]
-            except Exception:  # noqa: BLE001 — version is decoration
-                pass
-            # Advertise loadable checkpoints — registry rows' `filename`
-            # designations come from this list (slice B).
-            try:
-                oi = httpx.get(url + "/object_info/CheckpointLoaderSimple",
-                               timeout=3.0).json()
-                ckpts = oi["CheckpointLoaderSimple"]["input"]["required"]["ckpt_name"][0]
-                if isinstance(ckpts, list):
-                    out["checkpoints"] = ckpts[:50]
-            except Exception:  # noqa: BLE001 — list is best-effort
-                pass
-    except Exception:  # noqa: BLE001 — not installed / not running
-        pass
-    _COMFY_CACHE.update(at=now, value=out)
+        out = _COMFY_CACHE["value"]
+    else:
+        url = (os.environ.get("COMFY_URL") or "http://127.0.0.1:8188").rstrip("/")
+        out = {"available": False, "url": url}
+        try:
+            import httpx
+            r = httpx.get(url + "/system_stats", timeout=2.0)
+            if r.status_code == 200:
+                out["available"] = True
+                try:
+                    sysinfo = (r.json() or {}).get("system") or {}
+                    if sysinfo.get("comfyui_version"):
+                        out["version"] = sysinfo["comfyui_version"]
+                except Exception:  # noqa: BLE001 — version is decoration
+                    pass
+                # Advertise loadable checkpoints — registry rows' `filename`
+                # designations come from this list (slice B).
+                try:
+                    oi = httpx.get(url + "/object_info/CheckpointLoaderSimple",
+                                   timeout=3.0).json()
+                    ckpts = oi["CheckpointLoaderSimple"]["input"]["required"]["ckpt_name"][0]
+                    if isinstance(ckpts, list):
+                        out["checkpoints"] = ckpts[:50]
+                except Exception:  # noqa: BLE001 — list is best-effort
+                    pass
+        except Exception:  # noqa: BLE001 — not installed / not running
+            pass
+        _COMFY_CACHE.update(at=now, value=out)
+    # Refresh VRAM every call (cheap — reuses the heartbeat-cached nvidia-smi
+    # snapshot), so it isn't frozen for the 60s presence-cache window. Only when
+    # ComfyUI is actually up; null otherwise.
+    out["vram_bytes"] = _comfy_process_vram() if out.get("available") else None
     return out
 
 
