@@ -80,6 +80,7 @@ from .synthetic import (
 from .wan_i2v import (
     _REQUIRED_DEPS,
     _bnb_config,
+    _frame_to_pil,
     _local_model_dir,
     _missing_deps,
     _wan_geometry,
@@ -398,14 +399,17 @@ def run_wan_vace(
                 ErrorCode.CANCELLED, "cancelled mid-denoise (interrupted)",
                 (("content_hash", content_hash), ("model_id", manifest.model_id))))
 
-        # diffusers video pipelines return frames as result.frames[0] — a list of
-        # PIL.Image, one per output frame (output_type="pil").
+        # diffusers video pipelines return frames as result.frames[0]. We request
+        # output_type="pil" but the per-frame type varies by pipeline/version
+        # (wan_i2v got ndarray on ae 2026-07-07 and PIL-only .save() failed after
+        # a full denoise) — normalize per-frame, same belt as wan_i2v.
         frames = result.frames[0]
         actual_frames = len(frames)
 
         out_frame_dir = tempfile.mkdtemp(prefix=".frames-", dir=out_dir)
         for i, fr in enumerate(frames):
-            fr.save(os.path.join(out_frame_dir, f"frame_{i:05d}.png"), "PNG")
+            _frame_to_pil(fr).save(
+                os.path.join(out_frame_dir, f"frame_{i:05d}.png"), "PNG")
 
         # Same atomic ffmpeg assembly + promotion as the synthetic / i2v runners.
         tmp_mp4 = os.path.join(out_dir, f".clip-tmp-{os.getpid()}.mp4")

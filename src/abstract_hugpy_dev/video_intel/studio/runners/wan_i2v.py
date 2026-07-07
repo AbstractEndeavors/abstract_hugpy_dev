@@ -103,6 +103,35 @@ def _wan_geometry(manifest: RenderManifest) -> tuple[int, int, int, int]:
     return width, height, fps, n
 
 
+def _frame_to_pil(frame):
+    """Normalize ONE pipeline output frame to a PIL.Image.
+
+    Diffusers video pipelines vary in what ``result.frames[0]`` yields per frame
+    even under ``output_type="pil"`` (proven on ae 2026-07-07: WanPipeline handed
+    back numpy and the PIL-only save failed after a full denoise). Handles: PIL
+    passthrough, torch-like tensors (``.cpu()`` duck-typed — torch never imported
+    here), numpy HWC float [0,1] / uint8, CHW transposed, single-channel. Raises
+    TypeError on anything else (rides back as errors-as-data)."""
+    import numpy as np
+    from PIL import Image
+    if isinstance(frame, Image.Image):
+        return frame
+    if hasattr(frame, "cpu"):                      # torch tensor, duck-typed
+        frame = frame.cpu().numpy()
+    if isinstance(frame, np.ndarray):
+        arr = frame
+        if arr.dtype != np.uint8:
+            arr = (np.clip(arr.astype("float32"), 0.0, 1.0)
+                   * 255.0).round().astype(np.uint8)
+        if (arr.ndim == 3 and arr.shape[0] in (1, 3, 4)
+                and arr.shape[-1] not in (1, 3, 4)):
+            arr = np.transpose(arr, (1, 2, 0))     # CHW -> HWC
+        if arr.ndim == 3 and arr.shape[-1] == 1:
+            arr = arr[..., 0]
+        return Image.fromarray(arr)
+    raise TypeError(f"unsupported pipeline frame type: {type(frame).__name__}")
+
+
 def _missing_deps() -> list[str]:
     """Which of the heavy inference deps are absent — checked via find_spec so we
     never actually import (and thus never fail-loud) at preflight."""
@@ -356,6 +385,7 @@ def run_wan_i2v(
                 num_inference_steps=steps,
                 guidance_scale=cfg_scale,
                 generator=generator,
+                output_type="pil",
                 **call_extra,
             )
         else:
@@ -373,6 +403,7 @@ def run_wan_i2v(
                 num_inference_steps=steps,
                 guidance_scale=cfg_scale,
                 generator=generator,
+                output_type="pil",
                 **call_extra,
             )
 
@@ -384,14 +415,18 @@ def run_wan_i2v(
                 ErrorCode.CANCELLED, "cancelled mid-denoise (interrupted)",
                 (("content_hash", content_hash), ("model_id", manifest.model_id))))
 
-        # diffusers video pipelines return frames as result.frames[0] — a list of
-        # PIL.Image, one per output frame.
+        # diffusers video pipelines return frames as result.frames[0]. We request
+        # output_type="pil", but the actual per-frame type varies by pipeline/
+        # version (list of PIL, ndarray (T,H,W,C) float [0,1], torch tensor) —
+        # the FIRST real render on ae (2026-07-07) got ndarray and PIL-only
+        # .save() failed AFTER a full denoise. Normalize per-frame.
         frames = result.frames[0]
         actual_frames = len(frames)
 
         frame_dir = tempfile.mkdtemp(prefix=".frames-", dir=out_dir)
         for i, fr in enumerate(frames):
-            fr.save(os.path.join(frame_dir, f"frame_{i:05d}.png"), "PNG")
+            _frame_to_pil(fr).save(
+                os.path.join(frame_dir, f"frame_{i:05d}.png"), "PNG")
 
         # Same atomic ffmpeg assembly + promotion as the synthetic runner.
         tmp_mp4 = os.path.join(out_dir, f".clip-tmp-{os.getpid()}.mp4")
