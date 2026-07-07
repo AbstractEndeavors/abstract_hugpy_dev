@@ -26,6 +26,30 @@ from ..result_schema import JobError, JobResult
 def guard_gpu_worker(model_id: str, job_id: str) -> Optional[JobResult]:
     """Return a refusal JobResult when a fleet exists but no live worker serves
     `model_id` (and the local override is off); else None (proceed)."""
+    # Per-box "never serve locally" policy: this box runs no in-process
+    # generation at all, even in a standalone/no-provider posture. Refuse before
+    # a multi-GB diffusion model can land on this CPU. HUGPY_VIDEOGEN_LOCAL=always
+    # still overrides for a deliberate local run. Default off === today's
+    # behavior. See managers.serve.policy.
+    try:
+        from abstract_hugpy_dev.managers.serve.policy import no_local_serving
+        _policy_off = not no_local_serving()
+    except Exception:
+        _policy_off = True
+    _videogen_local = (
+        os.environ.get("HUGPY_VIDEOGEN_LOCAL", "").strip().lower()
+        in ("always", "1", "true", "yes", "on"))
+    if not _policy_off and not _videogen_local:
+        return JobResult(job_id, ok=False, error=JobError(
+            code="local_serving_disabled",
+            message=(
+                f"local model serving is disabled on this box "
+                f"(HUGPY_NO_LOCAL_SERVING); refusing in-process generation of "
+                f"{model_id!r}. Bring a GPU worker online, or set "
+                f"HUGPY_VIDEOGEN_LOCAL=always to permit local generation here."
+            ),
+            retryable=True,
+        ))
     try:
         from abstract_hugpy_dev.managers.resolvers.remote import get_worker_provider
         provider = get_worker_provider()

@@ -613,6 +613,15 @@ def serve_endpoint(model_key) -> Optional[str]:
     the model on the GPU, and only when every slot is busy do we fall back to
     the swap proxy (the configured overflow). Non-llama models stay in-process.
     """
+    # Per-box "never serve locally" policy: every serve mode here (slot pool,
+    # llama-swap proxy, local systemd unit) is LOCAL to this box, so a policy box
+    # must expose no local endpoint at all. Return None -> the HTTP runner treats
+    # it as mode=off and get_llama_runner's own policy gate raises the actionable
+    # LocalEngineUnavailable. Default off === today's behavior. See .policy.
+    from .policy import no_local_serving
+    if no_local_serving():
+        return None
+
     # Resolve a possibly-bare/ambiguous key to its canonical registry key,
     # preferring a variant already loaded in a slot so we reuse it instead of
     # loading a second copy. Everything downstream uses the canonical key.

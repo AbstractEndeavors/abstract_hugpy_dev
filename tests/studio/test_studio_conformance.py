@@ -271,7 +271,7 @@ def test_fix2_commercial_auto_not_whitelisted_away():
 # FIX-4 — precision never bound below the runner's min_precision floor
 # --------------------------------------------------------------------------- #
 def test_fix4_precision_floor():
-    ltx = MODEL_REGISTRY["ltx-video-0.9.8-dev"]  # vram FP16/FP8/INT8; runner floor FP8
+    ltx = MODEL_REGISTRY["ltx-video-0.9.7-dev"]  # vram FP16/FP8/INT8; runner floor FP8
 
     # budget fits only INT8 (below the FP8 floor) -> unfittable (None), NOT INT8
     below = _pick_precision(ltx, 9.0, Precision.FP8)

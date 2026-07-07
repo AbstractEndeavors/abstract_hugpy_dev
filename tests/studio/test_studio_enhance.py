@@ -198,12 +198,12 @@ def test_router_upres_tiny_binds_ffmpeg():
 
 
 # --------------------------------------------------------------------------- #
-# [4] Router: upres @ 12GB -> ltxv-spatial-upscaler-0.9.8. The REAL premium model
+# [4] Router: upres @ 12GB -> ltxv-spatial-upscaler-0.9.7. The REAL premium model
 #     fits (FP16 @ 12GB) and outranks the ffmpeg last-resort.
 # --------------------------------------------------------------------------- #
 def test_router_upres_big_binds_ltx_real_outranks_ffmpeg():
     b = CapabilityRouter().resolve(_req(Capability.UPRES, R_UPRES, 12.0)).unwrap()
-    assert b.model_id == "ltxv-spatial-upscaler-0.9.8", (
+    assert b.model_id == "ltxv-spatial-upscaler-0.9.7", (
         f"a fitting premium upres model must outrank the ffmpeg last-resort; got {b.model_id}")
     assert b.framework == Framework.LTX, b.framework
     assert b.task == Task.UPSCALE, b.task
@@ -369,7 +369,7 @@ def test_premium_ltx_graceful_weights_missing():
         print("      (ffmpeg unavailable — skipping premium ltx check)")
         return
     b = CapabilityRouter().resolve(_req(Capability.UPRES, R_UPRES, 12.0)).unwrap()
-    assert b.model_id == "ltxv-spatial-upscaler-0.9.8", b.model_id
+    assert b.model_id == "ltxv-spatial-upscaler-0.9.7", b.model_id
     out_root = tempfile.mkdtemp(prefix="studio-enh-ltx-")
     try:
         res = produce_clip(_req(Capability.UPRES, R_UPRES, 12.0),

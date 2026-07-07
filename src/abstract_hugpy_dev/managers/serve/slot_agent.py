@@ -527,6 +527,16 @@ def build_app():
         body = request.get_json(silent=True) or {}
         if not body.get("model_key"):
             return jsonify({"error": "missing model_key"}), 400
+        # Per-box "never serve locally" policy: a slot on a policy box must not
+        # spawn a llama-server child even on a direct /load (the scheduler
+        # already stops routing here, but this self-protects against any direct
+        # caller). Set HUGPY_NO_LOCAL_SERVING=true in the slot unit's env to
+        # arm it. Default off === today's behavior; workers never set the flag.
+        from .policy import no_local_serving, local_serving_error
+        if no_local_serving():
+            return jsonify({"error": local_serving_error(
+                body.get("model_key"),
+                detail="slot serving disabled on this box")}), 403
         try:
             return jsonify(slot.load(body["model_key"], body.get("n_gpu_layers"),
                                      body.get("ctx"), body.get("threads"),

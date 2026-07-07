@@ -216,13 +216,13 @@ _MODELS = (
 
     # ---- LTX family (Lightricks, commercial agreement required) ----------
     ModelConfig(
-        model_id="ltx-video-0.9.8-dev", family=Framework.LTX,
+        model_id="ltx-video-0.9.7-dev", family=Framework.LTX,
         tasks=(Task.T2V, Task.I2V),
         capabilities=(Capability.T2V, Capability.I2V, Capability.KEYFRAME),
         vram=E((Precision.FP16, 16.0), (Precision.FP8, 10.0), (Precision.INT8, 8.0)),
         resolutions=(R_1080P, R_720P, R_480P), max_frames=257, max_duration_s=10.0,
         license=LicenseClass.LTX_COMMERCIAL,
-        weight_uri="Lightricks/LTX-Video-0.9.8-dev", source_url=HF + "Lightricks/LTX-Video",
+        weight_uri="Lightricks/LTX-Video-0.9.7-dev", source_url=HF + "Lightricks/LTX-Video",
         default_determinism=DeterminismClass.SEEDED_APPROX, unpinned=True,
         accepts_adapters=frozenset({AdapterKind.CONTROLNET, AdapterKind.CAMERA_CTRL}),
         notes="Fastest open path; great for storyboard/preview (PIPE-4). Diffusers: LTXConditionPipeline.",
@@ -234,7 +234,7 @@ _MODELS = (
         vram=E((Precision.BF16, 32.0), (Precision.FP8, 16.0)),
         resolutions=(R_4K, R_1080P, R_720P), max_frames=1000, max_duration_s=20.0,
         license=LicenseClass.LTX_COMMERCIAL, native_audio=True,
-        weight_uri="Lightricks/LTX-2 (verify 2.3 tag)", source_url=HF + "Lightricks",
+        weight_uri="Lightricks/LTX-2", source_url=HF + "Lightricks",
         default_determinism=DeterminismClass.SEEDED_APPROX, unpinned=True, verify_uri=True,
         accepts_adapters=frozenset({AdapterKind.CONTROLNET, AdapterKind.CAMERA_CTRL}),
         notes="Single-pass synced 4K audio+video incl. lip-sync (AUD-1). 32GB official; "
@@ -343,13 +343,13 @@ _MODELS = (
 
     # ---- Quality ladder ---------------------------------------------------
     ModelConfig(
-        model_id="ltxv-spatial-upscaler-0.9.8", family=Framework.LTX,
+        model_id="ltxv-spatial-upscaler-0.9.7", family=Framework.LTX,
         tasks=(Task.UPSCALE,), capabilities=(Capability.UPRES,),
         vram=E((Precision.FP16, 12.0), (Precision.INT8, 8.0)),
         resolutions=(R_4K, R_1080P), max_frames=100000, max_duration_s=100000.0,
         license=LicenseClass.LTX_COMMERCIAL,
-        weight_uri="Lightricks/ltxv-spatial-upscaler-0.9.8",
-        source_url=HF + "Lightricks/ltxv-spatial-upscaler-0.9.8",
+        weight_uri="Lightricks/ltxv-spatial-upscaler-0.9.7",
+        source_url=HF + "Lightricks/ltxv-spatial-upscaler-0.9.7",
         default_determinism=DeterminismClass.SEEDED_APPROX, unpinned=True,
         notes="Latent spatial upscaler (QLD-2). Pairs with LTX base.",
     ),

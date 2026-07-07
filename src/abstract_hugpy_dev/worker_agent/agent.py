@@ -2058,6 +2058,19 @@ def build_app(state: "WorkerState") -> Flask:
                             "note": "nothing reclaimable"})
         return jsonify(_reap_reclaim(state, targets))
 
+    # Studio render offload (option a): mount POST /studio/render, GET
+    # /studio/render/<job_id>, POST /studio/cancel/<job_id> so central can delegate
+    # a REAL-model studio render (produce_clip) to THIS worker's GPU while keeping
+    # the control plane. Imported LAZILY (studio_render's own studio-spine imports
+    # are lazy inside its render thread, so this never pulls torch/diffusers at
+    # boot) and guarded so a mount hiccup can never break the rest of the agent's
+    # routes.
+    try:
+        from .studio_render import register_studio_routes
+        register_studio_routes(app, worker_id=state.worker_id, worker_name=state.name)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("studio render endpoints not mounted: %s", exc)
+
     return app
 
 

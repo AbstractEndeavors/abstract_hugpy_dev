@@ -126,6 +126,17 @@ def get_llama_runner(model_key: str) -> "LlamaCppBaseRunner":
 
 
 def _build_runner(model_key: str) -> "LlamaCppBaseRunner":
+    # Per-box "never serve locally" policy: every branch below is a LOCAL serve
+    # (slot spawn, native --mmproj/--rpc llama-server spawn, or in-process
+    # llama-cpp-python weights in this process). A policy box hosts none of them —
+    # fail fast with the actionable message instead of spawning/loading. Default
+    # off === today's behavior; workers (which serve locally by design) never set
+    # the flag. See managers.serve.policy.
+    from ...serve.policy import no_local_serving, local_serving_error
+    if no_local_serving():
+        raise LocalEngineUnavailable(local_serving_error(
+            model_key, detail="local GGUF serving is disabled on this box"))
+
     # Cross-machine shard lead: a spill override set HUGPY_RPC_SERVERS, meaning
     # the allocator pooled remote GPUs for this load. The 0.3.x python binding
     # can't shard (no Llama(rpc_servers=…)), so spawn a managed

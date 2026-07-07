@@ -6,26 +6,28 @@ never raises.
     run_ltx_upscale(manifest, out_root, start_image=None, should_cancel=None)
         -> Result[Artifact, StageError]
 
-WHY IT DEGRADES TODAY: the LTX spatial upscaler weights
-(``Lightricks/ltxv-spatial-upscaler-0.9.8``) are HF LICENSE-GATED — fetching them
-without an accepted Lightricks agreement returns HTTP 401, so they CANNOT be staged
-on this box now. Preflight therefore checks the weights root and reports
-WEIGHTS_MISSING (with the 401 license-gate note) until the weights are present. The
-diffusers import that the real path needs is LAZY (inside the runner, after
-preflight passes), so on a box without the weights it is never reached and this
-module never drags diffusers into app boot — matching the wan runners' discipline.
+WHY IT DEGRADES TODAY: the weights ARE staged (2026-07-07, official
+``Lightricks/ltxv-spatial-upscaler-0.9.7`` — public repo, NOT license-gated; the
+earlier "0.9.8 / 401 license gate" story was a wrong repo id — that name only
+exists as a third-party copy under ``linoyts/``) at the shared weights root, but
+the executable latent-upscale path is not wired yet (see below) and needs a GPU
+box. Preflight reports WEIGHTS_MISSING only on a box that can't see the shared
+store. The diffusers import that the real path needs is LAZY (inside the runner,
+after preflight passes), so this module never drags diffusers into app boot —
+matching the wan runners' discipline.
 
-    TO MAKE THIS RUNNER REAL (on the 4x3090 box):
-      1. accept the Lightricks license on the HF model page (clears the 401),
-      2. huggingface-cli download Lightricks/ltxv-spatial-upscaler-0.9.8 into
-         STUDIO_WEIGHTS_ROOT/Lightricks/ltxv-spatial-upscaler-0.9.8,
-      3. pip install the diffusers LTX stack, then wire the real latent-upscale path
-         here (ffmpeg-assemble into the same content-addressed clip layout).
+    TO MAKE THIS RUNNER REAL (on a GPU render box, e.g. via the studio worker
+    render seam):
+      1. weights: already at STUDIO_WEIGHTS_ROOT/Lightricks/
+         ltxv-spatial-upscaler-0.9.7 on the shared store (done 2026-07-07),
+      2. deps: the diffusers LTX stack (ae already ships diffusers 0.39.0),
+      3. wire the real latent-upscale path here (LTXLatentUpsamplePipeline,
+         ffmpeg-assemble into the same content-addressed clip layout).
 
 PREFLIGHT ORDER (mirrors the enhancement runners): source (SPEC) -> weights (box
 capability). A source-less upres is a SPEC error on ANY box (SOURCE_MISSING),
 reported before the box-level WEIGHTS_MISSING so it is not masked. NOTE the
-weights-first (not deps-first) order: the point of THIS runner is the license-gated
+weights-first (not deps-first) order: the point of THIS runner is the premium
 weights, so WEIGHTS_MISSING is the honest headline on a box that hasn't staged them
 (diffusers may or may not be installed; either way the weights are the blocker).
 
@@ -87,12 +89,12 @@ def run_ltx_upscale(
     # BOX capability: the HF-gated LTX upscaler weights are not on disk. This is the
     # headline blocker for THIS premium path (the weights are license-gated 401).
     cfg = MODEL_REGISTRY.get(manifest.model_id)
-    weight_uri = cfg.weight_uri if cfg is not None else "Lightricks/ltxv-spatial-upscaler-0.9.8"
+    weight_uri = cfg.weight_uri if cfg is not None else "Lightricks/ltxv-spatial-upscaler-0.9.7"
     weights_root = _weights_root(manifest)
-    gate = (" These weights are HF LICENSE-GATED: fetching them without an accepted "
-            "Lightricks agreement returns HTTP 401, so they cannot be staged now — "
-            "accept the license on the HF model page, then huggingface-cli download "
-            f"{weight_uri}. The ffmpeg lanczos last-resort serves UPRES in the meantime.")
+    gate = (" These weights are staged on the SHARED store since 2026-07-07 "
+            "(public repo, no license gate) — if missing on this box, mount the "
+            f"shared weights root or `hf download {weight_uri}` into it. The "
+            "ffmpeg lanczos last-resort serves UPRES in the meantime.")
     if not weights_root:
         return Err(StageError(
             ErrorCode.WEIGHTS_MISSING,

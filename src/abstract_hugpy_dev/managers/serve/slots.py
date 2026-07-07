@@ -67,6 +67,14 @@ def _slot_count() -> int:
 
 
 def slots_enabled() -> bool:
+    # Per-box "never serve locally" policy: force the slot pool off regardless of
+    # SLOT_COUNT, so serve routing/get_llama_runner never load a model into a
+    # local slot (the path that spawned the OOM'ing llama-server on central).
+    # Default off === today's behavior; workers never set the flag. See
+    # .policy.no_local_serving.
+    from .policy import no_local_serving
+    if no_local_serving():
+        return False
     return _slot_count() > 0
 
 
@@ -82,6 +90,12 @@ def _slot_port_base() -> int:
 
 
 def slot_urls() -> list[str]:
+    # Under the no-local-serving policy the pool has no targets, so a directly
+    # constructed SlotPool().endpoint_for() also returns None (defense-in-depth
+    # alongside slots_enabled). Default off === today's behavior.
+    from .policy import no_local_serving
+    if no_local_serving():
+        return []
     host, base = _slot_host(), _slot_port_base()
     return [f"http://{host}:{base + i}" for i in range(_slot_count())]
 

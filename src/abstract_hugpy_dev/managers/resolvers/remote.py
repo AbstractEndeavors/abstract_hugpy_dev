@@ -478,6 +478,14 @@ def make_delegating_runner(framework: str, task: str):
                                 f"set HUGPY_LOCAL_FALLBACK=always to allow)") from exc
                         logger.warning("worker run failed (%s); running %s locally",
                                        exc, self.model_key)
+            # Per-box "never serve locally" policy: no worker took this request
+            # (none selected, or one failed with fallback allowed), and this box
+            # hosts no models — refuse with a clear error instead of loading the
+            # model into this process. Default off === today's behavior; workers
+            # never set the flag. See managers.serve.policy.
+            from ..serve.policy import no_local_serving, local_serving_error
+            if no_local_serving():
+                raise RuntimeError(local_serving_error(self.model_key))
             result = self._local_runner().run(req=req)
             if inspect.isawaitable(result):
                 result = await result
@@ -561,6 +569,15 @@ def make_delegating_runner(framework: str, task: str):
                             return
                         logger.warning("worker offload failed (%s); running %s locally",
                                        exc, self.model_key)
+            # Per-box "never serve locally" policy: no worker took this request
+            # and this box hosts no models — surface a clear error instead of
+            # streaming from a locally-loaded model. Default off === today's
+            # behavior; workers never set the flag. See managers.serve.policy.
+            from ..serve.policy import no_local_serving, local_serving_error
+            if no_local_serving():
+                yield ErrorEvent(request_id=req.request_id,
+                                 message=local_serving_error(self.model_key))
+                return
             # Local fallback — reuse dispatch's shared stream-or-wrap primitive
             # (imported lazily to avoid a resolvers<->dispatch import cycle).
             # Re-announce as "local" so the banner reflects this path (covers
