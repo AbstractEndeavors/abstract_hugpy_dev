@@ -64,6 +64,11 @@ class StudioI2VSpec:
     start_image: Optional[str] = None   # abs path to a still (i2v conditioning)
     negative: Optional[str] = None      # carried; synthetic ignores it
     prompt: Optional[str] = None        # carried; synthetic ignores it
+    source_video: Optional[str] = None  # abs path to a prior-tier clip (movie/scene
+                                        # mp4). The movie->studio chain input (B2): an
+                                        # i2v job with no start_image EXTENDS this clip
+                                        # from its LAST FRAME. Carried in the manifest
+                                        # (part of the content_hash) either way.
 
 
 def make_studio_i2v(
@@ -78,6 +83,7 @@ def make_studio_i2v(
     start_image: Optional[str] = None,
     negative: Optional[str] = None,
     prompt: Optional[str] = None,
+    source_video: Optional[str] = None,
 ) -> StudioI2VSpec:
     """Validate every field and build the frozen ``StudioI2VSpec``. Raises
     ``ValueError``/``TypeError`` LOCALLY on any structural violation (house
@@ -98,6 +104,8 @@ def make_studio_i2v(
         raise ValueError(f"seed must be an int; got {seed!r}")
     if start_image is not None and not (isinstance(start_image, str) and start_image.strip()):
         raise ValueError(f"start_image must be a non-empty string or None; got {start_image!r}")
+    if source_video is not None and not (isinstance(source_video, str) and source_video.strip()):
+        raise ValueError(f"source_video must be a non-empty string or None; got {source_video!r}")
     if negative is not None and not isinstance(negative, str):
         raise ValueError(f"negative must be a string or None; got {negative!r}")
     if prompt is not None and not isinstance(prompt, str):
@@ -117,6 +125,7 @@ def make_studio_i2v(
         start_image=start_image,
         negative=negative,
         prompt=prompt,
+        source_video=source_video,
     )
 
 
@@ -136,6 +145,7 @@ def studio_i2v_from_dict(d: dict) -> StudioI2VSpec:
         start_image=d.get("start_image"),
         negative=d.get("negative"),
         prompt=d.get("prompt"),
+        source_video=d.get("source_video"),
     )
 
 

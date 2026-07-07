@@ -55,6 +55,13 @@ class ErrorCode(str, Enum):
     DEPS_MISSING = "deps_missing"         # torch/diffusers/bitsandbytes not installed
     NO_GPU = "no_gpu"                     # no CUDA device available for inference
     WEIGHTS_MISSING = "weights_missing"   # model weights not on disk under weights root
+    # B-3 VACE v2v preflight: a video-to-video render is DEFINED by the clip it
+    # restyles/enhances, so a v2v request whose manifest carries no (or a
+    # nonexistent) source_video is a SPEC error — malformed on ANY box, GPU or not.
+    # It is checked BEFORE deps/GPU/weights so the spec error is reported here rather
+    # than masked by a GPU-less box's DEPS_MISSING. INTENTIONAL / not retryable (the
+    # same source-less spec re-run fails identically).
+    SOURCE_MISSING = "source_missing"     # v2v render has no source clip to enhance
 
 
 @dataclass(frozen=True)

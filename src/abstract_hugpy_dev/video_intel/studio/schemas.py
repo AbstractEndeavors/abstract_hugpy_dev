@@ -153,6 +153,12 @@ class RenderManifest:
     # positional field shifts for existing construction sites.
     prompt: str = ""
     negative_prompt: str = ""
+    # Source clip the render extends (B2 movie->studio chain). A DIFFERENT source
+    # video genuinely changes the output (its last frame conditions an i2v extend),
+    # so it is part of the reproducibility key (canonical_inputs -> content_hash).
+    # "" is a valid "no source" (the common i2v/t2v case). Appended (not inserted)
+    # so no positional field shifts for existing construction sites.
+    source_video: str = ""
 
     def canonical_inputs(self) -> dict:
         """Everything that changes the output; nothing that is mere metadata.
@@ -197,6 +203,11 @@ class RenderManifest:
             # ALL prior content-addressed clips once — correct + acceptable for dev.
             "prompt": self.prompt,
             "negative_prompt": self.negative_prompt,
+            # Source-clip conditioning (B2 chain): a different source video -> a
+            # different extend -> a different clip, so it participates in the hash.
+            # "" (no source) still participates (re-addresses prior clips once, same
+            # one-time cost + rationale as the empty-prompt case above).
+            "source_video": self.source_video,
         }
 
     def content_hash(self) -> str:
@@ -266,6 +277,11 @@ class CapabilityRequest:
     preferred_framework: Framework | None = None
     risk_flags: frozenset[RiskFlag] = frozenset()
     min_frames: int = 0
+    # A prior-tier clip (movie/scene mp4) the request extends (B2 movie->studio chain).
+    # Carried through to the manifest; routing itself does not key on it (an i2v job
+    # extends it from its LAST FRAME — see produce_clip / the i2v runners). None when
+    # the request has no source clip (a plain i2v/t2v).
+    source_video: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

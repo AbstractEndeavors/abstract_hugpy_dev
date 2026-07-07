@@ -79,6 +79,7 @@ def _build_manifest(
     provenance: ProvenanceStub | None,
     prompt: str = "",
     negative_prompt: str = "",
+    source_video: str = "",
 ) -> RenderManifest:
     """Validate every field, then build the frozen manifest. Raises ``ValueError``
     LOCALLY on any structural violation. Shared by ``make_render_manifest`` (the
@@ -183,6 +184,14 @@ def _build_manifest(
         raise ValueError(
             f"negative_prompt must be a string or None; got {type(negative_prompt).__name__}")
 
+    # source_video (B2 chain): an Optional spec field / absent JSON key lands here as
+    # None -> normalized to "" (no source). Anything else non-str is programmer error.
+    if source_video is None:
+        source_video = ""
+    if not isinstance(source_video, str):
+        raise ValueError(
+            f"source_video must be a string or None; got {type(source_video).__name__}")
+
     return RenderManifest(
         render_id=render_id,
         capability=capability,
@@ -203,6 +212,7 @@ def _build_manifest(
         provenance=provenance,
         prompt=prompt,
         negative_prompt=negative_prompt,
+        source_video=source_video,
     )
 
 
@@ -225,6 +235,7 @@ def make_render_manifest(
     provenance: ProvenanceStub | None = None,
     prompt: str = "",
     negative_prompt: str = "",
+    source_video: str = "",
 ) -> RenderManifest:
     """Build a validated ``RenderManifest`` from a resolved ``ModelBinding`` and a
     resolved ``StudioEnv``.
@@ -275,6 +286,8 @@ def make_render_manifest(
         # --- text conditioning (C-prompt): part of the reproducibility key ---
         prompt=prompt,
         negative_prompt=negative_prompt,
+        # --- source-clip conditioning (B2 chain): part of the reproducibility key ---
+        source_video=source_video,
     )
 
 
@@ -331,6 +344,7 @@ def render_manifest_to_dict(m: RenderManifest) -> dict:
         "env_snapshot": [[var, val] for var, val in m.env_snapshot],
         "prompt": m.prompt,
         "negative_prompt": m.negative_prompt,
+        "source_video": m.source_video,
         "provenance": (
             None if m.provenance is None else {
                 "operator": m.provenance.operator,
@@ -420,4 +434,6 @@ def render_manifest_from_dict(d: dict) -> RenderManifest:
         # C-prompt: tolerate manifests serialized before this field existed (absent -> "").
         prompt=d.get("prompt", ""),
         negative_prompt=d.get("negative_prompt", ""),
+        # B2 chain: tolerate manifests serialized before source_video existed (absent -> "").
+        source_video=d.get("source_video", ""),
     )

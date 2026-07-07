@@ -68,6 +68,9 @@ def run_studio_i2v(spec, job_id: str) -> JobResult:
         capability=Capability(spec.capability),
         target_resolution=Resolution(spec.width, spec.height, spec.fps),
         vram_budget_gb=spec.vram_budget_gb,
+        # B2 chain: carry the source clip on the request (routing does not key on it;
+        # produce_clip reads spec.source_video for the manifest + extend). None -> None.
+        source_video=getattr(spec, "source_video", None),
     )
     env = resolve_studio_env(spec.out_root, master_fps=spec.fps)
     seeds = SeedBundle(global_seed=spec.seed, stage_seeds=(("base", spec.seed),))
@@ -87,6 +90,10 @@ def run_studio_i2v(spec, job_id: str) -> JobResult:
         start_image=spec.start_image,
         prompt=getattr(spec, "prompt", "") or "",
         negative_prompt=getattr(spec, "negative", "") or "",
+        # B2 chain: the prior-tier clip (movie/scene mp4) this job extends. Carried
+        # into the manifest; the i2v runner extends from its last frame when there is
+        # no start_image. None -> "" (no source) inside produce_clip.
+        source_video=getattr(spec, "source_video", None),
         should_cancel=should_cancel,
     )
 

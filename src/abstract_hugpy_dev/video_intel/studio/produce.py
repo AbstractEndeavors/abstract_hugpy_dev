@@ -29,9 +29,13 @@ from .env import StudioEnv
 from .errors import Err, ErrorCode, Result, StageError
 from .manifest import make_render_manifest
 from .router import CapabilityRouter
+from .runners.ffmpeg_enhance import run_ffmpeg_interpolate, run_ffmpeg_upscale
+from .runners.ltx_upscale import run_ltx_upscale
+from .runners.rife_interpolate import run_rife_interpolate
 from .runners.synthetic import run_synthetic_i2v, run_synthetic_t2v
 from .runners.wan_i2v import run_wan_i2v
 from .runners.wan_t2v import run_wan_t2v
+from .runners.wan_vace import run_wan_vace
 from .schemas import (
     CapabilityRequest,
     ProvenanceStub,
@@ -52,6 +56,19 @@ _DISPATCH = {
     (Framework.SYNTHETIC, Task.T2V): run_synthetic_t2v,
     (Framework.WAN, Task.I2V): run_wan_i2v,
     (Framework.WAN, Task.T2V): run_wan_t2v,
+    # B-3: WAN VACE v2v — the studio's first REAL enhancement path. A v2v binding
+    # (restyle/enhance an existing clip) dispatches here; run_wan_vace is import-safe
+    # (torch/diffusers lazy) and returns Err-as-data on a box that can't run it yet.
+    (Framework.WAN, Task.VACE_CONTROL): run_wan_vace,
+    # slice b: INTERP + UPRES enhancement paths. FFMPEG is the REAL last-resort
+    # (minterpolate / scale=lanczos via the system binary — works on this GPU-less
+    # box today); RIFE / LTX are the premium weight-backed runners, import-safe and
+    # returning Err-as-data (DEPS_MISSING / WEIGHTS_MISSING) until their assets are
+    # staged. All four are dispatched here so any interp/upres binding is executable.
+    (Framework.FFMPEG, Task.INTERPOLATE): run_ffmpeg_interpolate,
+    (Framework.FFMPEG, Task.UPSCALE): run_ffmpeg_upscale,
+    (Framework.RIFE, Task.INTERPOLATE): run_rife_interpolate,
+    (Framework.LTX, Task.UPSCALE): run_ltx_upscale,
 }
 
 _DEFAULT_SEED = 0
@@ -77,6 +94,7 @@ def produce_clip(
     start_image: str | None = None,
     prompt: str = "",
     negative_prompt: str = "",
+    source_video: str | None = None,
     should_cancel: Callable[[], bool] | None = None,
 ) -> Result[Artifact, StageError]:
     """Resolve ``request``, build its manifest, and run the bound runner.
@@ -114,6 +132,11 @@ def produce_clip(
         # normalized in the manifest factory.
         prompt=prompt,
         negative_prompt=negative_prompt,
+        # B2 chain: the source clip this render extends, threaded into the manifest
+        # (and thus its content_hash + the manifest.json sidecar). CARRIED for every
+        # capability; the i2v runners CONSUME it (extend from its last frame when no
+        # start_image is given) — see run_synthetic_i2v / run_wan_i2v. None -> "".
+        source_video=source_video or "",
     )
 
     runner = _DISPATCH.get((binding.framework, binding.task))

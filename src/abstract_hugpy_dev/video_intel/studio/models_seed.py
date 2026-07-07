@@ -56,11 +56,20 @@ _RUNNERS = (
     # bet lands (validate_registry only checks a runner is registered, not
     # importable). run_wan_i2v itself also serves t2v when start_image is None.
     RunnerSpec(Framework.WAN, Task.I2V, "abstract_hugpy_dev.video_intel.studio.runners.wan_i2v:run_wan_i2v", Precision.INT8),
-    RunnerSpec(Framework.WAN, Task.VACE_CONTROL, "abstract_hugpy_dev.video_intel.studio.runners.wan:vace", Precision.INT8),
+    # B-3: WAN VACE v2v is now WIRED to the real runner (import-safe, graceful-
+    # degrading, bitsandbytes int8/nf4 on the box). run_wan_vace restyles/enhances an
+    # existing clip (manifest.source_video) via diffusers' WanVACEPipeline; on this
+    # GPU-less / bitsandbytes-less dev box it returns Err-as-data (SOURCE_MISSING /
+    # DEPS_MISSING / NO_GPU / WEIGHTS_MISSING), never a raise.
+    RunnerSpec(Framework.WAN, Task.VACE_CONTROL, "abstract_hugpy_dev.video_intel.studio.runners.wan_vace:run_wan_vace", Precision.INT8),
     RunnerSpec(Framework.LTX, Task.T2V, "abstract_hugpy_dev.video_intel.studio.runners.ltx:t2v", Precision.FP8),
     RunnerSpec(Framework.LTX, Task.I2V, "abstract_hugpy_dev.video_intel.studio.runners.ltx:i2v", Precision.FP8),
     RunnerSpec(Framework.LTX, Task.AUDIO_VIDEO, "abstract_hugpy_dev.video_intel.studio.runners.ltx:av", Precision.FP8),
-    RunnerSpec(Framework.LTX, Task.UPSCALE, "abstract_hugpy_dev.video_intel.studio.runners.ltx:upscale", Precision.INT8),
+    # slice b: LTX UPSCALE re-pointed to the REAL graceful premium runner (import-
+    # safe, diffusers lazy). On this box the HF-license-gated weights (401) are not
+    # on disk, so it returns Err(WEIGHTS_MISSING) — the ffmpeg lanczos last-resort
+    # serves UPRES until the weights are staged. (Was runners.ltx:upscale, unwired.)
+    RunnerSpec(Framework.LTX, Task.UPSCALE, "abstract_hugpy_dev.video_intel.studio.runners.ltx_upscale:run_ltx_upscale", Precision.INT8),
     RunnerSpec(Framework.HUNYUAN, Task.T2V, "abstract_hugpy_dev.video_intel.studio.runners.hunyuan:t2v", Precision.INT8),
     RunnerSpec(Framework.HUNYUAN, Task.I2V, "abstract_hugpy_dev.video_intel.studio.runners.hunyuan:i2v", Precision.INT8),
     RunnerSpec(Framework.HUNYUAN, Task.AVATAR_LIPSYNC, "abstract_hugpy_dev.video_intel.studio.runners.hunyuan:avatar", Precision.FP8),
@@ -73,7 +82,19 @@ _RUNNERS = (
     RunnerSpec(Framework.ANIMATEDIFF, Task.MOTION_MODULE, "abstract_hugpy_dev.video_intel.studio.runners.animatediff:motion", Precision.INT8),
     RunnerSpec(Framework.FRAMEPACK, Task.STREAM_I2V, "abstract_hugpy_dev.video_intel.studio.runners.framepack:stream", Precision.FP16, supports_streaming=True),
     RunnerSpec(Framework.LTX, Task.UPSCALE, "abstract_hugpy_dev.video_intel.studio.runners.ltx:upscale2", Precision.INT8) if False else
-    RunnerSpec(Framework.RIFE, Task.INTERPOLATE, "abstract_hugpy_dev.video_intel.studio.runners.rife:interp", Precision.FP16),
+    # slice b: RIFE INTERPOLATE re-pointed to the REAL graceful premium runner
+    # (import-safe, Practical-RIFE lazy). On this box the Practical-RIFE arch is not
+    # vendored, so it returns Err(DEPS_MISSING) — the ffmpeg minterpolate last-resort
+    # serves INTERP until the box errand vendors it. (Was runners.rife:interp, unwired.)
+    RunnerSpec(Framework.RIFE, Task.INTERPOLATE, "abstract_hugpy_dev.video_intel.studio.runners.rife_interpolate:run_rife_interpolate", Precision.FP16),
+    # slice b: FFMPEG LAST-RESORT enhancers — REAL frame interpolation + spatial
+    # upscale via the system ffmpeg binary (zero new deps, GPU-less). Both models
+    # carry synthetic=True so the premium RIFE/LTX rows ALWAYS outrank them; they
+    # bind only when no premium model fits the budget. Import-safe (stdlib + numpy/PIL
+    # via the synthetic sidecar helpers, no GPU stack). min_precision=INT8 (the floor)
+    # so any precision binds — the tiny 0.05GB envelope means only INT8 exists anyway.
+    RunnerSpec(Framework.FFMPEG, Task.INTERPOLATE, "abstract_hugpy_dev.video_intel.studio.runners.ffmpeg_enhance:run_ffmpeg_interpolate", Precision.INT8),
+    RunnerSpec(Framework.FFMPEG, Task.UPSCALE, "abstract_hugpy_dev.video_intel.studio.runners.ffmpeg_enhance:run_ffmpeg_upscale", Precision.INT8),
     RunnerSpec(Framework.CODEFORMER, Task.RESTORE_FACE, "abstract_hugpy_dev.video_intel.studio.runners.codeformer:restore", Precision.FP16),
     # SYNTHETIC: no-model procedural runner (P0-B1). Proves the whole spine
     # (capability -> binding -> manifest -> frames -> ffmpeg -> mp4) end-to-end
@@ -353,6 +374,51 @@ _MODELS = (
         default_determinism=DeterminismClass.SEEDED_APPROX, unpinned=True, verify_uri=True,
         notes="Face/detail restore (QLD-4). NTU S-Lab 1.0 license = NON-COMMERCIAL: will not "
               "auto-route for commercial_use. Use GFPGAN (TencentARC/GFPGAN, Apache) for commercial.",
+    ),
+
+    # ---- FFMPEG LAST-RESORT enhancers (slice b, §6) ----------------------
+    # REAL frame interpolation + spatial upscale via the system ffmpeg binary — so
+    # INTERP/UPRES are genuine studio capabilities on a GPU-less box TODAY, with ZERO
+    # new deps. Each is synthetic=True (LAST-RESORT): the premium weight-backed model
+    # of the same capability (rife-practical / ltxv-spatial-upscaler) ALWAYS outranks
+    # it in router scoring, so it binds ONLY when no premium model fits the budget
+    # (e.g. a sub-3GB interp budget, a sub-8GB upres budget) — never shadowing a real
+    # binding. PINNED with a fixed pseudo weight_hash (no real weights exist — it uses
+    # the ffmpeg binary), so production-clean without STUDIO_ALLOW_UNPINNED, and
+    # DeterminismClass.EXACT (the ffmpeg transform is a pure function of the source
+    # bytes + filter; the runner fixes -threads 1 for bit-stable output). Wide
+    # resolution envelope so the last resort can cover any target the premium models
+    # would. License class APACHE_2_0 = the house runner code (ffmpeg_enhance.py); the
+    # underlying ffmpeg binary is itself LGPL/GPL (a system tool, invoked out-of-proc).
+    ModelConfig(
+        model_id="ffmpeg-minterpolate", family=Framework.FFMPEG,
+        tasks=(Task.INTERPOLATE,), capabilities=(Capability.INTERP,),
+        vram=E((Precision.INT8, 0.05)),
+        resolutions=(R_4K, R_1080P, R_720P, R_480P), max_frames=100000, max_duration_s=100000.0,
+        license=LicenseClass.APACHE_2_0,
+        weight_uri="ffmpeg://minterpolate", source_url="ffmpeg://minterpolate",
+        default_determinism=DeterminismClass.EXACT, path_class=PathClass.OFFLINE,
+        weight_hash="ffmpeg-minterpolate-v1-0000000000000000000000000000000000000000000000000000000000000000",
+        synthetic=True,   # LAST-RESORT: rife-practical ALWAYS outranks it when it fits.
+        notes="No-weights frame interpolation (slice b, QLD-3). ffmpeg minterpolate "
+              "(mi_mode=mci, motion-compensated) resamples the source clip to the "
+              "manifest's target fps. Tiny 0.05GB envelope so it only binds when no "
+              "premium interp model (rife-practical, 3GB+) fits the budget.",
+    ),
+    ModelConfig(
+        model_id="ffmpeg-lanczos-upscale", family=Framework.FFMPEG,
+        tasks=(Task.UPSCALE,), capabilities=(Capability.UPRES,),
+        vram=E((Precision.INT8, 0.05)),
+        resolutions=(R_4K, R_1080P, R_720P, R_480P), max_frames=100000, max_duration_s=100000.0,
+        license=LicenseClass.APACHE_2_0,
+        weight_uri="ffmpeg://lanczos-upscale", source_url="ffmpeg://lanczos-upscale",
+        default_determinism=DeterminismClass.EXACT, path_class=PathClass.OFFLINE,
+        weight_hash="ffmpeg-lanczos-upscale-v1-0000000000000000000000000000000000000000000000000000000000000000",
+        synthetic=True,   # LAST-RESORT: ltxv-spatial-upscaler ALWAYS outranks it when it fits.
+        notes="No-weights spatial upscale (slice b, QLD-2). ffmpeg scale=<W>:<H>:"
+              "flags=lanczos to the manifest resolution. Tiny 0.05GB envelope so it "
+              "only binds when no premium upres model (ltxv-spatial-upscaler, 8GB+) "
+              "fits the budget.",
     ),
 
     # ---- SYNTHETIC (no-model) --------------------------------------------

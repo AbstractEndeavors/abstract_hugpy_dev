@@ -97,6 +97,46 @@ def _jail_resolve(handle):
     return None
 
 
+def _resolve_asset_uri(asset_id):
+    """Resolve a media-catalog ``asset_id`` to the ``uri`` (abs path) of the produced
+    ref that carries it — the B2 chain lookup so the console can hand the studio a
+    prior tier's output BY ID (``source_asset_id``) rather than a path. Scans the
+    media-bus job store (the same durable catalog ``/video/studio/clips`` reads) for a
+    job result whose ``outputs[*].asset_id`` matches, newest first, and returns that
+    output's uri. Read-only ``mode=ro`` connection (mirrors the clips-list route); the
+    subsequent jail + ffprobe validation in the caller still guards the returned path.
+    Returns the uri string, or None (unknown id / no catalog / transient lock)."""
+    if not asset_id or not isinstance(asset_id, str):
+        return None
+    import json as _json
+    import sqlite3
+    try:
+        conn = sqlite3.connect(
+            f"file:{media_bus.DB_PATH}?mode=ro", uri=True, timeout=5.0)
+        conn.execute("PRAGMA busy_timeout=5000")
+        try:
+            rows = conn.execute(
+                "SELECT result_json FROM media_jobs "
+                "WHERE result_json IS NOT NULL ORDER BY updated DESC LIMIT 1000"
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+    for (result_json,) in rows:
+        if not result_json:
+            continue
+        try:
+            res = _json.loads(result_json)
+        except (ValueError, TypeError):
+            continue
+        for o in (res.get("outputs") or []):
+            if (isinstance(o, dict) and o.get("asset_id") == asset_id
+                    and isinstance(o.get("uri"), str) and o["uri"]):
+                return o["uri"]
+    return None
+
+
 # --------------------------------------------------------------------------- #
 # 1) POST /video/ingest — resolve metadata ONCE, mint a MediaRef
 # --------------------------------------------------------------------------- #
@@ -383,6 +423,39 @@ def video_studio_i2v():
         start_image = _jail_resolve(start_image)
         if start_image is None:
             return jsonify({"error": "start_image outside storage jail"}), 400
+    # source_video (B2 movie->studio chain): the prior tier's clip this studio job
+    # extends. Accept EITHER an absolute "source_video" path (jail-resolved like
+    # start_image) OR a "source_asset_id" resolved to its uri via the media catalog.
+    # An i2v job with a source but no start_image extends the clip from its LAST FRAME
+    # (the runner does the extraction); t2v is text-only, so a source is meaningless
+    # and DELIBERATELY DROPPED. A non-video / nonexistent / jail-escaping target is a
+    # clean 4xx here rather than a deferred runner failure.
+    source_video = body.get("source_video")
+    source_asset_id = body.get("source_asset_id")
+    if capability == "t2v":
+        source_video = None
+    else:
+        if source_video is None and source_asset_id:
+            source_video = _resolve_asset_uri(source_asset_id)
+            if source_video is None:
+                return jsonify(
+                    {"error": f"source_asset_id not found in catalog: {source_asset_id!r}"}), 404
+        if source_video is not None:
+            resolved_sv = _jail_resolve(source_video)
+            if resolved_sv is None:
+                return jsonify({"error": "source_video outside storage jail"}), 400
+            if not os.path.isfile(resolved_sv):
+                return jsonify({"error": "source_video not found"}), 404
+            # Authoritative video check: ffprobe-classify via media_store (probe wins).
+            try:
+                sref = media_store.ingest(resolved_sv, kind_hint="video")
+            except Exception as exc:  # unreadable / no A/V stream / jail = bad input
+                return jsonify(
+                    {"error": f"source_video is not a readable media file: {exc}"}), 400
+            if sref.kind != "video":
+                return jsonify(
+                    {"error": f"source_video is not a video (classified as {sref.kind})"}), 400
+            source_video = sref.uri
     try:
         spec = make_studio_i2v(
             capability=capability,
@@ -397,6 +470,8 @@ def video_studio_i2v():
             # the older "negative" key; "prompt" carries the positive text prompt.
             negative=body.get("negative_prompt", body.get("negative")),
             prompt=body.get("prompt"),
+            # B2 chain: the validated abs path of the prior tier's clip (or None).
+            source_video=source_video,
         )
     except (ValueError, TypeError) as exc:  # bad geometry / capability = 400
         return jsonify({"error": str(exc)}), 400
@@ -568,6 +643,40 @@ def movie_preset_apply(preset_id):
 
 
 # --------------------------------------------------------------------------- #
+# 2i) GET /video/studio/presets — curated STUDIO clip presets for the Studio Clips
+#     station. Studio twin of GET /video/presets + GET /movie/presets: import the
+#     static registry, dump it as JSON. No side effects — a studio preset is a named
+#     bundle of a capability ("i2v"/"t2v") + geometry + a routing vram_budget_gb the
+#     station pre-fills into its generate affordance. The model is NOT pinned here;
+#     the studio router resolves capability + resolution + budget at run time.
+# --------------------------------------------------------------------------- #
+@video_bp.route("/video/studio/presets", methods=["GET"])
+def studio_presets():
+    from abstract_hugpy_dev.video_intel.studio_presets import available_studio_presets
+    return jsonify({"presets": [p.to_dict() for p in available_studio_presets()]}), 200
+
+
+# --------------------------------------------------------------------------- #
+# 2j) POST /video/studio/presets/<preset_id>/apply — return the directly-POSTable
+#     /video/studio/i2v body for this preset (unknown id -> 404). Read-only/open,
+#     same posture as the movie apply: unlike the video-preset apply this does NOT
+#     touch the worker plane — a studio preset just pre-fills the generate affordance
+#     (its `request` sub-object is a curated /video/studio/i2v body).
+# --------------------------------------------------------------------------- #
+@video_bp.route("/video/studio/presets/<preset_id>/apply", methods=["POST"])
+def studio_preset_apply(preset_id):
+    from abstract_hugpy_dev.video_intel.studio_presets import get_studio_preset
+
+    preset = get_studio_preset(preset_id)
+    if preset is None:
+        return jsonify({"ok": False, "error": {
+            "code": "UnknownPreset",
+            "message": f"no studio preset {preset_id!r}"}}), 404
+
+    return jsonify(preset.apply()), 200
+
+
+# --------------------------------------------------------------------------- #
 # 3) GET /video/jobs/<job_id> — read-only job view (unknown id -> null view)
 # --------------------------------------------------------------------------- #
 @video_bp.route("/video/jobs/<job_id>", methods=["GET"])
@@ -662,6 +771,13 @@ def video_studio_clips():
                     o = outputs[0]
                     out = {
                         "asset_id": o.get("asset_id"),
+                        # The clip's abs path — so the console can build a full video
+                        # MediaRef for the Session Library + "Send to Studio" chain
+                        # (B2). It is the same uri the movie/scene job results already
+                        # expose on /video/jobs/<id>; playback still goes by job_id
+                        # through /video/studio/clip/<id>, which owns the jail.
+                        "uri": o.get("uri"),
+                        "mime": o.get("mime"),
                         "width": o.get("width"),
                         "height": o.get("height"),
                         "duration_s": o.get("duration_s"),

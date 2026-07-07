@@ -48,6 +48,12 @@ class Framework(str, Enum):
     FRAMEPACK = "framepack"
     RIFE = "rife"
     CODEFORMER = "codeformer"
+    FFMPEG = "ffmpeg"           # no-weights LAST-RESORT enhancer: real frame
+                                # interpolation (minterpolate) + spatial upscale
+                                # (scale=lanczos) via the system ffmpeg binary, so
+                                # INTERP/UPRES are real capabilities on a GPU-less
+                                # box today. Ranks below the premium models (RIFE,
+                                # LTX upscaler) via synthetic=True (§6, slice b).
     SYNTHETIC = "synthetic"     # no-model procedural runner: proves the spine
                                 # end-to-end (frames -> ffmpeg) with no GPU/weights
 

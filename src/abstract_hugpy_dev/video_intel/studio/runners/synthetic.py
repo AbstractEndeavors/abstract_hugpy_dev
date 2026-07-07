@@ -39,6 +39,7 @@ import numpy as np
 from PIL import Image
 
 from ..artifacts import Artifact
+from ..enums import Task
 from ..errors import Err, ErrorCode, Ok, Result, StageError
 from ..manifest import render_manifest_to_dict
 from ..registry import MODEL_REGISTRY
@@ -52,6 +53,10 @@ _ASSEMBLY_SEM = threading.BoundedSemaphore(1)
 _CLIP_NAME = "clip.mp4"
 _MANIFEST_NAME = "manifest.json"
 _PROVENANCE_NAME = "provenance.json"
+# Sidecar for the B2 "extend the movie" conditioning still: the source clip's last
+# frame, extracted next to the content-addressed clip it conditions (content_hash
+# already keys on manifest.source_video, so this path is deterministic + resume-safe).
+_SOURCE_LASTFRAME_NAME = "source_lastframe.png"
 
 
 # --------------------------------------------------------------------------- #
@@ -174,6 +179,32 @@ def _assemble_mp4(frame_dir: str, tmp_mp4: str, fps: int) -> tuple[bool, str]:
     return ok, (result.stderr or "")[-500:]
 
 
+def _extract_last_frame(source_video: str, dest_png: str) -> tuple[bool, str]:
+    """Extract the LAST frame of ``source_video`` to ``dest_png`` (a PNG still) —
+    the B2 "extend the movie" conditioning frame. Mirrors ``_assemble_mp4``'s house
+    ffmpeg invocation (shutil.which, PIPE, returncode check) and never raises on a
+    plain ffmpeg failure (errors-as-data, INV-3). The ``-sseof -3 -update 1`` idiom
+    seeks ~3s before the end and OVERWRITES the single output for every remaining
+    frame, so the final write is the clip's last frame (a clip shorter than 3s just
+    decodes from its start and still ends on the final frame). Reused by the Wan i2v
+    runner (like the other helpers here) so both extract identically. Returns
+    (ok, stderr_tail)."""
+    ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
+    cmd = [
+        ffmpeg, "-y",
+        "-sseof", "-3",
+        "-i", source_video,
+        "-update", "1",
+        "-q:v", "2",
+        dest_png,
+    ]
+    with _ASSEMBLY_SEM:
+        result = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    ok = result.returncode == 0 and os.path.isfile(dest_png) and os.path.getsize(dest_png) > 0
+    return ok, (result.stderr or "")[-500:]
+
+
 def _provenance_dict(manifest: RenderManifest) -> dict:
     prov = manifest.provenance
     if prov is None:
@@ -224,6 +255,30 @@ def run_synthetic_i2v(
         return Ok(Artifact(
             path=clip_path, content_hash=content_hash, frames=n_frames,
             width=width, height=height, duration_s=duration_s, resumed=True))
+
+    # B2 chain — "extend the movie": for an i2v render given a source clip but NO
+    # start_image, condition on the clip's LAST FRAME (extracted via ffmpeg). The
+    # source_video is in the manifest (and thus content_hash), so this is
+    # deterministic + resume-safe — the resume check above already served an existing
+    # clip WITHOUT touching the source. Placed AFTER resume so a re-run never
+    # re-extracts. t2v is text-only (manifest.task != I2V) -> the source is CARRIED
+    # in the manifest for provenance but never alters a frame here.
+    src_video = getattr(manifest, "source_video", "") or ""
+    if start_image is None and src_video and manifest.task == Task.I2V:
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except OSError as exc:
+            return Err(StageError(
+                ErrorCode.IO_ERROR, f"could not create out_dir: {exc}",
+                (("out_dir", out_dir),)))
+        last_frame = os.path.join(out_dir, _SOURCE_LASTFRAME_NAME)
+        ok, stderr_tail = _extract_last_frame(src_video, last_frame)
+        if not ok:
+            return Err(StageError(
+                ErrorCode.IO_ERROR,
+                f"could not extract last frame from source_video: {stderr_tail}",
+                (("source_video", src_video),)))
+        start_image = last_frame
 
     # Load the start image up front (an unreadable one is DATA, not a crash).
     start_arr = None

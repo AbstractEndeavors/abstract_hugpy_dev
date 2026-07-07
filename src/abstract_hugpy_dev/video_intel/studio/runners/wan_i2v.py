@@ -45,7 +45,7 @@ import tempfile
 from typing import Callable
 
 from ..artifacts import Artifact
-from ..enums import Precision
+from ..enums import Precision, Task
 from ..errors import Err, ErrorCode, Ok, Result, StageError
 from ..manifest import render_manifest_to_dict
 from ..registry import MODEL_REGISTRY
@@ -54,12 +54,16 @@ from ..storage import atomic_write_text
 # Reuse the synthetic runner's atomic/content-addressed plumbing so the Wan clip
 # lands in the IDENTICAL on-disk layout. These pull numpy/PIL (already house
 # deps, present everywhere) — NOT the heavy torch/diffusers stack, which stays
-# lazy inside run_wan_i2v.
+# lazy inside run_wan_i2v. ``_extract_last_frame`` + ``_SOURCE_LASTFRAME_NAME`` are
+# the B2 "extend the movie" helpers, shared so Wan extracts the source clip's last
+# frame byte-identically to the synthetic prover.
 from .synthetic import (
     _CLIP_NAME,
     _MANIFEST_NAME,
     _PROVENANCE_NAME,
+    _SOURCE_LASTFRAME_NAME,
     _assemble_mp4,
+    _extract_last_frame,
     _geometry,
     _provenance_dict,
 )
@@ -294,6 +298,23 @@ def run_wan_i2v(
             return Err(StageError(
                 ErrorCode.CANCELLED, "cancelled before wan load",
                 (("content_hash", content_hash), ("model_id", manifest.model_id))))
+
+        # B2 chain — "extend the movie": condition an i2v render on the source clip's
+        # LAST FRAME when no start_image was given, BEFORE loading multi-GB weights so
+        # a bad source fails fast (errors-as-data). source_video is in the manifest
+        # (content_hash), so the extend is deterministic + resume-safe. t2v is
+        # text-only (task != I2V) -> the source is carried, never used. BOX-ONLY like
+        # the rest of this real path (the GPU-less VM short-circuits at preflight).
+        if (start_image is None and (manifest.source_video or "")
+                and manifest.task == Task.I2V):
+            last_frame = os.path.join(out_dir, _SOURCE_LASTFRAME_NAME)
+            ok, stderr_tail = _extract_last_frame(manifest.source_video, last_frame)
+            if not ok:
+                return Err(StageError(
+                    ErrorCode.IO_ERROR,
+                    f"could not extract last frame from source_video: {stderr_tail}",
+                    (("source_video", manifest.source_video),)))
+            start_image = last_frame
 
         # bitsandbytes-quantized DiT transformer (int8 / nf4 per precision).
         tf_kwargs = {"subfolder": "transformer", "torch_dtype": compute_dtype}
