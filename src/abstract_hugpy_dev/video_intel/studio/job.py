@@ -45,6 +45,13 @@ DEFAULT_CLIPS_ROOT = os.path.join(STUDIO_ROOT, "clips")
 # comes back as JobResult(ok=False, RUNNER_MISSING) — errors as data, never a raise.
 _DEFAULT_VRAM_BUDGET_GB = 0.5
 
+# Sanity ranges for the optional sampler overrides (route passthrough). steps below 1
+# is a no-op denoise (gray mush); a huge step count or cfg is almost always a typo that
+# would burn a render. cfg 0 is valid (unguided). These bound the /video/studio/i2v
+# route's 400 AND every non-route caller (make_studio_i2v is the single validator).
+_MIN_STEPS, _MAX_STEPS = 1, 100
+_MIN_CFG, _MAX_CFG = 0.0, 20.0
+
 _VALID_CAPABILITIES = frozenset(c.value for c in Capability)
 
 
@@ -69,6 +76,19 @@ class StudioI2VSpec:
                                         # i2v job with no start_image EXTENDS this clip
                                         # from its LAST FRAME. Carried in the manifest
                                         # (part of the content_hash) either way.
+    # SAMPLER OVERRIDES (route passthrough). None = "unset": the studio spine fills the
+    # denoise settings from the BOUND model's family default (steps 32 / cfg 5.0 for
+    # Wan, steps 1 for synthetic). A number here PINS that field and ALWAYS wins over the
+    # model default. Range-validated in make_studio_i2v (steps 1-100, cfg 0-20) so an
+    # out-of-range value is a clean caller error, never a bad render.
+    steps: Optional[int] = None
+    cfg: Optional[float] = None
+    # DIRECT MODEL CHOICE (pin). None = auto-pick (the router chooses by capability +
+    # budget + resolution). A model_id here is threaded into the CapabilityRequest as a
+    # pin: the router binds THAT model or returns a clear Err-as-data (never a silent
+    # fallback). Not validated against the registry here (that is a runtime routing
+    # decision, surfaced as errors-as-data from produce_clip) — only shape-checked.
+    model_id: Optional[str] = None
 
 
 def make_studio_i2v(
@@ -84,6 +104,9 @@ def make_studio_i2v(
     negative: Optional[str] = None,
     prompt: Optional[str] = None,
     source_video: Optional[str] = None,
+    steps: Optional[int] = None,
+    cfg: Optional[float] = None,
+    model_id: Optional[str] = None,
 ) -> StudioI2VSpec:
     """Validate every field and build the frozen ``StudioI2VSpec``. Raises
     ``ValueError``/``TypeError`` LOCALLY on any structural violation (house
@@ -110,6 +133,24 @@ def make_studio_i2v(
         raise ValueError(f"negative must be a string or None; got {negative!r}")
     if prompt is not None and not isinstance(prompt, str):
         raise ValueError(f"prompt must be a string or None; got {prompt!r}")
+    # SAMPLER OVERRIDES: None = unset (model default fills it). A value is range-checked
+    # here so the same guard protects EVERY caller (route, preset apply, bus rehydrate),
+    # not just the HTTP route. bool is an int subclass — reject it explicitly.
+    if steps is not None:
+        if not isinstance(steps, int) or isinstance(steps, bool) \
+                or not (_MIN_STEPS <= steps <= _MAX_STEPS):
+            raise ValueError(
+                f"steps must be an int in [{_MIN_STEPS}, {_MAX_STEPS}] or None; got {steps!r}")
+    if cfg is not None:
+        if not isinstance(cfg, (int, float)) or isinstance(cfg, bool) \
+                or not (_MIN_CFG <= cfg <= _MAX_CFG):
+            raise ValueError(
+                f"cfg must be a number in [{_MIN_CFG}, {_MAX_CFG}] or None; got {cfg!r}")
+    # DIRECT MODEL CHOICE: shape-check only (a non-empty string). Whether the model_id
+    # actually EXISTS / serves the capability / fits is a routing decision surfaced as
+    # errors-as-data (ErrorCode.PINNED_MODEL_UNAVAILABLE) at run time, not here.
+    if model_id is not None and not (isinstance(model_id, str) and model_id.strip()):
+        raise ValueError(f"model_id must be a non-empty string or None; got {model_id!r}")
 
     resolved_out = out_root if (isinstance(out_root, str) and out_root.strip()) \
         else DEFAULT_CLIPS_ROOT
@@ -126,6 +167,9 @@ def make_studio_i2v(
         negative=negative,
         prompt=prompt,
         source_video=source_video,
+        steps=steps,
+        cfg=(float(cfg) if cfg is not None else None),
+        model_id=model_id,
     )
 
 
@@ -146,6 +190,9 @@ def studio_i2v_from_dict(d: dict) -> StudioI2VSpec:
         negative=d.get("negative"),
         prompt=d.get("prompt"),
         source_video=d.get("source_video"),
+        steps=d.get("steps"),
+        cfg=d.get("cfg"),
+        model_id=d.get("model_id"),
     )
 
 

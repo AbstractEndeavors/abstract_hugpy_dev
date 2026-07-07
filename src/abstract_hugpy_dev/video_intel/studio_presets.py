@@ -58,15 +58,25 @@ class StudioPreset:
     prompt: str = ""         # scaffold; "" is valid (image-conditioned i2v)
     negative: str = ""
     recommended: str = "gpu"  # advisory/display only — see module note
-    requires_source: bool = False  # UI signal (additive): this preset is a video
-                                    # TRANSFORM (v2v/restyle) — it MUST be handed a
-                                    # staged source clip at enqueue time to mean
-                                    # anything. Rides the wire (to_dict/apply) so the
-                                    # Studio Clips station can force the restyle flow
-                                    # (v2v capability + a prominent prompt). It is NOT
-                                    # a make_studio_i2v keyword, so it stays OUT of
-                                    # request_body() — the source is threaded from the
-                                    # staged clip by the route, never from the preset.
+    requires_source: bool = False  # UI signal (additive): this preset needs an INPUT
+                                    # to mean anything — a staged source clip for a v2v
+                                    # restyle, or a start image for an i2v render. Rides
+                                    # the wire (to_dict/apply) so the Studio Clips
+                                    # station can gate the flow (a v2v preset forces the
+                                    # restyle flow; an i2v preset that needs a start
+                                    # image can warn before enqueue). It is NOT a
+                                    # make_studio_i2v keyword, so it stays OUT of
+                                    # request_body() — the source/start image is threaded
+                                    # from the staged clip by the route, never the preset.
+    prompt_note: str = ""          # UI HONESTY badge (additive): a short note the
+                                    # station shows about the prompt for this preset.
+                                    # Set on SYNTHETIC presets to state plainly that the
+                                    # prompt is recorded in the manifest but NOT rendered
+                                    # (the synthetic prover's frames are a pure function
+                                    # of seed + geometry) — so an evocative scaffold can
+                                    # never again mislead an operator into expecting
+                                    # prompt-driven pixels. "" = no badge. NOT a
+                                    # make_studio_i2v keyword -> stays OUT of request_body().
 
     def request_body(self) -> Dict[str, Any]:
         """A directly-POSTable ``/video/studio/i2v`` body.
@@ -105,6 +115,7 @@ class StudioPreset:
             "negative": self.negative,
             "recommended": self.recommended,
             "requires_source": self.requires_source,
+            "prompt_note": self.prompt_note,
         }
 
     def apply(self) -> Dict[str, Any]:
@@ -154,6 +165,13 @@ def get_studio_preset(preset_id: str) -> Optional[StudioPreset]:
 # The two sub-real budgets (0.5 GB) bind the SYNTHETIC prover (no GPU); the real
 # budgets bind a real Wan model. The router (not this table) picks the exact model.
 
+# UI-honesty badge for the SYNTHETIC previews: their frames are a pure function of
+# seed + geometry, so the prompt is provenance-only. Synthetic presets ship an EMPTY
+# prompt (nothing evocative to prefill + mislead) AND carry this note so the station
+# can state plainly that a prompt won't change a pixel here.
+_SYNTHETIC_PROMPT_NOTE = ("Prompt is recorded in the manifest, not rendered "
+                          "(synthetic prover — frames come from seed + geometry).")
+
 register_studio_preset(StudioPreset(
     id="quick-preview-synthetic",
     name="Quick preview (synthetic, tiny budget)",
@@ -169,6 +187,7 @@ register_studio_preset(StudioPreset(
     prompt="",
     negative="",
     recommended="synthetic (no GPU)",
+    prompt_note=_SYNTHETIC_PROMPT_NOTE,
 ))
 
 register_studio_preset(StudioPreset(
@@ -183,9 +202,13 @@ register_studio_preset(StudioPreset(
     fps=24,
     vram_budget_gb=0.5,
     seed=0,
-    prompt="a slow drone shot over a glowing city grid at night",
+    # EMPTY prompt (was an evocative "drone shot…" that misled an operator into
+    # expecting prompt-driven pixels — synthetic ignores it). The honesty is carried by
+    # prompt_note instead of a scaffold the runner never reads.
+    prompt="",
     negative="",
     recommended="synthetic (no GPU)",
+    prompt_note=_SYNTHETIC_PROMPT_NOTE,
 ))
 
 register_studio_preset(StudioPreset(
@@ -285,5 +308,53 @@ register_studio_preset(StudioPreset(
     prompt="repaint this scene as a hand-painted watercolor, preserving the motion",
     negative="blurry, low quality, distorted, flicker, morphing, artifacts",
     recommended="single 3090 (INT8) · needs a source clip",
+    requires_source=True,
+))
+
+# ---- TWO first-class TIERS (operator directive: both optionable) ----------
+# DRAFT tier: Wan 2.1 T2V 1.3B — the consumer entry point. At 832x480 @16 with a 9 GB
+# budget the router binds wan2.1-t2v-1.3b (verified via CapabilityRouter 2026-07-07:
+# only the 1.3B fits — the A14B needs 16 GB+, LTX/mochi/cog reject on floor/resolution).
+# A REAL diffusion model, so its prompt DOES drive pixels — a scaffold prompt is honest
+# here (no prompt_note). No start image needed (text-to-video).
+register_studio_preset(StudioPreset(
+    id="draft-t2v-1.3b",
+    name="Draft t2v — Wan 2.1 1.3B (single 3090)",
+    description=("Fast DRAFT text-to-video at 832x480 @16fps with a 9 GB budget — binds "
+                 "the Wan 2.1 T2V 1.3B consumer model (FP16, fits a single 3090). Real "
+                 "32-step denoise; the prompt drives the pixels. No start image needed."),
+    capability="t2v",
+    width=832,
+    height=480,
+    fps=16,
+    vram_budget_gb=9.0,
+    seed=0,
+    prompt="a lone figure walking down a rain-slicked neon street at night, cinematic",
+    negative="blurry, low quality, distorted, flicker, deformed",
+    recommended="single 3090 (FP16, draft)",
+))
+
+# QUALITY tier: Wan 2.1 I2V 14B at INT8 — the identity-lock workhorse. At 832x480 @16
+# with a 16 GB budget the router binds wan2.1-i2v-14b-720p at INT8 (verified: it outranks
+# the 2.2 A14B on the tighter-footprint tie-break; both fit at int8, 14B min=14 < 16).
+# requires_source=True: an i2v render needs a START IMAGE (the subject is carried from
+# it) — mirrors the restyle preset's requires_source signal so the station can warn
+# before enqueue. A real diffusion model, so a scaffold prompt is honest (no prompt_note).
+register_studio_preset(StudioPreset(
+    id="quality-i2v-14b-int8",
+    name="Quality i2v — Wan 2.1 14B INT8 (single 3090)",
+    description=("QUALITY image-to-video at 832x480 @16fps with a 16 GB budget — binds "
+                 "the Wan 2.1 I2V 14B identity-lock workhorse at INT8 (fits a single "
+                 "3090). Real 32-step denoise. REQUIRES a start image: the subject is "
+                 "carried from it (nothing to animate without one)."),
+    capability="i2v",
+    width=832,
+    height=480,
+    fps=16,
+    vram_budget_gb=16.0,
+    seed=0,
+    prompt="natural, lifelike motion; the subject moves smoothly; filmic lighting",
+    negative="blurry, low quality, deformed, warped, morphing, flicker, extra limbs",
+    recommended="single 3090 (INT8, quality) · needs a start image",
     requires_source=True,
 ))

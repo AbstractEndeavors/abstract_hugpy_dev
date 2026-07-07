@@ -43,6 +43,43 @@ def E(*pairs: tuple[Precision, float]) -> VramEnvelope:
 
 HF = "https://huggingface.co/"
 
+
+# --------------------------------------------------------------------------
+# REAL SAMPLER DEFAULTS, as data (data-over-code). Keyed by model FAMILY: the
+# denoise settings a render uses when the spec did not PIN steps/cfg explicitly.
+# Consumed by ``studio.produce.resolve_sampler`` at manifest-build time and RECORDED
+# in the manifest (content_hash keys on the sampler), so the runner denoises with
+# exactly these values.
+#
+# WHY THIS EXISTS: the studio's synthetic-era placeholder was steps=1 / cfg=1.0 (a
+# no-op denoise — one step, no guidance). That is correct for the SYNTHETIC prover
+# (its frames are a pure function of seed + geometry — the sampler never touches a
+# pixel) but reaching a REAL diffusion runner it produces gray mush (a single
+# unguided step). A real family therefore declares real defaults here; a family
+# ABSENT from this table falls back to the placeholder (steps=1 / cfg=1.0), which
+# keeps synthetic + the ffmpeg/rife last-resort enhancers (whose runners ignore the
+# sampler entirely) byte-identical to their historical content-addressed output.
+#
+# ``shift`` (flow-match / UniPC scheduler shift) is RESOLUTION-dependent, so it is
+# NOT stored here — ``resolve_sampler`` derives it from the target resolution with a
+# simple threshold (the Wan reference: 3.0 @ 480p, 5.0 @ 720p+). Each entry is a flat
+# dict of the SamplerConfig scalar fields the family denoises with.
+FAMILY_SAMPLER_DEFAULTS: dict[Framework, dict] = {
+    # Wan 2.1/2.2 (t2v, i2v AND VACE v2v — all denoise): the diffusers Wan reference
+    # runs ~30-50 UniPC flow-match steps with guidance ~5.0. 32 steps / cfg 5.0 is a
+    # sane "get an init out and evaluated" default (operator directive) that lands well
+    # inside a single-render budget on a 3090-class box.
+    Framework.WAN: {"sampler": "unipc", "scheduler": "flow_match", "steps": 32, "cfg": 5.0},
+}
+
+# The placeholder used for any family NOT in FAMILY_SAMPLER_DEFAULTS (synthetic prover,
+# ffmpeg/rife/ltx enhancers). IDENTICAL to the studio's historical _default_sampler so
+# those content-addressed clips never re-address. steps=1 / cfg=1.0 = a no-op denoise —
+# honest for a runner that does not sample.
+PLACEHOLDER_SAMPLER_DEFAULTS: dict = {
+    "sampler": "euler", "scheduler": "normal", "steps": 1, "cfg": 1.0,
+}
+
 # --------------------------------------------------------------------------
 # Runners: (framework, task) -> how to execute it. Entrypoints wired explicitly.
 # --------------------------------------------------------------------------

@@ -456,6 +456,26 @@ def video_studio_i2v():
                 return jsonify(
                     {"error": f"source_video is not a video (classified as {sref.kind})"}), 400
             source_video = sref.uri
+    # SAMPLER OVERRIDES (route passthrough): optional "steps"/"cfg" numbers that PIN the
+    # denoise settings (explicit values ALWAYS win over the bound model's family
+    # default). Validate ranges HERE for a clean 400 with a precise message (steps 1-100,
+    # cfg 0-20); make_studio_i2v re-checks the same bounds for non-route callers. An
+    # integral float steps (e.g. 30.0 from a JS number input) is accepted as 30.
+    steps = body.get("steps")
+    if isinstance(steps, float) and steps.is_integer():
+        steps = int(steps)
+    if steps is not None and (not isinstance(steps, int) or isinstance(steps, bool)
+                              or not (1 <= steps <= 100)):
+        return jsonify({"error": "steps must be an integer in [1, 100]"}), 400
+    cfg = body.get("cfg")
+    if cfg is not None and (not isinstance(cfg, (int, float)) or isinstance(cfg, bool)
+                            or not (0 <= cfg <= 20)):
+        return jsonify({"error": "cfg must be a number in [0, 20]"}), 400
+    # DIRECT MODEL CHOICE (pin): optional "model_id". Threaded into the spec -> the
+    # CapabilityRequest pin. The router binds THAT model or returns a clear Err-as-data
+    # (PINNED_MODEL_UNAVAILABLE / a sharpened gate reason) that rides back on the job —
+    # never a silent fallback. Shape (non-empty string) is checked in make_studio_i2v.
+    model_id = body.get("model_id")
     try:
         spec = make_studio_i2v(
             capability=capability,
@@ -472,8 +492,12 @@ def video_studio_i2v():
             prompt=body.get("prompt"),
             # B2 chain: the validated abs path of the prior tier's clip (or None).
             source_video=source_video,
+            # Sampler overrides + model pin (validated above / shape-checked in factory).
+            steps=steps,
+            cfg=cfg,
+            model_id=model_id,
         )
-    except (ValueError, TypeError) as exc:  # bad geometry / capability = 400
+    except (ValueError, TypeError) as exc:  # bad geometry / capability / overrides = 400
         return jsonify({"error": str(exc)}), 400
     job_id = media_bus.enqueue("studio_i2v", spec)
     return jsonify({"job_id": job_id}), 200
@@ -707,6 +731,14 @@ def video_media():
     if resolved is None or not os.path.isfile(resolved):
         return jsonify({"error": "not found"}), 404
     mime, _ = mimetypes.guess_type(resolved)
+    if mime is None:
+        # A studio clip can be served here BY URI (cross-station library playback) from
+        # an extensionless media-store path — guess_type then returns None and the
+        # generic octet-stream fallback makes the console <video> show a gray unknown
+        # mime. A file under the studio clips dir is always an mp4, so prefer that.
+        from abstract_hugpy_dev.video_intel.studio.job import DEFAULT_CLIPS_ROOT
+        if _is_within(os.path.realpath(resolved), DEFAULT_CLIPS_ROOT):
+            mime = "video/mp4"
     return send_file(
         resolved,
         mimetype=mime or "application/octet-stream",
@@ -809,7 +841,8 @@ def video_studio_clip(job_id):
         return jsonify({"error": "no completed studio clip for that job"}), 404
 
     outputs = result.get("outputs") or []
-    uri = outputs[0].get("uri") if (outputs and isinstance(outputs[0], dict)) else None
+    first = outputs[0] if (outputs and isinstance(outputs[0], dict)) else {}
+    uri = first.get("uri")
     if not uri or not isinstance(uri, str):
         return jsonify({"error": "job result carries no clip uri"}), 404
 
@@ -820,8 +853,152 @@ def video_studio_clip(job_id):
     if not _is_within(resolved, DEFAULT_CLIPS_ROOT) or not os.path.isfile(resolved):
         return jsonify({"error": "clip not found"}), 404
 
+    # EXPLICIT Content-Type — NEVER filename guessing. A content-addressed studio clip
+    # can be served from a uri WITHOUT a .mp4 extension (media-store ingest names some
+    # assets by id), and send_file's extension guess then yields no/an unknown type, so
+    # the console <video> shows a gray "unknown mime" error. Source the mime from the
+    # catalog record (outputs[].mime, already "video/mp4"); fall back to "video/mp4" for
+    # anything under the studio clips dir (every file the jail above admits is a clip).
+    mime = first.get("mime")
+    if not (isinstance(mime, str) and mime.strip()):
+        mime = "video/mp4"
     return send_file(
         resolved,
-        mimetype="video/mp4",
+        mimetype=mime,
         conditional=True,   # HTTP Range + conditional requests => <video> can seek
     )
+
+
+# --------------------------------------------------------------------------- #
+# 5b) GET /video/studio/clip/<job_id>/detail — the exact CREATION PARAMETERS of a
+#     studio render, for a list-row "why did this pass/fail" expander. LAZY (fetched
+#     on expand, not on the 6s list poll) so the list stays lean, and JAILED like the
+#     stream route (the manifest.json is read only from beside a clip that really lives
+#     under the studio clips tree). Two data sources, used-not-invented:
+#       * DONE  -> the content-addressed manifest.json beside the clip (the TRUE render
+#                  params: model_id, precision, resolution, seed, sampler steps/cfg/shift,
+#                  prompt/negative, source_video, content_hash) + the output geometry.
+#       * FAILED/CANCELLED (or any non-done) -> the job's requested spec + the error
+#                  {code, message, retryable} from the job result. No clip, so no manifest.
+#     The requested SPEC (from the bus row's spec_json) rides along in every case so the
+#     UI can show "asked for X, got Y".
+# --------------------------------------------------------------------------- #
+@video_bp.route("/video/studio/clip/<job_id>/detail", methods=["GET"])
+def video_studio_clip_detail(job_id):
+    import json as _json
+    import sqlite3
+    from abstract_hugpy_dev.video_intel.studio.job import DEFAULT_CLIPS_ROOT
+
+    # Read the bus row read-only (mirrors /video/studio/clips) — spec_json carries the
+    # REQUESTED params, result_json the outcome. Unknown id -> 404 (nothing to detail).
+    row = None
+    try:
+        conn = sqlite3.connect(
+            f"file:{media_bus.DB_PATH}?mode=ro", uri=True, timeout=5.0)
+        conn.execute("PRAGMA busy_timeout=5000")
+        try:
+            row = conn.execute(
+                "SELECT status, spec_json, result_json FROM media_jobs "
+                "WHERE job_id=? AND name='studio_i2v'",
+                (job_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        row = None
+    if row is None:
+        return jsonify({"error": "no studio job for that id"}), 404
+    status, spec_json, result_json = row
+
+    # Curated view of the REQUESTED spec (drop out_root — an internal path). Everything
+    # else is a creation parameter worth showing.
+    spec_view = None
+    if spec_json:
+        try:
+            s = _json.loads(spec_json)
+            spec_view = {k: s.get(k) for k in (
+                "capability", "width", "height", "fps", "vram_budget_gb", "seed",
+                "prompt", "negative", "steps", "cfg", "model_id",
+                "start_image", "source_video")}
+        except (ValueError, TypeError):
+            spec_view = None
+
+    result = None
+    if result_json:
+        try:
+            result = _json.loads(result_json)
+        except (ValueError, TypeError):
+            result = None
+
+    error_view = None
+    manifest_view = None
+    if isinstance(result, dict):
+        if result.get("ok"):
+            outputs = result.get("outputs") or []
+            first = outputs[0] if (outputs and isinstance(outputs[0], dict)) else {}
+            uri = first.get("uri")
+            if isinstance(uri, str) and uri:
+                resolved = os.path.realpath(uri)
+                # Same jail as the stream route: only read a manifest beside a clip that
+                # really lives under the studio clips tree (checked on the realpath).
+                if _is_within(resolved, DEFAULT_CLIPS_ROOT) and os.path.isfile(resolved):
+                    mpath = os.path.join(os.path.dirname(resolved), "manifest.json")
+                    if _is_within(os.path.realpath(mpath), DEFAULT_CLIPS_ROOT) \
+                            and os.path.isfile(mpath):
+                        try:
+                            with open(mpath, "r", encoding="utf-8") as fh:
+                                m = _json.load(fh)
+                            manifest_view = _studio_manifest_view(m, resolved, first)
+                        except (OSError, ValueError, TypeError):
+                            manifest_view = None
+        else:
+            err = result.get("error") or {}
+            if isinstance(err, dict):
+                error_view = {
+                    "code": err.get("code"),
+                    "message": err.get("message"),
+                    "retryable": bool(err.get("retryable", False)),
+                }
+
+    return jsonify({
+        "job_id": job_id,
+        "status": status,
+        "playable": bool(status == "done" and manifest_view is not None),
+        "spec": spec_view,
+        "manifest": manifest_view,
+        "error": error_view,
+    }), 200
+
+
+def _studio_manifest_view(m: dict, clip_path: str, output: dict) -> dict:
+    """Compact projection of a render manifest.json for the clip-detail expander. The
+    clip DIR name IS the content_hash (content-addressed storage), so we surface it from
+    the path rather than recomputing. ``output`` (the cataloged MediaRef) supplies the
+    real duration; frames is DERIVED (duration * fps) for a CFR clip — not invented."""
+    ladder = m.get("resolution_ladder") or []
+    res = ladder[0] if (ladder and isinstance(ladder[0], (list, tuple))
+                        and len(ladder[0]) == 3) else None
+    resolution = ({"width": res[0], "height": res[1], "fps": res[2]}
+                  if res is not None else None)
+    seeds = m.get("seeds") or {}
+    duration_s = output.get("duration_s") if isinstance(output, dict) else None
+    frames = None
+    if resolution is not None and isinstance(duration_s, (int, float)):
+        frames = int(round(duration_s * resolution["fps"]))
+    return {
+        "content_hash": os.path.basename(os.path.dirname(clip_path)),
+        "model_id": m.get("model_id"),
+        "framework": m.get("framework"),
+        "task": m.get("task"),
+        "capability": m.get("capability"),
+        "precision": m.get("precision"),
+        "determinism_class": m.get("determinism_class"),
+        "resolution": resolution,
+        "duration_s": duration_s,
+        "frames": frames,
+        "seed": seeds.get("global_seed"),
+        "sampler": m.get("sampler"),   # {sampler, scheduler, steps, cfg, shift, sigmas}
+        "prompt": m.get("prompt"),
+        "negative_prompt": m.get("negative_prompt"),
+        "source_video": m.get("source_video"),
+    }

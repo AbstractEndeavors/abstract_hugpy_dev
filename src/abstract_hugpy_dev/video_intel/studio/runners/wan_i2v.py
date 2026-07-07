@@ -227,6 +227,57 @@ def _bnb_config(precision: Precision, BitsAndBytesConfig, torch):
 
 
 # --------------------------------------------------------------------------- #
+# GPU PLACEMENT decision (pure, no heavy deps — unit-tested without a GPU)
+# --------------------------------------------------------------------------- #
+# Fixed headroom (GB) on top of the model's declared weight footprint: activations,
+# the text encoder, and the fp32 VAE all live alongside the DiT. A conservative flat
+# margin (operator: "simple thresholds, no over-engineering") that keeps a whole-GPU
+# placement decision honest without modeling every tensor.
+_PLACEMENT_MARGIN_GB = 6.0
+
+
+def _max_vram_gb(manifest: RenderManifest) -> float | None:
+    """The GPU VRAM budget in GB, sourced FIRST from the manifest's captured
+    env_snapshot (``STUDIO_MAX_VRAM_GB``, threaded by ``env.to_snapshot()`` at build
+    time, INV-5) then the live process env. None if neither is set / unparseable — the
+    placement decision then conservatively keeps the current offload behavior."""
+    snap = dict(manifest.env_snapshot)
+    raw = snap.get("STUDIO_MAX_VRAM_GB") or os.environ.get("STUDIO_MAX_VRAM_GB")
+    if raw in (None, ""):
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _should_place_whole_on_gpu(
+    precision: Precision,
+    model_gb: float | None,
+    max_vram_gb: float | None,
+    margin: float = _PLACEMENT_MARGIN_GB,
+) -> bool:
+    """PURE placement decision (no GPU — unit-testable). True => move the WHOLE pipeline
+    to CUDA (``pipe.to("cuda")``); False => ``enable_model_cpu_offload()`` (historical).
+
+    Rule (operator directive — stop parking ~15GB in worker RAM for models that FIT the
+    envelope):
+      * A bitsandbytes-quantized precision (INT8 / FP8) => ALWAYS False. bnb weights are
+        already pinned where they loaded; calling ``.to()`` on an 8-/4-bit model is
+        unsupported and corrupts it — offload the rest as today.
+      * An UNQUANTIZED precision (BF16 / FP16 / FP32) => True iff the model's declared GB
+        at that precision PLUS the activation/encoder margin fits the VRAM budget. Those
+        are plain tensors, so putting the whole pipeline on the GPU (no per-step host<->
+        device shuffling) is both correct and faster.
+    A missing ``model_gb`` / ``max_vram_gb`` (unknown budget) => False (keep offload)."""
+    if precision in (Precision.INT8, Precision.FP8):
+        return False
+    if model_gb is None or max_vram_gb is None:
+        return False
+    return (model_gb + margin) <= max_vram_gb
+
+
+# --------------------------------------------------------------------------- #
 # The runner
 # --------------------------------------------------------------------------- #
 def run_wan_i2v(
@@ -283,6 +334,7 @@ def run_wan_i2v(
     from diffusers import (
         AutoencoderKLWan,
         BitsAndBytesConfig,
+        UniPCMultistepScheduler,
         WanImageToVideoPipeline,
         WanPipeline,
         WanTransformer3DModel,
@@ -301,6 +353,38 @@ def run_wan_i2v(
     # so the pipeline uses its own default rather than an explicit "" negative.
     prompt = manifest.prompt
     negative_prompt = manifest.negative_prompt or None
+
+    # PLACEMENT decision (operator directive: put sub-envelope UNQUANTIZED models WHOLLY
+    # on the GPU instead of parking ~15GB in worker RAM via offload). Pure + precomputed
+    # here; applied per pipe below. A bnb-quantized (INT8/FP8) precision always returns
+    # False (never .to() a quantized pipeline) -> the historical offload path.
+    model_gb = cfg.vram.as_map().get(manifest.precision)
+    place_whole = _should_place_whole_on_gpu(
+        manifest.precision, model_gb, _max_vram_gb(manifest))
+    # SHIFT: the flow-match/UniPC scheduler shift RECORDED in the manifest (set by
+    # resolve_sampler from the resolution: 3.0 @480p, 5.0 @720p+). None (unset) leaves
+    # the pipeline's own default scheduler untouched.
+    flow_shift = manifest.sampler.shift
+
+    def _prepare_pipe(pipe):
+        """Apply the manifest's scheduler shift + the placement decision to a loaded
+        pipe. Wiring shift here (not just recording it) closes the gap where
+        manifest.sampler.shift existed but was never consumed — the denoise now uses
+        EXACTLY the value in the manifest (INV-1)."""
+        if flow_shift is not None:
+            try:
+                # Wan denoises with a flow-prediction UniPC scheduler; from_config keeps
+                # the model's own scheduler config and only overrides flow_shift.
+                pipe.scheduler = UniPCMultistepScheduler.from_config(
+                    pipe.scheduler.config, flow_shift=flow_shift)
+            except Exception:
+                # A diffusers build whose UniPC lacks flow_shift: keep the default
+                # scheduler rather than fail the render (shift is still in the manifest).
+                pass
+        if place_whole:
+            pipe.to("cuda")                    # whole pipeline on GPU (unquantized, fits)
+        else:
+            pipe.enable_model_cpu_offload()    # bnb-quantized OR too big -> offload
 
     # Cooperative mid-render cancel wiring (Task 1). diffusers 0.39's
     # WanImageToVideoPipeline.__call__ supports `callback_on_step_end`; the callback
@@ -370,9 +454,9 @@ def run_wan_i2v(
             pipe = WanImageToVideoPipeline.from_pretrained(
                 model_dir, transformer=transformer, vae=vae,
                 torch_dtype=compute_dtype)
-            # bnb-quantized weights stay put; offload the rest to fit 3090-class
-            # VRAM. (Do NOT call .to("cuda") on an 8bit/4bit model.)
-            pipe.enable_model_cpu_offload()
+            # Placement + scheduler shift (see _prepare_pipe). bnb-quantized weights stay
+            # put (offload); an unquantized model that fits goes wholly to CUDA.
+            _prepare_pipe(pipe)
             # C-prompt: the manifest's text prompt (+ negative) drives conditioning.
             # i2v is image-conditioned, so an empty prompt is still valid.
             result = pipe(
@@ -393,7 +477,8 @@ def run_wan_i2v(
             pipe = WanPipeline.from_pretrained(
                 model_dir, transformer=transformer, vae=vae,
                 torch_dtype=compute_dtype)
-            pipe.enable_model_cpu_offload()
+            # Placement + scheduler shift (see _prepare_pipe).
+            _prepare_pipe(pipe)
             result = pipe(
                 prompt=prompt,
                 negative_prompt=negative_prompt,

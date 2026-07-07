@@ -82,7 +82,9 @@ from .wan_i2v import (
     _bnb_config,
     _frame_to_pil,
     _local_model_dir,
+    _max_vram_gb,
     _missing_deps,
+    _should_place_whole_on_gpu,
     _wan_geometry,
     _weights_root,
 )
@@ -292,6 +294,7 @@ def run_wan_vace(
     from diffusers import (
         AutoencoderKLWan,
         BitsAndBytesConfig,
+        UniPCMultistepScheduler,
         WanVACEPipeline,
         WanVACETransformer3DModel,
     )
@@ -309,6 +312,14 @@ def run_wan_vace(
     # own default rather than an explicit "" negative.
     prompt = manifest.prompt
     negative_prompt = manifest.negative_prompt or None
+
+    # PLACEMENT + SHIFT (shared decision with wan_i2v). Put a sub-envelope UNQUANTIZED
+    # model wholly on the GPU; a bnb-quantized (INT8/FP8) VACE precision offloads (never
+    # .to() a quantized pipeline). flow_shift is the manifest's recorded scheduler shift.
+    model_gb = cfg.vram.as_map().get(manifest.precision)
+    place_whole = _should_place_whole_on_gpu(
+        manifest.precision, model_gb, _max_vram_gb(manifest))
+    flow_shift = manifest.sampler.shift
 
     # Cooperative mid-render cancel wiring (T1). diffusers 0.39's
     # WanVACEPipeline.__call__ supports `callback_on_step_end`; the callback sets
@@ -369,9 +380,21 @@ def run_wan_vace(
 
         pipe = WanVACEPipeline.from_pretrained(
             model_dir, transformer=transformer, vae=vae, torch_dtype=compute_dtype)
-        # bnb-quantized weights stay put; offload the rest to fit 3090-class VRAM.
-        # (Do NOT call .to("cuda") on an 8bit/4bit model.)
-        pipe.enable_model_cpu_offload()
+        # SHIFT: wire the manifest's flow-match/UniPC shift into the scheduler so the
+        # denoise uses exactly the recorded value (INV-1). None leaves the default.
+        if flow_shift is not None:
+            try:
+                pipe.scheduler = UniPCMultistepScheduler.from_config(
+                    pipe.scheduler.config, flow_shift=flow_shift)
+            except Exception:
+                pass  # diffusers build without flow_shift on UniPC — keep the default
+        # PLACEMENT: whole pipeline to GPU when it fits unquantized, else offload. A
+        # bnb-quantized (INT8/FP8) precision ALWAYS offloads (never .to() a quantized
+        # pipeline — _should_place_whole_on_gpu returns False for INT8/FP8).
+        if place_whole:
+            pipe.to("cuda")
+        else:
+            pipe.enable_model_cpu_offload()
 
         # VACE unified control: `video=` conditions the generation on the source
         # clip's frames (no mask / reference_images => pure v2v restyle/enhance).

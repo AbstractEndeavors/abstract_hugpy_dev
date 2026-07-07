@@ -282,6 +282,14 @@ class CapabilityRequest:
     # extends it from its LAST FRAME — see produce_clip / the i2v runners). None when
     # the request has no source clip (a plain i2v/t2v).
     source_video: str | None = None
+    # DIRECT MODEL CHOICE (pin): the caller wants a SPECIFIC model_id, not the router's
+    # auto-pick. When set, the router restricts its candidate set to exactly this model
+    # and either binds it (if it declares the capability, serves it, and fits the live
+    # budget/resolution) or returns a CLEAR Err-as-data — NEVER a silent fallback to a
+    # different model (see CapabilityRouter.resolve + ErrorCode.PINNED_MODEL_UNAVAILABLE).
+    # None (the default) = auto-pick, the historical behavior. Appended (not inserted)
+    # so no positional field shifts for existing construction sites.
+    pinned_model_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -67,6 +67,34 @@ class CapabilityRouter:
                 f"no model declares capability {req.capability.value!r}",
             ))
 
+        # DIRECT MODEL CHOICE (pin): the caller asked for a SPECIFIC model_id. Restrict
+        # the candidate set to exactly that model — it still runs the full gate ladder
+        # below (resolution / license / VRAM), so a pin that "doesn't fit" surfaces the
+        # normal sharpened reason. Two pin-specific failures are reported UP FRONT as
+        # clear data (never a silent fallback to a different model): the model_id is
+        # unknown to the registry, or it exists but does not declare this capability.
+        if req.pinned_model_id is not None:
+            pinned = MODEL_REGISTRY.get(req.pinned_model_id)
+            if pinned is None:
+                return Err(StageError(
+                    ErrorCode.PINNED_MODEL_UNAVAILABLE,
+                    f"pinned model_id {req.pinned_model_id!r} is not in the studio "
+                    f"registry",
+                    (("pinned_model_id", req.pinned_model_id),
+                     ("capability", req.capability.value)),
+                ))
+            if req.capability not in pinned.capabilities:
+                return Err(StageError(
+                    ErrorCode.PINNED_MODEL_UNAVAILABLE,
+                    f"pinned model {req.pinned_model_id!r} does not serve capability "
+                    f"{req.capability.value!r}",
+                    (("pinned_model_id", req.pinned_model_id),
+                     ("capability", req.capability.value),
+                     ("model_capabilities",
+                      ",".join(sorted(c.value for c in pinned.capabilities)))),
+                ))
+            candidates = [pinned]
+
         rejected: list[str] = []
         survivors: list[tuple[ModelConfig, object, Precision]] = []
 

@@ -134,6 +134,12 @@ def build_capability_request(spec):
         # B2 chain: carry the source clip on the request (routing does not key on it;
         # produce_clip reads spec.source_video for the manifest + extend). None -> None.
         source_video=getattr(spec, "source_video", None),
+        # DIRECT MODEL CHOICE: thread the pin so the router binds the requested model or
+        # returns a clear Err. Also steers the delegation DECISION (a pinned real model
+        # delegates to the GPU worker), since should_delegate/resolves_to_real_model both
+        # build the request through here. getattr keeps older spec dicts (no model_id)
+        # working. None -> auto-pick.
+        pinned_model_id=getattr(spec, "model_id", None),
     )
 
 
@@ -157,6 +163,11 @@ def run_produce_clip(spec, should_cancel):
         env=env,
         out_root=spec.out_root,
         seeds=seeds,
+        # SAMPLER OVERRIDES: pass the spec's optional steps/cfg (None = unset -> the bound
+        # model's family default fills them in produce_clip). getattr keeps older spec
+        # dicts (no steps/cfg fields) working.
+        steps=getattr(spec, "steps", None),
+        cfg=getattr(spec, "cfg", None),
         start_image=spec.start_image,
         prompt=getattr(spec, "prompt", "") or "",
         negative_prompt=getattr(spec, "negative", "") or "",

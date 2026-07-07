@@ -121,6 +121,10 @@ _EXPECTED = {
     "portrait-720p-i2v":       (Framework.WAN, "wan2.1-i2v-14b-720p"),
     "wan-t2v-1.3b-3090":       (Framework.WAN, "wan2.1-t2v-1.3b"),
     "max-quality-t2v":         (Framework.WAN, "wan2.2-t2v-a14b"),
+    # Two first-class TIERS (this slice): the DRAFT (1.3B t2v @ 9 GB) and QUALITY
+    # (14B i2v @ 16 GB) one-click presets. Router-verified like the other seeds.
+    "draft-t2v-1.3b":          (Framework.WAN, "wan2.1-t2v-1.3b"),
+    "quality-i2v-14b-int8":    (Framework.WAN, "wan2.1-i2v-14b-720p"),
     # Slice (a) / v2v RESTYLE: capability v2v @ 832x480 @ 6 GB is the only V2V bind
     # that fits (the 14B needs 14 GB+), so it resolves to the Wan 2.1 VACE 1.3B model.
     "restyle-480p-v2v":        (Framework.WAN, "wan2.1-vace-1.3b"),

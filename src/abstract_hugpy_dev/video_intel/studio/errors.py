@@ -62,6 +62,16 @@ class ErrorCode(str, Enum):
     # than masked by a GPU-less box's DEPS_MISSING. INTENTIONAL / not retryable (the
     # same source-less spec re-run fails identically).
     SOURCE_MISSING = "source_missing"     # v2v render has no source clip to enhance
+    # DIRECT MODEL CHOICE (pin): a request pinned a specific model_id (the caller wants
+    # THAT model, not the router's auto-pick). This code is returned as DATA (never a
+    # silent fallback to another model) when the pin cannot be honored: the model_id is
+    # unknown to the studio registry, or the model exists but does not declare the
+    # requested capability. A pinned model that DOES serve the capability but fails a
+    # live gate (resolution / VRAM budget / license) surfaces the normal sharpened code
+    # (RESOLUTION_UNSUPPORTED / VRAM_EXCEEDED / LICENSE_VIOLATION) with the single
+    # rejected reason — so the caller always learns exactly why the pin didn't bind.
+    # Deterministic (the same pin fails identically) -> the bus classifies it not-retryable.
+    PINNED_MODEL_UNAVAILABLE = "pinned_model_unavailable"
 
 
 @dataclass(frozen=True)
