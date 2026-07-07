@@ -64,6 +64,43 @@ def llm_jobs():
 
 
 # ---------------------------------------------------------------------------
+# Cancel fan-out (B1): one control-plane cancel across BOTH planes on the shared
+# job id. comms.JobStore.cancel handles chat/download (and raises the mirror
+# flag); for a media job (transport == "media") we ALSO reach the media_bus so
+# the execution plane actually stops (queued -> terminal 'cancelled', running ->
+# cooperative 'cancelling'). The media_bus import lives HERE (the flask route),
+# never in comms/, so comms stays free of any video_intel coupling.
+# ---------------------------------------------------------------------------
+@comms_bp.route("/llm/jobs/<job_id>/cancel", methods=["POST"])
+def llm_job_cancel(job_id):
+    from abstract_hugpy_dev.comms import job_store
+    body = request.get_json(silent=True) or {}
+    reason = str(body.get("reason") or "")
+    ok = job_store.cancel(job_id, reason)
+    job = job_store.get(job_id)
+    transport = getattr(job, "transport", None) if job is not None else None
+    comms_status = job.to_dict()["status"] if job is not None else None
+    # Reach the execution plane UNCONDITIONALLY. media_bus.cancel is a safe no-op
+    # for a non-media id (unknown -> {cancelled:False, status:None}, a pure read),
+    # so calling it always also covers a QUEUED media job — which has no local
+    # JobStore record (on_enqueue is mirror-only) and therefore no readable
+    # transport from job_store.get; the gated version silently skipped it. The
+    # media_bus import lives HERE (flask route), never in comms/, so comms stays
+    # free of any video_intel coupling.
+    from abstract_hugpy_dev.video_intel import media_bus
+    mb = media_bus.cancel(job_id)
+    mb_known = mb.get("status") is not None or bool(mb.get("cancelled"))
+    if mb_known and transport is None:
+        transport = "media"  # queued media, inferred from the execution plane
+    cancelled = bool(ok) or bool(mb.get("cancelled"))
+    status = mb.get("status") if mb_known else comms_status
+    audit("job.cancel", {"job_id": job_id, "transport": transport,
+                         "cancelled": cancelled, "reason": reason})
+    return jsonify({"job_id": job_id, "cancelled": cancelled,
+                    "status": status, "transport": transport})
+
+
+# ---------------------------------------------------------------------------
 # F2 — principals (operator-gated writes; see _SENSITIVE)
 # ---------------------------------------------------------------------------
 @comms_bp.route("/auth/principals", methods=["GET"])

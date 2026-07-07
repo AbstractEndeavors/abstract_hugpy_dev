@@ -67,9 +67,11 @@ class VideoGenPreset:
     negative: str = ""
     recommended: str = "gpu"
     quant: str = "auto"          # advisory/display only — see module quant note
-    # DISPLAY-ONLY: the comfy runtime hardcodes sampler_name="euler",
-    # scheduler="normal" (managers/comfy/comfy_runner.py:67) — not yet plumbed;
-    # additive to the wire shape, UI may ignore.
+    # The comfy runner now honors per-request sampler_name/scheduler
+    # (managers/comfy/comfy_runner.py — plumbed 2026-07-06 via
+    # ImageGenRequest.sampler_name/scheduler + the builders' 'sampler' alias).
+    # The scene/movie spec path does NOT yet forward this field, so from the
+    # scene UI it remains display-only until that plumbing lands.
     sampler: str = "euler"
 
     def defaults(self) -> Dict[str, Any]:
@@ -98,8 +100,8 @@ class VideoGenPreset:
             # advisory, display-only (see module quant note) — additive to the
             # pinned shape; the UI is free to ignore it.
             "quant": self.quant,
-            # advisory, display-only — runtime hardcodes euler/normal (see the
-            # sampler note on the dataclass); additive, the UI may ignore it.
+            # the comfy runner honors sampler per-request (dataclass note); the
+            # scene path doesn't forward it yet. Additive; the UI may ignore it.
             "sampler": self.sampler,
         }
 
@@ -190,8 +192,9 @@ register_preset(VideoGenPreset(
 # ---- ComfyUI Field Guide presets ------------------------------------------
 # Derived from the "ComfyUI Field Guide" recipe table; each model_key validated
 # against the live catalog (get_models_dict) on 2026-07-06 and exercised by the
-# 17-model battery (all 6/6 green). ``sampler`` values are advisory/display-only
-# (see the sampler note on the dataclass — runtime uses euler/normal).
+# 17-model battery (all 6/6 green). ``sampler`` values are honored by the comfy
+# runner for direct image-gen requests (see the dataclass note); the scene path
+# does not forward them yet.
 
 register_preset(VideoGenPreset(
     id="photoreal-portrait-sd15",
@@ -343,6 +346,12 @@ class MoviePreset:
     chain: bool
     # the goal timeline — contiguous half-open intervals tiling [0, total)
     goals: Tuple[Dict[str, Any], ...]
+    # scene-template img2img knobs (shared by every segment; both default so the
+    # 6 pre-existing presets are unaffected). Mirror MovieSpec/make_movie, which
+    # already accept both: ``strength`` is the img2img denoise (None -> backend
+    # default), ``negative`` the shared negative prompt ("" -> none).
+    strength: Optional[float] = None
+    negative: str = ""
     # director knobs (opt-in per-segment vision scoring + retry)
     vision_enabled: bool = False
     score_threshold: int = 60
@@ -357,6 +366,8 @@ class MoviePreset:
             "guidance": self.guidance,
             "fps": self.fps,
             "chain": self.chain,
+            "strength": self.strength,
+            "negative": self.negative,
         }
 
     def goals_list(self) -> List[Dict[str, Any]]:
@@ -384,6 +395,8 @@ class MoviePreset:
             "settings": self.settings(),
             "goals": self.goals_list(),
             "total_frames": self.total_frames(),
+            "strength": self.strength,
+            "negative": self.negative,
             "vision_enabled": self.vision_enabled,
             "score_threshold": self.score_threshold,
             "recommended": self.recommended,
@@ -403,6 +416,8 @@ class MoviePreset:
             "fps": self.fps,
             "assemble": True,
             "chain": self.chain,
+            "strength": self.strength,
+            "negative": self.negative,
             "goals": self.goals_list(),
             "vision_enabled": self.vision_enabled,
             "score_threshold": self.score_threshold,
@@ -586,4 +601,44 @@ register_movie_preset(MoviePreset(
         _goal(9, 12, "a single radiant star filling the frame, blinding light, "
                      "lens flare"),
     ),
+))
+
+# Empirically tuned (2026-07-06) img2img drift template — the FIRST movie preset
+# to lean on strength + negative. REQUIRES a start image (an img2img chain): the
+# person is carried from YOUR start frame, so without one it has nothing to follow.
+# strength 0.45 is the sweet spot where the head-turns actually land (lower toward
+# 0.35 for tighter identity but less motion). Four contiguous 3-frame segments
+# tiling [0, 12).
+register_movie_preset(MoviePreset(
+    id="street-walk",
+    name="Street Walk (bring a start image)",
+    description=("Drift a person from YOUR start image: they walk down the street, "
+                 "reach the corner, then look left and right. REQUIRES a start image "
+                 "(this is an img2img chain — without one it can't follow your "
+                 "subject). Strength 0.45 is the sweet spot where the head-turns "
+                 "actually happen; lower it toward 0.35 for tighter identity but "
+                 "less motion."),
+    model_key="comfy-juggernautxl-ragnarok",
+    width=512,
+    height=680,
+    steps=18,
+    guidance=6.0,
+    fps=8,
+    chain=True,
+    strength=0.45,
+    negative=("different person, face change, identity change, deformed face, "
+              "extra limbs, warped body, morphing, blurry"),
+    goals=(
+        _goal(0, 3, "the same person from the start image walking down a city "
+                    "sidewalk, tracking shot following them, mid-stride, moving "
+                    "forward"),
+        _goal(3, 6, "the same person reaching the street corner and easing to a "
+                    "stop, standing at the curb"),
+        _goal(6, 9, "the same person at the corner turning their head to look to "
+                    "the LEFT, profile view of their face"),
+        _goal(9, 12, "the same person turning their head to look to the RIGHT, "
+                     "profile of their face facing the other way"),
+    ),
+    vision_enabled=False,
+    recommended="gpu",
 ))

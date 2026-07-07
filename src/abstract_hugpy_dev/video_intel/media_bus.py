@@ -35,6 +35,7 @@ from .job_schema import JOB_REGISTRY
 from .media_schema import make_media_ref
 from .movie_schema import GoalInterval, make_movie
 from .scene_schema import make_generate_scene
+from .studio.job import studio_i2v_from_dict
 from .result_schema import JobResult
 from .runners import DISPATCH
 
@@ -194,6 +195,9 @@ SPEC_DESERIALIZERS: Dict[str, Callable[[dict], object]] = {
     "generate_image": _generate_image_from_dict,
     "generate_scene": _generate_scene_from_dict,
     "generate_movie": _generate_movie_from_dict,
+    # B2 (closes manifest.py TODO(P0-3)): the studio i2v spec rehydrates through
+    # its own validate-at-construction factory (studio.job.studio_i2v_from_dict).
+    "studio_i2v": studio_i2v_from_dict,
 }
 
 
@@ -255,6 +259,21 @@ def _ensure_db() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# comms.JobStore bridge (A/P0-2) — one-directional (bus -> JobStore) mirror of
+# media-job lifecycle so media jobs surface in GET /llm/jobs. Kept as a thin,
+# lazily-imported, exception-swallowing dispatcher so this module has ZERO
+# import-time coupling to comms and a bridge failure can never break a media
+# job. All bridge policy lives in video_intel/job_bridge.py.
+# --------------------------------------------------------------------------- #
+def _bridge(fn_name: str, *args, **kwargs) -> None:
+    try:
+        from . import job_bridge
+        getattr(job_bridge, fn_name)(*args, **kwargs)
+    except Exception:
+        pass  # bus -> JobStore mirror is best-effort; execution is unaffected
+
+
+# --------------------------------------------------------------------------- #
 # API
 # --------------------------------------------------------------------------- #
 def enqueue(name: str, spec) -> str:
@@ -275,6 +294,9 @@ def enqueue(name: str, spec) -> str:
         )
     finally:
         conn.close()
+    # One-directional bridge (A/P0-2): surface this queued job in comms.JobStore
+    # (GET /llm/jobs). Best-effort — never fails the enqueue.
+    _bridge("on_enqueue", job_id, name)
     return job_id
 
 
@@ -339,6 +361,10 @@ def run_claimed(job_id: str, worker_token: str) -> Optional[JobResult]:
     finally:
         conn.close()
 
+    # One-directional bridge (A/P0-2): mark this job running in comms.JobStore
+    # (GET /llm/jobs), in the process that actually owns the run. Best-effort.
+    _bridge("on_running", job_id, name, worker=worker_token)
+
     # ---- run outside the DB connection; the runner is pure & may block ----
     try:
         spec = deserialize_spec(name, json.loads(spec_json))
@@ -382,6 +408,10 @@ def run_claimed(job_id: str, worker_token: str) -> Optional[JobResult]:
         )
     finally:
         conn.close()
+    # One-directional bridge (A/P0-2): mark the terminal state in comms.JobStore
+    # (done | failed | cancelled), carrying the clip uri on success. Best-effort.
+    _bridge("on_terminal", job_id, name, status, result=result,
+            worker=worker_token)
     return result
 
 
@@ -413,6 +443,14 @@ def cancel(job_id: str) -> dict:
                 "updated=? WHERE job_id=? AND status='queued'",
                 (result_json, time.time(), job_id),
             )
+            # Bridge the immediate (pre-start) terminal so a cancel-before-run
+            # shows as cancelled in GET /llm/jobs too. Best-effort; the name is
+            # read from the row so no signature change is needed.
+            nrow = conn.execute(
+                "SELECT name FROM media_jobs WHERE job_id=?", (job_id,)
+            ).fetchone()
+            _bridge("on_terminal", job_id, (nrow[0] if nrow else "media"),
+                    "cancelled")
             return {"job_id": job_id, "status": "cancelled", "cancelled": True}
         if status in ("claimed", "running"):
             conn.execute(

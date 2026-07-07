@@ -12,9 +12,28 @@ from typing import Optional, Tuple, Dict, Any
 
 from .media_schema import MediaRef
 
+# --- Task 2 (JobError class-collapse) --------------------------------------
+# JobError is UNIFIED with comms.jobs.JobError: there is now exactly ONE JobError
+# class in the tree, and this name re-binds to it, so every existing
+# ``from ..result_schema import JobError`` site (the runners + media_bus)
+# transparently constructs the canonical class. Direction is legal — video_intel
+# already depends on comms (job_bridge) — and comms imports nothing from
+# video_intel, so no cycle. The canonical class is a superset of the old shape
+# (it adds a nullable ``detail`` between ``message`` and ``retryable``, plus
+# ``to_dict``/``coerce``); every construction here passes ``code=/message=/
+# retryable=`` as KEYWORDS, so the extra middle field stays inert and defaults to
+# None. On /api/video/jobs (media_bus serializes JobResult via ``asdict``) the
+# nested error therefore gains ``"detail": null`` — additive, backward-compatible.
+from ..comms.jobs import JobError  # noqa: F401  (re-export: result_schema.JobError IS comms.jobs.JobError)
 
+
+# ARCHIVED — do NOT delete (operator rule: archive preexisting code, never delete).
+# The original result_schema-local JobError, SUPERSEDED by comms.jobs.JobError in
+# the Task 2 collapse. Retained for history only; nothing references this name —
+# the live ``JobError`` above is the canonical comms class. Kept frozen exactly as
+# it was.
 @dataclass(frozen=True)
-class JobError:
+class _ArchivedResultSchemaJobError:
     code: str
     message: str
     retryable: bool

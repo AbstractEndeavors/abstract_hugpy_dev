@@ -34,6 +34,12 @@ class ImageGenRequest(BaseModel):
     height: Optional[int] = Field(default=None, ge=64, le=4096, multiple_of=8)
     num_inference_steps: Optional[int] = Field(default=None, ge=1, le=200)
     guidance_scale: Optional[float] = Field(default=None, ge=0.0, le=50.0)
+    # --- ComfyUI sampler plumbing (additive) ---
+    # Read only by the comfy runner (managers/comfy/comfy_runner.py); the
+    # diffusers runners ignore them. None -> the runner's historical
+    # euler/normal defaults, so requests without them behave exactly as before.
+    sampler_name: Optional[str] = None
+    scheduler: Optional[str] = None
     seed: Optional[int] = None
     # --- img2img (image-to-image) additive fields ---
     # text-to-image callers never set these (extra="ignore" on the frozen model

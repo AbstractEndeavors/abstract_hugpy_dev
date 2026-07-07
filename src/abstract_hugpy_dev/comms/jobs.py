@@ -50,6 +50,15 @@ CANONICAL_STATUSES = ("pending", "processing", "streaming",
                       "done", "cancelled", "failed")
 TERMINAL_STATUSES = frozenset(("done", "cancelled", "failed"))
 
+# The media_bus job kinds bridged in via video_intel.job_bridge (transport
+# "media"). snapshot(live_only=False) surfaces a sibling process's *terminal*
+# rows for THESE kinds only (via mirror.terminal_rows), so a finished media job
+# is visible on every process — not just the one that ran it. Strictly gated to
+# media so chat/download terminal cross-process behavior is unchanged (their
+# terminal rows still show only via each process's local ~600s retention).
+MEDIA_KINDS = ("crop", "frame_extract", "generate_scene",
+               "generate_movie", "studio_i2v")
+
 # Old JOBSTATUS names (and activity.py's view states) -> canonical.
 _LEGACY_STATUS = {
     "queued": "pending",
@@ -86,11 +95,19 @@ class JobError:
     code: str = "error"
     message: str = ""
     detail: Optional[dict] = None
+    # Field-aligned with video_intel.result_schema.JobError (which serializes on
+    # /video/jobs and REQUIRES retryable). Here it is nullable and additive: chat
+    # /download rows serialize "retryable": null; bridged media rows carry the
+    # real bool. Deliberately NOT required — never break the non-media callers.
+    retryable: Optional[bool] = None
 
     def to_dict(self) -> dict:
         out = {"code": self.code, "message": self.message}
         if self.detail:
             out["detail"] = self.detail
+        # Emitted ALWAYS (nullable) so every /llm/jobs error object carries the
+        # field — a real bool for media, null for chat/download.
+        out["retryable"] = self.retryable
         return out
 
     @classmethod
@@ -100,7 +117,8 @@ class JobError:
         if isinstance(err, dict):
             return cls(code=str(err.get("code") or "error"),
                        message=str(err.get("message") or ""),
-                       detail=err.get("detail"))
+                       detail=err.get("detail"),
+                       retryable=err.get("retryable"))
         if isinstance(err, BaseException):
             return cls(code=type(err).__name__, message=str(err))
         return cls(message=str(err))
@@ -441,6 +459,22 @@ class JobStore:
                     out.append(d)
             except Exception:
                 pass
+            # Cross-process TERMINAL media rows (media-gated). live_rows() hides
+            # terminal rows by design; this additive merge surfaces a sibling's
+            # finished media job on the full (live_only=False) view — and ONLY
+            # for MEDIA_KINDS, so chat/download terminal behavior is unchanged.
+            if not live_only:
+                try:
+                    seen = {d.get("id") for d in out}   # local + live-merged ids
+                    for d in self.mirror.terminal_rows(MEDIA_KINDS):
+                        if d.get("id") in seen:
+                            continue
+                        if kinds is not None and d.get("kind") not in kinds:
+                            continue
+                        out.append(d)
+                        seen.add(d.get("id"))
+                except Exception:
+                    pass
         out.sort(key=lambda d: (d["status"] not in ("pending", "processing"),
                                 -d.get("elapsed", 0)))
         return out

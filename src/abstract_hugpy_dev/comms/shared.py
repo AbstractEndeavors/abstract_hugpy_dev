@@ -229,3 +229,35 @@ class SqliteMirror:
             except Exception:
                 continue
         return out
+
+    def terminal_rows(self, kinds: tuple) -> list[dict[str, Any]]:
+        """Snapshots of TERMINAL jobs of the given kinds — the additive
+        complement to live_rows() (which excludes terminal by design). Callers
+        pass a strict kind allowlist (MEDIA_KINDS) so this surfaces a sibling's
+        finished media job cross-process WITHOUT touching chat/download terminal
+        behavior. Empty kinds -> nothing (never a full-table terminal scan)."""
+        kinds = tuple(kinds or ())
+        if not kinds:
+            return []
+        if not self._ensure():
+            return []
+        try:
+            # Placeholders are '?' derived from the count only — the kind values
+            # themselves are always bound parameters (no SQL injection surface).
+            placeholders = ",".join("?" for _ in kinds)
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT data FROM jobs WHERE "
+                    "status IN ('done','cancelled','failed') "
+                    f"AND kind IN ({placeholders})", kinds).fetchall()
+            self._ok()
+        except Exception as exc:
+            self._note_failure("terminal_rows", exc)
+            return []
+        out = []
+        for (data,) in rows:
+            try:
+                out.append(json.loads(data))
+            except Exception:
+                continue
+        return out

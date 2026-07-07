@@ -59,6 +59,7 @@ from abstract_hugpy_dev.video_intel.gen_schema import (
 )
 from abstract_hugpy_dev.video_intel.scene_schema import make_generate_scene
 from abstract_hugpy_dev.video_intel.movie_schema import GoalInterval, make_movie
+from abstract_hugpy_dev.video_intel.studio.job import make_studio_i2v
 from abstract_hugpy_dev.video_intel.chains import (
     resolve_video_parts,
     resolve_video_parts_scene,
@@ -347,6 +348,63 @@ def video_generate_movie():
 
 
 # --------------------------------------------------------------------------- #
+# 2d'') POST /video/studio/i2v — a studio image-to-video clip via the cinema
+#        studio spine (B2). Mirrors the movie/scene routes: parse body -> build
+#        the validated StudioI2VSpec -> media_bus.enqueue -> {job_id}. The job
+#        runs through the studio's own router->manifest->runner->content-addressed
+#        clip path (produce_clip) and its output is cataloged in the media store.
+#        Query it exactly like any other media job: GET /video/jobs/<job_id>.
+# --------------------------------------------------------------------------- #
+@video_bp.route("/video/studio/i2v", methods=["POST"])
+def video_studio_i2v():
+    body = request.get_json(silent=True) or {}
+    # resolution may arrive nested ({"resolution": {"width","height","fps"}}) or as
+    # flat top-level keys — accept both (nested wins, mirrors the frontend contract).
+    res = body.get("resolution") if isinstance(body.get("resolution"), dict) else {}
+    width = res.get("width", body.get("width"))
+    height = res.get("height", body.get("height"))
+    fps = res.get("fps", body.get("fps"))
+    # sane studio default so an empty POST still produces a clip (synthetic spine).
+    width = 512 if width is None else width
+    height = 512 if height is None else height
+    fps = 24 if fps is None else fps
+    # capability defaults to "i2v" (backward-compat); "t2v" (text-to-video) and any
+    # other Capability value are accepted and validated inside make_studio_i2v.
+    capability = body.get("capability", "i2v")
+    # a start_image, if supplied, must resolve inside the storage jail (never an
+    # arbitrary-file read) — same seam as /video/ingest. T2V is TEXT-ONLY, so a
+    # start_image is meaningless for it: we DELIBERATELY IGNORE it (drop to None),
+    # never jail-resolve or reject it — a t2v clip is a pure function of prompt +
+    # seed + geometry. i2v (the default) is unaffected.
+    start_image = body.get("start_image")
+    if capability == "t2v":
+        start_image = None
+    elif start_image is not None:
+        start_image = _jail_resolve(start_image)
+        if start_image is None:
+            return jsonify({"error": "start_image outside storage jail"}), 400
+    try:
+        spec = make_studio_i2v(
+            capability=capability,
+            width=width,
+            height=height,
+            fps=fps,
+            vram_budget_gb=body.get("vram_budget_gb", 0.5),
+            seed=body.get("seed", 0),
+            out_root=body.get("out_root"),
+            start_image=start_image,
+            # C-prompt: accept "negative_prompt" (canonical) with backward-compat to
+            # the older "negative" key; "prompt" carries the positive text prompt.
+            negative=body.get("negative_prompt", body.get("negative")),
+            prompt=body.get("prompt"),
+        )
+    except (ValueError, TypeError) as exc:  # bad geometry / capability = 400
+        return jsonify({"error": str(exc)}), 400
+    job_id = media_bus.enqueue("studio_i2v", spec)
+    return jsonify({"job_id": job_id}), 200
+
+
+# --------------------------------------------------------------------------- #
 # 2e) GET /video/presets — curated "ideal default loads" for scene generation
 # --------------------------------------------------------------------------- #
 # Thin idiom (mirrors prompt_routes' GET /prompt/tasks): import the static
@@ -544,4 +602,110 @@ def video_media():
         resolved,
         mimetype=mime or "application/octet-stream",
         conditional=True,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 5) GET /video/studio/clip/<job_id> — STREAM a produced studio clip (slice #3).
+#     Convenience twin of /video/media for studio i2v: resolve the clip path from
+#     the media-bus job result (the content-addressed clip cataloged by the studio
+#     runner) BY JOB ID, so the console viewer plays a clip without ever handling a
+#     filesystem path. Range-aware (send_file conditional=True) so an HTML5 <video>
+#     can seek. Path-traversal guard: the resolved realpath MUST live under the
+#     studio clips dir — a job whose output escapes that tree (or any non-studio /
+#     non-done job) is refused, so this can only ever serve a cataloged studio clip.
+# --------------------------------------------------------------------------- #
+@video_bp.route("/video/studio/clips", methods=["GET"])
+def video_studio_clips():
+    # DURABLE recent-clips list for the console viewer (slice #3). Sources the media
+    # CATALOG (the media-bus job store) rather than the comms /llm/jobs view, which
+    # only retains terminal rows for ~600s — so a clip produced an hour ago still
+    # lists here. Read-only projection: job_id + status + the first output's display
+    # metadata (asset_id/geometry/duration). The clip bytes are NEVER referenced by
+    # path in the response — playback is by job_id through /video/studio/clip/<id>,
+    # which owns the jail. Reads media_bus's own DB_PATH via a read-only connection
+    # (mirrors media_bus.get's read); it does not mutate the bus or its schema.
+    import json as _json
+    import sqlite3
+
+    try:
+        limit = int(request.args.get("limit", 50))
+    except (TypeError, ValueError):
+        limit = 50
+    limit = max(1, min(limit, 200))
+
+    clips = []
+    try:
+        conn = sqlite3.connect(
+            f"file:{media_bus.DB_PATH}?mode=ro", uri=True, timeout=5.0)
+        conn.execute("PRAGMA busy_timeout=5000")
+        try:
+            rows = conn.execute(
+                "SELECT job_id, status, result_json, created, updated "
+                "FROM media_jobs WHERE name='studio_i2v' "
+                "ORDER BY updated DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        # No DB yet / transient lock -> an empty list is the honest answer.
+        rows = []
+
+    for job_id, status, result_json, created, updated in rows:
+        out = None
+        if result_json:
+            try:
+                res = _json.loads(result_json)
+                outputs = res.get("outputs") or []
+                if outputs and isinstance(outputs[0], dict):
+                    o = outputs[0]
+                    out = {
+                        "asset_id": o.get("asset_id"),
+                        "width": o.get("width"),
+                        "height": o.get("height"),
+                        "duration_s": o.get("duration_s"),
+                    }
+            except (ValueError, TypeError):
+                out = None
+        clips.append({
+            "job_id": job_id,
+            "status": status,
+            "playable": bool(status == "done" and out),
+            "created": created,
+            "updated": updated,
+            "output": out,
+        })
+
+    return jsonify({"clips": clips}), 200
+
+
+@video_bp.route("/video/studio/clip/<job_id>", methods=["GET"])
+def video_studio_clip(job_id):
+    # Canonical clips root — imported LAZILY (mirrors the runner's lazy studio-spine
+    # imports) so this module stays app-boot cheap and drift-free with studio.job.
+    from abstract_hugpy_dev.video_intel.studio.job import DEFAULT_CLIPS_ROOT
+
+    view = media_bus.get(job_id)              # {"status","result",...} — unknown -> nulls
+    result = view.get("result") if isinstance(view, dict) else None
+    if not (isinstance(result, dict) and result.get("ok")):
+        # unknown / queued / running / failed / cancelled — no playable clip yet
+        return jsonify({"error": "no completed studio clip for that job"}), 404
+
+    outputs = result.get("outputs") or []
+    uri = outputs[0].get("uri") if (outputs and isinstance(outputs[0], dict)) else None
+    if not uri or not isinstance(uri, str):
+        return jsonify({"error": "job result carries no clip uri"}), 404
+
+    # Jail: only serve a file that really lives under the studio clips tree. This is
+    # the single seam that keeps a crafted/rehomed uri from becoming an arbitrary
+    # file read — it is checked on the REALPATH, so symlinks/.. can't escape.
+    resolved = os.path.realpath(uri)
+    if not _is_within(resolved, DEFAULT_CLIPS_ROOT) or not os.path.isfile(resolved):
+        return jsonify({"error": "clip not found"}), 404
+
+    return send_file(
+        resolved,
+        mimetype="video/mp4",
+        conditional=True,   # HTTP Range + conditional requests => <video> can seek
     )

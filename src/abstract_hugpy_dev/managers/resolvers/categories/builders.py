@@ -245,12 +245,16 @@ def _build_imagegen_request(kwargs: Dict[str, Any], model_key: str) -> ImageGenR
         "request_id": kwargs.get("request_id", make_request_id()),
     }
     for k in ("negative_prompt", "width", "height", "num_inference_steps",
-              "guidance_scale", "seed", "num_images", "return_b64", "pool"):
+              "guidance_scale", "sampler_name", "scheduler", "seed",
+              "num_images", "return_b64", "pool"):
         if k in kwargs:
             out[k] = kwargs[k]
     # 'steps' is the colloquial alias clients reach for first.
     if "steps" in kwargs and "num_inference_steps" not in out:
         out["num_inference_steps"] = kwargs["steps"]
+    # 'sampler' is the colloquial alias (matches presets.py's field name).
+    if "sampler" in kwargs and "sampler_name" not in out:
+        out["sampler_name"] = kwargs["sampler"]
     return ImageGenRequest(**out)
 
 
@@ -289,13 +293,16 @@ def _build_img2img_request(kwargs: Dict[str, Any], model_key: str) -> ImageGenRe
         "request_id": kwargs.get("request_id", make_request_id()),
     }
     for k in ("negative_prompt", "width", "height", "num_inference_steps",
-              "guidance_scale", "seed", "num_images", "return_b64", "pool",
-              "strength"):
+              "guidance_scale", "sampler_name", "scheduler", "seed",
+              "num_images", "return_b64", "pool", "strength"):
         if k in kwargs:
             out[k] = kwargs[k]
     # 'steps' is the colloquial alias clients reach for first.
     if "steps" in kwargs and "num_inference_steps" not in out:
         out["num_inference_steps"] = kwargs["steps"]
+    # 'sampler' is the colloquial alias (matches presets.py's field name).
+    if "sampler" in kwargs and "sampler_name" not in out:
+        out["sampler_name"] = kwargs["sampler"]
     return ImageGenRequest(**out)
 
 

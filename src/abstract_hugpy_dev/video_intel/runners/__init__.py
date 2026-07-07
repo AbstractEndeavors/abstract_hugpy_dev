@@ -21,6 +21,10 @@ from .ffmpeg_frames import run_frame_extract
 from .imagegen import run_generate_image
 from .movie import run_generate_movie
 from .scene import run_generate_scene
+# B2: studio i2v — the media bus's seam to the studio spine (produce_clip). Its
+# module top is dependency-light (studio/numpy imports are lazy inside the runner),
+# so this import can never break app boot.
+from .studio_i2v import run_studio_i2v
 
 DISPATCH = {
     ("ffmpeg", "crop"): run_crop,
@@ -29,4 +33,5 @@ DISPATCH = {
     ("diffusers", "generate_image"): run_generate_image,
     ("diffusers", "generate_scene"): run_generate_scene,
     ("diffusers", "generate_movie"): run_generate_movie,
+    ("studio", "i2v"): run_studio_i2v,
 }
