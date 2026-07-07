@@ -26,6 +26,7 @@ from uuid import uuid4
 
 from .frame_schema import make_frame_extract
 from .gen_schema import GenerateImageSpec, GenPromptPart, image_part, make_generate_image
+from .movie_schema import GoalInterval, MovieSpec, make_movie
 from .scene_schema import GenerateSceneSpec, make_generate_scene
 from .runners.ffmpeg_frames import run_frame_extract
 
@@ -89,6 +90,7 @@ def resolve_video_parts(spec: GenerateImageSpec, *, uniform_n: int = 4) -> Gener
         seed=spec.seed,
         negative=spec.negative,
         strength=spec.strength,   # carry the img2img knob through re-validation
+        project=spec.project,     # carry the auto-archive NAME through re-validation
     )
 
 
@@ -122,4 +124,46 @@ def resolve_video_parts_scene(spec: GenerateSceneSpec, *, uniform_n: int = 4) ->
         negative=spec.negative,
         strength=spec.strength,   # carry img2img knobs through re-validation
         chain=spec.chain,
+        project=spec.project,     # carry the auto-archive NAME through re-validation
+    )
+
+
+def resolve_video_parts_movie(spec: MovieSpec) -> MovieSpec:
+    """Movie twin of resolve_video_parts_scene: return a NEW MovieSpec whose goal
+    refs are provably video-free. A goal.ref that is a VIDEO is replaced by the
+    FIRST frame of a uniform 1-frame extraction (its representative still), so the
+    runner's per-segment start image is always an image. Text-only goals + goals
+    with an image ref (or no ref) pass through unchanged. Reuses the same
+    _extract_uniform_frames helper and re-validates through make_movie (carrying
+    every scene-template field + director knob). Extraction failure SURFACES as a
+    raised ValueError (route -> 400)."""
+    new_goals = []
+    for g in spec.goals:
+        ref = g.ref
+        if ref is not None and ref.kind == "video":
+            frames = _extract_uniform_frames(ref, uniform_n=1)
+            ref = frames[0]  # the representative still frame
+        new_goals.append(GoalInterval(
+            start_frame=g.start_frame, end_frame=g.end_frame,
+            prompt=g.prompt, ref=ref,
+        ))
+    return make_movie(
+        goals=tuple(new_goals),
+        model_id=spec.model_id,
+        width=spec.width,
+        height=spec.height,
+        steps=spec.steps,
+        guidance=spec.guidance,
+        fps=spec.fps,
+        assemble=spec.assemble,
+        seed=spec.seed,
+        negative=spec.negative,
+        strength=spec.strength,
+        chain=spec.chain,
+        project=spec.project,
+        vision_enabled=spec.vision_enabled,
+        score_threshold=spec.score_threshold,
+        max_attempts_per_segment=spec.max_attempts_per_segment,
+        judge_model_id=spec.judge_model_id,
+        time_budget_s=spec.time_budget_s,
     )

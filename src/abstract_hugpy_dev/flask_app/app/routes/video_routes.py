@@ -58,9 +58,11 @@ from abstract_hugpy_dev.video_intel.gen_schema import (
     make_generate_image,
 )
 from abstract_hugpy_dev.video_intel.scene_schema import make_generate_scene
+from abstract_hugpy_dev.video_intel.movie_schema import GoalInterval, make_movie
 from abstract_hugpy_dev.video_intel.chains import (
     resolve_video_parts,
     resolve_video_parts_scene,
+    resolve_video_parts_movie,
 )
 
 video_bp, logger = get_bp("video_bp", __name__)
@@ -212,6 +214,7 @@ def video_generate_image():
             seed=body.get("seed"),
             negative=body.get("negative"),
             strength=body.get("strength"),   # img2img (additive, optional)
+            project=body.get("project"),     # auto-archive NAME (optional)
         )
     except (ValueError, TypeError) as exc:  # bad fields / part combo = 400
         return jsonify({"error": str(exc)}), 400
@@ -265,6 +268,7 @@ def video_generate_scene():
             # strength None -> runner 0.45; chain defaults True).
             strength=body.get("strength"),
             chain=body.get("chain", True),
+            project=body.get("project"),     # auto-archive NAME (optional)
         )
     except (ValueError, TypeError) as exc:  # bad fields / part combo / frame_cap = 400
         return jsonify({"error": str(exc)}), 400
@@ -277,6 +281,68 @@ def video_generate_scene():
         return jsonify({"error": str(exc)}), 400
 
     job_id = media_bus.enqueue("generate_scene", resolved)
+    return jsonify({"job_id": job_id}), 200
+
+
+# --------------------------------------------------------------------------- #
+# 2d') POST /video/jobs/generate_movie — a GOAL TIMELINE -> a stitched movie
+# --------------------------------------------------------------------------- #
+# Mirrors generate_scene: parse body -> build GoalIntervals -> make_movie
+# (validates contiguity/ranges) -> resolve any video goal refs -> enqueue. The
+# scene-template fields (model/size/steps/…) are shared by every segment; `goals`
+# is the ordered, contiguous, non-overlapping timeline; the director knobs turn on
+# optional per-segment vision scoring + retry.
+@video_bp.route("/video/jobs/generate_movie", methods=["POST"])
+def video_generate_movie():
+    body = request.get_json(silent=True) or {}
+    goals_in = body.get("goals")
+    if not isinstance(goals_in, list) or not goals_in:
+        return jsonify({"error": "missing or empty 'goals' list"}), 400
+    try:
+        goals = []
+        for gd in goals_in:
+            if not isinstance(gd, dict):
+                raise ValueError("each goal must be an object")
+            ref_d = gd.get("ref")
+            ref = make_media_ref(**ref_d) if isinstance(ref_d, dict) else None
+            goals.append(GoalInterval(
+                start_frame=gd.get("start_frame"),
+                end_frame=gd.get("end_frame"),
+                prompt=gd.get("prompt"),
+                ref=ref,
+            ))
+        spec = make_movie(
+            goals=tuple(goals),
+            model_id=body.get("model_id"),
+            width=body.get("width"),
+            height=body.get("height"),
+            steps=body.get("steps"),
+            guidance=body.get("guidance"),
+            fps=body.get("fps"),
+            assemble=body.get("assemble"),
+            seed=body.get("seed"),
+            negative=body.get("negative"),
+            strength=body.get("strength"),
+            chain=body.get("chain", True),
+            project=body.get("project"),
+            # director knobs (optional; absent -> factory defaults)
+            vision_enabled=body.get("vision_enabled", False),
+            score_threshold=body.get("score_threshold", 60),
+            max_attempts_per_segment=body.get("max_attempts_per_segment", 1),
+            judge_model_id=body.get("judge_model_id"),
+            time_budget_s=body.get("time_budget_s"),
+        )
+    except (ValueError, TypeError) as exc:  # bad fields / contiguity / frame_cap = 400
+        return jsonify({"error": str(exc)}), 400
+
+    # Resolve any VIDEO goal refs to a representative still BEFORE enqueue, so the
+    # runner never sees a video ref. Extraction failure -> 400 (see chains).
+    try:
+        resolved = resolve_video_parts_movie(spec)
+    except (ValueError, TypeError) as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    job_id = media_bus.enqueue("generate_movie", resolved)
     return jsonify({"job_id": job_id}), 200
 
 
@@ -408,6 +474,39 @@ def video_preset_apply(preset_id):
         "defaults": preset.defaults(),
         "warming": True,
     }), 200
+
+
+# --------------------------------------------------------------------------- #
+# 2g) GET /movie/presets — curated MOVIE TEMPLATES for the Movie Maker tab
+# --------------------------------------------------------------------------- #
+# Movie twin of GET /video/presets: import the static registry, dump it as JSON.
+# No side effects — a movie template is just a named bundle of a model_key + the
+# scene-template settings + a goal timeline (contiguous half-open intervals that
+# tile [0, total)) the Movie Maker tab pre-fills into its goal editor.
+@video_bp.route("/movie/presets", methods=["GET"])
+def movie_presets():
+    from abstract_hugpy_dev.video_intel.presets import available_movie_presets
+    return jsonify({"presets": [p.to_dict() for p in available_movie_presets()]}), 200
+
+
+# --------------------------------------------------------------------------- #
+# 2h) POST /movie/presets/<preset_id>/apply — return the directly-POSTable
+#     generate_movie body for this template (unknown id -> 404). Read-only/open,
+#     same auth posture as GET /movie/presets: unlike the video apply this does
+#     NOT touch the worker plane — a movie template just pre-fills the goal editor
+#     (its `request` sub-object is a curated /video/jobs/generate_movie body).
+# --------------------------------------------------------------------------- #
+@video_bp.route("/movie/presets/<preset_id>/apply", methods=["POST"])
+def movie_preset_apply(preset_id):
+    from abstract_hugpy_dev.video_intel.presets import get_movie_preset
+
+    preset = get_movie_preset(preset_id)
+    if preset is None:
+        return jsonify({"ok": False, "error": {
+            "code": "UnknownPreset",
+            "message": f"no movie preset {preset_id!r}"}}), 404
+
+    return jsonify(preset.apply()), 200
 
 
 # --------------------------------------------------------------------------- #

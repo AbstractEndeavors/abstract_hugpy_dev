@@ -25,18 +25,60 @@ to surface — this runner does NOT force pool="ml".
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
+import shutil
+import time
+
+from abstract_hugpy_dev.imports.src.constants.constants import DEFAULT_ROOT
 
 from ..gen_schema import GenerateImageSpec
 from ..media_store import ingest
 from ..result_schema import JobError, JobResult
-from ._img2img import img2img_available
+from ._img2img import img2img_available, start_image_required
 
 logger = logging.getLogger(__name__)
 
 
+def _write_image_bundle(spec: GenerateImageSpec, job_id: str, projectmeta: str,
+                        image_path: str, prompt: str,
+                        started_at: float, finished_at: float) -> str:
+    """Copy the single generated image into ``<DEFAULT_ROOT>/assets/<projectmeta>/``
+    and write ``project.json`` beside it. Returns the absolute bundle dir.
+
+    RAISES on IO error — the caller wraps this best-effort so a bundle failure
+    never crosses the job boundary. Module-level (no closures) so it is
+    unit-testable GPU-free."""
+    bundle_dir = os.path.join(DEFAULT_ROOT, "assets", projectmeta)
+    os.makedirs(bundle_dir, exist_ok=True)
+    rel = os.path.basename(image_path)
+    shutil.copyfile(image_path, os.path.join(bundle_dir, rel))
+    manifest = {
+        "project_name": spec.project,
+        "project_uuid": job_id,
+        "model_key": spec.model_id,
+        "prompt": prompt,
+        "negative": spec.negative,
+        "width": spec.width,
+        "height": spec.height,
+        "steps": spec.steps,
+        "guidance": spec.guidance,
+        "n_frames": 1,
+        "strength": spec.strength,
+        "seed": spec.seed if spec.seed is not None else "random",
+        "frames": [rel],
+        "image": rel,
+        "started_at": started_at,
+        "finished_at": finished_at,
+    }
+    with open(os.path.join(bundle_dir, "project.json"), "w") as fh:
+        json.dump(manifest, fh, indent=2)
+    return bundle_dir
+
+
 def run_generate_image(spec: GenerateImageSpec, job_id: str) -> JobResult:
+    started_at = time.time()
     # ---- safety net: video parts MUST be resolved to image parts upstream ----
     # (video_intel.chains.resolve_video_parts runs in the enqueue path). If a raw
     # video part reaches the runner, refuse loudly rather than silently drop it.
@@ -74,6 +116,21 @@ def run_generate_image(spec: GenerateImageSpec, job_id: str) -> JobResult:
     # regress the existing "image ignored, text-to-image runs" flow — we still
     # generate from the text and log LOUDLY.
     start_frame = image_paths[0] if image_paths else None
+
+    # ---- HONEST early refusal: an image-to-image-ONLY model (a native edit
+    # model like Qwen-Image-Edit — cfg.tasks lists image-to-image but NOT
+    # text-to-image) with NO start image USED to fall through to
+    # task="text-to-image" below and die LATE inside the plane ("model can't
+    # serve t2i"). Refuse UP FRONT + truthfully instead. Gated on
+    # img2img_available (inside start_image_required) so a registry/plane outage
+    # is never mis-blamed on the caller. Matches the no_prompt error idiom above.
+    if start_image_required(spec.model_id, start_frame is not None):
+        return JobResult(job_id, ok=False, error=JobError(
+            code="start_image_required",
+            message="This model edits an image — add a start image.",
+            retryable=False,
+        ))
+
     strength = spec.strength if spec.strength is not None else 0.45   # documented default
     use_img2img = start_frame is not None and img2img_available(spec.model_id)
     if start_frame is not None and not use_img2img:
@@ -94,6 +151,20 @@ def run_generate_image(spec: GenerateImageSpec, job_id: str) -> JobResult:
     _refusal = guard_gpu_worker(spec.model_id, job_id)
     if _refusal is not None:
         return _refusal
+
+    # ---- live progress: a single image is one shot, so emit ONE 'generating'
+    # heartbeat (done=0/total=1) and rely on result.outputs at terminal. ----
+    try:
+        from ..media_bus import set_progress
+        set_progress(job_id, {
+            "done": 0, "total": 1, "stage": "generating",
+            "label": (prompt if len(prompt) <= 80 else prompt[:79] + "…"),
+            "model": spec.model_id, "frames": [],
+            "started_at": started_at, "eta_s": None,
+        })
+    except Exception:
+        logger.debug("generate_image %s: set_progress failed (non-fatal)",
+                     job_id, exc_info=True)
 
     # ---- build kwargs; leave `pool` UNSET (routing note in the docstring) ----
     if use_img2img:
@@ -190,4 +261,21 @@ def run_generate_image(spec: GenerateImageSpec, job_id: str) -> JobResult:
     # Re-ingest so the output's dims/mime are authoritatively resolved (§9.2).
     # (ingest jails the path under UPLOADS_HOME/DEFAULT_ROOT.)
     ref = ingest(path)
-    return JobResult(job_id, ok=True, outputs=(ref,))
+
+    # ---- auto-archive: single image -> assets/<projectmeta>/ bundle ----
+    # projectmeta = slug(project name) or the job_id uuid when unnamed. Best-effort:
+    # a bundle failure is logged + swallowed (never crosses the job boundary).
+    from abstract_hugpy_dev.imports.src.utils import slugify
+    projectmeta = slugify(spec.project) if spec.project else job_id
+    try:
+        _write_image_bundle(spec, job_id, projectmeta, ref.uri, prompt,
+                            started_at, time.time())
+    except Exception as exc:  # best-effort — do NOT raise across the job boundary
+        logger.warning("generate_image %s: auto-archive bundle FAILED (non-fatal): "
+                       "%s: %s", job_id, type(exc).__name__, exc)
+
+    return JobResult(
+        job_id, ok=True, outputs=(ref,),
+        project={"name": spec.project, "uuid": job_id,
+                 "dir": f"assets/{projectmeta}"},
+    )

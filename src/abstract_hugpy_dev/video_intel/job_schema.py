@@ -13,6 +13,7 @@ from .audio_schema import AudioExtractSpec
 from .crop_schema import CropSpec
 from .frame_schema import FrameExtractSpec
 from .gen_schema import GenerateImageSpec
+from .movie_schema import MovieSpec
 from .scene_schema import GenerateSceneSpec
 
 
@@ -34,4 +35,7 @@ JOB_REGISTRY = {
     "audio_extract": JobSpec("audio_extract", AudioExtractSpec, ("ffmpeg", "audio_extract"), "media", 300),
     "generate_image": JobSpec("generate_image", GenerateImageSpec, ("diffusers", "generate_image"), "gpu", 900),
     "generate_scene": JobSpec("generate_scene", GenerateSceneSpec, ("diffusers", "generate_scene"), "gpu", 3600),
+    # Movie = a SEQUENCE of scene segments; the fat orchestrator sequences them
+    # inline, so its wall-clock is (segments × per-scene) — a longer timeout.
+    "generate_movie": JobSpec("generate_movie", MovieSpec, ("diffusers", "generate_movie"), "gpu", 14400),
 }

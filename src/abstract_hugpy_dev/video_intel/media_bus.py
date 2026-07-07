@@ -33,6 +33,7 @@ from .frame_schema import make_frame_extract
 from .gen_schema import GenPromptPart, make_generate_image
 from .job_schema import JOB_REGISTRY
 from .media_schema import make_media_ref
+from .movie_schema import GoalInterval, make_movie
 from .scene_schema import make_generate_scene
 from .result_schema import JobResult
 from .runners import DISPATCH
@@ -41,14 +42,15 @@ DB_PATH = os.path.join(DEFAULT_ROOT, "video_intel", "media_jobs.db")
 
 _CREATE_SQL = """
 CREATE TABLE IF NOT EXISTS media_jobs (
-    job_id      TEXT PRIMARY KEY,
-    name        TEXT,
-    status      TEXT,
-    spec_json   TEXT,
-    result_json TEXT,
-    claim_token TEXT,
-    created     REAL,
-    updated     REAL
+    job_id       TEXT PRIMARY KEY,
+    name         TEXT,
+    status       TEXT,
+    spec_json    TEXT,
+    result_json  TEXT,
+    claim_token  TEXT,
+    created      REAL,
+    updated      REAL,
+    progress_json TEXT
 )
 """
 
@@ -112,6 +114,7 @@ def _generate_image_from_dict(d: dict):
         seed=d.get("seed"),
         negative=d.get("negative"),
         strength=d.get("strength"),   # img2img (additive; v1 payloads omit it)
+        project=d.get("project"),     # auto-archive NAME (additive; may be absent)
     )
 
 
@@ -141,6 +144,45 @@ def _generate_scene_from_dict(d: dict):
         # strength=None -> runner applies 0.45; chain defaults True).
         strength=d.get("strength"),
         chain=d.get("chain", True),
+        project=d.get("project"),     # auto-archive NAME (additive; may be absent)
+    )
+
+
+def _generate_movie_from_dict(d: dict):
+    """Rebuild a MovieSpec from its asdict() form, through the validating factory.
+    Each goal round-trips into a GoalInterval (its optional ref through
+    make_media_ref); the scene-template fields + director knobs (vision_enabled,
+    score_threshold, max_attempts_per_segment, judge_model_id, time_budget_s) are
+    carried through so a re-enqueue (RESUME) rebuilds an identical spec."""
+    goals = []
+    for gd in d["goals"]:
+        ref_d = gd.get("ref")
+        ref = make_media_ref(**ref_d) if ref_d is not None else None
+        goals.append(GoalInterval(
+            start_frame=gd["start_frame"],
+            end_frame=gd["end_frame"],
+            prompt=gd["prompt"],
+            ref=ref,
+        ))
+    return make_movie(
+        goals=tuple(goals),
+        model_id=d["model_id"],
+        width=d["width"],
+        height=d["height"],
+        steps=d["steps"],
+        guidance=d["guidance"],
+        fps=d["fps"],
+        assemble=d["assemble"],
+        seed=d.get("seed"),
+        negative=d.get("negative"),
+        strength=d.get("strength"),
+        chain=d.get("chain", True),
+        project=d.get("project"),
+        vision_enabled=d.get("vision_enabled", False),
+        score_threshold=d.get("score_threshold", 60),
+        max_attempts_per_segment=d.get("max_attempts_per_segment", 1),
+        judge_model_id=d.get("judge_model_id"),
+        time_budget_s=d.get("time_budget_s"),
     )
 
 
@@ -151,6 +193,7 @@ SPEC_DESERIALIZERS: Dict[str, Callable[[dict], object]] = {
     "audio_extract": _audio_extract_from_dict,
     "generate_image": _generate_image_from_dict,
     "generate_scene": _generate_scene_from_dict,
+    "generate_movie": _generate_movie_from_dict,
 }
 
 
@@ -199,6 +242,13 @@ def _ensure_db() -> None:
         conn = _connect()
         try:
             conn.execute(_CREATE_SQL)
+            # Idempotent migration: DBs created before the live-progress feature
+            # lack progress_json. ADD COLUMN is a no-op-or-raise on re-run, so we
+            # swallow the "duplicate column name" OperationalError.
+            try:
+                conn.execute("ALTER TABLE media_jobs ADD COLUMN progress_json TEXT")
+            except sqlite3.OperationalError:
+                pass  # column already present (fresh CREATE or prior migration)
         finally:
             conn.close()
         _initialized = True
@@ -326,8 +376,8 @@ def run_claimed(job_id: str, worker_token: str) -> Optional[JobResult]:
     conn = _connect()
     try:
         conn.execute(
-            "UPDATE media_jobs SET status=?, result_json=?, updated=? "
-            "WHERE job_id=? AND claim_token=?",
+            "UPDATE media_jobs SET status=?, result_json=?, progress_json=NULL, "
+            "updated=? WHERE job_id=? AND claim_token=?",
             (status, result_json, time.time(), job_id, worker_token),
         )
     finally:
@@ -390,6 +440,25 @@ def is_cancelling(job_id: str) -> bool:
         conn.close()
 
 
+def set_progress(job_id: str, progress: dict) -> None:
+    """Record the live per-frame progress blob for a running job — written by the
+    frame-loop runners as frames land and read by the poller via get().
+
+    Un-gated (like is_cancelling): the runner owns its own job_id, so no
+    claim_token guard is needed. Overwrites progress_json each call. Best-effort
+    at the call site — the runners wrap this so a transient DB hiccup never fails
+    a generation."""
+    _ensure_db()
+    conn = _connect()
+    try:
+        conn.execute(
+            "UPDATE media_jobs SET progress_json=?, updated=? WHERE job_id=?",
+            (json.dumps(progress), time.time(), job_id),
+        )
+    finally:
+        conn.close()
+
+
 def work_once(worker_token: Optional[str] = None) -> Optional[str]:
     """Claim one job and run it. Returns the processed job_id or None if the
     queue was empty. This is what the headless self-test and the daemon call."""
@@ -402,21 +471,25 @@ def work_once(worker_token: Optional[str] = None) -> Optional[str]:
 
 
 def get(job_id: str) -> dict:
-    """Read-only view: {"job_id", "status", "result": <JobResult dict|None>}."""
+    """Read-only view: {"job_id", "status", "result": <JobResult dict|None>,
+    "progress": <blob dict|None>}. `progress` is an object WHILE running (the
+    live per-frame blob) and null at a terminal state (run_claimed nulls it on
+    the terminal write). Unknown id -> all-null view."""
     _ensure_db()
     conn = _connect()
     try:
         row = conn.execute(
-            "SELECT status, result_json FROM media_jobs WHERE job_id=?",
+            "SELECT status, result_json, progress_json FROM media_jobs WHERE job_id=?",
             (job_id,),
         ).fetchone()
     finally:
         conn.close()
     if row is None:
-        return {"job_id": job_id, "status": None, "result": None}
-    status, result_json = row
+        return {"job_id": job_id, "status": None, "result": None, "progress": None}
+    status, result_json, progress_json = row
     result = json.loads(result_json) if result_json else None
-    return {"job_id": job_id, "status": status, "result": result}
+    progress = json.loads(progress_json) if progress_json else None
+    return {"job_id": job_id, "status": status, "result": result, "progress": progress}
 
 
 def start_worker_daemon(worker_token: Optional[str] = None,

@@ -1,10 +1,15 @@
 """GET /video/presets + POST /video/presets/<id>/apply — route contract.
 
 Verifies the video-preset HTTP surface WITHOUT a live worker/catalog touch:
-  * GET  /video/presets            -> {"presets":[...]} with the 3 seed presets,
-                                       each in the pinned wire shape;
+  * GET  /video/presets            -> {"presets":[...]} carrying (at least) the
+                                       known seed presets, each in the pinned
+                                       wire shape (incl. the advisory sampler);
   * POST /video/presets/<bad>/apply-> 404 (get_preset -> None short-circuits
                                        before any catalog/worker work).
+
+The known-id checks are subset assertions (``<=``) so that adding presets to the
+registry does not break this contract test — only removing/renaming a known one
+or dropping a pinned wire key does.
 
 Mirrors test_reap_approve_route.py's idiom (temp PROJECTS_HOME, a minimal Flask
 app with the blueprint mounted, a test_client), but exposed as pytest tests so
@@ -35,10 +40,28 @@ client = app.test_client()
 _TOP_KEYS = {"id", "name", "description", "mode", "model_key", "defaults", "recommended"}
 _DEFAULT_KEYS = {"strength", "steps", "guidance", "width", "height",
                  "n_frames", "fps", "negative"}
+# The known preset ids -> catalog model_key (the 3 seeds + the 5 ComfyUI Field
+# Guide presets). Subset-checked, so future additions won't break this test.
 _EXPECTED = {
     "realistic-edit-chain": "a3527183~Qwen-Image-Edit-2509",
     "realistic-img2img": "comfy-juggernautxl-ragnarok",
     "fast-draft": "sdxl-turbo",
+    "photoreal-portrait-sd15": "comfy-epicrealism-naturalsinrc1vae",
+    "photoreal-sdxl": "comfy-juggernautxl-ragnarok",
+    "anime-stylized": "comfy-neverendingdreamned-v122bakedvae",
+    "painterly-art": "comfy-dreamshaper-8",
+    "sdxl-lightning": "comfy-dreamshaperxl-lightningdpmsde",
+}
+# The known modes (subset-checked alongside _EXPECTED).
+_EXPECTED_MODES = {
+    "realistic-edit-chain": "edit-chain",
+    "realistic-img2img": "img2img",
+    "fast-draft": "text-to-image",
+    "photoreal-portrait-sd15": "text-to-image",
+    "photoreal-sdxl": "text-to-image",
+    "anime-stylized": "text-to-image",
+    "painterly-art": "text-to-image",
+    "sdxl-lightning": "text-to-image",
 }
 
 
@@ -48,10 +71,11 @@ def test_get_presets_contract_shape():
     body = r.get_json()
     assert isinstance(body, dict) and "presets" in body
     presets = body["presets"]
-    assert isinstance(presets, list) and len(presets) == 3, presets
+    assert isinstance(presets, list) and presets, presets
 
     by_id = {p["id"]: p for p in presets}
-    assert set(by_id) == set(_EXPECTED), set(by_id)
+    # every known preset id is present (subset — additions are fine)
+    assert set(_EXPECTED) <= set(by_id), set(by_id)
 
     for pid, model_key in _EXPECTED.items():
         p = by_id[pid]
@@ -62,15 +86,16 @@ def test_get_presets_contract_shape():
         # defaults sub-object carries exactly the pinned keys
         assert _DEFAULT_KEYS <= set(p["defaults"]), (pid, set(p["defaults"]))
 
+    # the advisory sampler field is present in every preset's wire shape
+    for p in presets:
+        assert "sampler" in p, (p.get("id"), set(p))
+
 
 def test_get_presets_modes():
     presets = client.get("/video/presets").get_json()["presets"]
     modes = {p["id"]: p["mode"] for p in presets}
-    assert modes == {
-        "realistic-edit-chain": "edit-chain",
-        "realistic-img2img": "img2img",
-        "fast-draft": "text-to-image",
-    }, modes
+    for pid, mode in _EXPECTED_MODES.items():
+        assert modes.get(pid) == mode, (pid, modes.get(pid))
 
 
 def test_apply_unknown_preset_404():

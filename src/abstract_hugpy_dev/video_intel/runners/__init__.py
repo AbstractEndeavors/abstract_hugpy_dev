@@ -19,6 +19,7 @@ from .ffmpeg_audio import run_audio_extract
 from .ffmpeg_crop import run_crop
 from .ffmpeg_frames import run_frame_extract
 from .imagegen import run_generate_image
+from .movie import run_generate_movie
 from .scene import run_generate_scene
 
 DISPATCH = {
@@ -27,4 +28,5 @@ DISPATCH = {
     ("ffmpeg", "audio_extract"): run_audio_extract,
     ("diffusers", "generate_image"): run_generate_image,
     ("diffusers", "generate_scene"): run_generate_scene,
+    ("diffusers", "generate_movie"): run_generate_movie,
 }

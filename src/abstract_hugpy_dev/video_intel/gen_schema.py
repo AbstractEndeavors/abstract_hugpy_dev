@@ -64,6 +64,9 @@ class GenerateImageSpec:
     # img2img is available on the fleet; the runner applies 0.45 when None.
     # v1 payloads omit it -> None -> unchanged text-to-image behavior.
     strength: Optional[float] = None
+    # optional human project NAME; the runner archives the generation into an
+    # assets/<slug|job_id>/ bundle (absent -> bundle dir is the job_id uuid).
+    project: Optional[str] = None
 
 
 def make_generate_image(
@@ -76,6 +79,7 @@ def make_generate_image(
     seed: Optional[int] = None,
     negative: Optional[str] = None,
     strength: Optional[float] = None,
+    project: Optional[str] = None,
 ) -> GenerateImageSpec:
     """Validate + build a GenerateImageSpec. Raises are LOCAL to construction.
 
@@ -124,4 +128,5 @@ def make_generate_image(
         seed=seed,
         negative=negative,
         strength=(float(strength) if strength is not None else None),
+        project=(project or None),
     )

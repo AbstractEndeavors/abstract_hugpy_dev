@@ -39,11 +39,14 @@ remote-GPU-bound and is intentionally NOT gated here.
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import os
 import shutil
 import subprocess
 import threading
+import time
+from dataclasses import asdict
 
 from abstract_hugpy_dev._platform.binaries import resolve_bin
 from abstract_hugpy_dev.imports.src.constants.constants import DEFAULT_ROOT
@@ -52,7 +55,7 @@ from ..media_store import ingest
 from ..result_schema import JobError, JobResult
 from ..scene_schema import GenerateSceneSpec, FRAME_CAP
 from ._gpu_guard import guard_gpu_worker
-from ._img2img import img2img_available
+from ._img2img import img2img_available, start_image_required
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +114,7 @@ def _scene_concurrency(model_id: str, n_frames: int) -> int:
 
 
 def _generate_frames_parallel(frame_kwargs: "list[dict]", out_dir: str,
-                              job_id: str, model_id: str):
+                              job_id: str, model_id: str, on_frame_done=None):
     """Tier-1 scene fan-out: generate INDEPENDENT frames concurrently.
 
     Only for orders where frames don't feed each other — v1 (seed-schedule
@@ -119,6 +122,12 @@ def _generate_frames_parallel(frame_kwargs: "list[dict]", out_dir: str,
     chain=True stays strictly sequential at the call site. Cooperative cancel:
     frames not yet started become no-ops once 'cancelling' is set; in-flight
     frames finish (same between-frames contract as the sequential path).
+
+    ``on_frame_done(frame_path, i)`` (when given) is invoked IN FRAME ORDER as
+    each frame lands — it re-ingests the frame and emits live progress. It runs
+    in the CALLING thread (the map/loop body), never a pool worker, so its refs
+    list stays single-threaded + ordered. Callers rely on it to populate refs;
+    the returned path list is retained for symmetry only.
     Returns (ordered_frame_paths, None) or (None, JobResult error)."""
     from concurrent.futures import ThreadPoolExecutor
     from ..media_bus import is_cancelling
@@ -137,6 +146,8 @@ def _generate_frames_parallel(frame_kwargs: "list[dict]", out_dir: str,
             if err is not None:
                 return None, err
             paths.append(frame_path)
+            if on_frame_done is not None:
+                on_frame_done(frame_path, i)
         return paths, None
 
     logger.info("scene %s: fan-out %d frames across up to %d concurrent "
@@ -148,11 +159,19 @@ def _generate_frames_parallel(frame_kwargs: "list[dict]", out_dir: str,
         frame_path, err = _generate_one_frame(kw, out_dir, i, job_id)
         return i, frame_path, err
 
+    # pool.map yields in INPUT order, so emitting per landed frame here is
+    # in-order + monotonic (a slow early frame just batches the later emits). We
+    # stop emitting once any frame errors/cancels — refs is discarded on error.
     results: dict = {}
+    saw_error = False
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for i, frame_path, err in pool.map(
                 lambda args: _task(*args), enumerate(frame_kwargs)):
             results[i] = (frame_path, err)
+            if err is not None:
+                saw_error = True
+            elif frame_path is not None and on_frame_done is not None and not saw_error:
+                on_frame_done(frame_path, i)
 
     cancelled = sum(1 for p, e in results.values() if e == "cancelled")
     if cancelled:
@@ -223,7 +242,262 @@ def _generate_one_frame(kwargs: dict, out_dir: str, i: int, job_id: str):
     return frame_path, None
 
 
+def _write_bundle(spec: GenerateSceneSpec, job_id: str, projectmeta: str,
+                  frame_paths: "list[str]", mp4_path: "str | None",
+                  base_prompt: str, started_at: float, finished_at: float,
+                  per_frame_secs: "list[float]") -> str:
+    """Copy the scene's frame PNGs + assembled mp4 into a self-contained
+    ``<DEFAULT_ROOT>/assets/<projectmeta>/`` bundle and write ``project.json``
+    beside them. Returns the absolute bundle dir.
+
+    RAISES on IO error — the caller wraps this best-effort (mirrors the
+    assembly-failure handling), so a bundle failure never crosses the job
+    boundary. Kept module-level (no closures) so it is unit-testable with a
+    stubbed frame set, GPU-free."""
+    bundle_dir = os.path.join(DEFAULT_ROOT, "assets", projectmeta)
+    os.makedirs(bundle_dir, exist_ok=True)
+
+    frame_relnames: "list[str]" = []
+    for fp in frame_paths:
+        rel = os.path.basename(fp)
+        shutil.copyfile(fp, os.path.join(bundle_dir, rel))
+        frame_relnames.append(rel)
+
+    mp4_rel = None
+    if mp4_path and os.path.isfile(mp4_path):
+        mp4_rel = "video.mp4"
+        shutil.copyfile(mp4_path, os.path.join(bundle_dir, mp4_rel))
+
+    seeds = ([spec.seed + i for i in range(spec.n_frames)]
+             if spec.seed is not None else "random")
+    manifest = {
+        "project_name": spec.project,
+        "project_uuid": job_id,
+        "model_key": spec.model_id,
+        "prompt": base_prompt,
+        "negative": spec.negative,
+        "chain": spec.chain,
+        "width": spec.width,
+        "height": spec.height,
+        "steps": spec.steps,
+        "guidance": spec.guidance,
+        "n_frames": spec.n_frames,
+        "fps": spec.fps,
+        "strength": spec.strength,
+        "seeds": seeds,
+        "frames": frame_relnames,
+        "mp4": mp4_rel,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "per_frame_secs": per_frame_secs,
+    }
+    with open(os.path.join(bundle_dir, "project.json"), "w") as fh:
+        json.dump(manifest, fh, indent=2)
+    return bundle_dir
+
+
+def render_scene_frames(
+    *,
+    model_id: str,
+    base_prompt: str,
+    n_frames: int,
+    width: int,
+    height: int,
+    steps: int,
+    guidance: float,
+    seed,
+    motion,
+    negative,
+    strength,
+    chain: bool,
+    start_frame,
+    out_dir: str,
+    job_id: str,
+    on_frame_done,
+):
+    """EXTRACTED frame-generation core — render ``n_frames`` frames into
+    ``out_dir`` via the THREE frame shapes and return None on success or a
+    JobResult(ok=False) on any EXPECTED failure (DATA, never a raise across the
+    boundary).
+
+    Shared verbatim by ``run_generate_scene`` (scene-level bundle/progress) and
+    ``runners.movie.run_generate_movie`` (movie-level bundle/progress): the CALLER
+    owns progress + bundle; this core only drives the inference plane and calls
+    ``on_frame_done(frame_path, i)`` per landed frame IN ORDER so the caller can
+    re-ingest + record it (its refs list stays single-threaded + ordered).
+
+    The three shapes (chosen by start_frame + chain, exactly as before):
+      * NO start_frame            -> v1 text-to-image (seed + prompt-schedule),
+        fanned out across the fleet.
+      * start_frame + chain=True  -> TRUE sequential img2img chaining (frame i+1
+        conditions on frame i's output).
+      * start_frame + chain=False -> img2img off the START frame, fanned out.
+
+    The same up-front guards run HERE so both callers share ONE policy:
+    start_image_required, the init-image size gate, img2img_available, and the
+    shared GPU-worker guard. ``strength`` defaults to the LOCKED 0.45 when None."""
+    from ..media_bus import is_cancelling
+
+    # Runner-applied default when None (LOCKED CONTRACT): 0.45.
+    strength = strength if strength is not None else 0.45
+
+    # ---- HONEST early refusal (mirrors imagegen) ----
+    # An image-to-image-ONLY model (a native edit model like Qwen-Image-Edit)
+    # with NO start frame must refuse UP FRONT, not fall through to text-to-image
+    # and die LATE inside the plane. Gated on img2img_available so a registry/
+    # plane outage isn't mis-blamed on the caller.
+    if start_image_required(model_id, start_frame is not None):
+        return JobResult(job_id, ok=False, error=JobError(
+            code="start_image_required",
+            message="This model edits an image — add a start image.",
+            retryable=False,
+        ))
+
+    # ---- init-image size gate ----
+    # A degenerate init (a thumbnail attached instead of the full image) dies as
+    # an opaque VAE error; refuse it HERE with the real dimensions. 64px floor.
+    _MIN_INIT_PX = 64
+    if start_frame is not None:
+        try:
+            from PIL import Image as _PILImage
+            with _PILImage.open(start_frame) as _im:
+                _w, _h = _im.size
+        except Exception as exc:  # unreadable init is the same honest failure
+            return JobResult(job_id, ok=False, error=JobError(
+                code="init_image_unreadable",
+                message=f"start-frame image could not be read ({type(exc).__name__}: {exc})",
+                retryable=False,
+            ))
+        if min(_w, _h) < _MIN_INIT_PX:
+            return JobResult(job_id, ok=False, error=JobError(
+                code="init_image_too_small",
+                message=(f"start-frame image is {_w}x{_h}px — too small for "
+                         f"image-to-image (minimum {_MIN_INIT_PX}px on the short "
+                         f"side)."),
+                retryable=False,
+            ))
+
+    # A start-frame image REQUIRES a servable img2img pair. NEVER silently fall
+    # back to text-to-image; a model that genuinely can't serve img2img yields an
+    # honest, retryable failure (the movie orchestrator uses this to decide
+    # whether cross-segment carry is feasible).
+    if start_frame is not None and not img2img_available(model_id):
+        logger.info(
+            "render_scene_frames %s: start-frame present but image-to-image is "
+            "not available on the fleet (model=%s); honest failure", job_id, model_id,
+        )
+        return JobResult(job_id, ok=False, error=JobError(
+            code="image_to_image_unavailable",
+            message="image-to-image not available on the fleet",
+            retryable=True,
+        ))
+
+    # ---- GPU-worker guard (shared refusal policy; ADDITIONAL to the img2img probe) ----
+    _refusal = guard_gpu_worker(model_id, job_id)
+    if _refusal is not None:
+        return _refusal
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    if start_frame is not None:
+        # ---- img2img path: condition each frame on an init image ----
+        mode = "chain" if chain else "parallel"
+        logger.info(
+            "render_scene_frames %s: IMG2IMG-%s (model=%s start_frame=%s "
+            "strength=%s n=%d)", job_id, mode, model_id,
+            os.path.basename(start_frame), strength, n_frames,
+        )
+
+        def _img2img_kwargs(i: int, cond_path: str) -> dict:
+            # chain:    frame 0 = base prompt; frame i>0 = base + motion step i.
+            # parallel: every frame = base + motion step i (all off the start frame).
+            include_motion = bool(motion) and (chain is False or i > 0)
+            prompt = base_prompt
+            if include_motion:
+                # .replace (NOT .format): user strings may contain stray braces.
+                prompt += ", " + motion.replace("{i}", str(i + 1)).replace("{n}", str(n_frames))
+            kwargs = dict(
+                task="image-to-image",
+                image_path=cond_path,
+                strength=strength,
+                prompt=prompt,
+                model_key=model_id,
+                width=width,
+                height=height,
+                num_inference_steps=steps,
+                guidance_scale=guidance,
+                num_images=1,
+                return_b64=True,
+            )
+            if seed is not None:
+                kwargs["seed"] = seed + i
+            if negative is not None:
+                kwargs["negative_prompt"] = negative
+            return kwargs
+
+        if chain:
+            # TRUE sequential chaining — frame i+1 consumes frame i's output.
+            prev_output = start_frame
+            for i in range(n_frames):
+                # Cooperative cancel — honored BETWEEN frames (mid-frame
+                # inference is never interrupted).
+                if is_cancelling(job_id):
+                    return JobResult(job_id, ok=False, error=JobError(
+                        code="cancelled",
+                        message=f"cancelled after {i} of {n_frames} frame(s)",
+                        retryable=False))
+                frame_path, err = _generate_one_frame(
+                    _img2img_kwargs(i, prev_output), out_dir, i, job_id)
+                if err is not None:
+                    return err
+                prev_output = frame_path
+                on_frame_done(frame_path, i)
+        else:
+            # parallel mode: every frame conditions on the START frame — fan out.
+            _paths, err = _generate_frames_parallel(
+                [_img2img_kwargs(i, start_frame) for i in range(n_frames)],
+                out_dir, job_id, model_id, on_frame_done)
+            if err is not None:
+                return err
+    else:
+        # ---- v1 path: seed + prompt-schedule (NO img2img) ----
+        logger.info(
+            "render_scene_frames %s: V1 text-to-image (seed+prompt-schedule; "
+            "model=%s n=%d)", job_id, model_id, n_frames,
+        )
+
+        def _v1_kwargs(i: int) -> dict:
+            prompt = base_prompt + f", frame {i + 1} of {n_frames}"
+            if motion:
+                prompt += ", " + motion.replace("{i}", str(i + 1)).replace("{n}", str(n_frames))
+            kwargs = dict(
+                task="text-to-image",
+                prompt=prompt,
+                model_key=model_id,
+                width=width,
+                height=height,
+                num_inference_steps=steps,
+                guidance_scale=guidance,
+                num_images=1,
+                return_b64=True,
+            )
+            if seed is not None:
+                kwargs["seed"] = seed + i
+            if negative is not None:
+                kwargs["negative_prompt"] = negative
+            return kwargs
+
+        _paths, err = _generate_frames_parallel(
+            [_v1_kwargs(i) for i in range(n_frames)],
+            out_dir, job_id, model_id, on_frame_done)
+        if err is not None:
+            return err
+
+    return None
+
+
 def run_generate_scene(spec: GenerateSceneSpec, job_id: str) -> JobResult:
+    started_at = time.time()
     # ---- defensive frame cap (belt-and-suspenders; the factory already guards) ----
     if spec.n_frames > FRAME_CAP:
         return JobResult(job_id, ok=False, error=JobError(
@@ -265,178 +539,91 @@ def run_generate_scene(spec: GenerateSceneSpec, job_id: str) -> JobResult:
         (p.media.uri for p in spec.parts if p.kind == "image" and p.media is not None),
         None,
     )
-    # Runner-applied default when None (LOCKED CONTRACT): 0.45.
-    strength = spec.strength if spec.strength is not None else 0.45
-
-    # ---- init-image size gate (2026-07-05) ----
-    # A degenerate init (a thumbnail attached instead of the full image) sails
-    # all the way into the worker's VAE and dies as an opaque ComfyUI error
-    # ("Kernel size can't be greater than actual input size" — a 16px image is
-    # a 2x2 latent). Refuse it HERE with the real dimensions so the caller
-    # knows what was actually attached. 64px floor: below that no SD-class
-    # pipeline produces anything but noise anyway.
-    _MIN_INIT_PX = 64
-    if start_frame is not None:
-        try:
-            from PIL import Image as _PILImage
-            with _PILImage.open(start_frame) as _im:
-                _w, _h = _im.size
-        except Exception as exc:  # unreadable init is the same honest failure
-            return JobResult(job_id, ok=False, error=JobError(
-                code="init_image_unreadable",
-                message=f"start-frame image could not be read ({type(exc).__name__}: {exc})",
-                retryable=False,
-            ))
-        if min(_w, _h) < _MIN_INIT_PX:
-            return JobResult(job_id, ok=False, error=JobError(
-                code="init_image_too_small",
-                message=(f"start-frame image is {_w}x{_h}px — too small for "
-                         f"image-to-image (minimum {_MIN_INIT_PX}px on the short "
-                         f"side). The FIRST image part is used as the init frame; "
-                         f"a thumbnail may have been attached instead of the full "
-                         f"image."),
-                retryable=False,
-            ))
-
-    # A start-frame image REQUIRES a servable img2img pair. Image-generation
-    # models advertise image-to-image (config layer — models_config
-    # ._augment_img2img), so this passes for them; a model that genuinely can't
-    # serve img2img yields an honest, retryable failure. NEVER silently fall back
-    # to text-to-image.
-    if start_frame is not None and not img2img_available(spec.model_id):
-        logger.info(
-            "scene %s: start-frame image present but image-to-image is not "
-            "available on the fleet (model=%s); returning honest failure",
-            job_id, spec.model_id,
-        )
-        return JobResult(job_id, ok=False, error=JobError(
-            code="image_to_image_unavailable",
-            message="image-to-image not available on the fleet",
-            retryable=True,
-        ))
-
-    # ---- GPU-worker guard ONCE before the loop (shared refusal policy) ----
-    # The img2img probe above is ADDITIONAL to this guard, not a replacement.
-    _refusal = guard_gpu_worker(spec.model_id, job_id)
-    if _refusal is not None:
-        return _refusal
+    # The frame-generation core (render_scene_frames, below) owns the img2img/v1
+    # guards (start_image_required, the init-image size gate, img2img_available)
+    # + the shared GPU-worker guard + the three-shape frame loop, so BOTH
+    # run_generate_scene and runners.movie.run_generate_movie share ONE policy.
+    # This wrapper keeps only the scene-level prompt resolution, live progress,
+    # assembly, and auto-archive bundle.
 
     out_dir = os.path.join(DEFAULT_ROOT, "video_intel", "scenes", job_id)
     os.makedirs(out_dir, exist_ok=True)
 
     refs = []
+    done_frame_paths: "list[str]" = []   # frame PNG paths, in order (for the bundle)
+    per_frame_secs: "list[float]" = []   # wall-clock secs between frame completions
+    total = spec.n_frames
+    _frame_clock = [started_at]          # last-completion ts (mutable holder)
+    _label_prompt = base_prompt if len(base_prompt) <= 80 else base_prompt[:79] + "…"
 
-    if start_frame is not None:
-        # ---- img2img path: condition each frame on an init image ----
-        mode = "chain" if spec.chain else "parallel"
-        logger.info(
-            "scene %s: IMG2IMG-%s path (model=%s start_frame=%s strength=%s n=%d)",
-            job_id, mode, spec.model_id, os.path.basename(start_frame),
-            strength, spec.n_frames,
-        )
-        def _img2img_kwargs(i: int, cond_path: str) -> dict:
-            # chain:    frame 0 = base prompt; frame i>0 = base + motion step i.
-            # parallel: every frame = base + motion step i (all off the start frame).
-            include_motion = bool(spec.motion) and (spec.chain is False or i > 0)
-            prompt = base_prompt
-            if include_motion:
-                # .replace (NOT .format): user strings may contain stray braces.
-                prompt += ", " + spec.motion.replace("{i}", str(i + 1)).replace("{n}", str(spec.n_frames))
-            kwargs = dict(
-                task="image-to-image",
-                image_path=cond_path,
-                strength=strength,
-                prompt=prompt,
-                model_key=spec.model_id,
-                width=spec.width,
-                height=spec.height,
-                num_inference_steps=spec.steps,
-                guidance_scale=spec.guidance,
-                num_images=1,
-                return_b64=True,
-            )
-            if spec.seed is not None:
-                kwargs["seed"] = spec.seed + i
-            if spec.negative is not None:
-                kwargs["negative_prompt"] = spec.negative
-            return kwargs
+    def _emit(stage: str, done: int, label: str) -> None:
+        """Build + persist the live progress blob (best-effort — never raises)."""
+        elapsed = time.time() - started_at
+        eta = round((elapsed / done) * (total - done), 2) if done > 0 else None
+        blob = {
+            "done": done,
+            "total": total,
+            "stage": stage,
+            "label": label,
+            "model": spec.model_id,
+            # completed FRAMES only (kind=='image'); the mp4 is a terminal output,
+            # never a gallery frame. Same MediaRef dict shape as result.outputs so
+            # the UI's frame renderer works unchanged.
+            "frames": [asdict(r) for r in refs if r.kind == "image"],
+            "started_at": started_at,
+            "eta_s": eta,
+        }
+        try:
+            from ..media_bus import set_progress
+            set_progress(job_id, blob)
+        except Exception:
+            logger.debug("scene %s: set_progress failed (non-fatal)",
+                         job_id, exc_info=True)
 
-        if spec.chain:
-            # TRUE sequential chaining — frame i+1 consumes frame i's output;
-            # inherently unparallelizable.
-            prev_output = start_frame
-            for i in range(spec.n_frames):
-                # Cooperative cancel — honored BETWEEN frames (mid-frame
-                # inference is never interrupted).
-                from ..media_bus import is_cancelling
-                if is_cancelling(job_id):
-                    return JobResult(job_id, ok=False, error=JobError(
-                        code="cancelled",
-                        message=f"cancelled after {i} of {spec.n_frames} frame(s)",
-                        retryable=False))
-                frame_path, err = _generate_one_frame(
-                    _img2img_kwargs(i, prev_output), out_dir, i, job_id)
-                if err is not None:
-                    return err
-                prev_output = frame_path
-                # Re-ingest so dims/mime are authoritatively resolved (§9.2).
-                refs.append(ingest(frame_path))
-        else:
-            # parallel mode: every frame conditions on the START frame — the
-            # frames are independent, so fan them out across the fleet (the
-            # plane's least-recently-picked routing spreads concurrent calls).
-            frame_paths, err = _generate_frames_parallel(
-                [_img2img_kwargs(i, start_frame) for i in range(spec.n_frames)],
-                out_dir, job_id, spec.model_id)
-            if err is not None:
-                return err
-            for frame_path in frame_paths:
-                refs.append(ingest(frame_path))
-    else:
-        # ---- v1 path: seed + prompt-schedule (NO img2img) ----
-        # Frames are seed/prompt-scheduled but INDEPENDENT (frame i never sees
-        # frame i-1), so they fan out like img2img parallel mode.
-        logger.info(
-            "scene %s: V1 text-to-image path (seed+prompt-schedule; model=%s n=%d)",
-            job_id, spec.model_id, spec.n_frames,
-        )
+    def on_frame_done(frame_path: str, i: int) -> None:
+        """Per-frame hook: re-ingest the landed frame (dims/mime resolved, §9.2),
+        record it, and emit live progress carrying every completed frame so far
+        (live-as-generated gallery)."""
+        now = time.time()
+        per_frame_secs.append(round(now - _frame_clock[0], 3))
+        _frame_clock[0] = now
+        refs.append(ingest(frame_path))
+        done_frame_paths.append(frame_path)
+        done = len(done_frame_paths)
+        _emit("generating", done, f"frame {done}/{total} — {_label_prompt}")
 
-        def _v1_kwargs(i: int) -> dict:
-            # ---- per-frame prompt schedule (v1): positional tag + optional motion ----
-            prompt = base_prompt + f", frame {i + 1} of {spec.n_frames}"
-            if spec.motion:
-                # .replace (NOT .format): user strings may contain stray braces.
-                prompt += ", " + spec.motion.replace("{i}", str(i + 1)).replace("{n}", str(spec.n_frames))
-            # ---- per-frame kwargs — SAME shape as imagegen ----
-            kwargs = dict(
-                task="text-to-image",
-                prompt=prompt,
-                model_key=spec.model_id,
-                width=spec.width,
-                height=spec.height,
-                num_inference_steps=spec.steps,
-                guidance_scale=spec.guidance,
-                num_images=1,
-                return_b64=True,
-            )
-            # per-frame seed: base_seed + i for coherence; omit -> random per frame
-            if spec.seed is not None:
-                kwargs["seed"] = spec.seed + i
-            if spec.negative is not None:
-                kwargs["negative_prompt"] = spec.negative
-            return kwargs
+    # Initial heartbeat: the poller sees a progress object the moment the job runs
+    # (the plane may still be loading the model before frame 1 lands).
+    _emit("loading", 0, f"loading {spec.model_id} — 0/{total}")
 
-        frame_paths, err = _generate_frames_parallel(
-            [_v1_kwargs(i) for i in range(spec.n_frames)],
-            out_dir, job_id, spec.model_id)
-        if err is not None:
-            return err
-        for frame_path in frame_paths:
-            # Re-ingest so the frame's dims/mime are authoritatively resolved (§9.2).
-            refs.append(ingest(frame_path))
+    # ---- render the frames via the shared three-shape core ----
+    # The core owns the img2img/v1 guards + the frame loop; it calls on_frame_done
+    # per landed frame so this wrapper's refs/live-progress closures stay intact.
+    err = render_scene_frames(
+        model_id=spec.model_id,
+        base_prompt=base_prompt,
+        n_frames=spec.n_frames,
+        width=spec.width,
+        height=spec.height,
+        steps=spec.steps,
+        guidance=spec.guidance,
+        seed=spec.seed,
+        motion=spec.motion,
+        negative=spec.negative,
+        strength=spec.strength,
+        chain=spec.chain,
+        start_frame=start_frame,
+        out_dir=out_dir,
+        job_id=job_id,
+        on_frame_done=on_frame_done,
+    )
+    if err is not None:
+        return err
 
     # ---- optional assembly: frames -> browser-playable mp4 (ingested LAST) ----
+    bundle_mp4 = None
     if spec.assemble:
+        _emit("assembling", total, "assembling mp4…")
         mp4_path = os.path.join(out_dir, f"{job_id}.mp4")
         try:
             _assemble_scene_mp4(out_dir, mp4_path, spec.fps)
@@ -448,5 +635,28 @@ def run_generate_scene(spec: GenerateSceneSpec, job_id: str) -> JobResult:
             ))
         # ingest LAST so the video ref is outputs[-1] (classifies as kind="video").
         refs.append(ingest(mp4_path))
+        bundle_mp4 = mp4_path
 
-    return JobResult(job_id, ok=True, outputs=tuple(refs))
+    # ---- auto-archive: self-contained assets/<projectmeta>/ bundle ----
+    # projectmeta = slug(project name) or the job_id uuid when unnamed. Best-effort:
+    # a bundle failure is logged and swallowed (mirrors the assembly guard) — it
+    # must never fail an otherwise-successful generation across the job boundary.
+    from abstract_hugpy_dev.imports.src.utils import slugify
+    projectmeta = slugify(spec.project) if spec.project else job_id
+    _emit("archiving", total, f"archiving bundle assets/{projectmeta}")
+    try:
+        _write_bundle(
+            spec=spec, job_id=job_id, projectmeta=projectmeta,
+            frame_paths=done_frame_paths, mp4_path=bundle_mp4,
+            base_prompt=base_prompt, started_at=started_at,
+            finished_at=time.time(), per_frame_secs=per_frame_secs,
+        )
+    except Exception as exc:  # best-effort — do NOT raise across the job boundary
+        logger.warning("scene %s: auto-archive bundle FAILED (non-fatal): %s: %s",
+                       job_id, type(exc).__name__, exc)
+
+    return JobResult(
+        job_id, ok=True, outputs=tuple(refs),
+        project={"name": spec.project, "uuid": job_id,
+                 "dir": f"assets/{projectmeta}"},
+    )

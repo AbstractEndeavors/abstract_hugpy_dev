@@ -64,6 +64,9 @@ class GenerateSceneSpec:
     # --- img2img additive fields (v1 payloads omit them -> defaults apply) ---
     strength: Optional[float] = None
     chain: bool = True
+    # optional human project NAME; the runner archives the generation into an
+    # assets/<slug|job_id>/ bundle (absent -> bundle dir is the job_id uuid).
+    project: Optional[str] = None
 
 
 def make_generate_scene(
@@ -81,6 +84,7 @@ def make_generate_scene(
     negative: Optional[str] = None,
     strength: Optional[float] = None,
     chain: bool = True,
+    project: Optional[str] = None,
 ) -> GenerateSceneSpec:
     """Validate + build a GenerateSceneSpec. Raises are LOCAL to construction.
 
@@ -153,4 +157,5 @@ def make_generate_scene(
         negative=negative,
         strength=(float(strength) if strength is not None else None),
         chain=chain,
+        project=(project or None),
     )
