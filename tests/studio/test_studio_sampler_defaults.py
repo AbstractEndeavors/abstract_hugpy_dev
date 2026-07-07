@@ -231,11 +231,11 @@ def test_placement_decision_pure():
     assert _should_place_whole_on_gpu(Precision.INT8, 14.0, 24.0) is False
     assert _should_place_whole_on_gpu(Precision.FP8, 4.0, 24.0) is False
     # unquantized + fits (model + 6GB margin <= budget) -> whole to GPU
-    assert _should_place_whole_on_gpu(Precision.BF16, 8.2, 24.0) is True
-    assert _should_place_whole_on_gpu(Precision.FP16, 17.9, 24.0) is True   # 17.9+6=23.9
+    assert _should_place_whole_on_gpu(Precision.BF16, 8.2, 24.0) is False  # 8.2+16=24.2 (ae OOM lesson)
+    assert _should_place_whole_on_gpu(Precision.FP16, 7.9, 24.0) is True    # 7.9+16=23.9
     # unquantized but doesn't fit -> offload
     assert _should_place_whole_on_gpu(Precision.BF16, 40.0, 24.0) is False
-    assert _should_place_whole_on_gpu(Precision.BF16, 18.1, 24.0) is False  # 18.1+6=24.1
+    assert _should_place_whole_on_gpu(Precision.BF16, 8.1, 24.0) is False   # 8.1+16=24.1
     # unknown budget / size -> conservative offload
     assert _should_place_whole_on_gpu(Precision.BF16, 8.2, None) is False
     assert _should_place_whole_on_gpu(Precision.BF16, None, 24.0) is False

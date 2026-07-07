@@ -229,11 +229,14 @@ def _bnb_config(precision: Precision, BitsAndBytesConfig, torch):
 # --------------------------------------------------------------------------- #
 # GPU PLACEMENT decision (pure, no heavy deps — unit-tested without a GPU)
 # --------------------------------------------------------------------------- #
-# Fixed headroom (GB) on top of the model's declared weight footprint: activations,
-# the text encoder, and the fp32 VAE all live alongside the DiT. A conservative flat
-# margin (operator: "simple thresholds, no over-engineering") that keeps a whole-GPU
-# placement decision honest without modeling every tensor.
-_PLACEMENT_MARGIN_GB = 6.0
+# Fixed headroom (GB) on top of the model's declared weight footprint. The envelope
+# counts the DiT ONLY — Wan's UMT5-XXL text encoder (~11GB bf16), the VAE, and
+# denoise activations all ride alongside it. Empirical (ae 3090, 2026-07-07):
+# wan2.1-t2v-1.3b "8.2GB" placed whole-on-GPU actually allocated 19.6GB and OOM'd
+# at 832x480x29f next to comfy's 512MB. 16GB headroom keeps the decision honest:
+# full-GPU only when the WHOLE pipeline truly fits (24GB cards -> offload; the
+# multi-GPU box or 48GB cards -> whole-GPU).
+_PLACEMENT_MARGIN_GB = 16.0
 
 
 def _max_vram_gb(manifest: RenderManifest) -> float | None:
