@@ -46,7 +46,8 @@ from abstract_hugpy_dev.video_intel.studio import produce as produce_mod  # noqa
 from abstract_hugpy_dev.video_intel.studio.produce import (  # noqa: E402
     produce_clip, resolve_sampler)
 from abstract_hugpy_dev.video_intel.studio.runners.wan_i2v import (  # noqa: E402
-    _engage_memory_savers, _max_vram_gb, _place_pipe, _should_place_whole_on_gpu)
+    _engage_memory_savers, _max_vram_gb, _place_pipe, _prime_cuda_allocator,
+    _should_place_whole_on_gpu)
 from abstract_hugpy_dev.video_intel.studio.schemas import (  # noqa: E402
     CapabilityRequest, Resolution)
 
@@ -321,6 +322,29 @@ def test_place_pipe_engages_levers_on_offload_branch():
         "attention_slicing", "vae_tiling"]
 
 
+# --------------------------------------------------------------------------- #
+# [12] CUDA allocator defragmentation (item 7): _prime_cuda_allocator uses setdefault
+#      — it fills PYTORCH_CUDA_ALLOC_CONF when unset, and NEVER overrides an operator's.
+# --------------------------------------------------------------------------- #
+def test_prime_cuda_allocator_setdefault():
+    _KEY = "PYTORCH_CUDA_ALLOC_CONF"
+    prev = os.environ.pop(_KEY, None)
+    try:
+        # unset -> filled with the defrag default; returns a bool (torch-imported probe).
+        ret = _prime_cuda_allocator()
+        assert os.environ.get(_KEY) == "expandable_segments:True", os.environ.get(_KEY)
+        assert isinstance(ret, bool), ret
+        # pre-set -> operator's value ALWAYS wins (setdefault never overrides).
+        os.environ[_KEY] = "garbage_collection_threshold:0.9"
+        _prime_cuda_allocator()
+        assert os.environ.get(_KEY) == "garbage_collection_threshold:0.9", os.environ.get(_KEY)
+    finally:
+        if prev is None:
+            os.environ.pop(_KEY, None)
+        else:
+            os.environ[_KEY] = prev
+
+
 CHECKS = [
     ("resolve_sampler: Wan real defaults + resolution shift (3.0@480p, 5.0@720p)",
      test_resolve_sampler_wan_defaults),
@@ -341,6 +365,8 @@ CHECKS = [
     ("_max_vram_gb reads STUDIO_MAX_VRAM_GB from env_snapshot", test_max_vram_from_env_snapshot),
     ("offload VRAM levers (item 4): _place_pipe engages attn/VAE slicing+tiling, guarded",
      test_place_pipe_engages_levers_on_offload_branch),
+    ("cuda allocator (item 7): _prime_cuda_allocator setdefault fills unset, respects preset",
+     test_prime_cuda_allocator_setdefault),
 ]
 
 

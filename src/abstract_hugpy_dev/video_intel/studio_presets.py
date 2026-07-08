@@ -68,6 +68,17 @@ class StudioPreset:
                                     # make_studio_i2v keyword, so it stays OUT of
                                     # request_body() — the source/start image is threaded
                                     # from the staged clip by the route, never the preset.
+    requires_reference: bool = False  # UI signal (additive), the id_lock twin of
+                                    # requires_source: this preset needs at least one
+                                    # REFERENCE IMAGE of the subject to mean anything
+                                    # (Wan VACE reference-to-video identity lock). Rides
+                                    # the wire (to_dict/apply) so the Studio Clips station
+                                    # gates the flow (an id_lock preset forces the
+                                    # reference-picker before enqueue). Like
+                                    # requires_source it is NOT a make_studio_i2v keyword,
+                                    # so it stays OUT of request_body() — the reference
+                                    # images are threaded by the route from the picker,
+                                    # never baked into the preset.
     prompt_note: str = ""          # UI HONESTY badge (additive): a short note the
                                     # station shows about the prompt for this preset.
                                     # Set on SYNTHETIC presets to state plainly that the
@@ -115,6 +126,7 @@ class StudioPreset:
             "negative": self.negative,
             "recommended": self.recommended,
             "requires_source": self.requires_source,
+            "requires_reference": self.requires_reference,
             "prompt_note": self.prompt_note,
         }
 
@@ -133,6 +145,7 @@ class StudioPreset:
             "name": self.name,
             "capability": self.capability,
             "requires_source": self.requires_source,
+            "requires_reference": self.requires_reference,
             "request": self.request_body(),
         }
 
@@ -357,4 +370,32 @@ register_studio_preset(StudioPreset(
     negative="blurry, low quality, deformed, warped, morphing, flicker, extra limbs",
     recommended="single 3090 (INT8, quality) · needs a start image",
     requires_source=True,
+))
+
+# IDENTITY LOCK: the flagship reference-to-video preset. Capability "id_lock" resolves
+# through the studio router (ID_LOCK -> Task.VACE_CONTROL, preferred) to the Wan 2.1 VACE
+# 1.3B control model at INT8 — the only VACE model that fits a sub-14 GB budget (the 14B
+# needs 14 GB+). 832x480 LANDSCAPE only (VACE-1.3B's native envelope; portrait/oversized
+# rejects at the router). requires_reference=True: an identity-locked render is DEFINED by
+# the subject reference image(s) — with none it returns REFERENCE_MISSING. The references
+# are threaded from the station's reference-picker at enqueue time, so request_body() stays
+# a valid, reference-free make_studio_i2v body (references are NOT a preset field).
+register_studio_preset(StudioPreset(
+    id="identity-lock-1.3b",
+    name="Identity lock 1.3B (Wan 2.1 VACE)",
+    description=("Generate a video of YOUR subject at 832x480 landscape with a 9 GB "
+                 "budget — binds the Wan 2.1 VACE 1.3B control model (INT8, fits a "
+                 "single 3090) in reference-to-video mode. REQUIRES at least one "
+                 "reference image of the subject (up to 4 are consumed); the identity "
+                 "is preserved across the render. 480p LANDSCAPE only."),
+    capability="id_lock",
+    width=832,
+    height=480,
+    fps=16,
+    vram_budget_gb=9.0,
+    seed=0,
+    prompt="the subject moves naturally, cinematic lighting, consistent identity",
+    negative="blurry, low quality, deformed face, identity drift, morphing, flicker",
+    recommended="single 3090 (INT8) · needs reference image(s)",
+    requires_reference=True,
 ))

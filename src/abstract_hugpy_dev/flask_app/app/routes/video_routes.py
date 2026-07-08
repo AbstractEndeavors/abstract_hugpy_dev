@@ -456,6 +456,73 @@ def video_studio_i2v():
                 return jsonify(
                     {"error": f"source_video is not a video (classified as {sref.kind})"}), 400
             source_video = sref.uri
+    # IDENTITY LOCK (id_lock): reference image(s) of the subject preserved across the
+    # render (Wan VACE reference-to-video). Each is jail-resolved + ffprobe/PIL-classified
+    # as an IMAGE (a non-image / jail-escaping / missing target is a clean 4xx here, not a
+    # deferred runner failure). Up to 4 (all consumed by diffusers 0.39). Permitted for
+    # the VACE capabilities (id_lock / v2v — the runners that consume them); rejected for
+    # any other capability so a non-VACE runner can never silently ignore them.
+    _REF_CAPS = {"id_lock", "v2v"}
+    reference_images_in = body.get("reference_images")
+    resolved_refs: list = []
+    if reference_images_in is not None:
+        if not isinstance(reference_images_in, list):
+            return jsonify({"error": "reference_images must be a list of paths"}), 400
+        if capability not in _REF_CAPS:
+            return jsonify({"error": "reference_images require capability id_lock or v2v; "
+                                     f"got {capability!r}"}), 400
+        if len(reference_images_in) > 4:
+            return jsonify({"error": "at most 4 reference_images are accepted"}), 400
+        for raw in reference_images_in:
+            if not isinstance(raw, str) or not raw.strip():
+                return jsonify({"error": "each reference_image must be a non-empty path"}), 400
+            rp = _jail_resolve(raw)
+            if rp is None:
+                return jsonify({"error": "reference_image outside storage jail"}), 400
+            if not os.path.isfile(rp):
+                return jsonify({"error": "reference_image not found"}), 404
+            try:
+                iref = media_store.ingest(rp, kind_hint="image")
+            except Exception as exc:  # unreadable / not a real image = bad input
+                return jsonify(
+                    {"error": f"reference_image is not a readable media file: {exc}"}), 400
+            if iref.kind != "image":
+                return jsonify(
+                    {"error": f"reference_image is not an image (classified as {iref.kind})"}), 400
+            resolved_refs.append(iref.uri)
+    # ROUTE RULE: capability id_lock REQUIRES >=1 reference image.
+    if capability == "id_lock" and not resolved_refs:
+        return jsonify(
+            {"error": "capability id_lock requires at least one reference_image"}), 400
+
+    # OPTIONAL VACE control still (composition blocking) — ONLY valid with id_lock. A
+    # single image + its kind (pose|depth|sketch), jail-resolved + image-classified.
+    control_image = body.get("control_image")
+    control_kind = body.get("control_kind")
+    if (control_image is not None or control_kind is not None) and capability != "id_lock":
+        return jsonify(
+            {"error": "control_image/control_kind are only valid with capability id_lock"}), 400
+    if control_image is not None:
+        if not isinstance(control_image, str) or not control_image.strip():
+            return jsonify({"error": "control_image must be a non-empty path"}), 400
+        if control_kind not in ("pose", "depth", "sketch"):
+            return jsonify({"error": "control_kind must be one of pose|depth|sketch"}), 400
+        cp = _jail_resolve(control_image)
+        if cp is None:
+            return jsonify({"error": "control_image outside storage jail"}), 400
+        if not os.path.isfile(cp):
+            return jsonify({"error": "control_image not found"}), 404
+        try:
+            cref = media_store.ingest(cp, kind_hint="image")
+        except Exception as exc:
+            return jsonify(
+                {"error": f"control_image is not a readable media file: {exc}"}), 400
+        if cref.kind != "image":
+            return jsonify(
+                {"error": f"control_image is not an image (classified as {cref.kind})"}), 400
+        control_image = cref.uri
+    elif control_kind is not None:
+        return jsonify({"error": "control_kind requires a control_image"}), 400
     # SAMPLER OVERRIDES (route passthrough): optional "steps"/"cfg" numbers that PIN the
     # denoise settings (explicit values ALWAYS win over the bound model's family
     # default). Validate ranges HERE for a clean 400 with a precise message (steps 1-100,
@@ -496,6 +563,11 @@ def video_studio_i2v():
             steps=steps,
             cfg=cfg,
             model_id=model_id,
+            # IDENTITY LOCK (id_lock): the validated reference image uris + optional VACE
+            # control still (both already jail-resolved + image-classified above).
+            reference_images=tuple(resolved_refs),
+            control_image=control_image,
+            control_kind=control_kind,
         )
     except (ValueError, TypeError) as exc:  # bad geometry / capability / overrides = 400
         return jsonify({"error": str(exc)}), 400

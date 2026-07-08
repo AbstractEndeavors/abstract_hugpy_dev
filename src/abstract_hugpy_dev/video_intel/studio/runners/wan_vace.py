@@ -1,6 +1,20 @@
-"""REAL Wan VACE v2v runner (B-3) — the studio's FIRST weight-backed ENHANCEMENT
-executor: it restyles/enhances an existing clip (e.g. a movie-tier output) via
-diffusers' unified VACE control path, IMPORT-SAFE and GRACEFULLY-DEGRADING now.
+"""REAL Wan VACE runner (B-3 + identity-lock) — the studio's weight-backed VACE
+executor over diffusers' unified control path, IMPORT-SAFE and GRACEFULLY-DEGRADING
+now. It serves THREE conditioning modes off the same pipeline
+(``WanVACEPipeline``, diffusers 0.39):
+
+  * v2v restyle (``source_video``): decode the source clip to per-frame control
+    frames and drive ``video=`` (the historical B-3 path).
+  * id_lock / reference-to-video (``reference_images``, capability ID_LOCK): load
+    the subject reference image(s) as PIL and drive ``reference_images=`` — the
+    identity is preserved across a freshly generated video (with no source, the
+    pipeline zero-fills the control video + an all-ones mask = generate everything).
+    Multiple references are ALL consumed (each prepended as a reference latent).
+  * optional control still (``control_image`` + ``control_kind`` pose|depth|sketch):
+    a single still repeated across the frame count as the ``video=`` control channel
+    for composition blocking when there is no source_video.
+
+Historically it only restyled/enhanced an existing clip (e.g. a movie-tier output).
 
     run_wan_vace(manifest, out_root, start_image=None, should_cancel=None)
         -> Result[Artifact, StageError]
@@ -58,7 +72,7 @@ import tempfile
 from typing import Callable
 
 from ..artifacts import Artifact
-from ..enums import Precision
+from ..enums import Capability, Precision
 from ..errors import Err, ErrorCode, Ok, Result, StageError
 from ..manifest import render_manifest_to_dict
 from ..registry import MODEL_REGISTRY
@@ -86,6 +100,7 @@ from .wan_i2v import (
     _max_vram_gb,
     _missing_deps,
     _place_pipe,
+    _prime_cuda_allocator,
     _resolve_model_dir,
     _should_place_whole_on_gpu,
     _wan_geometry,
@@ -112,26 +127,60 @@ def _resolve_source(manifest: RenderManifest) -> str | None:
 # --------------------------------------------------------------------------- #
 def _preflight(manifest: RenderManifest) -> StageError | None:
     """Gate the real path. Returns a ``StageError`` (the caller wraps it in ``Err``)
-    when this box can't run Wan VACE v2v, or None when everything is present.
+    when this box can't run the render, or None when everything is present.
 
-    ORDER: source -> deps -> GPU -> weights. The SOURCE check is FIRST because a
-    v2v render with no source clip is a SPEC error (malformed on any box), and it
-    must surface as SOURCE_MISSING rather than be masked by a GPU-less box's
-    DEPS_MISSING. The deps/GPU/weights checks then mirror ``wan_i2v._preflight``."""
-    # --- SPEC: a v2v render is DEFINED by the clip it enhances (source first) ---
+    ORDER: SPEC (conditioning input) -> deps -> GPU -> weights. The SPEC check is
+    FIRST because a VACE render with no conditioning input is malformed on ANY box,
+    and must surface as a spec error (SOURCE_MISSING / REFERENCE_MISSING) rather than
+    be masked by a GPU-less box's DEPS_MISSING. The deps/GPU/weights checks then
+    mirror ``wan_i2v._preflight``.
+
+    A VACE render is DEFINED by at least one conditioning input:
+      * ``source_video``     -> v2v restyle (the historical path);
+      * ``reference_images`` -> id_lock (reference-to-video identity); REQUIRED for
+        the ID_LOCK capability;
+      * ``control_image``    -> a still control (pose/depth/sketch) for composition.
+    A render carrying none of these is a spec error — REFERENCE_MISSING for an
+    id_lock request (the flagship path), else SOURCE_MISSING (v2v / other VACE)."""
+    # --- SPEC: at least one conditioning input; id_lock REQUIRES reference(s) ---
     source = _resolve_source(manifest)
-    if source is None:
+    refs = tuple(getattr(manifest, "reference_images", ()) or ())
+    control = getattr(manifest, "control_image", "") or ""
+    is_id_lock = (manifest.capability == Capability.ID_LOCK)
+
+    if is_id_lock and not refs:
         return StageError(
-            ErrorCode.SOURCE_MISSING,
-            "v2v (VACE) render carries no source_video — a video-to-video "
-            "enhancement is defined by the clip it restyles; supply source_video",
+            ErrorCode.REFERENCE_MISSING,
+            "id_lock (VACE reference-to-video) render carries no reference_images — "
+            "an identity-locked render is defined by the subject reference image(s); "
+            "supply at least one reference_image",
             (("model_id", manifest.model_id), ("capability", manifest.capability.value)),
         )
-    if not os.path.isfile(source):
+    if source is None and not refs and not control:
+        return StageError(
+            ErrorCode.REFERENCE_MISSING if is_id_lock else ErrorCode.SOURCE_MISSING,
+            "VACE render carries no conditioning input — supply a source_video "
+            "(v2v restyle), reference_images (id_lock), or a control_image",
+            (("model_id", manifest.model_id), ("capability", manifest.capability.value)),
+        )
+    if source is not None and not os.path.isfile(source):
         return StageError(
             ErrorCode.SOURCE_MISSING,
-            f"v2v (VACE) source_video not found on disk: {source}",
+            f"VACE source_video not found on disk: {source}",
             (("source_video", source), ("model_id", manifest.model_id)),
+        )
+    for r in refs:
+        if not os.path.isfile(r):
+            return StageError(
+                ErrorCode.REFERENCE_MISSING,
+                f"id_lock reference image not found on disk: {r}",
+                (("reference_image", r), ("model_id", manifest.model_id)),
+            )
+    if control and not os.path.isfile(control):
+        return StageError(
+            ErrorCode.SOURCE_MISSING,
+            f"VACE control_image not found on disk: {control}",
+            (("control_image", control), ("model_id", manifest.model_id)),
         )
 
     # --- ENV: deps -> GPU -> weights (identical discipline to wan_i2v) ---
@@ -289,6 +338,11 @@ def run_wan_vace(
             width=width, height=height, duration_s=n_frames / float(fps),
             resumed=True))
 
+    # CUDA allocator defragmentation (item 7): set PYTORCH_CUDA_ALLOC_CONF BEFORE any
+    # torch import (preflight below imports torch to probe CUDA). Shared helper with
+    # wan_i2v. No-op + harmless on this GPU-less box.
+    _prime_cuda_allocator()
+
     # PREFLIGHT: everything below the real path returns as DATA, never raises.
     # Order: source (spec) -> deps -> GPU -> weights (see _preflight).
     pf = _preflight(manifest)
@@ -315,7 +369,11 @@ def run_wan_vace(
     model_dir, weights_root_used = _resolve_model_dir(manifest, cfg.weight_uri)
     logger.info("wan vace: loading %s from %s (%s weights root)",
                 cfg.weight_uri, model_dir, weights_root_used)
-    source_video = _resolve_source(manifest)      # preflight proved it exists
+    source_video = _resolve_source(manifest)      # v2v restyle input (or None)
+    # id_lock / control conditioning (preflight proved any supplied paths exist).
+    reference_images = tuple(getattr(manifest, "reference_images", ()) or ())
+    control_image = getattr(manifest, "control_image", "") or ""
+    control_kind = getattr(manifest, "control_kind", "") or ""
     compute_dtype = torch.bfloat16
     quant_config = _bnb_config(manifest.precision, BitsAndBytesConfig, torch)
     seed = manifest.seeds.global_seed
@@ -361,17 +419,55 @@ def run_wan_vace(
                 ErrorCode.CANCELLED, "cancelled before wan vace load",
                 (("content_hash", content_hash), ("model_id", manifest.model_id))))
 
-        # Decode the FULL source clip to VACE control frames BEFORE loading multi-GB
-        # weights, so a bad source fails fast (errors-as-data). source_video is in the
-        # manifest (content_hash), so this is deterministic + resume-safe.
-        src_frame_dir = tempfile.mkdtemp(prefix=".srcframes-", dir=out_dir)
-        control_frames, stderr_tail = _read_control_frames(
-            source_video, width, height, n_frames, src_frame_dir)
-        if control_frames is None:
-            return Err(StageError(
-                ErrorCode.IO_ERROR,
-                f"could not decode control frames from source_video: {stderr_tail}",
-                (("source_video", source_video),)))
+        # Build the VACE conditioning channels BEFORE loading multi-GB weights so a bad
+        # input fails fast (errors-as-data). All inputs are in the manifest (content_hash),
+        # so this is deterministic + resume-safe.
+        #   * `video=` control channel: the source clip's per-frame frames (v2v restyle),
+        #     OR a single control still (pose/depth/sketch) REPEATED across the frame
+        #     count for composition blocking, OR omitted (pure reference-to-video, where
+        #     the pipeline zero-fills the control video and generates everything).
+        #   * `reference_images=` identity channel: the subject reference PIL image(s),
+        #     each prepended by the pipeline as a VACE reference latent (diffusers 0.39
+        #     WanVACEPipeline.__call__; ALL supplied references are consumed).
+        from PIL import Image
+        vace_call: dict = {}
+        control_frames_repeated = 0
+        if source_video:
+            src_frame_dir = tempfile.mkdtemp(prefix=".srcframes-", dir=out_dir)
+            control_frames, stderr_tail = _read_control_frames(
+                source_video, width, height, n_frames, src_frame_dir)
+            if control_frames is None:
+                return Err(StageError(
+                    ErrorCode.IO_ERROR,
+                    f"could not decode control frames from source_video: {stderr_tail}",
+                    (("source_video", source_video),)))
+            vace_call["video"] = control_frames
+        elif control_image:
+            try:
+                ctrl_pil = Image.open(control_image).convert("RGB").resize(
+                    (width, height), Image.LANCZOS)
+            except Exception as exc:  # noqa: BLE001 — bad control still is input data
+                return Err(StageError(
+                    ErrorCode.IO_ERROR,
+                    f"could not load control_image ({control_kind}): {exc}",
+                    (("control_image", control_image),)))
+            # A single still repeated across the frame count = a STATIC composition
+            # anchor (the VACE `video=` control expects a per-frame list). Recorded in
+            # provenance so the static-vs-dynamic control is never silent.
+            vace_call["video"] = [ctrl_pil] * n_frames
+            control_frames_repeated = n_frames
+
+        reference_pils: list = []
+        if reference_images:
+            for r in reference_images:
+                try:
+                    reference_pils.append(Image.open(r).convert("RGB"))
+                except Exception as exc:  # noqa: BLE001 — bad reference is input data
+                    return Err(StageError(
+                        ErrorCode.REFERENCE_MISSING,
+                        f"could not load reference image: {r} ({exc})",
+                        (("reference_image", r),)))
+            vace_call["reference_images"] = reference_pils
 
         # bitsandbytes-quantized VACE DiT transformer (int8 / nf4 per precision).
         tf_kwargs = {"subfolder": "transformer", "torch_dtype": compute_dtype}
@@ -408,12 +504,12 @@ def run_wan_vace(
         # _should_place_whole_on_gpu returns False for INT8/FP8).
         _place_pipe(pipe, place_whole)
 
-        # VACE unified control: `video=` conditions the generation on the source
-        # clip's frames (no mask / reference_images => pure v2v restyle/enhance).
-        # output_type="pil" so result.frames[0] is a list of PIL.Image for the save
-        # loop below (the VACE pipeline otherwise defaults to numpy output).
+        # VACE unified control (diffusers 0.39 WanVACEPipeline.__call__): the built
+        # `video=` control channel and/or `reference_images=` identity channel are
+        # threaded via vace_call. With neither, the pipeline zero-fills the control
+        # video + an all-ones mask (generate everything). output_type="pil" so
+        # result.frames[0] is a list of PIL.Image for the save loop below.
         result = pipe(
-            video=control_frames,
             prompt=prompt,
             negative_prompt=negative_prompt,
             height=height,
@@ -423,6 +519,7 @@ def run_wan_vace(
             guidance_scale=cfg_scale,
             generator=generator,
             output_type="pil",
+            **vace_call,
             **call_extra,
         )
 
@@ -462,10 +559,21 @@ def run_wan_vace(
         atomic_write_text(
             os.path.join(out_dir, _MANIFEST_NAME),
             json.dumps(render_manifest_to_dict(manifest), indent=2, sort_keys=True))
-        # Provenance records WHICH weights root served (hot NVMe vs shared) — a
-        # sidecar-only field (item 5); NOT a canonical input, never in content_hash.
+        # Provenance records WHICH weights root served (hot NVMe vs shared, item 5) and
+        # the id_lock conditioning HONESTY (item: identity-lock) — sidecar-only fields;
+        # NOT canonical inputs, never in content_hash.
         prov = _provenance_dict(manifest)
         prov["weights_root_used"] = weights_root_used
+        # Multi-reference honesty: diffusers 0.39 consumes ALL supplied references (each
+        # prepended as a reference latent), so supplied == consumed here. Recorded so a
+        # future version that consumes fewer is caught by the drift, never silent.
+        prov["reference_images_supplied"] = len(reference_images)
+        prov["reference_images_consumed"] = len(reference_pils)
+        if control_image:
+            # Static control still repeated across the frame count (composition anchor):
+            # recorded so the static-vs-per-frame control semantics are never silent.
+            prov["control_kind"] = control_kind
+            prov["control_frames_repeated"] = control_frames_repeated
         atomic_write_text(
             os.path.join(out_dir, _PROVENANCE_NAME),
             json.dumps(prov, indent=2, sort_keys=True))

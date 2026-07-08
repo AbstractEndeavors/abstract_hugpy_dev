@@ -80,6 +80,9 @@ def _build_manifest(
     prompt: str = "",
     negative_prompt: str = "",
     source_video: str = "",
+    reference_images: tuple[str, ...] = (),
+    control_image: str = "",
+    control_kind: str = "",
 ) -> RenderManifest:
     """Validate every field, then build the frozen manifest. Raises ``ValueError``
     LOCALLY on any structural violation. Shared by ``make_render_manifest`` (the
@@ -192,6 +195,29 @@ def _build_manifest(
         raise ValueError(
             f"source_video must be a string or None; got {type(source_video).__name__}")
 
+    # IDENTITY LOCK reference images (id_lock): None/absent -> () ; each must be a str.
+    # ORDER PRESERVED (canonical). A caller threading a list (from JSON) is coerced to
+    # a tuple so the frozen manifest stays hashable + order-stable.
+    if reference_images is None:
+        reference_images = ()
+    reference_images = tuple(reference_images)
+    for i, r in enumerate(reference_images):
+        if not isinstance(r, str):
+            raise ValueError(
+                f"reference_images[{i}] must be a str; got {type(r).__name__}")
+
+    # OPTIONAL VACE control channel: None/absent -> "" (no control). Both must be str.
+    if control_image is None:
+        control_image = ""
+    if control_kind is None:
+        control_kind = ""
+    if not isinstance(control_image, str):
+        raise ValueError(
+            f"control_image must be a string or None; got {type(control_image).__name__}")
+    if not isinstance(control_kind, str):
+        raise ValueError(
+            f"control_kind must be a string or None; got {type(control_kind).__name__}")
+
     return RenderManifest(
         render_id=render_id,
         capability=capability,
@@ -213,6 +239,9 @@ def _build_manifest(
         prompt=prompt,
         negative_prompt=negative_prompt,
         source_video=source_video,
+        reference_images=reference_images,
+        control_image=control_image,
+        control_kind=control_kind,
     )
 
 
@@ -236,6 +265,9 @@ def make_render_manifest(
     prompt: str = "",
     negative_prompt: str = "",
     source_video: str = "",
+    reference_images: tuple[str, ...] = (),
+    control_image: str = "",
+    control_kind: str = "",
 ) -> RenderManifest:
     """Build a validated ``RenderManifest`` from a resolved ``ModelBinding`` and a
     resolved ``StudioEnv``.
@@ -288,6 +320,10 @@ def make_render_manifest(
         negative_prompt=negative_prompt,
         # --- source-clip conditioning (B2 chain): part of the reproducibility key ---
         source_video=source_video,
+        # --- identity-lock reference images + optional control (part of the key) ---
+        reference_images=tuple(reference_images),
+        control_image=control_image,
+        control_kind=control_kind,
     )
 
 
@@ -345,6 +381,9 @@ def render_manifest_to_dict(m: RenderManifest) -> dict:
         "prompt": m.prompt,
         "negative_prompt": m.negative_prompt,
         "source_video": m.source_video,
+        "reference_images": list(m.reference_images),
+        "control_image": m.control_image,
+        "control_kind": m.control_kind,
         "provenance": (
             None if m.provenance is None else {
                 "operator": m.provenance.operator,
@@ -436,4 +475,8 @@ def render_manifest_from_dict(d: dict) -> RenderManifest:
         negative_prompt=d.get("negative_prompt", ""),
         # B2 chain: tolerate manifests serialized before source_video existed (absent -> "").
         source_video=d.get("source_video", ""),
+        # id_lock: tolerate manifests serialized before these fields existed (absent -> ()/"").
+        reference_images=tuple(d.get("reference_images", ())),
+        control_image=d.get("control_image", ""),
+        control_kind=d.get("control_kind", ""),
     )

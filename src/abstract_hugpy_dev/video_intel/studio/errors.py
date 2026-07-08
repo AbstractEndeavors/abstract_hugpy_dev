@@ -62,6 +62,13 @@ class ErrorCode(str, Enum):
     # than masked by a GPU-less box's DEPS_MISSING. INTENTIONAL / not retryable (the
     # same source-less spec re-run fails identically).
     SOURCE_MISSING = "source_missing"     # v2v render has no source clip to enhance
+    # IDENTITY LOCK (id_lock) preflight: an identity-locked render is DEFINED by the
+    # reference image(s) of the subject it preserves (Wan VACE reference-to-video). An
+    # id_lock request whose manifest carries no (or a nonexistent) reference_images is a
+    # SPEC error — malformed on ANY box, GPU or not. Checked BEFORE deps/GPU/weights so
+    # the spec error is reported here rather than masked by a GPU-less DEPS_MISSING.
+    # INTENTIONAL / not retryable (the same reference-less spec re-run fails identically).
+    REFERENCE_MISSING = "reference_missing"   # id_lock render has no reference image(s)
     # DIRECT MODEL CHOICE (pin): a request pinned a specific model_id (the caller wants
     # THAT model, not the router's auto-pick). This code is returned as DATA (never a
     # silent fallback to another model) when the pin cannot be honored: the model_id is

@@ -42,6 +42,7 @@ import json
 import logging
 import os
 import shutil
+import sys
 import tempfile
 from typing import Callable
 
@@ -354,6 +355,30 @@ def _should_place_whole_on_gpu(
 
 
 # --------------------------------------------------------------------------- #
+# CUDA allocator defragmentation (item 7) — must run BEFORE torch imports
+# --------------------------------------------------------------------------- #
+def _prime_cuda_allocator() -> bool:
+    """Set ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`` via ``setdefault``
+    (an operator-set value ALWAYS wins) BEFORE torch is imported, to defragment the
+    CUDA allocator. Evidence: the live 14B-int8 OOM on ae failed an 80MB allocation
+    while holding ~2.71 GiB "reserved by PyTorch but unallocated" — allocator
+    fragmentation, the single most promising lever for fitting int8 on a 24GB card.
+
+    HONESTY: the setting only takes effect if the CUDA allocator has NOT already
+    initialized in this process. On a worker whose agent avoids torch at boot that is
+    normally true for the first studio render, but a prior in-process
+    torch/transformers load may have initialized it — so we log whether ``torch`` was
+    already imported at this point (sys.modules probe) so it is clear whether this line
+    or the process env is doing the work. Returns True iff torch was already imported
+    (the line is then likely a no-op for this process)."""
+    already = "torch" in sys.modules
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    logger.info("wan cuda allocator: PYTORCH_CUDA_ALLOC_CONF=%s (torch already imported: %s)",
+                os.environ.get("PYTORCH_CUDA_ALLOC_CONF"), already)
+    return already
+
+
+# --------------------------------------------------------------------------- #
 # OFFLOAD-branch VRAM levers (item 4) — pure/duck-testable, no heavy deps here
 # --------------------------------------------------------------------------- #
 def _engage_memory_savers(pipe) -> list[str]:
@@ -445,6 +470,12 @@ def run_wan_i2v(
             path=clip_path, content_hash=content_hash, frames=n_frames,
             width=width, height=height, duration_s=n_frames / float(fps),
             resumed=True))
+
+    # CUDA allocator defragmentation (item 7): set PYTORCH_CUDA_ALLOC_CONF BEFORE any
+    # torch import (preflight below imports torch to probe CUDA), so it precedes the
+    # very first import in this render flow and the sys.modules log stays honest. No-op
+    # + harmless on this GPU-less box (preflight then returns DEPS_MISSING before torch).
+    _prime_cuda_allocator()
 
     # PREFLIGHT: everything below the real path returns as DATA, never raises.
     pf = _preflight(manifest)

@@ -152,7 +152,14 @@ for _r in _RUNNERS:
 set_capability_tasks({
     Capability.T2V: (Task.T2V, Task.AUDIO_VIDEO),
     Capability.I2V: (Task.I2V, Task.AUDIO_VIDEO, Task.STREAM_I2V),
-    Capability.ID_LOCK: (Task.I2V,),
+    # IDENTITY LOCK: VACE reference-to-video is the flagship id_lock path (the only
+    # runner that CONSUMES reference images), so Task.VACE_CONTROL is PREFERRED (first).
+    # Task.I2V stays as a fallback so the i2v rows that claim ID_LOCK remain valid, but
+    # in practice VACE always wins: the cheapest VACE model (vace-1.3b INT8=6 @480p) fits
+    # a lower budget than any i2v model at the same resolution, and the router binds the
+    # first task with a fitting model — so id_lock never silently routes to a runner that
+    # would ignore the references.
+    Capability.ID_LOCK: (Task.VACE_CONTROL, Task.I2V),
     Capability.KEYFRAME: (Task.I2V,),
     Capability.MOTION: (Task.VACE_CONTROL, Task.MOTION_MODULE),
     Capability.V2V: (Task.VACE_CONTROL,),
@@ -228,7 +235,7 @@ _MODELS = (
         model_id="wan2.1-vace-1.3b", family=Framework.WAN,
         tasks=(Task.VACE_CONTROL,),
         capabilities=(Capability.MOTION, Capability.V2V, Capability.INPAINT,
-                      Capability.OUTPAINT, Capability.RETAKE),
+                      Capability.OUTPAINT, Capability.RETAKE, Capability.ID_LOCK),
         vram=E((Precision.FP16, 10.0), (Precision.INT8, 6.0)),
         resolutions=(R_480P,), max_frames=81, max_duration_s=5.0,
         license=LicenseClass.APACHE_2_0,
@@ -241,7 +248,7 @@ _MODELS = (
         model_id="wan2.1-vace-14b", family=Framework.WAN,
         tasks=(Task.VACE_CONTROL,),
         capabilities=(Capability.MOTION, Capability.V2V, Capability.INPAINT,
-                      Capability.OUTPAINT, Capability.RETAKE),
+                      Capability.OUTPAINT, Capability.RETAKE, Capability.ID_LOCK),
         vram=E((Precision.BF16, 40.0), (Precision.FP8, 20.0), (Precision.INT8, 14.0)),
         resolutions=(R_720P, R_480P), max_frames=81, max_duration_s=5.0,
         license=LicenseClass.APACHE_2_0,

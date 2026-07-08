@@ -153,6 +153,9 @@ def produce_clip(
     prompt: str = "",
     negative_prompt: str = "",
     source_video: str | None = None,
+    reference_images: tuple[str, ...] | None = None,
+    control_image: str | None = None,
+    control_kind: str | None = None,
     should_cancel: Callable[[], bool] | None = None,
 ) -> Result[Artifact, StageError]:
     """Resolve ``request``, build its manifest, and run the bound runner.
@@ -219,6 +222,12 @@ def produce_clip(
         # capability; the i2v runners CONSUME it (extend from its last frame when no
         # start_image is given) — see run_synthetic_i2v / run_wan_i2v. None -> "".
         source_video=source_video or "",
+        # IDENTITY LOCK (id_lock): reference image paths + optional VACE control still,
+        # threaded into the manifest (canonical inputs). CARRIED for every capability;
+        # the VACE runner CONSUMES them (reference-to-video / control channel). None -> ()/"".
+        reference_images=tuple(reference_images or ()),
+        control_image=control_image or "",
+        control_kind=control_kind or "",
     )
 
     runner = _DISPATCH.get((binding.framework, binding.task))

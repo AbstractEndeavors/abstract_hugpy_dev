@@ -159,6 +159,20 @@ class RenderManifest:
     # "" is a valid "no source" (the common i2v/t2v case). Appended (not inserted)
     # so no positional field shifts for existing construction sites.
     source_video: str = ""
+    # IDENTITY LOCK (id_lock, Wan VACE reference-to-video): the reference image path(s)
+    # of the subject whose identity is preserved across the render. CANONICAL — a
+    # DIFFERENT reference set genuinely changes the output (each is prepended as a VACE
+    # reference latent), so it is part of the reproducibility key (canonical_inputs ->
+    # content_hash). ORDER IS PRESERVED in the hash (the pipeline consumes them in
+    # order). () is the valid "no reference" case (v2v restyle / plain i2v/t2v).
+    reference_images: tuple[str, ...] = ()
+    # OPTIONAL VACE CONTROL channel used for composition blocking when there is no
+    # source_video: a single still (pose/depth/sketch) repeated across the frame count
+    # as the pipeline's `video=` control input. CANONICAL when present (it changes the
+    # generated composition). "" = no control image; control_kind is the control type
+    # ("pose"|"depth"|"sketch"), "" when unused.
+    control_image: str = ""
+    control_kind: str = ""
 
     def canonical_inputs(self) -> dict:
         """Everything that changes the output; nothing that is mere metadata.
@@ -208,6 +222,14 @@ class RenderManifest:
             # "" (no source) still participates (re-addresses prior clips once, same
             # one-time cost + rationale as the empty-prompt case above).
             "source_video": self.source_video,
+            # Identity-lock reference images (id_lock): CANONICAL, ORDER-PRESERVED (each
+            # is a VACE reference latent prepended in order — a reorder is a different
+            # render). () -> [] participates like the empty-source case. Different refs
+            # -> different content_hash (proven in the id_lock suite).
+            "reference_images": list(self.reference_images),
+            # Optional VACE control channel (composition blocking): canonical when set.
+            "control_image": self.control_image,
+            "control_kind": self.control_kind,
         }
 
     def content_hash(self) -> str:

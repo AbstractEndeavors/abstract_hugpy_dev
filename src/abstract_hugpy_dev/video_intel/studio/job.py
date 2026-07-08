@@ -54,6 +54,14 @@ _MIN_CFG, _MAX_CFG = 0.0, 20.0
 
 _VALID_CAPABILITIES = frozenset(c.value for c in Capability)
 
+# IDENTITY LOCK (id_lock, Wan VACE reference-to-video). Multiple reference images ARE
+# consumed by diffusers 0.39 (each prepended as a VACE reference latent), so we accept
+# up to this many; more is rejected with a clean caller error (NEVER silently dropped).
+_MAX_REFERENCE_IMAGES = 4
+# The VACE control channel kinds (composition blocking). A control image needs a kind
+# to be meaningful; a kind outside this set is a caller error.
+_VALID_CONTROL_KINDS = frozenset({"pose", "depth", "sketch"})
+
 
 @dataclass(frozen=True)
 class StudioI2VSpec:
@@ -89,6 +97,17 @@ class StudioI2VSpec:
     # fallback). Not validated against the registry here (that is a runtime routing
     # decision, surfaced as errors-as-data from produce_clip) — only shape-checked.
     model_id: Optional[str] = None
+    # IDENTITY LOCK (id_lock): jailed abs paths of the subject reference image(s), in
+    # order. CANONICAL (they define the identity → part of the content_hash). () = none
+    # (a plain i2v/t2v/v2v render). The route jail-resolves + image-classifies each; the
+    # VACE runner loads them as PIL and drives reference-to-video conditioning.
+    reference_images: tuple[str, ...] = ()
+    # OPTIONAL VACE control channel (composition blocking): a single jailed still
+    # (control_image) + its kind (control_kind ∈ pose|depth|sketch), used as the VACE
+    # `video=` control input (repeated across the frame count) when there is no
+    # source_video. Both None = no control. CANONICAL when set.
+    control_image: Optional[str] = None
+    control_kind: Optional[str] = None
 
 
 def make_studio_i2v(
@@ -107,6 +126,9 @@ def make_studio_i2v(
     steps: Optional[int] = None,
     cfg: Optional[float] = None,
     model_id: Optional[str] = None,
+    reference_images: Optional[tuple] = None,
+    control_image: Optional[str] = None,
+    control_kind: Optional[str] = None,
 ) -> StudioI2VSpec:
     """Validate every field and build the frozen ``StudioI2VSpec``. Raises
     ``ValueError``/``TypeError`` LOCALLY on any structural violation (house
@@ -152,6 +174,41 @@ def make_studio_i2v(
     if model_id is not None and not (isinstance(model_id, str) and model_id.strip()):
         raise ValueError(f"model_id must be a non-empty string or None; got {model_id!r}")
 
+    # IDENTITY LOCK reference images: None -> (); coerce a list/tuple to a tuple (so an
+    # asdict->json->from_dict round-trip lands a tuple). Each must be a non-empty string;
+    # at most _MAX_REFERENCE_IMAGES (more is a clean caller error, never silently dropped).
+    # Existence / jail / image-classification are the ROUTE's job (a runtime input check),
+    # not this structural validator.
+    if reference_images is None:
+        reference_images = ()
+    if isinstance(reference_images, (list, tuple)):
+        reference_images = tuple(reference_images)
+    else:
+        raise ValueError(
+            f"reference_images must be a list/tuple of paths or None; got {reference_images!r}")
+    for i, r in enumerate(reference_images):
+        if not (isinstance(r, str) and r.strip()):
+            raise ValueError(
+                f"reference_images[{i}] must be a non-empty string; got {r!r}")
+    if len(reference_images) > _MAX_REFERENCE_IMAGES:
+        raise ValueError(
+            f"at most {_MAX_REFERENCE_IMAGES} reference_images are accepted; "
+            f"got {len(reference_images)}")
+
+    # OPTIONAL VACE control channel: a control image needs a kind, and a kind needs an
+    # image — both-or-neither. control_kind must be one of the supported kinds.
+    if control_image is not None and not (isinstance(control_image, str) and control_image.strip()):
+        raise ValueError(f"control_image must be a non-empty string or None; got {control_image!r}")
+    if control_kind is not None:
+        if not isinstance(control_kind, str) or control_kind not in _VALID_CONTROL_KINDS:
+            raise ValueError(
+                f"control_kind must be one of {sorted(_VALID_CONTROL_KINDS)} or None; "
+                f"got {control_kind!r}")
+    if (control_image is None) != (control_kind is None):
+        raise ValueError(
+            "control_image and control_kind must be set together (a control still needs "
+            "a kind, and a kind needs a still) or both omitted")
+
     resolved_out = out_root if (isinstance(out_root, str) and out_root.strip()) \
         else DEFAULT_CLIPS_ROOT
 
@@ -170,6 +227,9 @@ def make_studio_i2v(
         steps=steps,
         cfg=(float(cfg) if cfg is not None else None),
         model_id=model_id,
+        reference_images=reference_images,
+        control_image=control_image,
+        control_kind=control_kind,
     )
 
 
@@ -193,6 +253,9 @@ def studio_i2v_from_dict(d: dict) -> StudioI2VSpec:
         steps=d.get("steps"),
         cfg=d.get("cfg"),
         model_id=d.get("model_id"),
+        reference_images=d.get("reference_images"),
+        control_image=d.get("control_image"),
+        control_kind=d.get("control_kind"),
     )
 
 

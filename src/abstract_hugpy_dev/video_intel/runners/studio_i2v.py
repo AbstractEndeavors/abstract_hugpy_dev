@@ -187,6 +187,12 @@ def run_produce_clip(spec, should_cancel):
         # into the manifest; the i2v runner extends from its last frame when there is
         # no start_image. None -> "" (no source) inside produce_clip.
         source_video=getattr(spec, "source_video", None),
+        # IDENTITY LOCK (id_lock): reference image paths + optional VACE control still,
+        # carried into the manifest (canonical inputs). The VACE runner consumes them
+        # (reference-to-video / control channel). getattr keeps older spec dicts working.
+        reference_images=getattr(spec, "reference_images", None),
+        control_image=getattr(spec, "control_image", None),
+        control_kind=getattr(spec, "control_kind", None),
         should_cancel=should_cancel,
     )
 
