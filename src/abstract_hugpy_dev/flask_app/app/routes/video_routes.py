@@ -898,7 +898,7 @@ def video_studio_clip_detail(job_id):
         conn.execute("PRAGMA busy_timeout=5000")
         try:
             row = conn.execute(
-                "SELECT status, spec_json, result_json FROM media_jobs "
+                "SELECT status, spec_json, result_json, created, updated FROM media_jobs "
                 "WHERE job_id=? AND name='studio_i2v'",
                 (job_id,),
             ).fetchone()
@@ -908,7 +908,7 @@ def video_studio_clip_detail(job_id):
         row = None
     if row is None:
         return jsonify({"error": "no studio job for that id"}), 404
-    status, spec_json, result_json = row
+    status, spec_json, result_json, created, updated = row
 
     # Curated view of the REQUESTED spec (drop out_root — an internal path). Everything
     # else is a creation parameter worth showing.
@@ -960,13 +960,30 @@ def video_studio_clip_detail(job_id):
                     "retryable": bool(err.get("retryable", False)),
                 }
 
+    # SOURCE discriminator (coordinator addendum): which record the render params come
+    # from. "manifest" = the content-addressed manifest.json beside a produced clip — the
+    # TRUE, RESOLVED params (model bound, sampler steps/cfg actually used). "job_record" =
+    # only the media-bus row exists: a FAILED / CANCELLED / still-running job wrote NO
+    # manifest (only successful renders write the clip dir), so `spec` carries the
+    # REQUESTED params (unresolved — e.g. `steps` null means "model default", which was
+    # never bound) and `error` carries the failure {code,message,retryable}. The UI reads
+    # this to label job_record params as REQUESTED and to explain the row that most needs
+    # it. We surface only what the record HOLDS — no resolved sampler value is invented
+    # for a job that failed before it bound a model.
+    source = "manifest" if manifest_view is not None else "job_record"
     return jsonify({
         "job_id": job_id,
         "status": status,
+        "source": source,
         "playable": bool(status == "done" and manifest_view is not None),
         "spec": spec_view,
         "manifest": manifest_view,
         "error": error_view,
+        # Bus row timestamps (epoch seconds) — when the job was enqueued / last updated.
+        # Present in every case (the row always carries them); the UI shows them on a
+        # failed/cancelled row alongside the requested params + error.
+        "created": created,
+        "updated": updated,
     }), 200
 
 

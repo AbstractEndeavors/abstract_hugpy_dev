@@ -74,9 +74,21 @@ _RETRYABLE_CODES = frozenset({"oom", "nan_in_vae", "assembly_failed", "io_error"
 _WORKER_ENV = "HUGPY_STUDIO_WORKER"            # base URL of the studio GPU worker
 _FORCE_REMOTE_ENV = "HUGPY_STUDIO_FORCE_REMOTE"  # TEST-ONLY: delegate even synthetic
 _POLL_ENV = "HUGPY_STUDIO_POLL_INTERVAL_S"     # status poll cadence (s)
-_TIMEOUT_ENV = "HUGPY_STUDIO_DELEGATE_TIMEOUT_S"  # overall wall-clock budget (s)
+_TIMEOUT_ENV = "HUGPY_STUDIO_DELEGATE_TIMEOUT_S"  # RENDER budget once RUNNING (s)
+_OVERALL_CAP_ENV = "HUGPY_STUDIO_OVERALL_CAP_S"   # overall wall-clock cap incl. queue wait (s)
+# Kick-off retry (item 2): a ConnectionReset/refused at kick-off (the post-restart /
+# converge socket window) retries within this window before falling back in-process.
+_KICKOFF_RETRY_WINDOW_ENV = "HUGPY_STUDIO_KICKOFF_RETRY_WINDOW_S"
+_KICKOFF_RETRY_INTERVAL_ENV = "HUGPY_STUDIO_KICKOFF_RETRY_INTERVAL_S"
 _DEFAULT_POLL_S = 2.0
+# TWO clocks (item 1): the RENDER budget bounds a render once it is actually RUNNING
+# on the worker (it does NOT penalize time a job spent WAITING in the worker's queue);
+# the OVERALL cap is a separate wall-clock ceiling over the whole delegation (queue
+# wait + kick-off-409 retries + render) so a wedged worker can never hang a job forever.
 _DEFAULT_TIMEOUT_S = 1800.0                     # 30 min: a real Wan render fits well under
+_DEFAULT_OVERALL_CAP_S = 7200.0                # 2 h: render budget + a few queued jobs ahead
+_DEFAULT_KICKOFF_RETRY_WINDOW_S = 30.0         # retry a reset/refused kick-off for ~30s
+_DEFAULT_KICKOFF_RETRY_INTERVAL_S = 5.0        # ...every ~5s (also the queue-full retry cadence)
 _MAX_POLL_ERRORS = 5                            # consecutive poll failures => worker_lost
 _KICKOFF_TIMEOUT_S = 30.0                       # POST /studio/render connect budget
 _CANCEL_TIMEOUT_S = 15.0
@@ -306,11 +318,18 @@ def _delegate_to_worker(base: str, spec, job_id: str):
     """Delegate the render to the studio worker at ``base`` and settle the job.
 
     Returns a ``JobResult`` once the remote render settles (done/error/cancelled/
-    timeout/worker-lost), OR ``None`` to signal "kick-off failed, fall back to the
-    in-process path" — used ONLY before the worker has accepted the job (an
-    unreachable worker at kick-off is exactly the scout's "worker unreachable ->
+    timeout/worker-lost/queue-full), OR ``None`` to signal "kick-off failed, fall
+    back to the in-process path" — used ONLY before the worker has accepted the job
+    (an unreachable worker at kick-off is exactly the scout's "worker unreachable ->
     current behavior"). Once the worker returns 202 we never fall back (that would
-    risk a double render); a later failure becomes a retryable JobError."""
+    risk a double render); a later failure becomes a retryable JobError.
+
+    QUEUE (item 1): a busy worker now QUEUES a second render (202 accepted="queued"
+    + position) rather than 409ing, so the delegation just polls it through. A 409
+    means the worker's bounded queue is FULL — worker_busy now means WAIT, so we
+    retry kick-off with backoff inside the OVERALL cap, only failing worker_busy when
+    that window expires. KICK-OFF RESET RETRY (item 2): a ConnectionReset/refused at
+    kick-off (post-restart socket window) retries for ~30s before falling back."""
     from .. import media_bus
 
     spec_dict = asdict(spec)
@@ -318,43 +337,90 @@ def _delegate_to_worker(base: str, spec, job_id: str):
     start_payload = {"job_id": job_id, "spec": spec_dict,
                      "central_version": central_version}
 
-    # ---- kick off the remote render -------------------------------------------
-    try:
-        code, body = _http_post_json(
-            base + "/studio/render", start_payload, timeout=_KICKOFF_TIMEOUT_S)
-    except urllib.error.HTTPError as exc:
-        if exc.code == 409:
-            logger.warning("studio worker %s busy (409) — job %s", base, job_id)
-            return JobResult(job_id=job_id, ok=False, error=JobError(
-                code="worker_busy",
-                message=f"studio worker busy (one render at a time): {base}",
-                retryable=True))
-        # Any other HTTP error at kick-off: the worker never started this render,
-        # so fall back to the in-process path (graceful NO_GPU/DEPS on central).
-        logger.warning("studio worker %s rejected /studio/render (HTTP %s) — "
-                       "falling back in-process for job %s", base, exc.code, job_id)
-        return None
-    except (urllib.error.URLError, OSError, ValueError) as exc:
-        logger.warning("studio worker %s unreachable at kick-off (%s: %s) — "
-                       "falling back in-process for job %s",
-                       base, type(exc).__name__, exc, job_id)
-        return None
+    poll_s = _float_env(_POLL_ENV, _DEFAULT_POLL_S)
+    render_budget = _float_env(_TIMEOUT_ENV, _DEFAULT_TIMEOUT_S)
+    overall_cap = _float_env(_OVERALL_CAP_ENV, _DEFAULT_OVERALL_CAP_S)
+    reset_window = _float_env(_KICKOFF_RETRY_WINDOW_ENV, _DEFAULT_KICKOFF_RETRY_WINDOW_S)
+    retry_interval = _float_env(_KICKOFF_RETRY_INTERVAL_ENV, _DEFAULT_KICKOFF_RETRY_INTERVAL_S)
+
+    started_at = time.time()
+    overall_deadline = started_at + overall_cap    # whole-delegation ceiling
+    reset_deadline = started_at + reset_window      # connection-reset retry window
+    cancel_url = base + "/studio/cancel/" + job_id
+
+    # ---- kick off the remote render (retry: 409-full within overall cap; a reset/
+    #      refused within the reset window; other errors -> fall back in-process) --
+    body = None
+    while True:
+        try:
+            _code, body = _http_post_json(
+                base + "/studio/render", start_payload, timeout=_KICKOFF_TIMEOUT_S)
+            break
+        except urllib.error.HTTPError as exc:
+            if exc.code == 409:
+                # Worker's bounded queue is FULL. worker_busy means WAIT: retry within
+                # the overall cap, only failing worker_busy when the window expires.
+                if time.time() >= overall_deadline:
+                    logger.warning("studio worker %s queue full past overall cap — "
+                                   "job %s", base, job_id)
+                    return JobResult(job_id=job_id, ok=False, error=JobError(
+                        code="worker_busy",
+                        message=f"studio worker queue full past the delegation "
+                                f"window: {base}",
+                        retryable=True))
+                logger.info("studio worker %s queue full (409) — retrying kick-off "
+                            "in %.1fs (job %s)", base, retry_interval, job_id)
+                time.sleep(retry_interval)
+                continue
+            # Any other HTTP error at kick-off: the worker never started this render,
+            # so fall back to the in-process path (graceful NO_GPU/DEPS on central).
+            logger.warning("studio worker %s rejected /studio/render (HTTP %s) — "
+                           "falling back in-process for job %s", base, exc.code, job_id)
+            return None
+        except (urllib.error.URLError, OSError) as exc:
+            # ConnectionReset/refused/unreachable (e.g. the post-restart converge
+            # socket window, seen twice live): retry within the reset window, then
+            # fall back in-process (the scout's "worker unreachable" behavior).
+            if time.time() >= reset_deadline:
+                logger.warning("studio worker %s unreachable at kick-off past retry "
+                               "window (%s: %s) — falling back in-process for job %s",
+                               base, type(exc).__name__, exc, job_id)
+                return None
+            logger.info("studio worker %s kick-off connection error (%s: %s) — "
+                        "retrying in %.1fs (job %s)",
+                        base, type(exc).__name__, exc, retry_interval, job_id)
+            time.sleep(retry_interval)
+            continue
+        except ValueError as exc:
+            # Malformed response body — not transient; fall back in-process.
+            logger.warning("studio worker %s returned an unparseable kick-off body "
+                           "(%s) — falling back in-process for job %s",
+                           base, exc, job_id)
+            return None
 
     worker_version = str(body.get("pkg_version") or "")
     if worker_version and worker_version != central_version:
         logger.warning("studio offload VERSION SKEW: central=%s worker=%s (job %s) "
                        "— delegating anyway; behavior may differ across versions",
                        central_version, worker_version, job_id)
-    logger.info("studio job %s delegated to %s (accepted=%s, worker_pkg=%s)",
-                job_id, base, body.get("accepted"), worker_version or "?")
+    logger.info("studio job %s delegated to %s (accepted=%s, position=%s, worker_pkg=%s)",
+                job_id, base, body.get("accepted"), body.get("position"),
+                worker_version or "?")
 
     # ---- poll to settlement ----------------------------------------------------
-    poll_s = _float_env(_POLL_ENV, _DEFAULT_POLL_S)
-    deadline = time.time() + _float_env(_TIMEOUT_ENV, _DEFAULT_TIMEOUT_S)
+    # TWO clocks: the RENDER budget clock starts only at the RUNNING transition (a
+    # queued job is not charged for its wait); the OVERALL cap is the absolute ceiling
+    # over queue wait + render.
     status_url = base + "/studio/render/" + job_id
-    cancel_url = base + "/studio/cancel/" + job_id
     cancel_sent = False
     consecutive_errors = 0
+    render_deadline = None            # set when we first observe status == "running"
+
+    def _past_budget() -> bool:
+        now = time.time()
+        if now > overall_deadline:
+            return True
+        return render_deadline is not None and now > render_deadline
 
     while True:
         time.sleep(poll_s)
@@ -387,9 +453,31 @@ def _delegate_to_worker(base: str, spec, job_id: str):
                     message=f"studio worker {base} unreachable after "
                             f"{consecutive_errors} status polls",
                     retryable=True))
-            if time.time() > deadline:
+            if _past_budget():
                 return _timeout_result(job_id, base, cancel_url)
             continue
+
+        status = st.get("status")
+
+        # QUEUED (item 1): the render is WAITING behind another on the worker. Keep
+        # polling, forward the queue position as progress so the console shows it, and
+        # bound the wait by the OVERALL cap only (the render budget hasn't started).
+        if status == "queued":
+            position = st.get("position")
+            try:
+                media_bus.set_progress(
+                    job_id, {"phase": "queued", "position": position})
+            except Exception:  # noqa: BLE001
+                pass
+            if time.time() > overall_deadline:
+                logger.warning("studio job %s queued past overall cap on %s",
+                               job_id, base)
+                return _timeout_result(job_id, base, cancel_url)
+            continue
+
+        # RUNNING transition: start the render budget clock (not charged for the wait).
+        if status == "running" and render_deadline is None:
+            render_deadline = time.time() + render_budget
 
         # Forward live progress best-effort (whatever the worker exposes).
         prog = st.get("progress")
@@ -399,7 +487,6 @@ def _delegate_to_worker(base: str, spec, job_id: str):
             except Exception:  # noqa: BLE001
                 pass
 
-        status = st.get("status")
         if status in ("done", "error"):
             # Both carry a result payload; error-as-data (incl. a cancelled render,
             # which is an Err(CANCELLED) produce_clip result -> code "cancelled").
@@ -412,7 +499,7 @@ def _delegate_to_worker(base: str, spec, job_id: str):
                         f"(worker restarted?)",
                 retryable=True))
         # status == "running" -> keep polling until settled or timed out.
-        if time.time() > deadline:
+        if _past_budget():
             return _timeout_result(job_id, base, cancel_url)
 
 

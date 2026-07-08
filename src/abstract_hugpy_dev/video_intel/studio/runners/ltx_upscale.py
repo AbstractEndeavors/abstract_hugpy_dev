@@ -47,7 +47,12 @@ from ..schemas import RenderManifest
 # an HF ``org/name`` under STUDIO_WEIGHTS_ROOT). Reuse those PURE helpers — they pull
 # only stdlib + the synthetic sidecar helpers (numpy/PIL), NOT the GPU stack, so this
 # import stays app-boot-safe.
-from .wan_i2v import _local_model_dir, _weights_root
+from .wan_i2v import (
+    _hot_weights_root,
+    _local_model_dir,
+    _resolve_model_dir,
+    _weights_root,
+)
 
 
 def _resolve_source(manifest: RenderManifest) -> str | None:
@@ -90,25 +95,34 @@ def run_ltx_upscale(
     # headline blocker for THIS premium path (the weights are license-gated 401).
     cfg = MODEL_REGISTRY.get(manifest.model_id)
     weight_uri = cfg.weight_uri if cfg is not None else "Lightricks/ltxv-spatial-upscaler-0.9.7"
+    # WEIGHTS root resolution honors the box-local HOT NVMe copy first (item 5), then
+    # the shared/snapshot root — identical to the wan runners (_resolve_model_dir).
+    hot = _hot_weights_root()
     weights_root = _weights_root(manifest)
     gate = (" These weights are staged on the SHARED store since 2026-07-07 "
             "(public repo, no license gate) — if missing on this box, mount the "
-            f"shared weights root or `hf download {weight_uri}` into it. The "
-            "ffmpeg lanczos last-resort serves UPRES in the meantime.")
-    if not weights_root:
+            f"shared weights root, stage a hot NVMe copy, or `hf download {weight_uri}` "
+            "into one. The ffmpeg lanczos last-resort serves UPRES in the meantime.")
+    if not hot and not weights_root:
         return Err(StageError(
             ErrorCode.WEIGHTS_MISSING,
-            "STUDIO_WEIGHTS_ROOT is not set — no weights root to resolve the LTX "
-            "spatial-upscaler weights against." + gate,
+            "no weights root set — neither STUDIO_WEIGHTS_HOT_ROOT (box-local NVMe) "
+            "nor STUDIO_WEIGHTS_ROOT is configured to resolve the LTX spatial-upscaler "
+            "weights against." + gate,
             (("model_id", manifest.model_id), ("weight_uri", weight_uri))))
 
-    model_dir = _local_model_dir(weights_root, weight_uri)
-    if not (os.path.isdir(model_dir)
+    model_dir, _root_used = _resolve_model_dir(manifest, weight_uri)
+    if not model_dir or not (os.path.isdir(model_dir)
             and os.path.isfile(os.path.join(model_dir, "model_index.json"))):
         return Err(StageError(
             ErrorCode.WEIGHTS_MISSING,
-            f"LTX spatial-upscaler weights not found on disk at {model_dir}." + gate,
-            (("model_dir", model_dir), ("weight_uri", weight_uri))))
+            "LTX spatial-upscaler weights not found on disk (hot NVMe "
+            + (_local_model_dir(hot, weight_uri) if hot else "unset")
+            + ", shared "
+            + (_local_model_dir(weights_root, weight_uri) if weights_root else "unset")
+            + ")." + gate,
+            (("weight_uri", weight_uri),
+             ("hot_root", hot or ""), ("shared_root", weights_root or ""))))
 
     # REAL PATH (only once the weights are staged on the box; never reached on this
     # dev VM). diffusers is imported LAZILY here so this module stays app-boot-safe.

@@ -143,6 +143,17 @@ _insert_job(
         capability="i2v", width=1280, height=720, fps=16, vram_budget_gb=2.0, seed=0,
         out_root=_WORK, prompt="wanted big", steps=40, cfg=6.0)))
 
+# A CANCELLED-before-start job — detail also falls back to the job record: the cancel is
+# the error, the requested spec explains what was asked, no manifest exists.
+_insert_job(
+    "cancelled-job", "cancelled",
+    {"job_id": "x", "ok": False, "outputs": [],
+     "error": {"code": "cancelled", "message": "cancelled before it started",
+               "retryable": False}},
+    dataclasses.asdict(make_studio_i2v(
+        capability="t2v", width=832, height=480, fps=16, vram_budget_gb=6.0, seed=7,
+        out_root=_WORK, prompt="never ran")))
+
 
 def _ct(resp):
     return (resp.headers.get("Content-Type") or "").split(";")[0].strip()
@@ -220,6 +231,10 @@ def test_detail_done_clip():
     # the requested spec rides along too
     assert body["spec"]["capability"] == "i2v", body["spec"]
     assert "out_root" not in body["spec"], body["spec"]     # internal path redacted
+    # SOURCE discriminator: a DONE clip's params come from the content-addressed manifest.
+    assert body["source"] == "manifest", body
+    # Bus timestamps ride along in every case (epoch seconds).
+    assert body["created"] is not None and body["updated"] is not None, body
 
 
 # --------------------------------------------------------------------------- #
@@ -232,15 +247,36 @@ def test_detail_failed_job():
     body = r.get_json()
     assert body["status"] == "failed", body
     assert body["manifest"] is None, body
+    # SOURCE discriminator (coordinator addendum): a FAILED job wrote no manifest, so the
+    # detail falls back to the media-bus JOB RECORD — the params are REQUESTED, not
+    # resolved, and this marker lets the UI label them so.
+    assert body["source"] == "job_record", body
     assert body["error"]["code"] == "vram_exceeded", body["error"]
     assert body["error"]["retryable"] is False, body["error"]
     # the requested spec explains WHAT was asked for (incl. the override + budget)
     assert body["spec"]["steps"] == 40 and body["spec"]["cfg"] == 6.0, body["spec"]
     assert body["spec"]["vram_budget_gb"] == 2.0, body["spec"]
+    # Bus timestamps present on the failed row too (for the expander's "when" line).
+    assert body["created"] is not None and body["updated"] is not None, body
 
 
 # --------------------------------------------------------------------------- #
-# [7] DETAIL of an unknown id -> 404.
+# [7] DETAIL of a CANCELLED job: falls back to the job record (source job_record),
+#     surfacing the cancel error + the requested spec, manifest null.
+# --------------------------------------------------------------------------- #
+def test_detail_cancelled_job():
+    r = client.get("/video/studio/clip/cancelled-job/detail")
+    assert r.status_code == 200, (r.status_code, r.get_json())
+    body = r.get_json()
+    assert body["status"] == "cancelled", body
+    assert body["source"] == "job_record", body
+    assert body["manifest"] is None, body
+    assert body["error"]["code"] == "cancelled", body["error"]
+    assert body["spec"]["capability"] == "t2v", body["spec"]
+
+
+# --------------------------------------------------------------------------- #
+# [8] DETAIL of an unknown id -> 404.
 # --------------------------------------------------------------------------- #
 def test_detail_unknown_404():
     r = client.get("/video/studio/clip/does-not-exist/detail")
@@ -253,8 +289,11 @@ CHECKS = [
     ("serve extensionless uri, NO catalog mime -> video/mp4 fallback (the bug fix)",
      test_serve_no_extension_no_mime_falls_back),
     ("/video/media extensionless studio clip -> video/mp4", test_video_media_extensionless_clip),
-    ("detail of a done clip: manifest params + spec", test_detail_done_clip),
-    ("detail of a failed job: error + spec, manifest null", test_detail_failed_job),
+    ("detail of a done clip: manifest params + spec (source manifest)", test_detail_done_clip),
+    ("detail of a failed job: error + spec, manifest null (source job_record)",
+     test_detail_failed_job),
+    ("detail of a cancelled job: error + spec, manifest null (source job_record)",
+     test_detail_cancelled_job),
     ("detail of an unknown id -> 404", test_detail_unknown_404),
 ]
 

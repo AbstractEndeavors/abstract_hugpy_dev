@@ -1634,9 +1634,23 @@ def _worker_storage(state: "WorkerState") -> dict:
         "cache_used_bytes": cache_used,
         "disk_free": int(disk.get("free_bytes", 0) or 0),
         "models": models,
+        # HOT-CACHE tier (box-local NVMe LRU of the main catalog). Honest section
+        # so central/console can surface root/budget/used + per-entry last_called.
+        # {"enabled": False} when HUGPY_HOT_CACHE_ROOT is unset (no behaviour).
+        "hot_cache": _hot_cache_status(),
     }
     _STORAGE_CACHE.update(at=now, value=out)
     return out
+
+
+def _hot_cache_status() -> dict:
+    """Best-effort hot-cache overview for the heartbeat storage view; never
+    raises into a heartbeat (returns {"enabled": False} on any failure)."""
+    try:
+        from ..managers.serve import hot_cache
+        return hot_cache.status()
+    except Exception:  # noqa: BLE001
+        return {"enabled": False}
 
 
 def _spill_describe() -> dict:

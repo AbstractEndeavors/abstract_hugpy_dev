@@ -264,9 +264,28 @@ def resolve_model_source(key: str) -> str:
         return str(gguf)
 
     if model_looks_downloaded(local, cfg):
-        return str(local)
+        # Read-through the box-local NVMe HOT-CACHE tier: a transformers/diffusers
+        # model dir is served from the hot copy when complete, else the shared dir
+        # unchanged (a background promotion is scheduled). Env-gated
+        # (HUGPY_HOT_CACHE_ROOT) so central and un-configured boxes are unaffected
+        # — byte-identical when unset. GGUF stays UN-hooked here: its hot-caching
+        # happens at the slot load site (slot_agent) so a model is never promoted
+        # twice. Never raises into resolution.
+        return _hot_cache_dir(str(local))
 
     return cfg.hub_id
+
+
+def _hot_cache_dir(shared_dir: str) -> str:
+    """Env-gated hot-cache read-through for a transformers/diffusers model dir.
+    Returns ``shared_dir`` unchanged on any failure or when the tier is disabled.
+    Lazy import keeps imports.config free of a managers dependency at import
+    time (both sides import lazily -> no cycle)."""
+    try:
+        from ...managers.serve import hot_cache
+        return hot_cache.use(shared_dir)
+    except Exception:  # noqa: BLE001
+        return shared_dir
 
 
 # ---------------------------------------------------------------------

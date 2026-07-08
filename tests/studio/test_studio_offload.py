@@ -36,6 +36,7 @@ import shutil
 import sys
 import threading
 import time
+import urllib.error
 from dataclasses import asdict
 
 logging.disable(logging.INFO)
@@ -93,6 +94,10 @@ _ENV_KEYS = (
     "HUGPY_STUDIO_FORCE_REMOTE",
     "HUGPY_STUDIO_POLL_INTERVAL_S",
     "HUGPY_STUDIO_DELEGATE_TIMEOUT_S",
+    "HUGPY_STUDIO_OVERALL_CAP_S",
+    "HUGPY_STUDIO_KICKOFF_RETRY_WINDOW_S",
+    "HUGPY_STUDIO_KICKOFF_RETRY_INTERVAL_S",
+    "HUGPY_STUDIO_QUEUE_DEPTH",
 )
 
 
@@ -236,28 +241,58 @@ def test_payload_to_job_result_errors():
 
 
 # --------------------------------------------------------------------------- #
-# (5) StudioRenderManager — one at a time (busy), idempotent, unknown cancel
+# (5) StudioRenderManager — QUEUE: accept/position, idempotent, full->409,
+#     queued-cancel, running-cancel, unknown status/cancel.
 # --------------------------------------------------------------------------- #
 def test_render_manager_state_machine():
-    # A stub manager whose render thread never settles, so we can observe the
-    # in-flight state deterministically (no dependence on render timing).
+    # A stub manager whose render thread never settles, so the FIRST job stays
+    # 'running' and later jobs stay 'queued' — deterministic state observation.
     class _StubMgr(StudioRenderManager):
-        def _run(self, job, spec_dict):
+        def _run(self, job):
             return  # leave status 'running' + _active set (simulated in-flight)
 
-    mgr = _StubMgr()
-    ok_a, why_a = mgr.start("job-A", {"width": 1})
-    assert ok_a and why_a == "started", (ok_a, why_a)
+    # Bounded depth 2 so we can drive the queue to FULL deterministically.
+    mgr = _StubMgr(queue_depth=2)
 
-    # A DIFFERENT job while one is in flight -> busy (one render at a time).
-    ok_b, why_b = mgr.start("job-B", {"width": 1})
-    assert ok_b is False and why_b == "busy", (ok_b, why_b)
+    # First job -> starts immediately (no position).
+    ok_a, why_a, pos_a = mgr.start("job-A", {"width": 1})
+    assert ok_a and why_a == "started" and pos_a is None, (ok_a, why_a, pos_a)
 
-    # A re-POST of the SAME job -> idempotent (exists), not busy.
-    ok_a2, why_a2 = mgr.start("job-A", {"width": 1})
-    assert ok_a2 is True and why_a2 == "exists", (ok_a2, why_a2)
+    # A DIFFERENT job while one is in flight -> QUEUED (not busy), position 1.
+    ok_b, why_b, pos_b = mgr.start("job-B", {"width": 1})
+    assert ok_b is True and why_b == "queued" and pos_b == 1, (ok_b, why_b, pos_b)
 
-    # cancel of a running job -> cancelling; unknown job -> not cancelled.
+    # Another -> queued at position 2.
+    ok_c, why_c, pos_c = mgr.start("job-C", {"width": 1})
+    assert ok_c is True and why_c == "queued" and pos_c == 2, (ok_c, why_c, pos_c)
+
+    # status reflects the queued position (central forwards this to the console).
+    assert mgr.status("job-B")["status"] == "queued" and mgr.status("job-B")["position"] == 1
+    assert mgr.status("job-C")["status"] == "queued" and mgr.status("job-C")["position"] == 2
+
+    # Queue is now FULL (depth 2) -> the ONLY 409 (start returns ok=False, "full").
+    ok_d, why_d, pos_d = mgr.start("job-D", {"width": 1})
+    assert ok_d is False and why_d == "full" and pos_d is None, (ok_d, why_d, pos_d)
+
+    # A re-POST of a KNOWN job -> idempotent (exists), never re-queued.
+    ok_a2, why_a2, pos_a2 = mgr.start("job-A", {"width": 1})
+    assert ok_a2 is True and why_a2 == "exists" and pos_a2 is None, (ok_a2, why_a2, pos_a2)
+
+    # cancel of a QUEUED job -> removed from the queue, settled cancelled WITHOUT
+    # rendering; the response says 'cancelled' and the polled result carries the
+    # cancelled error payload (so central records a 'cancelled' terminal).
+    cq = mgr.cancel("job-B")
+    assert cq["cancelled"] is True and cq["status"] == "cancelled", cq
+    stq = mgr.status("job-B")
+    assert stq["result"] and stq["result"]["ok"] is False, stq
+    assert stq["result"]["error"]["code"] == "cancelled", stq
+
+    # C moves up to position 1 now that B is gone, and there's room to queue again.
+    assert mgr.status("job-C")["position"] == 1, mgr.status("job-C")
+    ok_e, why_e, pos_e = mgr.start("job-E", {"width": 1})
+    assert ok_e is True and why_e == "queued" and pos_e == 2, (ok_e, why_e, pos_e)
+
+    # cancel of a RUNNING job -> cancelling (cooperative); unknown -> not cancelled.
     c = mgr.cancel("job-A")
     assert c["cancelled"] is True and c["status"] == "cancelling", c
     cu = mgr.cancel("nope")
@@ -266,6 +301,50 @@ def test_render_manager_state_machine():
     # status of an unknown job -> 'unknown' (central reads this as worker_lost).
     su = mgr.status("nope")
     assert su["status"] == "unknown" and su["result"] is None, su
+
+
+# --------------------------------------------------------------------------- #
+# (5b) StudioRenderManager — the FIFO drains SERIALLY (one render executes at a
+#      time; each render's finally promotes the next queued job, in order).
+# --------------------------------------------------------------------------- #
+def test_render_manager_serial_drain_fifo():
+    # A gated stub: each render blocks on a shared gate, then settles + promotes the
+    # next queued job exactly as the real _run's finally does. Releasing the gate
+    # lets the whole FIFO drain; we assert it drained in enqueue order, one at a time.
+    class _GatedMgr(StudioRenderManager):
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.gate = threading.Event()
+            self.order = []
+            self.max_concurrent = 0
+            self._live = 0
+
+        def _run(self, job):
+            with self._lock:
+                self._live += 1
+                self.max_concurrent = max(self.max_concurrent, self._live)
+            self.gate.wait(timeout=5.0)
+            with self._lock:
+                self._live -= 1
+                job.status = "done"
+                job.result = {"ok": True, "job": job.job_id}
+                job.progress = None
+                self.order.append(job.job_id)
+                if self._active == job.job_id:
+                    self._active = None
+                self._start_next_locked()
+
+    mgr = _GatedMgr(queue_depth=8)
+    for jid in ("A", "B", "C", "D"):
+        mgr.start(jid, {"width": 1})
+    # A is running (blocked on the gate); B/C/D are queued behind it.
+    assert mgr.status("A")["status"] == "running", mgr.status("A")
+    assert [mgr.status(j)["position"] for j in ("B", "C", "D")] == [1, 2, 3]
+
+    mgr.gate.set()  # release -> the FIFO drains serially
+    assert _wait_until(lambda: len(mgr.order) == 4, 5.0), f"drain stalled: {mgr.order}"
+    assert mgr.order == ["A", "B", "C", "D"], f"FIFO order violated: {mgr.order}"
+    assert mgr.max_concurrent == 1, f"more than one render ran at once: {mgr.max_concurrent}"
 
 
 # --------------------------------------------------------------------------- #
@@ -429,6 +508,181 @@ def test_e2e_cancel_mid_render():
         shutil.rmtree(out_root, ignore_errors=True)
 
 
+# --------------------------------------------------------------------------- #
+# central-side delegation tests (item 1 queue polling + item 2 kick-off retry).
+# These mock the worker's HTTP surface (S._http_post_json / S._http_get_json) so the
+# central _delegate_to_worker loop is exercised deterministically with NO worker, NO
+# GPU. A terminal ERROR payload (oom) settles the job without needing a real clip
+# ingest, so we can assert the poll/retry control flow in isolation.
+# --------------------------------------------------------------------------- #
+def _spec_for_delegate():
+    """Any valid spec — these tests fully mock the HTTP calls, so the spec only has
+    to ``asdict`` cleanly (no routing/GPU is exercised)."""
+    return _real_spec()
+
+
+# --------------------------------------------------------------------------- #
+# (8) central QUEUED polling: 202 accepted="queued" -> keep polling through queued
+#     -> running -> terminal, forwarding the queue position as progress.
+# --------------------------------------------------------------------------- #
+def test_central_queued_polling_forwards_position():
+    _clear_offload_env()
+    os.environ["HUGPY_STUDIO_POLL_INTERVAL_S"] = "0.01"
+    os.environ["HUGPY_STUDIO_OVERALL_CAP_S"] = "10"
+    script = [
+        {"status": "queued", "position": 2},
+        {"status": "queued", "position": 1},
+        {"status": "running", "progress": {"phase": "rendering"}},
+        {"status": "error", "result": {"ok": False, "error": {
+            "code": "oom", "message": "boom", "retryable": True}}},
+    ]
+    seq = {"i": 0}
+    prog_calls = []
+
+    def fake_post(url, payload, timeout):
+        return 202, {"ok": True, "accepted": "queued", "position": 2,
+                     "pkg_version": S._pkg_version()}
+
+    def fake_get(url, timeout):
+        i = min(seq["i"], len(script) - 1)
+        seq["i"] += 1
+        return 200, dict(script[i])
+
+    op, og, osp = S._http_post_json, S._http_get_json, media_bus.set_progress
+    S._http_post_json, S._http_get_json = fake_post, fake_get
+    media_bus.set_progress = lambda jid, prog: prog_calls.append(prog)
+    try:
+        jr = S._delegate_to_worker("http://worker.test", _spec_for_delegate(), "job-q")
+        # Delegated (NOT fallen back in-process) and settled on the terminal error.
+        assert jr is not None and jr.ok is False, jr
+        assert jr.error.code == "oom", jr.error
+        # Queue positions were forwarded to the console via set_progress, in order.
+        queued = [p.get("position") for p in prog_calls if p.get("phase") == "queued"]
+        assert queued == [2, 1], f"queued positions not forwarded in order: {queued}"
+    finally:
+        S._http_post_json, S._http_get_json, media_bus.set_progress = op, og, osp
+        _clear_offload_env()
+
+
+# --------------------------------------------------------------------------- #
+# (9) central 409 (queue FULL) -> retry kick-off within the overall window, then
+#     delegate once a slot frees (worker_busy means WAIT, not fail).
+# --------------------------------------------------------------------------- #
+def test_central_queue_full_retries_then_delegates():
+    _clear_offload_env()
+    os.environ["HUGPY_STUDIO_POLL_INTERVAL_S"] = "0.01"
+    os.environ["HUGPY_STUDIO_OVERALL_CAP_S"] = "5"
+    os.environ["HUGPY_STUDIO_KICKOFF_RETRY_INTERVAL_S"] = "0.01"
+    posts = {"n": 0}
+
+    def fake_post(url, payload, timeout):
+        if url.endswith("/studio/render"):
+            posts["n"] += 1
+            if posts["n"] <= 2:                       # queue full twice, then room
+                raise urllib.error.HTTPError(url, 409, "queue full", {}, None)
+            return 202, {"ok": True, "accepted": "started",
+                         "pkg_version": S._pkg_version()}
+        return 200, {}
+
+    def fake_get(url, timeout):
+        return 200, {"status": "error", "result": {"ok": False, "error": {
+            "code": "oom", "message": "x", "retryable": True}}}
+
+    op, og = S._http_post_json, S._http_get_json
+    S._http_post_json, S._http_get_json = fake_post, fake_get
+    try:
+        jr = S._delegate_to_worker("http://worker.test", _spec_for_delegate(), "job-f")
+        assert posts["n"] == 3, f"expected 2x 409 then success; got {posts['n']} posts"
+        assert jr is not None and jr.ok is False and jr.error.code == "oom", jr
+    finally:
+        S._http_post_json, S._http_get_json = op, og
+        _clear_offload_env()
+
+
+# --------------------------------------------------------------------------- #
+# (10) central 409 that never clears within the window -> retryable worker_busy
+#      (only fails AFTER the delegation window expires, never immediately).
+# --------------------------------------------------------------------------- #
+def test_central_queue_full_gives_up_worker_busy():
+    _clear_offload_env()
+    os.environ["HUGPY_STUDIO_OVERALL_CAP_S"] = "0.05"        # window expires fast
+    os.environ["HUGPY_STUDIO_KICKOFF_RETRY_INTERVAL_S"] = "0.01"
+    posts = {"n": 0}
+
+    def fake_post(url, payload, timeout):
+        posts["n"] += 1
+        raise urllib.error.HTTPError(url, 409, "queue full", {}, None)
+
+    op = S._http_post_json
+    S._http_post_json = fake_post
+    try:
+        jr = S._delegate_to_worker("http://worker.test", _spec_for_delegate(), "job-fb")
+        assert jr is not None and jr.ok is False, jr
+        assert jr.error.code == "worker_busy" and jr.error.retryable is True, jr.error
+        assert posts["n"] >= 2, f"must retry at least once before giving up; got {posts['n']}"
+    finally:
+        S._http_post_json = op
+        _clear_offload_env()
+
+
+# --------------------------------------------------------------------------- #
+# (11) item 2 — a ConnectionReset at kick-off (post-restart socket window) retries
+#      within the reset window, then delegates once the socket recovers.
+# --------------------------------------------------------------------------- #
+def test_kickoff_reset_retries_then_delegates():
+    _clear_offload_env()
+    os.environ["HUGPY_STUDIO_POLL_INTERVAL_S"] = "0.01"
+    os.environ["HUGPY_STUDIO_KICKOFF_RETRY_WINDOW_S"] = "2"
+    os.environ["HUGPY_STUDIO_KICKOFF_RETRY_INTERVAL_S"] = "0.01"
+    posts = {"n": 0}
+
+    def fake_post(url, payload, timeout):
+        if url.endswith("/studio/render"):
+            posts["n"] += 1
+            if posts["n"] <= 2:                       # socket window, then recovers
+                raise ConnectionResetError("connection reset by peer")
+            return 202, {"ok": True, "accepted": "started",
+                         "pkg_version": S._pkg_version()}
+        return 200, {}
+
+    def fake_get(url, timeout):
+        return 200, {"status": "done", "result": {"ok": False, "error": {
+            "code": "oom", "message": "x", "retryable": True}}}
+
+    op, og = S._http_post_json, S._http_get_json
+    S._http_post_json, S._http_get_json = fake_post, fake_get
+    try:
+        jr = S._delegate_to_worker("http://worker.test", _spec_for_delegate(), "job-r")
+        assert posts["n"] == 3, f"expected 2 resets then success; got {posts['n']}"
+        # Delegated (NOT None), so it did NOT double-render via the in-process fallback.
+        assert jr is not None and jr.ok is False and jr.error.code == "oom", jr
+    finally:
+        S._http_post_json, S._http_get_json = op, og
+        _clear_offload_env()
+
+
+# --------------------------------------------------------------------------- #
+# (12) item 2 — a ConnectionReset that persists PAST the retry window falls back to
+#      the in-process path (return None), the historical "worker unreachable" case.
+# --------------------------------------------------------------------------- #
+def test_kickoff_reset_falls_back_in_process():
+    _clear_offload_env()
+    os.environ["HUGPY_STUDIO_KICKOFF_RETRY_WINDOW_S"] = "0.05"   # window expires fast
+    os.environ["HUGPY_STUDIO_KICKOFF_RETRY_INTERVAL_S"] = "0.01"
+
+    def fake_post(url, payload, timeout):
+        raise ConnectionResetError("reset persists")
+
+    op = S._http_post_json
+    S._http_post_json = fake_post
+    try:
+        jr = S._delegate_to_worker("http://worker.test", _spec_for_delegate(), "job-rb")
+        assert jr is None, f"a reset past the retry window must fall back in-process; got {jr}"
+    finally:
+        S._http_post_json = op
+        _clear_offload_env()
+
+
 CHECKS = [
     ("decision rule: synthetic->local, real->delegate, unset->local, force->delegate",
      test_decision_rule_matrix),
@@ -438,12 +692,24 @@ CHECKS = [
      test_artifact_result_to_payload),
     ("_payload_to_job_result: worker error/cancel/malformed -> JobError",
      test_payload_to_job_result_errors),
-    ("StudioRenderManager: one-at-a-time busy, idempotent re-POST, unknown cancel",
+    ("StudioRenderManager: queue accept/position, full->409, queued-cancel, unknown",
      test_render_manager_state_machine),
+    ("StudioRenderManager: FIFO drains serially (one render at a time, in order)",
+     test_render_manager_serial_drain_fifo),
     ("E2E: enqueue -> delegate -> worker synthetic render -> shared ingest -> done",
      test_e2e_delegate_synthetic_render),
     ("E2E: cancel mid-render -> forwarded to worker -> settles 'cancelled', no clip",
      test_e2e_cancel_mid_render),
+    ("central: 202 queued -> keep polling, forward queue position as progress",
+     test_central_queued_polling_forwards_position),
+    ("central: 409 queue-full -> retry kick-off within window, then delegate",
+     test_central_queue_full_retries_then_delegates),
+    ("central: 409 persisting past the window -> retryable worker_busy (never immediate)",
+     test_central_queue_full_gives_up_worker_busy),
+    ("central: kick-off ConnectionReset retries within window, then delegates",
+     test_kickoff_reset_retries_then_delegates),
+    ("central: kick-off ConnectionReset past window -> in-process fallback (None)",
+     test_kickoff_reset_falls_back_in_process),
 ]
 
 

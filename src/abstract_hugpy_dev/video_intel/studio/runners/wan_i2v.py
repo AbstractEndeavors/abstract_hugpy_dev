@@ -39,6 +39,7 @@ No pathlib anywhere. os.path only.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import tempfile
@@ -68,9 +69,16 @@ from .synthetic import (
     _provenance_dict,
 )
 
+logger = logging.getLogger(__name__)
+
 # Python deps the REAL inference path needs. Preflight reports any that are
 # absent as DEPS_MISSING data (never an ImportError at module import).
-_REQUIRED_DEPS = ("torch", "diffusers", "transformers", "bitsandbytes", "accelerate")
+# ``ftfy`` is required because the Wan pipelines' prompt-clean path imports it (the
+# i2v/t2v denoise calls ``ftfy.fix_text`` on the prompt); a box missing it OOM-free
+# used to surface it as a mid-load IO_ERROR AFTER loading ~14GB of weights (live
+# 2026-07-07) — listing it here makes it an honest DEPS_MISSING at PREFLIGHT instead.
+_REQUIRED_DEPS = (
+    "torch", "diffusers", "transformers", "bitsandbytes", "accelerate", "ftfy")
 
 
 # --------------------------------------------------------------------------- #
@@ -89,6 +97,67 @@ def _local_model_dir(weights_root: str, weight_uri: str) -> str:
     the weights root (``<weights_root>/<org>/<name>``)."""
     parts = [p for p in weight_uri.split("/") if p]
     return os.path.join(weights_root, *parts)
+
+
+# --------------------------------------------------------------------------- #
+# HOT weights root (item 5) — a per-box NVMe copy that loads faster than the shared
+# /mnt/llm_storage mount. Box-local ONLY; NEVER a canonical input.
+# --------------------------------------------------------------------------- #
+_HOT_WEIGHTS_ROOT_ENV = "STUDIO_WEIGHTS_HOT_ROOT"
+
+
+def _hot_weights_root() -> str | None:
+    """A per-box NVMe hot-copy weights root, read from the LOCAL PROCESS ENV ONLY
+    (``STUDIO_WEIGHTS_HOT_ROOT``) — deliberately NOT from the manifest env_snapshot,
+    which is captured on central and must not dictate a box-local path. None if unset
+    or empty.
+
+    The hot copy is a faster LOAD SOURCE only: it is never written into the manifest /
+    env_snapshot, so it CANNOT change a clip's content_hash (weights come from the
+    same bytes wherever they load from). Central builds the manifest without ever
+    seeing this var; the worker resolves it here at render time."""
+    root = os.environ.get(_HOT_WEIGHTS_ROOT_ENV)
+    return root or None
+
+
+def _resolve_model_dir(manifest: RenderManifest, weight_uri: str) -> tuple[str | None, str]:
+    """Resolve the on-disk model dir for ``weight_uri`` PLUS a tag for WHICH root
+    served it. Order (box-local NVMe hot copy first, then the shared/snapshot root):
+
+      1. ``STUDIO_WEIGHTS_HOT_ROOT`` set AND
+         ``<hot>/<org>/<name>/model_index.json`` present -> (``<hot_dir>``, "hot");
+      2. else -> (``<shared_dir>`` | None, "shared") — ``_local_model_dir`` over the
+         shared weights root from the manifest snapshot (or process env), UNCHANGED;
+         None when no shared root is configured.
+
+    The hot presence gate is ``model_index.json`` (the same completeness gate the
+    shared preflight uses), so a partial / in-flight hot copy transparently falls back
+    to the shared store rather than loading half a model."""
+    hot = _hot_weights_root()
+    if hot:
+        hot_dir = _local_model_dir(hot, weight_uri)
+        if os.path.isfile(os.path.join(hot_dir, "model_index.json")):
+            return hot_dir, "hot"
+    shared_root = _weights_root(manifest)
+    if not shared_root:
+        return None, "shared"
+    return _local_model_dir(shared_root, weight_uri), "shared"
+
+
+def _weights_missing_msg(weight_uri: str, hot: str | None, shared_root: str | None) -> str:
+    """A WEIGHTS_MISSING message that names BOTH roots that were tried (item 5), so a
+    box operator can see whether the hot NVMe copy, the shared mount, or both are
+    absent."""
+    tried: list[str] = []
+    if hot:
+        tried.append("hot NVMe " + _local_model_dir(hot, weight_uri))
+    if shared_root:
+        tried.append("shared " + _local_model_dir(shared_root, weight_uri))
+    where = "; ".join(tried) if tried else "no weights root configured"
+    dl_root = shared_root or hot or "<weights_root>"
+    return (f"weights not found on disk for {weight_uri} (looked in: {where}); "
+            f"download with `huggingface-cli download {weight_uri} "
+            f"--local-dir {_local_model_dir(dl_root, weight_uri)}`")
 
 
 def _wan_geometry(manifest: RenderManifest) -> tuple[int, int, int, int]:
@@ -160,7 +229,7 @@ def _preflight(manifest: RenderManifest) -> StageError | None:
             "Wan i2v needs GPU inference deps that are not installed: "
             + ", ".join(missing)
             + ". Install: pip install torch (CUDA build) diffusers transformers "
-              "bitsandbytes accelerate",
+              "bitsandbytes accelerate ftfy",
             (("missing", ",".join(missing)),),
         )
 
@@ -185,23 +254,27 @@ def _preflight(manifest: RenderManifest) -> StageError | None:
             (("model_id", manifest.model_id),),
         )
 
-    weights_root = _weights_root(manifest)
-    if not weights_root:
+    # WEIGHTS root resolution honors the box-local HOT NVMe copy first (item 5), then
+    # the shared/snapshot root — see _resolve_model_dir. Neither configured is the
+    # "no weights root" error; configured-but-model-absent names BOTH roots tried.
+    hot = _hot_weights_root()
+    shared_root = _weights_root(manifest)
+    if not hot and not shared_root:
         return StageError(
             ErrorCode.WEIGHTS_MISSING,
-            "STUDIO_WEIGHTS_ROOT is not set — no weights root to resolve the Wan "
-            "weights against",
+            "no weights root set — neither STUDIO_WEIGHTS_HOT_ROOT (box-local NVMe) "
+            "nor STUDIO_WEIGHTS_ROOT is configured to resolve the Wan weights against",
             (("model_id", manifest.model_id),),
         )
 
-    model_dir = _local_model_dir(weights_root, cfg.weight_uri)
-    if not (os.path.isdir(model_dir)
+    model_dir, _root_used = _resolve_model_dir(manifest, cfg.weight_uri)
+    if not model_dir or not (os.path.isdir(model_dir)
             and os.path.isfile(os.path.join(model_dir, "model_index.json"))):
         return StageError(
             ErrorCode.WEIGHTS_MISSING,
-            f"Wan weights not found on disk at {model_dir}; download with "
-            f"`huggingface-cli download {cfg.weight_uri} --local-dir {model_dir}`",
-            (("model_dir", model_dir), ("weight_uri", cfg.weight_uri)),
+            "Wan " + _weights_missing_msg(cfg.weight_uri, hot, shared_root),
+            (("weight_uri", cfg.weight_uri),
+             ("hot_root", hot or ""), ("shared_root", shared_root or "")),
         )
     return None
 
@@ -281,6 +354,56 @@ def _should_place_whole_on_gpu(
 
 
 # --------------------------------------------------------------------------- #
+# OFFLOAD-branch VRAM levers (item 4) — pure/duck-testable, no heavy deps here
+# --------------------------------------------------------------------------- #
+def _engage_memory_savers(pipe) -> list[str]:
+    """On the OFFLOAD placement branch, engage diffusers' peak-VRAM levers so a
+    14B-int8 i2v @480p fits next to comfy on a shared 24GB card (live 2026-07-07 it
+    OOM'd by ~0.5GB). Each lever is best-effort: a diffusers build / pipeline / VAE
+    that lacks it raises ``AttributeError``, which is caught and the lever skipped —
+    never fail a render over a memory hint. Returns the names that engaged (also
+    logged), so a duck-typed pipe can unit-test the wiring with no GPU.
+
+    diffusers 0.39 surface (verified in-tree): ``DiffusionPipeline`` (base of all
+    three Wan pipelines) has ``enable_attention_slicing``; ``AutoencoderKLWan`` has
+    ``enable_tiling`` but NOT ``enable_slicing`` — so ``vae.enable_slicing()`` is
+    the AttributeError-guarded lever that legitimately no-ops on the Wan VAE."""
+    engaged: list[str] = []
+    try:
+        pipe.enable_attention_slicing()
+        engaged.append("attention_slicing")
+    except Exception:  # a memory HINT must never fail a render (keeper hardening)
+        pass
+    vae = getattr(pipe, "vae", None)
+    if vae is not None:
+        try:
+            vae.enable_tiling()
+            engaged.append("vae_tiling")
+        except Exception:  # a memory HINT must never fail a render (keeper hardening)
+            pass
+        try:
+            vae.enable_slicing()
+            engaged.append("vae_slicing")
+        except Exception:  # a memory HINT must never fail a render (keeper hardening)
+            pass
+    if engaged:
+        logger.info("wan offload VRAM levers engaged: %s", ", ".join(engaged))
+    return engaged
+
+
+def _place_pipe(pipe, place_whole: bool) -> list[str]:
+    """Apply the placement decision to a loaded pipe, and — on the OFFLOAD branch —
+    engage the VRAM levers. Module-level (shared by wan_i2v + wan_vace) and
+    duck-testable with no GPU. Returns the list of engaged levers ([] when placed
+    whole-on-GPU; a bnb-quantized pipe always offloads, never ``.to()``)."""
+    if place_whole:
+        pipe.to("cuda")                        # whole pipeline on GPU (unquantized, fits)
+        return []
+    pipe.enable_model_cpu_offload()            # bnb-quantized OR too big -> offload
+    return _engage_memory_savers(pipe)
+
+
+# --------------------------------------------------------------------------- #
 # The runner
 # --------------------------------------------------------------------------- #
 def run_wan_i2v(
@@ -345,7 +468,11 @@ def run_wan_i2v(
     from diffusers.utils import load_image
 
     cfg = MODEL_REGISTRY.get(manifest.model_id)
-    model_dir = _local_model_dir(_weights_root(manifest), cfg.weight_uri)
+    # WEIGHTS SOURCE (item 5): prefer the box-local hot NVMe copy if it holds the
+    # model, else the shared root — a faster LOAD only; does not affect content_hash.
+    model_dir, weights_root_used = _resolve_model_dir(manifest, cfg.weight_uri)
+    logger.info("wan i2v: loading %s from %s (%s weights root)",
+                cfg.weight_uri, model_dir, weights_root_used)
     compute_dtype = torch.bfloat16
     quant_config = _bnb_config(manifest.precision, BitsAndBytesConfig, torch)
     seed = manifest.seeds.global_seed
@@ -384,10 +511,10 @@ def run_wan_i2v(
                 # A diffusers build whose UniPC lacks flow_shift: keep the default
                 # scheduler rather than fail the render (shift is still in the manifest).
                 pass
-        if place_whole:
-            pipe.to("cuda")                    # whole pipeline on GPU (unquantized, fits)
-        else:
-            pipe.enable_model_cpu_offload()    # bnb-quantized OR too big -> offload
+        # Placement + (on the offload branch) the VRAM levers (item 4). _place_pipe
+        # offloads a bnb-quantized/over-envelope pipe and engages attention slicing +
+        # VAE tiling/slicing; an unquantized model that fits goes wholly to CUDA.
+        _place_pipe(pipe, place_whole)
 
     # Cooperative mid-render cancel wiring (Task 1). diffusers 0.39's
     # WanImageToVideoPipeline.__call__ supports `callback_on_step_end`; the callback
@@ -532,9 +659,14 @@ def run_wan_i2v(
         atomic_write_text(
             os.path.join(out_dir, _MANIFEST_NAME),
             json.dumps(render_manifest_to_dict(manifest), indent=2, sort_keys=True))
+        # Provenance records WHICH weights root served (hot NVMe vs shared) — a
+        # sidecar-only field (item 5); it is NOT a canonical input, so it never
+        # participates in the content_hash.
+        prov = _provenance_dict(manifest)
+        prov["weights_root_used"] = weights_root_used
         atomic_write_text(
             os.path.join(out_dir, _PROVENANCE_NAME),
-            json.dumps(_provenance_dict(manifest), indent=2, sort_keys=True))
+            json.dumps(prov, indent=2, sort_keys=True))
     except Exception as exc:  # inference/IO failure rides back as data (INV-3)
         name = type(exc).__name__
         is_oom = "OutOfMemory" in name or "out of memory" in str(exc).lower()

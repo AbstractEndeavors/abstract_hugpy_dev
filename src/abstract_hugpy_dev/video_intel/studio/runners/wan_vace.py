@@ -50,6 +50,7 @@ No pathlib anywhere. os.path only.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -81,13 +82,18 @@ from .wan_i2v import (
     _REQUIRED_DEPS,
     _bnb_config,
     _frame_to_pil,
-    _local_model_dir,
+    _hot_weights_root,
     _max_vram_gb,
     _missing_deps,
+    _place_pipe,
+    _resolve_model_dir,
     _should_place_whole_on_gpu,
     _wan_geometry,
+    _weights_missing_msg,
     _weights_root,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------- #
@@ -161,23 +167,27 @@ def _preflight(manifest: RenderManifest) -> StageError | None:
             (("model_id", manifest.model_id),),
         )
 
-    weights_root = _weights_root(manifest)
-    if not weights_root:
+    # WEIGHTS root resolution honors the box-local HOT NVMe copy first (item 5), then
+    # the shared/snapshot root — identical discipline to wan_i2v (_resolve_model_dir).
+    hot = _hot_weights_root()
+    shared_root = _weights_root(manifest)
+    if not hot and not shared_root:
         return StageError(
             ErrorCode.WEIGHTS_MISSING,
-            "STUDIO_WEIGHTS_ROOT is not set — no weights root to resolve the Wan "
-            "VACE weights against",
+            "no weights root set — neither STUDIO_WEIGHTS_HOT_ROOT (box-local NVMe) "
+            "nor STUDIO_WEIGHTS_ROOT is configured to resolve the Wan VACE weights "
+            "against",
             (("model_id", manifest.model_id),),
         )
 
-    model_dir = _local_model_dir(weights_root, cfg.weight_uri)
-    if not (os.path.isdir(model_dir)
+    model_dir, _root_used = _resolve_model_dir(manifest, cfg.weight_uri)
+    if not model_dir or not (os.path.isdir(model_dir)
             and os.path.isfile(os.path.join(model_dir, "model_index.json"))):
         return StageError(
             ErrorCode.WEIGHTS_MISSING,
-            f"Wan VACE weights not found on disk at {model_dir}; download with "
-            f"`huggingface-cli download {cfg.weight_uri} --local-dir {model_dir}`",
-            (("model_dir", model_dir), ("weight_uri", cfg.weight_uri)),
+            "Wan VACE " + _weights_missing_msg(cfg.weight_uri, hot, shared_root),
+            (("weight_uri", cfg.weight_uri),
+             ("hot_root", hot or ""), ("shared_root", shared_root or "")),
         )
     return None
 
@@ -300,7 +310,11 @@ def run_wan_vace(
     )
 
     cfg = MODEL_REGISTRY.get(manifest.model_id)
-    model_dir = _local_model_dir(_weights_root(manifest), cfg.weight_uri)
+    # WEIGHTS SOURCE (item 5): box-local hot NVMe copy first, else shared — a faster
+    # LOAD only; does not affect content_hash.
+    model_dir, weights_root_used = _resolve_model_dir(manifest, cfg.weight_uri)
+    logger.info("wan vace: loading %s from %s (%s weights root)",
+                cfg.weight_uri, model_dir, weights_root_used)
     source_video = _resolve_source(manifest)      # preflight proved it exists
     compute_dtype = torch.bfloat16
     quant_config = _bnb_config(manifest.precision, BitsAndBytesConfig, torch)
@@ -388,13 +402,11 @@ def run_wan_vace(
                     pipe.scheduler.config, flow_shift=flow_shift)
             except Exception:
                 pass  # diffusers build without flow_shift on UniPC — keep the default
-        # PLACEMENT: whole pipeline to GPU when it fits unquantized, else offload. A
-        # bnb-quantized (INT8/FP8) precision ALWAYS offloads (never .to() a quantized
-        # pipeline — _should_place_whole_on_gpu returns False for INT8/FP8).
-        if place_whole:
-            pipe.to("cuda")
-        else:
-            pipe.enable_model_cpu_offload()
+        # PLACEMENT: whole pipeline to GPU when it fits unquantized, else offload +
+        # engage the VRAM levers (item 4, shared _place_pipe). A bnb-quantized
+        # (INT8/FP8) precision ALWAYS offloads (never .to() a quantized pipeline —
+        # _should_place_whole_on_gpu returns False for INT8/FP8).
+        _place_pipe(pipe, place_whole)
 
         # VACE unified control: `video=` conditions the generation on the source
         # clip's frames (no mask / reference_images => pure v2v restyle/enhance).
@@ -450,9 +462,13 @@ def run_wan_vace(
         atomic_write_text(
             os.path.join(out_dir, _MANIFEST_NAME),
             json.dumps(render_manifest_to_dict(manifest), indent=2, sort_keys=True))
+        # Provenance records WHICH weights root served (hot NVMe vs shared) — a
+        # sidecar-only field (item 5); NOT a canonical input, never in content_hash.
+        prov = _provenance_dict(manifest)
+        prov["weights_root_used"] = weights_root_used
         atomic_write_text(
             os.path.join(out_dir, _PROVENANCE_NAME),
-            json.dumps(_provenance_dict(manifest), indent=2, sort_keys=True))
+            json.dumps(prov, indent=2, sort_keys=True))
     except Exception as exc:  # inference/IO failure rides back as data (INV-3)
         name = type(exc).__name__
         is_oom = "OutOfMemory" in name or "out of memory" in str(exc).lower()

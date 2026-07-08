@@ -338,6 +338,24 @@ def test_wan_t2v_graceful_err_on_this_box():
         ErrorCode.DEPS_MISSING, ErrorCode.NO_GPU, ErrorCode.WEIGHTS_MISSING)
 
 
+# --------------------------------------------------------------------------- #
+# [9] item 3 — ftfy is a REQUIRED Wan dep, so a box without it reports DEPS_MISSING
+#     at PREFLIGHT (before loading ~14GB), not a mid-load io_error (live 2026-07-07).
+# --------------------------------------------------------------------------- #
+def test_ftfy_is_a_required_wan_dep():
+    import importlib.util
+
+    from abstract_hugpy_dev.video_intel.studio.runners.wan_i2v import (
+        _REQUIRED_DEPS, _missing_deps)
+    assert "ftfy" in _REQUIRED_DEPS, (
+        f"ftfy must be a required Wan dep (prompt-clean path needs it); {_REQUIRED_DEPS}")
+    # When ftfy is genuinely absent on this box, it surfaces in the preflight
+    # dep-scan (so the DEPS_MISSING headline lists it) — the item-3 honesty fix.
+    if importlib.util.find_spec("ftfy") is None:
+        assert "ftfy" in _missing_deps(), (
+            f"an absent ftfy must appear in _missing_deps(); got {_missing_deps()}")
+
+
 CHECKS = [
     ("registry: (SYNTHETIC,T2V)+(WAN,T2V) wired, synthetic-t2v prover, join total",
      test_registry_t2v_wired),
@@ -355,6 +373,8 @@ CHECKS = [
      test_run_studio_i2v_t2v_spec_ok_with_clip_ref),
     ("wan t2v @16GB -> graceful Err (deps_missing) + routed to a real Wan t2v model",
      test_wan_t2v_graceful_err_on_this_box),
+    ("item 3: ftfy is a required Wan dep -> DEPS_MISSING at preflight, not mid-load",
+     test_ftfy_is_a_required_wan_dep),
 ]
 
 

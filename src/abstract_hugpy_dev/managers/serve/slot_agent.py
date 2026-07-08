@@ -218,14 +218,22 @@ def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None,
             f"{model_key}: no usable GGUF on disk (resolved {path!r}) — missing "
             "or empty; refusing to spawn llama.cpp (would SIGILL)")
 
-    # Serve from the SSD hot-cache when this model is warmed there (NVMe-fast);
-    # otherwise this kicks a background HDD->SSD warm and returns the HDD path for
-    # this (cold) load, so the next load is fast. Never blocks.
+    # Serve from the box-local NVMe HOT-CACHE tier when this model is warmed there
+    # (NVMe-fast); otherwise this kicks a background shared->hot promotion and
+    # returns the shared path for this (cold) load, so the next load is fast.
+    # Never blocks. The hot_cache tier (HUGPY_HOT_CACHE_ROOT) is the general
+    # main-catalog mechanism; the legacy model_cache (HUGPY_MODEL_CACHE) is kept
+    # as a fallback so a box still on the old env is not regressed. Neither env
+    # set -> path is returned unchanged (byte-identical behaviour).
     try:
-        from . import model_cache
-        path = model_cache.use(path)
+        from . import hot_cache
+        if hot_cache.enabled():
+            path = hot_cache.use(path)
+        else:
+            from . import model_cache
+            path = model_cache.use(path)
     except Exception as exc:
-        logger.warning("model_cache unavailable (%s); loading from %s", exc, path)
+        logger.warning("hot-cache unavailable (%s); loading from %s", exc, path)
 
     # Autofit from the VRAM free RIGHT NOW, so later slots take what's left.
     # An explicit per-model VRAM budget (gpu_mem_gib) caps what autofit may

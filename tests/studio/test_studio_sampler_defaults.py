@@ -46,7 +46,7 @@ from abstract_hugpy_dev.video_intel.studio import produce as produce_mod  # noqa
 from abstract_hugpy_dev.video_intel.studio.produce import (  # noqa: E402
     produce_clip, resolve_sampler)
 from abstract_hugpy_dev.video_intel.studio.runners.wan_i2v import (  # noqa: E402
-    _max_vram_gb, _should_place_whole_on_gpu)
+    _engage_memory_savers, _max_vram_gb, _place_pipe, _should_place_whole_on_gpu)
 from abstract_hugpy_dev.video_intel.studio.schemas import (  # noqa: E402
     CapabilityRequest, Resolution)
 
@@ -261,6 +261,66 @@ def test_max_vram_from_env_snapshot():
             os.environ["STUDIO_MAX_VRAM_GB"] = prev
 
 
+# --------------------------------------------------------------------------- #
+# [11] OFFLOAD-branch VRAM levers (item 4): _place_pipe engages attention slicing +
+#      VAE tiling/slicing ONLY on the offload branch; each lever is AttributeError-
+#      guarded (duck-typed pipe/VAE, no GPU, no torch).
+# --------------------------------------------------------------------------- #
+class _DuckVAE:
+    def __init__(self, tiling=True, slicing=False):
+        self.calls = []
+        if tiling:
+            self.enable_tiling = lambda: self.calls.append("tiling")
+        if slicing:
+            self.enable_slicing = lambda: self.calls.append("slicing")
+
+
+class _DuckPipe:
+    def __init__(self, vae=None, attn=True):
+        self.calls = []
+        self.vae = vae
+        if attn:
+            self.enable_attention_slicing = lambda *a, **k: self.calls.append("attn")
+
+    def to(self, device):
+        self.calls.append(("to", device))
+
+    def enable_model_cpu_offload(self):
+        self.calls.append("offload")
+
+
+def test_place_pipe_engages_levers_on_offload_branch():
+    # whole-GPU branch: only .to("cuda") — NO offload, NO memory levers.
+    p_whole = _DuckPipe(vae=_DuckVAE())
+    assert _place_pipe(p_whole, True) == [], "whole-GPU branch must engage no levers"
+    assert ("to", "cuda") in p_whole.calls and "offload" not in p_whole.calls, p_whole.calls
+
+    # offload branch, VAE shaped like the real AutoencoderKLWan (tiling YES, slicing
+    # NO -> the slicing lever AttributeErrors and is skipped, never fails the render).
+    vae = _DuckVAE(tiling=True, slicing=False)
+    p = _DuckPipe(vae=vae, attn=True)
+    engaged = _place_pipe(p, False)
+    assert "offload" in p.calls, p.calls
+    assert engaged == ["attention_slicing", "vae_tiling"], engaged
+    assert "attn" in p.calls and vae.calls == ["tiling"], (p.calls, vae.calls)
+
+    # offload branch, a VAE that DOES expose slicing -> all three engage.
+    p2 = _DuckPipe(vae=_DuckVAE(tiling=True, slicing=True), attn=True)
+    assert _place_pipe(p2, False) == ["attention_slicing", "vae_tiling", "vae_slicing"]
+
+    # offload branch, a pipeline WITHOUT enable_attention_slicing -> guarded, skipped.
+    p3 = _DuckPipe(vae=_DuckVAE(tiling=True), attn=False)
+    assert _place_pipe(p3, False) == ["vae_tiling"], "attention slicing must be skipped"
+
+    # offload branch, NO vae attribute -> only attention slicing.
+    p4 = _DuckPipe(vae=None, attn=True)
+    assert _place_pipe(p4, False) == ["attention_slicing"], "no vae -> attn only"
+
+    # the helper is idempotent-safe to call directly on a duck too.
+    assert _engage_memory_savers(_DuckPipe(vae=_DuckVAE(), attn=True)) == [
+        "attention_slicing", "vae_tiling"]
+
+
 CHECKS = [
     ("resolve_sampler: Wan real defaults + resolution shift (3.0@480p, 5.0@720p)",
      test_resolve_sampler_wan_defaults),
@@ -279,6 +339,8 @@ CHECKS = [
     ("placement decision (pure, no GPU): quantized never .to(); unquantized fits",
      test_placement_decision_pure),
     ("_max_vram_gb reads STUDIO_MAX_VRAM_GB from env_snapshot", test_max_vram_from_env_snapshot),
+    ("offload VRAM levers (item 4): _place_pipe engages attn/VAE slicing+tiling, guarded",
+     test_place_pipe_engages_levers_on_offload_branch),
 ]
 
 
