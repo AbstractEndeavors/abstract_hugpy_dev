@@ -399,3 +399,114 @@ register_studio_preset(StudioPreset(
     recommended="single 3090 (INT8) · needs reference image(s)",
     requires_reference=True,
 ))
+
+# ---- IDENTITY-LOCK TEMPLATES (Round 6) ------------------------------------
+# Three first-class id_lock TEMPLATE cards around the generic identity-lock-1.3b:
+# lock-person / lock-thing / scene-bias. All three resolve through the studio router
+# (ID_LOCK -> Task.VACE_CONTROL) to the SAME Wan 2.1 VACE 1.3B control model, but at a
+# 12 GB budget the router selects FP16 (verified 2026-07-08 via CapabilityRouter: the
+# FP16 threshold for VACE-1.3B @ 832x480 is 10 GB — 9 GB binds INT8, >=10 GB binds
+# FP16). 832x480 LANDSCAPE only (VACE-1.3B's native envelope; portrait/oversized rejects
+# at the router). requires_reference=True on all three — an identity-locked render is
+# DEFINED by the reference image(s); with none it returns REFERENCE_MISSING. The
+# references are threaded from the station's reference-picker at enqueue time, so
+# request_body() stays a valid, reference-free make_studio_i2v body. These differ from
+# each other ONLY in curated prompt/negative + honest copy — they are intent templates,
+# not distinct model bindings (a person, a product, a place each want different
+# denoise guidance). Router-verified in tests/test_studio_lock_templates.py.
+_LOCK_W, _LOCK_H, _LOCK_FPS, _LOCK_BUDGET = 832, 480, 16, 12.0
+
+register_studio_preset(StudioPreset(
+    id="lock-person",
+    name="Lock a person (Wan 2.1 VACE 1.3B)",
+    description=("Hold a PERSON'S identity across the render at 832x480 landscape with "
+                 "a 12 GB budget — binds the Wan 2.1 VACE 1.3B control model (FP16, "
+                 "fits a single 3090). Add 1–4 reference images of the SAME person; "
+                 "multiple angles (front + 3/4 + profile) help the model keep the face "
+                 "and build consistent across motion. 480p LANDSCAPE only."),
+    capability="id_lock",
+    width=_LOCK_W,
+    height=_LOCK_H,
+    fps=_LOCK_FPS,
+    vram_budget_gb=_LOCK_BUDGET,
+    seed=0,
+    prompt="the person moves naturally, the same face and build throughout, cinematic lighting",
+    negative="identity drift, face morphing, deformed face, extra limbs, warped body, blurry, flicker",
+    recommended="single 3090 (FP16) · 1–4 face refs (multiple angles help)",
+    requires_reference=True,
+))
+
+register_studio_preset(StudioPreset(
+    id="lock-thing",
+    name="Lock a product / object (Wan 2.1 VACE 1.3B)",
+    description=("Hold a PRODUCT or OBJECT'S identity across the render at 832x480 "
+                 "landscape with a 12 GB budget — binds the Wan 2.1 VACE 1.3B control "
+                 "model (FP16, fits a single 3090). Add up to 4 clean reference images "
+                 "of the item (a plain background and a couple of angles help); its "
+                 "exact shape, markings and colour are preserved across the shot. "
+                 "480p LANDSCAPE only."),
+    capability="id_lock",
+    width=_LOCK_W,
+    height=_LOCK_H,
+    fps=_LOCK_FPS,
+    vram_budget_gb=_LOCK_BUDGET,
+    seed=0,
+    prompt="the object holds its exact shape, markings and colour, product-clean, cinematic lighting",
+    negative="shape drift, warped geometry, morphing, wrong colour, smeared logo, blurry, flicker",
+    recommended="single 3090 (FP16) · up to 4 object refs",
+    requires_reference=True,
+))
+
+register_studio_preset(StudioPreset(
+    id="scene-bias",
+    name="Scene bias — a place (Wan 2.1 VACE 1.3B)",
+    description=("Bias the render toward a PLACE at 832x480 landscape with a 12 GB "
+                 "budget — binds the Wan 2.1 VACE 1.3B control model (FP16, fits a "
+                 "single 3090). Add a reference image of the location. HONEST NOTE: a "
+                 "place reference BIASES the setting, lighting and palette — it does "
+                 "not hard-lock a scene the way a person/object identity does. 480p "
+                 "LANDSCAPE only."),
+    capability="id_lock",
+    width=_LOCK_W,
+    height=_LOCK_H,
+    fps=_LOCK_FPS,
+    vram_budget_gb=_LOCK_BUDGET,
+    seed=0,
+    prompt="the scene is set in the referenced place, matching its setting, lighting and palette",
+    negative="wrong location, mismatched lighting, blurry, low quality, flicker, artifacts",
+    recommended="single 3090 (FP16) · place BIASES the look (not a hard lock)",
+    requires_reference=True,
+))
+
+# ---- SCENE-TO-SCENE CONTINUITY (Round 6) ----------------------------------
+# scene-continuity: a v2v RESTYLE/EXTEND that HOLDS an identity across a cut. Capability
+# "v2v" resolves through the router (V2V -> Task.VACE_CONTROL) to the SAME Wan 2.1 VACE
+# 1.3B control model at FP16 (12 GB budget). requires_source=True — like restyle-480p-v2v
+# it is a video TRANSFORM (needs a prior scene's clip; SOURCE_MISSING without one). The
+# route ALSO accepts OPTIONAL reference_images on v2v (backend contract: _REF_CAPS =
+# {"id_lock","v2v"}), so this preset can carry the subject's identity forward while
+# restyling/extending the source — but references are OPTIONAL here (requires_reference
+# stays False; a plain restyle is still valid). Both source and references are threaded
+# from the station at enqueue time, so request_body() stays a valid, input-free
+# make_studio_i2v body. 480p LANDSCAPE only. Router-verified in
+# tests/test_studio_lock_templates.py.
+register_studio_preset(StudioPreset(
+    id="scene-continuity",
+    name="Scene continuity (Wan 2.1 VACE 1.3B)",
+    description=("Continue from a PRIOR scene's clip — restyle or extend it while "
+                 "HOLDING an identity — at 832x480 landscape with a 12 GB budget "
+                 "(Wan 2.1 VACE 1.3B, FP16, fits a single 3090). REQUIRES a source "
+                 "clip (send one to the studio, or use a library clip as source). "
+                 "OPTIONALLY add 1–4 reference images to carry a subject's identity "
+                 "across the cut. 480p LANDSCAPE only."),
+    capability="v2v",
+    width=_LOCK_W,
+    height=_LOCK_H,
+    fps=_LOCK_FPS,
+    vram_budget_gb=_LOCK_BUDGET,
+    seed=0,
+    prompt="continue the scene, preserve the motion and the subject's identity, cinematic",
+    negative="identity drift, morphing, flicker, deformed, discontinuity, blurry, artifacts",
+    recommended="single 3090 (FP16) · needs a source clip · optional identity refs",
+    requires_source=True,
+))
