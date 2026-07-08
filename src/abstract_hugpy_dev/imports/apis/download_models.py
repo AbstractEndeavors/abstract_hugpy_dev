@@ -241,7 +241,20 @@ def ensure_model(key: str, root: str = DEFAULT_ROOT) -> str:
     path = route_destination(routing,root)     # root/framework/task/owner/repo
 
     if model_looks_downloaded(path, cfg):
-        return path
+        # Read-through the box-local NVMe HOT-CACHE tier for the steady-state
+        # load: a complete hot copy is served, else the shared path unchanged
+        # (a background promotion is scheduled -> the NEXT call is NVMe-hot).
+        # Env-gated (HUGPY_HOT_CACHE_ROOT); byte-identical when unset. This is
+        # the transformers/diffusers dir chokepoint that resolve_model_source
+        # does NOT see (imagegen/embed/keywords/summarizers load via
+        # ensure_model). A just-downloaded model (below) is intentionally NOT
+        # promoted inline — it promotes on its next call, so a fresh multi-GB
+        # pull is never immediately re-copied. Never raises into a load.
+        try:
+            from ...managers.serve import hot_cache
+            return hot_cache.use(path)
+        except Exception:  # noqa: BLE001
+            return path
 
     os.makedirs(path, exist_ok=True)
 
