@@ -323,26 +323,44 @@ def test_place_pipe_engages_levers_on_offload_branch():
 
 
 # --------------------------------------------------------------------------- #
-# [12] CUDA allocator defragmentation (item 7): _prime_cuda_allocator uses setdefault
-#      — it fills PYTORCH_CUDA_ALLOC_CONF when unset, and NEVER overrides an operator's.
+# [12] CUDA allocator defragmentation (item 7, REVISED 2026-07-08): OPT-IN ONLY
+#      (HUGPY_CUDA_EXPANDABLE=1). The setdefault-by-default variant crash-looped ae
+#      (expandable_segments leaked through re-exec via os.environ and this
+#      driver/torch combo dies natively under it), so: no opt-in -> never set AND
+#      the exact leaked value is DETOXED; opt-in -> setdefault (operator wins).
 # --------------------------------------------------------------------------- #
 def test_prime_cuda_allocator_setdefault():
     _KEY = "PYTORCH_CUDA_ALLOC_CONF"
-    prev = os.environ.pop(_KEY, None)
+    _OPT = "HUGPY_CUDA_EXPANDABLE"
+    prev, prev_opt = os.environ.pop(_KEY, None), os.environ.pop(_OPT, None)
     try:
-        # unset -> filled with the defrag default; returns a bool (torch-imported probe).
+        # no opt-in, unset -> stays unset; returns a bool (torch-imported probe).
         ret = _prime_cuda_allocator()
-        assert os.environ.get(_KEY) == "expandable_segments:True", os.environ.get(_KEY)
+        assert _KEY not in os.environ, os.environ.get(_KEY)
         assert isinstance(ret, bool), ret
-        # pre-set -> operator's value ALWAYS wins (setdefault never overrides).
+        # no opt-in, leaked prime value -> DETOXED (popped).
+        os.environ[_KEY] = "expandable_segments:True"
+        _prime_cuda_allocator()
+        assert _KEY not in os.environ, "leaked value not detoxed"
+        # no opt-in, operator's own different value -> untouched.
+        os.environ[_KEY] = "garbage_collection_threshold:0.9"
+        _prime_cuda_allocator()
+        assert os.environ.get(_KEY) == "garbage_collection_threshold:0.9", os.environ.get(_KEY)
+        os.environ.pop(_KEY, None)
+        # opt-in, unset -> filled with the defrag default.
+        os.environ[_OPT] = "1"
+        _prime_cuda_allocator()
+        assert os.environ.get(_KEY) == "expandable_segments:True", os.environ.get(_KEY)
+        # opt-in, pre-set -> operator's value ALWAYS wins (setdefault never overrides).
         os.environ[_KEY] = "garbage_collection_threshold:0.9"
         _prime_cuda_allocator()
         assert os.environ.get(_KEY) == "garbage_collection_threshold:0.9", os.environ.get(_KEY)
     finally:
-        if prev is None:
-            os.environ.pop(_KEY, None)
-        else:
-            os.environ[_KEY] = prev
+        for k, p in ((_KEY, prev), (_OPT, prev_opt)):
+            if p is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = p
 
 
 CHECKS = [

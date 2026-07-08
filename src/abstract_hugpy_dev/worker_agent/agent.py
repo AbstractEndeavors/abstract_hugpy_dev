@@ -3089,6 +3089,18 @@ def _apply_cli_spill(args) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # BOOT DETOX (2026-07-08 ae crash-loop): a 0.1.158 studio render setdefault'ed
+    # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True, which SURVIVES the agent's
+    # re-exec (os.environ is inherited by execv) and this driver/torch combo dies
+    # natively under it — poisoning every subsequent CUDA load incl. boot warms.
+    # Unless the operator explicitly opted in (HUGPY_CUDA_EXPANDABLE=1), strip the
+    # exact leaked value BEFORE any torch import so the box heals on converge.
+    if (os.environ.get("HUGPY_CUDA_EXPANDABLE", "").strip() != "1"
+            and os.environ.get("PYTORCH_CUDA_ALLOC_CONF") == "expandable_segments:True"):
+        os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+        logging.getLogger(__name__).warning(
+            "boot detox: removed leaked PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True "
+            "(opt back in with HUGPY_CUDA_EXPANDABLE=1)")
     args = _build_parser().parse_args(argv)
 
     if not args.central:

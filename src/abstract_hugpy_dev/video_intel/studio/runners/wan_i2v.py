@@ -358,11 +358,17 @@ def _should_place_whole_on_gpu(
 # CUDA allocator defragmentation (item 7) — must run BEFORE torch imports
 # --------------------------------------------------------------------------- #
 def _prime_cuda_allocator() -> bool:
-    """Set ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`` via ``setdefault``
-    (an operator-set value ALWAYS wins) BEFORE torch is imported, to defragment the
-    CUDA allocator. Evidence: the live 14B-int8 OOM on ae failed an 80MB allocation
-    while holding ~2.71 GiB "reserved by PyTorch but unallocated" — allocator
-    fragmentation, the single most promising lever for fitting int8 on a 24GB card.
+    """OPT-IN ONLY (HUGPY_CUDA_EXPANDABLE=1): set
+    ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`` before torch import to
+    defragment the CUDA allocator (evidence: the 14B-int8 OOM failed an 80MB
+    allocation with ~2.71 GiB reserved-but-unallocated).
+
+    WHY OPT-IN (2026-07-08 ae incident): the original setdefault-on-by-default
+    variant CRASH-LOOPED ae — os.environ survives the agent's re-exec, so one
+    render primed the flag into the process lineage forever, and this
+    driver/torch combo dies natively under expandable_segments (renders died in
+    load ~30-40s; then even boot warm-ups crashed). The flag is only applied
+    when the operator explicitly sets HUGPY_CUDA_EXPANDABLE=1 on a box.
 
     HONESTY: the setting only takes effect if the CUDA allocator has NOT already
     initialized in this process. On a worker whose agent avoids torch at boot that is
@@ -372,7 +378,13 @@ def _prime_cuda_allocator() -> bool:
     or the process env is doing the work. Returns True iff torch was already imported
     (the line is then likely a no-op for this process)."""
     already = "torch" in sys.modules
-    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    if os.environ.get("HUGPY_CUDA_EXPANDABLE", "").strip() == "1":
+        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    else:
+        # DETOX: if a prior (0.1.158) prime leaked this exact value into the
+        # re-exec-surviving environ, remove it so the box heals on converge.
+        if os.environ.get("PYTORCH_CUDA_ALLOC_CONF") == "expandable_segments:True":
+            os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
     logger.info("wan cuda allocator: PYTORCH_CUDA_ALLOC_CONF=%s (torch already imported: %s)",
                 os.environ.get("PYTORCH_CUDA_ALLOC_CONF"), already)
     return already
