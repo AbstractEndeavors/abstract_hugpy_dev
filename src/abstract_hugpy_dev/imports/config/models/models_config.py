@@ -689,6 +689,19 @@ def get_models_dict(models_dict_path=None, dict_return=False, return_dict=False,
     Operator-pruned model_keys (pruned_models.json) are filtered out as a final
     step so a hidden "ghost" row never shows in any listing."""
     dict_return = dict_return or return_dict
+    # Last-known cache (Keeper 2026-07-09): the default read path — model_key
+    # membership guards and manifest lookups hit on every worker heartbeat —
+    # must NOT rebuild the whole registry (disk report + comfy sweep + dedup
+    # merge). That rebuild-per-call pegged the API workers and flooded the logs.
+    # Serve the cached MODEL_REGISTRY(_DICT), which refresh_registry() advances
+    # IN PLACE on real changes (download complete, discover POST) — so even a
+    # caller that reads right after a refresh sees fresh data. Only an explicit
+    # discovery/path (a fresh walk) forces a rebuild. During the import-time
+    # build the globals aren't bound yet -> globals().get() is None -> build.
+    if discovery is None and models_dict_path is None:
+        cached = globals().get("MODEL_REGISTRY_DICT" if dict_return else "MODEL_REGISTRY")
+        if cached:
+            return cached
     report = discovery if discovery is not None else _load_discovery_report(models_dict_path)
 
     # Comfy checkpoint sweep FIRST, so its rows join the dedupe BASE of the
@@ -707,8 +720,11 @@ def get_models_dict(models_dict_path=None, dict_return=False, return_dict=False,
 
     merged, dropped = merge_discovery_into_models(report, base=base)
 
+    # DEBUG, not INFO: dedup merges are routine registry bookkeeping re-emitted
+    # on every 30s reconcile rebuild (~2k lines/pass across workers). At INFO
+    # this floods the journal + host rsyslog and pegs vCPUs. Keeper 2026-07-09.
     for model_key, why in dropped:
-        logger.info("registry: dropped %s (%s)", model_key, why)
+        logger.debug("registry: dropped %s (%s)", model_key, why)
 
     pruned = _load_pruned()
     nudict = {}

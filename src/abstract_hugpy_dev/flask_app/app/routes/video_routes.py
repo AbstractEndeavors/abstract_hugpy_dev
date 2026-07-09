@@ -557,6 +557,7 @@ def video_studio_i2v():
             # the older "negative" key; "prompt" carries the positive text prompt.
             negative=body.get("negative_prompt", body.get("negative")),
             prompt=body.get("prompt"),
+            project=body.get("project"),     # auto-archive NAME (optional)
             # B2 chain: the validated abs path of the prior tier's clip (or None).
             source_video=source_video,
             # Sampler overrides + model pin (validated above / shape-checked in factory).
@@ -1091,3 +1092,54 @@ def _studio_manifest_view(m: dict, clip_path: str, output: dict) -> dict:
         "negative_prompt": m.get("negative_prompt"),
         "source_video": m.get("source_video"),
     }
+
+
+# --------------------------------------------------------------------------- #
+# 5c) GET /video/projects — the distinct known auto-archive PROJECT names.
+#     Read-only projection over the media-bus job store: scans EVERY job's stored
+#     spec_json (studio_i2v, generate_movie, generate_scene, generate_image) for
+#     distinct non-empty "project" values — the optional human archive NAME threaded
+#     through each enqueue route — and returns them sorted case-insensitively. Uses
+#     the same jailed mode=ro connection idiom as /video/studio/clips (no writes, no
+#     schema touch). A frontend project-picker reads this to offer known names; a
+#     job that carried no project contributes nothing (no empty entry).
+# --------------------------------------------------------------------------- #
+@video_bp.route("/video/projects", methods=["GET"])
+def video_projects():
+    import json as _json
+    import sqlite3
+
+    # Distinct EXACT names (a set); the case-insensitive ordering is the SORT, not the
+    # de-dup, so "Alpha" and "alpha" would both list (they are distinct strings) — the
+    # frontend contract only pins the shape {"projects": [...]} and the sort.
+    names: set = set()
+    try:
+        conn = sqlite3.connect(
+            f"file:{media_bus.DB_PATH}?mode=ro", uri=True, timeout=5.0)
+        conn.execute("PRAGMA busy_timeout=5000")
+        try:
+            rows = conn.execute(
+                "SELECT spec_json FROM media_jobs WHERE spec_json IS NOT NULL"
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        # No DB yet / transient lock -> an empty list is the honest answer.
+        rows = []
+
+    for (spec_json,) in rows:
+        if not spec_json:
+            continue
+        try:
+            spec = _json.loads(spec_json)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(spec, dict):
+            continue
+        p = spec.get("project")
+        if isinstance(p, str):
+            p = p.strip()
+            if p:
+                names.add(p)
+
+    return jsonify({"projects": sorted(names, key=str.lower)}), 200

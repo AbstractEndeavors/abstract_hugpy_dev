@@ -23,8 +23,9 @@ llm_storage_routes.py pulls its registry helpers.
 """
 import os
 import re
+import mimetypes
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from flask import request, jsonify, abort, send_file, Response
 
 from .imports import *
@@ -129,6 +130,36 @@ def _enrollment_ok() -> bool:
     if tok is not None:
         return verify_enrollment_token(tok)
     return not enroll_required()
+
+
+def _transfer_authorized() -> bool:
+    """Credential gate for the worker file-transfer endpoints (manifest / file /
+    chunksums). These stream multi-GB model weights to workers over WireGuard and
+    were previously UNAUTHENTICATED on an internet-facing central — anyone who
+    could reach the origin could exfiltrate every weight (and, before the
+    seek-based Range fix below, peg central's CPU).
+
+    A caller is authorized when EITHER:
+      * it presents operator credentials (console session / ``HUGPY_OPERATOR_TOKEN``)
+        — the same gate that guards the privileged console routes; OR
+      * it presents a valid, un-revoked worker enrollment bearer token — the same
+        machine-to-machine credential the agent already sends on register/heartbeat.
+
+    Tokenless callers follow the SAME gradual-rollout rule as register/heartbeat
+    (``_enrollment_ok`` → ``enroll_required``): allowed only while
+    ``HUGPY_WORKER_ENROLL_REQUIRED`` is off. A present-but-invalid/revoked token
+    is ALWAYS denied. No new auth scheme — this is ``operator_authenticated()``
+    OR the existing enrollment gate.
+    """
+    try:
+        from ..operator_auth import operator_authenticated
+        if operator_authenticated():
+            return True
+    except Exception:
+        # Operator gate unavailable for any reason -> fall back to the worker
+        # enrollment gate rather than failing open.
+        pass
+    return _enrollment_ok()
 
 
 class GpuInfo(BaseModel):
@@ -329,7 +360,15 @@ def workers_register():
         # Bad/revoked token, or tokenless when enrollment is required. The agent
         # treats 401 as terminal and exits (no respawn).
         abort(401, description="Worker enrollment token invalid or required.")
-    body = RegisterRequest(**(request.get_json(silent=True) or {}))
+    # A malformed/empty body is a client error (400), not a server fault (500):
+    # RegisterRequest requires at least ``name`` and would otherwise raise an
+    # unhandled ValidationError → 500. The enrollment 401 above still takes
+    # precedence, so a tokenless caller (when enrollment is required) never
+    # reaches body parsing. Valid bodies are unaffected.
+    try:
+        body = RegisterRequest(**(request.get_json(silent=True) or {}))
+    except ValidationError:
+        abort(400, description="Malformed worker registration body.")
     # Central decides the reachable callback URL from the request source IP when
     # the worker can't self-report a usable address.
     url = _resolve_worker_url(body.url, body.port)
@@ -1252,6 +1291,8 @@ def _model_dir_or_404(model_key: str):
 
 @worker_bp.route("/llm/models/<path:model_key>/manifest", methods=["GET"])
 def model_file_manifest(model_key):
+    if not _transfer_authorized():
+        abort(401, description="Worker enrollment or operator token required.")
     model, dest = _model_dir_or_404(model_key)
 
     files = []
@@ -1285,14 +1326,86 @@ def model_file_manifest(model_key):
     })
 
 
+# Fixed streaming window for ranged serving: seek once, then copy the requested
+# bytes in 1 MiB reads. This is the DoS fix. werkzeug's send_file(conditional=True)
+# reaches a Range's start offset by CONSUMING the response iterable chunk-by-chunk
+# (``_RangeWrapper._first_iteration``: ``while read_length <= start_byte:
+# _next_chunk()``) — O(offset) per request, O(offset^2) across a chunked multi-GB
+# pull. A handful of large-offset Range GETs then peg all of central's CPU: a
+# trivial remote DoS on an internet-facing origin. A real ``file.seek(start)`` is
+# O(1) to any offset and reads only the requested window.
+_FILE_STREAM_CHUNK = 1024 * 1024  # 1 MiB
+
+# Single-range header: "bytes=<first>-<last>" with either side optionally empty.
+_RANGE_RE = re.compile(r"^\s*bytes\s*=\s*(\d*)\s*-\s*(\d*)\s*$", re.IGNORECASE)
+
+
+def _parse_single_range(range_header: str, size: int):
+    """Interpret a ``Range`` header against a file of ``size`` bytes.
+
+    Returns one of:
+      * ``(start, end)`` — inclusive offsets of a satisfiable single range (206);
+      * ``None``          — serve the WHOLE file (200): no/blank/unparseable
+        header, or a multi-range request we deliberately answer whole rather than
+        emit ``multipart/byteranges`` (the worker puller only asks single ranges);
+      * ``"unsatisfiable"`` — well-formed but unmeetable range (416).
+
+    Never loops or scans — pure arithmetic on the offsets.
+    """
+    if not range_header:
+        return None
+    # Multi-range ("bytes=0-1,4-5"): don't build multipart — hand back the whole
+    # file (200). Correct and cheap; crucially it never spins.
+    if "," in range_header:
+        return None
+    m = _RANGE_RE.match(range_header)
+    if not m:
+        return None  # malformed -> ignore Range, serve full (200)
+    first, last = m.group(1), m.group(2)
+    if first == "" and last == "":
+        return None  # "bytes=-" is malformed -> serve full
+    if first == "":
+        # Suffix range: "bytes=-N" -> the final N bytes. N==0 is unsatisfiable.
+        n = int(last)
+        if n <= 0:
+            return "unsatisfiable"
+        start = max(0, size - n)
+        end = size - 1
+    else:
+        start = int(first)
+        end = int(last) if last != "" else size - 1
+        if end >= size:
+            end = size - 1  # clamp an over-long end to the last byte (RFC 7233)
+    if size == 0 or start >= size or start > end:
+        return "unsatisfiable"
+    return (start, end)
+
+
+def _stream_file_window(path: str, start: int, end: int):
+    """Yield ``path[start..end]`` inclusive in fixed 1 MiB reads after a single
+    ``seek`` — O(1) to reach ``start``, and reads ONLY the requested window."""
+    remaining = end - start + 1
+    with open(path, "rb") as fh:
+        fh.seek(start)
+        while remaining > 0:
+            buf = fh.read(min(_FILE_STREAM_CHUNK, remaining))
+            if not buf:
+                break  # file truncated under us; stop rather than loop
+            remaining -= len(buf)
+            yield buf
+
+
 @worker_bp.route("/llm/models/<path:model_key>/file", methods=["GET"])
 def model_file(model_key):
+    if not _transfer_authorized():
+        abort(401, description="Worker enrollment or operator token required.")
     _model, dest = _model_dir_or_404(model_key)
 
     rel = request.args.get("path", "")
     if not rel:
         abort(400, description="Missing ?path=")
 
+    # ── path jail (UNCHANGED — do not weaken) ─────────────────────────────
     # Confine LEXICALLY first (catches ../ and absolute paths WITHOUT following
     # a symlink at the target — comfy checkpoints in the model dir ARE symlinks
     # into the shared /checkpoints store, and realpath-first falsely 403'd them,
@@ -1311,10 +1424,45 @@ def model_file(model_key):
     if not os.path.isfile(target):
         abort(404, description="No such file.")
 
-    # conditional/Range handling is provided by send_file.
-    return send_file(target, as_attachment=True,
-                     download_name=os.path.basename(target),
-                     conditional=True)
+    # ── serve the bytes ───────────────────────────────────────────────────
+    # KEEPER FOLLOW-UP (X-Accel-Redirect): everything above RESOLVES the target;
+    # everything below SERVES it. That split is the seam for the nginx sendfile
+    # offload — replace the body below with a Response carrying
+    # ``X-Accel-Redirect: <internal-location-mapping-to target>`` so nginx serves
+    # the bytes (Range included) and Python never touches them. Left explicit and
+    # self-contained for exactly that swap. (NOT implemented here on purpose.)
+    size = os.path.getsize(target)
+    download_name = os.path.basename(target)
+    ctype = mimetypes.guess_type(download_name)[0] or "application/octet-stream"
+
+    rng = _parse_single_range(request.headers.get("Range", ""), size)
+
+    if rng == "unsatisfiable":
+        resp = Response(status=416)
+        resp.headers["Content-Range"] = f"bytes */{size}"
+        resp.headers["Accept-Ranges"] = "bytes"
+        return resp
+
+    if rng is None:
+        # Full-file GET. send_file streams via wsgi.file_wrapper (sendfile) and
+        # sets Content-Length/Content-Type/Last-Modified. conditional=False so
+        # werkzeug's O(offset) _RangeWrapper is NEVER engaged — every Range is
+        # handled by the seek path above, so this only ever serves a whole file.
+        resp = send_file(target, as_attachment=True, download_name=download_name,
+                         conditional=False)
+        resp.headers["Accept-Ranges"] = "bytes"  # advertise range support
+        return resp
+
+    # Satisfiable single range -> 206 with a real seek (O(1) to the offset).
+    start, end = rng
+    length = end - start + 1
+    resp = Response(_stream_file_window(target, start, end), status=206,
+                    mimetype=ctype, direct_passthrough=True)
+    resp.headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+    resp.headers["Accept-Ranges"] = "bytes"
+    resp.headers["Content-Length"] = str(length)
+    resp.headers["Content-Disposition"] = f'attachment; filename="{download_name}"'
+    return resp
 
 
 # Per-chunk hashing for verified transfers. 32 MiB chunks: big enough that a
@@ -1369,6 +1517,8 @@ def model_file_chunksums(model_key):
     as it lands, and re-fetches ONLY chunks that fail — so completeness is
     proven content, not a size that a preallocated-then-crashed pull can fake.
     """
+    if not _transfer_authorized():
+        abort(401, description="Worker enrollment or operator token required.")
     _model, dest = _model_dir_or_404(model_key)
     rel = request.args.get("path", "")
     if not rel:
@@ -1409,6 +1559,12 @@ def model_archive(model_key):
     import tarfile
     import threading
 
+    # Same exfil surface as /file and /manifest (streams the WHOLE model dir),
+    # so it wears the same credential gate. NOT in the keeper's enumerated three
+    # (file/manifest/chunksums) — flagged in the change report; revert this one
+    # check if strict scoping is preferred.
+    if not _transfer_authorized():
+        abort(401, description="Worker enrollment or operator token required.")
     _model, dest = _model_dir_or_404(model_key)
 
     # Deterministic file list (same walk as the manifest), newest layout intact.

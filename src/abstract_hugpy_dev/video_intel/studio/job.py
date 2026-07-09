@@ -79,6 +79,10 @@ class StudioI2VSpec:
     start_image: Optional[str] = None   # abs path to a still (i2v conditioning)
     negative: Optional[str] = None      # carried; synthetic ignores it
     prompt: Optional[str] = None        # carried; synthetic ignores it
+    # optional human project NAME (auto-archive metadata). NON-CANONICAL: carried on the
+    # spec + cataloged, but NEVER threaded into produce.py/manifest.py, so it is NOT part
+    # of the render content_hash (addressing). Mirrors gen/scene/movie_schema's `project`.
+    project: Optional[str] = None
     source_video: Optional[str] = None  # abs path to a prior-tier clip (movie/scene
                                         # mp4). The movie->studio chain input (B2): an
                                         # i2v job with no start_image EXTENDS this clip
@@ -122,6 +126,7 @@ def make_studio_i2v(
     start_image: Optional[str] = None,
     negative: Optional[str] = None,
     prompt: Optional[str] = None,
+    project: Optional[str] = None,
     source_video: Optional[str] = None,
     steps: Optional[int] = None,
     cfg: Optional[float] = None,
@@ -155,6 +160,13 @@ def make_studio_i2v(
         raise ValueError(f"negative must be a string or None; got {negative!r}")
     if prompt is not None and not isinstance(prompt, str):
         raise ValueError(f"prompt must be a string or None; got {prompt!r}")
+    # PROJECT: optional human auto-archive NAME (NON-CANONICAL metadata — never enters the
+    # content_hash). A value must be a string; surrounding whitespace is stripped and an
+    # all-blank name coerces to None (empty -> None is acceptable — mirrors the
+    # gen/scene/movie_schema ``project=(project or None)`` coercion).
+    if project is not None and not isinstance(project, str):
+        raise ValueError(f"project must be a string or None; got {project!r}")
+    project = (project.strip() or None) if isinstance(project, str) else None
     # SAMPLER OVERRIDES: None = unset (model default fills it). A value is range-checked
     # here so the same guard protects EVERY caller (route, preset apply, bus rehydrate),
     # not just the HTTP route. bool is an int subclass — reject it explicitly.
@@ -223,6 +235,7 @@ def make_studio_i2v(
         start_image=start_image,
         negative=negative,
         prompt=prompt,
+        project=project,
         source_video=source_video,
         steps=steps,
         cfg=(float(cfg) if cfg is not None else None),
@@ -249,6 +262,7 @@ def studio_i2v_from_dict(d: dict) -> StudioI2VSpec:
         start_image=d.get("start_image"),
         negative=d.get("negative"),
         prompt=d.get("prompt"),
+        project=d.get("project"),
         source_video=d.get("source_video"),
         steps=d.get("steps"),
         cfg=d.get("cfg"),
