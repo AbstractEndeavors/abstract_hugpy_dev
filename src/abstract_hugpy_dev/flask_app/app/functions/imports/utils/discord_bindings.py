@@ -333,11 +333,17 @@ class DiscordBindingStore:
     _MSGS_KEEP = 200  # cap transcript length per bridge
 
     BRAINS = ("model", "keeper")
+    # log_mode: "open" -> retain the transcript (default; required by keeper,
+    #   defer/approval, and session-token bridges, which all READ it to work);
+    #   "none" -> retain nothing (ephemeral) — only valid for an auto model
+    #   bridge, which generates its reply from the current inbound alone.
+    LOG_MODES = ("open", "none")
 
     def add_bridge(self, *, channel_id, model_key=None, user_id=None,
                    directive: str = "", defer_mode: str = "auto",
                    brain: str = "model",
-                   keeper_target: Optional[str] = None) -> Dict[str, Any]:
+                   keeper_target: Optional[str] = None,
+                   log_mode: str = "open") -> Dict[str, Any]:
         channel_id = _norm_id(channel_id)
         if channel_id is None:
             raise ValueError("a bridge needs a channel_id")
@@ -345,6 +351,16 @@ class DiscordBindingStore:
             raise ValueError(f"defer_mode must be one of {self.DEFER_MODES}")
         if brain not in self.BRAINS:
             raise ValueError(f"brain must be one of {self.BRAINS}")
+        if log_mode not in self.LOG_MODES:
+            raise ValueError(f"log_mode must be one of {self.LOG_MODES}")
+        if log_mode == "none" and (brain != "model" or defer_mode != "auto"):
+            # A no-logs bridge stores nothing, so any consumer that reads the
+            # transcript would break: keeper brains poll it, defer/approval holds
+            # pending candidates in it, and session tokens read it. Guard here so
+            # the incompatible combination can't be created.
+            raise ValueError("no-logs is only allowed for a model bridge in auto "
+                             "mode — keeper/defer/session bridges need a retained "
+                             "transcript to function")
         bridge = {
             "id": uuid.uuid4().hex,
             "channel_id": channel_id,
@@ -357,6 +373,7 @@ class DiscordBindingStore:
             #        central only records inbound (no auto-candidate).
             "brain": brain,
             "keeper_target": (keeper_target or "").strip() or None,
+            "log_mode": log_mode,
             "created_at": time.time(),
         }
         with self._transaction() as doc:
@@ -393,7 +410,8 @@ class DiscordBindingStore:
 
     def append_message(self, bridge_id: str, *, direction: str, source: str,
                        content: str, author: Optional[str] = None,
-                       status: str = "sent") -> Optional[Dict[str, Any]]:
+                       status: str = "sent",
+                       attachments: Optional[List[Dict[str, Any]]] = None) -> Optional[Dict[str, Any]]:
         msg = {
             "id": uuid.uuid4().hex,
             "bridge_id": bridge_id,
@@ -401,12 +419,20 @@ class DiscordBindingStore:
             "source": source,         # "discord" | "console" | "terminal" | "model"
             "author": author or "",
             "content": content,
+            # each: {filename, content_type, size, url, path?} — path is the
+            # central-uploaded copy (keeper-readable); url is the Discord fallback.
+            "attachments": attachments or [],
             "status": status,         # "sent" | "pending" (awaiting operator) | "rejected"
             "ts": time.time(),
         }
         with self._transaction() as doc:
-            if not any(b.get("id") == bridge_id for b in doc["bridges"]):
+            bridge = next((b for b in doc["bridges"] if b.get("id") == bridge_id), None)
+            if bridge is None:
                 return None
+            if bridge.get("log_mode", "open") == "none":
+                # Ephemeral bridge: the message transits (caller still gets it for
+                # the immediate reply flow) but nothing is retained.
+                return dict(msg)
             log = doc.setdefault("bridge_msgs", {}).setdefault(bridge_id, [])
             log.append(msg)
             if len(log) > self._MSGS_KEEP:
@@ -428,6 +454,20 @@ class DiscordBindingStore:
                         m["content"] = content
                     return dict(m)
         return None
+
+    def clear_messages(self, bridge_id: str) -> Optional[int]:
+        """Wipe a bridge's stored transcript. Returns how many messages were
+        removed, or None if the bridge is unknown. The bridge and its Discord
+        binding are untouched — only the console-side history is cleared (which
+        also resets the model reply context for model-brained bridges, since
+        _generate_candidate rebuilds from this transcript). Does NOT delete
+        anything from the Discord channel itself."""
+        with self._transaction() as doc:
+            if not any(b.get("id") == bridge_id for b in doc["bridges"]):
+                return None
+            removed = len(doc.get("bridge_msgs", {}).get(bridge_id, []))
+            doc.setdefault("bridge_msgs", {})[bridge_id] = []
+            return removed
 
     # -- comms sessions (scoped bearer tokens for terminal agents) -----------
     # A session is the "drop this into a terminal/agent chat" credential: its
@@ -584,6 +624,10 @@ def get_bridge_messages(bridge_id: str, since: float = 0.0) -> List[Dict[str, An
 
 def update_bridge_message(bridge_id: str, msg_id: str, **kwargs) -> Optional[Dict[str, Any]]:
     return discord_store.update_message(bridge_id, msg_id, **kwargs)
+
+
+def clear_bridge_messages(bridge_id: str) -> Optional[int]:
+    return discord_store.clear_messages(bridge_id)
 
 
 def add_session(**kwargs) -> Tuple[str, Dict[str, Any]]:

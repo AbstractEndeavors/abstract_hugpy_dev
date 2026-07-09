@@ -37,6 +37,61 @@ logger = logging.getLogger("abstract_hugpy_dev.worker_agent.provision")
 
 _CHUNK = 8 * 1024 * 1024  # 8 MiB streaming chunks
 
+
+# ---------------------------------------------------------------------------
+# Central-transfer authentication.
+# ---------------------------------------------------------------------------
+# Central's worker file-transfer endpoints (/manifest, /file, /chunksums,
+# /archive) gate on a credential: the operator token OR a valid worker
+# enrollment bearer token (_transfer_authorized in worker_routes.py). The puller
+# therefore presents the SAME enrollment token the agent's CentralClient already
+# sends on register/heartbeat — ``Authorization: Bearer <token>`` (see
+# CentralClient._post in agent.py). When no token is available (the gradual-
+# rollout default, HUGPY_WORKER_ENROLL_REQUIRED off) NO header is added, so
+# behavior is byte-for-byte what it was before this change — a pure superset.
+_ENROLL_TOKEN: str | None = None
+
+
+def set_enroll_token(token: str | None) -> None:
+    """Remember the worker's enrollment token so central-transfer requests carry
+    it. Called once by the agent at startup with the very value it hands
+    CentralClient (``args.token`` = --token / WORKER_ENROLL_TOKEN). A blank/None
+    token clears it, restoring the tokenless (pre-auth) behavior."""
+    global _ENROLL_TOKEN
+    _ENROLL_TOKEN = (token or "").strip() or None
+
+
+def _enroll_token() -> str | None:
+    """The worker enrollment token, if any. Prefers a value the agent explicitly
+    set (:func:`set_enroll_token`, i.e. exactly CentralClient's token, so a
+    CLI-only ``--token`` is honored); falls back to the same
+    ``WORKER_ENROLL_TOKEN`` env var CentralClient's ``--token`` defaults to, so a
+    provision that runs without the agent bootstrap still authenticates. Returns
+    None when neither is set."""
+    if _ENROLL_TOKEN:
+        return _ENROLL_TOKEN
+    env = (os.environ.get("WORKER_ENROLL_TOKEN") or "").strip()
+    return env or None
+
+
+def _auth_headers() -> dict:
+    """``{"Authorization": "Bearer <token>"}`` when an enrollment token is
+    available, else ``{}``. The exact header CentralClient._post attaches; an
+    empty dict means no Authorization header (today's tokenless behavior)."""
+    tok = _enroll_token()
+    return {"Authorization": f"Bearer {tok}"} if tok else {}
+
+
+def _auth_request(url: str, headers: dict | None = None) -> "urllib.request.Request":
+    """Build a GET Request for a central-transfer URL, adding the enrollment
+    bearer token (when available) on top of any caller headers (e.g. Range).
+    Token absent -> no Authorization header, i.e. an ordinary ``Request(url,
+    headers)`` identical to the pre-auth call sites."""
+    merged = dict(headers or {})
+    merged.update(_auth_headers())
+    return urllib.request.Request(url, headers=merged)
+
+
 # Single-flight provisioning: one download per model_key at a time. Without this
 # every concurrent /infer/stream (plus the pre-provision) kicks off its own full
 # multi-GB transfer into the SAME directory, and the parallel writers stomp each
@@ -386,7 +441,7 @@ def _local_destination(meta: dict) -> str:
 
 
 def _get_json(url: str, timeout: float = 30.0) -> dict:
-    with urllib.request.urlopen(url, timeout=timeout) as resp:
+    with urllib.request.urlopen(_auth_request(url), timeout=timeout) as resp:
         import json
         return json.loads(resp.read().decode("utf-8"))
 
@@ -406,7 +461,7 @@ def _download_file(url: str, dest_path: str, expected_size: int | None,
             on_bytes(have)   # count the already-present bytes toward progress
         return  # already complete
 
-    req = urllib.request.Request(url)
+    req = _auth_request(url)
     if have and expected_size and have < expected_size:
         req.add_header("Range", f"bytes={have}-")
         mode = "ab"
@@ -527,7 +582,7 @@ _SEGMENT_BYTES = 64 * 1024 * 1024
 def _supports_range(url: str) -> bool:
     """True if central honours HTTP Range (returns 206) for this file URL."""
     try:
-        req = urllib.request.Request(url, headers={"Range": "bytes=0-0"})
+        req = _auth_request(url, {"Range": "bytes=0-0"})
         with urllib.request.urlopen(req, timeout=20) as resp:
             return resp.getcode() == 206
     except Exception:
@@ -537,7 +592,7 @@ def _supports_range(url: str) -> bool:
 def _download_segment(url: str, dest_path: str, start: int, end: int,
                       on_bytes=None) -> None:
     """Fetch one inclusive byte range [start, end] into dest_path at its offset."""
-    req = urllib.request.Request(url, headers={"Range": f"bytes={start}-{end}"})
+    req = _auth_request(url, {"Range": f"bytes={start}-{end}"})
     with urllib.request.urlopen(req, timeout=120) as resp:
         if resp.getcode() != 206:
             raise RuntimeError("server ignored Range request")
@@ -644,7 +699,7 @@ def _fetch_chunk_verified(url: str, part_path: str, index: int, size: int,
     last_exc: Exception | None = None
     for i in range(attempts):
         try:
-            req = urllib.request.Request(url, headers={"Range": f"bytes={start}-{end}"})
+            req = _auth_request(url, {"Range": f"bytes={start}-{end}"})
             with urllib.request.urlopen(req, timeout=120) as resp:
                 if resp.getcode() != 206:
                     raise RuntimeError("server ignored Range request")
@@ -948,7 +1003,7 @@ def fetch_archive_from_central(central_url: str, model_key: str, progress=None) 
                 model_key, len(files), _human(total), dest)
 
     try:
-        resp = urllib.request.urlopen(base + "/archive", timeout=120)
+        resp = urllib.request.urlopen(_auth_request(base + "/archive"), timeout=120)
     except urllib.error.HTTPError as exc:
         if exc.code in (404, 405, 409):
             logger.info("central has no archive endpoint for %s (HTTP %s); "

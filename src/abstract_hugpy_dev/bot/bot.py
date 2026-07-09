@@ -149,12 +149,34 @@ class HugpyBot(commands.Bot):
         return str(channel_id) in self._bridged
 
     async def relay_inbound(self, message) -> None:
-        """Forward a bridged-channel message up to central's bridge inbox."""
+        """Forward a bridged-channel message (text + any attachments) up to
+        central's bridge inbox. Each attachment is pulled from Discord and
+        uploaded to central so the console / keeper gets a stable local file;
+        the original Discord CDN url is kept as a fallback ref."""
         try:
             author = getattr(message.author, "display_name", None) or str(message.author)
+            attachments = []
+            for att in (getattr(message, "attachments", None) or []):
+                ref = {
+                    "filename": getattr(att, "filename", None),
+                    "content_type": getattr(att, "content_type", None),
+                    "size": getattr(att, "size", None),
+                    "url": getattr(att, "url", None),
+                }
+                try:
+                    if (getattr(att, "size", 0) or 0) <= config.MAX_ATTACHMENT_BYTES:
+                        up = await self.hugpy.upload(att.filename, await att.read())
+                        ref["path"] = up.get("path")
+                    else:
+                        ref["skipped"] = "too large"
+                except Exception:
+                    log.debug("attachment upload failed for %s",
+                              getattr(att, "filename", "?"), exc_info=True)
+                attachments.append(ref)
             await self.hugpy.relay_inbound(
                 channel_id=message.channel.id, author=author,
                 content=message.content or "",
+                attachments=attachments or None,
             )
         except Exception:
             log.debug("relay_inbound failed", exc_info=True)

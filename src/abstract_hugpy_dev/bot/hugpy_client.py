@@ -99,13 +99,14 @@ class HugpyClient:
         data = await self._json("GET", "/discord/bridges")
         return {str(b["channel_id"]) for b in data.get("bridges", []) if b.get("channel_id")}
 
-    async def relay_inbound(self, *, channel_id, author=None, content="") -> dict:
-        """Forward an inbound channel message to central's bridge inbox."""
-        return await self._json("POST", "/discord/inbox", json={
-            "channel_id": str(channel_id),
-            "author": author,
-            "content": content,
-        })
+    async def relay_inbound(self, *, channel_id, author=None, content="",
+                            attachments=None) -> dict:
+        """Forward an inbound channel message (text + attachments) to central's
+        bridge inbox."""
+        body = {"channel_id": str(channel_id), "author": author, "content": content}
+        if attachments:
+            body["attachments"] = attachments
+        return await self._json("POST", "/discord/inbox", json=body)
 
     async def delete_model(self, model_key: str) -> dict:
         return await self._json("DELETE", f"/models/{model_key}")

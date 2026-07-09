@@ -3214,6 +3214,12 @@ def main(argv: list[str] | None = None) -> int:
         logger.info("role=rpc — advertising shard endpoint %s", state.rpc_endpoint)
 
     client = CentralClient(args.central, token=args.token)
+    # Present the SAME enrollment token on central-transfer (model-pull) requests
+    # in provision.py, so provisioning keeps working once central turns on
+    # HUGPY_WORKER_ENROLL_REQUIRED. No-op (tokenless, exactly today's behavior)
+    # when args.token is None.
+    from .provision import set_enroll_token
+    set_enroll_token(args.token)
 
     try:
         _register(client, state, args)

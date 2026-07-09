@@ -12,3 +12,4 @@ from .auth_proxy_routes import auth_proxy_bp
 from .welcome_routes import welcome_bp
 from .comms_routes import comms_bp
 from .video_routes import video_bp
+from .fleet_routes import fleet_bp

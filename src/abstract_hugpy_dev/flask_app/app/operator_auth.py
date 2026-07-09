@@ -75,7 +75,7 @@ _SENSITIVE = [
     ({"POST"},                   re.compile(r"^/discord/bridges$")),
     ({"DELETE"},                 re.compile(r"^/discord/bridges/[^/]+$")),
     ({"POST"},                   re.compile(r"^/discord/bridges/[^/]+/(send|keeper-reply|approve|reject)$")),
-    ({"GET"},                    re.compile(r"^/discord/bridges/[^/]+/messages$")),
+    ({"GET", "DELETE"},          re.compile(r"^/discord/bridges/[^/]+/messages$")),
     # Comms sessions: minting/listing/revoking the scoped bearer tokens is
     # operator-only. The /discord/session/<token>/… verbs are deliberately NOT
     # here — the session token IS their credential (same rationale as
@@ -91,6 +91,15 @@ _SENSITIVE = [
     # F4 settings: reads stay open (UIs render from them); writes are the
     # console's authoritative control plane (CON-08) -> operator-only.
     ({"POST", "PUT", "DELETE"},  re.compile(r"^/settings/.+$")),
+    # Fleet templates (FLEET-TEMPLATES-DESIGN §6): the template DEFINITIONS are
+    # operator intent that projects onto the fleet, so writes are operator-only.
+    # GET (list/get/active) and POST .../diff stay OPEN — diff is a read-only
+    # dry-run (no writes, no relays), the review gate the console renders before
+    # any (Slice 1+) apply. Save/delete a named template + snapshot-the-live-fleet
+    # are the writes gated here. (The "snapshot" literal is caught by the
+    # <name> rule under PUT/DELETE too, harmlessly — it's a write either way.)
+    ({"PUT", "DELETE"},          re.compile(r"^/fleet/templates/[^/]+$")),
+    ({"POST"},                   re.compile(r"^/fleet/templates/snapshot$")),
     # Worker ops (CON-05/06, UTIL-02): restart / module update / pip install /
     # serving-config are privileged executor actions on a worker —
     # operator-only, audited. (config added 2026-07-03: it re-execs the agent

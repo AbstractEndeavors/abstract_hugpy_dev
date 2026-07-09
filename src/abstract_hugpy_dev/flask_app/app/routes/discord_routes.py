@@ -42,6 +42,7 @@ from ..functions.imports.utils.discord_bindings import (
     append_bridge_message,
     get_bridge_messages,
     update_bridge_message,
+    clear_bridge_messages,
     add_session,
     list_sessions,
     revoke_session,
@@ -174,6 +175,7 @@ class BridgeRequest(BaseModel):
     defer_mode: str = "auto"              # auto | defer | directive
     brain: str = "model"                  # model (auto-reply) | keeper (keeper drives)
     keeper_target: str | None = None      # informational: which keeper is wired here
+    log_mode: str = "open"                # open (retain transcript) | none (ephemeral)
 
 
 @discord_bp.route("/discord/bridges", methods=["GET"])
@@ -197,7 +199,8 @@ def discord_bridges_create():
     try:
         bridge = add_bridge(channel_id=channel_id, model_key=model_key, user_id=user_id,
                             directive=body.directive, defer_mode=body.defer_mode,
-                            brain=body.brain, keeper_target=body.keeper_target)
+                            brain=body.brain, keeper_target=body.keeper_target,
+                            log_mode=body.log_mode)
     except ValueError as exc:
         abort(400, description=str(exc))
     return jsonify(bridge), 201
@@ -222,22 +225,41 @@ def discord_bridge_messages(bridge_id):
     return jsonify({"messages": get_bridge_messages(bridge_id, since)})
 
 
+@discord_bp.route("/discord/bridges/<bridge_id>/messages", methods=["DELETE"])
+def discord_bridge_clear_messages(bridge_id):
+    """Clear a bridge's console-side transcript. Operator-gated (see
+    operator_auth._SENSITIVE). Does NOT delete anything from the Discord channel
+    — only the history stored here (which also resets the model reply context
+    for model-brained bridges)."""
+    if not get_bridge(bridge_id):
+        abort(404, description="Unknown bridge id.")
+    cleared = clear_bridge_messages(bridge_id)
+    return jsonify({"ok": True, "id": bridge_id, "cleared": cleared or 0})
+
+
 @discord_bp.route("/discord/bridges/<bridge_id>/send", methods=["POST"])
 def discord_bridge_send(bridge_id):
-    """Console output for a bridge: record it AND push it into the Discord channel."""
-    bridge = get_bridge(bridge_id)
-    if not bridge:
+    """DISABLED 2026-07-09 (operator): console→channel send was an outbound-send
+    vector reachable by anyone past the auth gate (not just the operator), so the
+    console can no longer push arbitrary text into a Discord channel. Legitimate
+    outbound still flows via /keeper-reply (keeper-driven, defer-gated) and the
+    scoped session token (/discord/session/<token>/send). To restore: drop the
+    abort and un-archive the body below."""
+    if not get_bridge(bridge_id):
         abort(404, description="Unknown bridge id.")
-    body = request.get_json(silent=True) or {}
-    content = (body.get("content") or "").strip()
-    if not content:
-        abort(400, description="content is required.")
-    source = body.get("source") or "console"
-    msg = append_bridge_message(bridge_id, direction="out", source=source,
-                                content=content, author=body.get("author"))
-    enqueue_outbound(content=content, channel_id=bridge.get("channel_id"),
-                     user_id=bridge.get("user_id"))
-    return jsonify(msg or {}), 201
+    abort(403, description="Console→channel send is disabled (removed as an "
+                           "outbound-send vector). Use a keeper or a session token.")
+    # ── ARCHIVED original body (kept per the no-delete rule) ──────────────
+    # body = request.get_json(silent=True) or {}
+    # content = (body.get("content") or "").strip()
+    # if not content:
+    #     abort(400, description="content is required.")
+    # source = body.get("source") or "console"
+    # msg = append_bridge_message(bridge_id, direction="out", source=source,
+    #                             content=content, author=body.get("author"))
+    # enqueue_outbound(content=content, channel_id=bridge.get("channel_id"),
+    #                  user_id=bridge.get("user_id"))
+    # return jsonify(msg or {}), 201
 
 
 # ── candidate generation (the bridge's "brain") ───────────────────────────
@@ -276,9 +298,14 @@ _DIRECTIVE_DECIDE = (
 )
 
 
-def _generate_candidate(bridge: dict) -> str:
+def _generate_candidate(bridge: dict, current_inbound: str = "") -> str:
     """A model reply built from the bridge's directive + recent sent transcript.
-    Returns '' on any failure so the caller falls back to manual operation."""
+    Returns '' on any failure so the caller falls back to manual operation.
+
+    current_inbound is used for no-logs (ephemeral) bridges, whose transcript is
+    never stored: the current turn can't be read back, so it is passed in and
+    appended as the sole user turn (history is empty). For logged bridges the
+    inbound is already in the transcript, so current_inbound is left blank."""
     model_key = bridge.get("model_key")
     if not model_key:
         return ""
@@ -292,6 +319,8 @@ def _generate_candidate(bridge: dict) -> str:
             continue  # skip pending/rejected — not part of the real conversation
         role = "user" if m.get("direction") == "in" else "assistant"
         msgs.append({"role": role, "content": m.get("content") or ""})
+    if current_inbound:
+        msgs.append({"role": "user", "content": current_inbound})
     if len(msgs) > 13:                       # cap history (system + last 12 turns)
         msgs = [msgs[0]] + msgs[-12:]
     from ..functions.imports import execute_prompt
@@ -309,15 +338,18 @@ def discord_inbox():
     body = request.get_json(silent=True) or {}
     channel_id = body.get("channel_id")
     content = (body.get("content") or "").strip()
+    attachments = body.get("attachments") or []
     bridge = bridge_for_channel(channel_id) if channel_id else None
     if not bridge:
         return jsonify({"bridged": False})
-    if not content:
+    if not content and not attachments:
+        # nothing to record (an image-only message still has attachments)
         return jsonify({"bridged": True, "bridge_id": bridge["id"],
                         "defer_mode": bridge.get("defer_mode"), "action": "none"})
 
     append_bridge_message(bridge["id"], direction="in", source="discord",
-                          content=content, author=body.get("author"))
+                          content=content, author=body.get("author"),
+                          attachments=attachments)
 
     # keeper-brained bridges: an attached keeper process polls the transcript
     # and drives replies itself (via /keeper-reply), so central only records the
@@ -327,9 +359,12 @@ def discord_inbox():
                         "brain": "keeper", "defer_mode": bridge.get("defer_mode"),
                         "action": "await_keeper"})
 
+    # For a no-logs bridge the inbound was not retained, so hand it to the model
+    # directly; logged bridges already have it in the transcript.
+    ephemeral = bridge.get("log_mode", "open") == "none"
     action = "none"
     try:
-        candidate = _generate_candidate(bridge)
+        candidate = _generate_candidate(bridge, current_inbound=content if ephemeral else "")
     except Exception:
         logger.exception("bridge candidate generation failed")
         candidate = ""
@@ -386,7 +421,11 @@ def discord_bridge_keeper_reply(bridge_id):
 
 @discord_bp.route("/discord/bridges/<bridge_id>/approve", methods=["POST"])
 def discord_bridge_approve(bridge_id):
-    """Approve (optionally edit) a pending candidate and send it to Discord."""
+    """Approve a pending candidate AS GENERATED and send it to Discord. Editing
+    the candidate before send was removed 2026-07-09 (operator): it let anyone
+    past the auth gate push arbitrary text into a channel. Reviewers can now only
+    approve the model's exact draft or reject it. (Archived: the request's
+    `content` field is intentionally ignored.)"""
     bridge = get_bridge(bridge_id)
     if not bridge:
         abort(404, description="Unknown bridge id.")
@@ -394,9 +433,8 @@ def discord_bridge_approve(bridge_id):
     msg_id = body.get("message_id")
     if not msg_id:
         abort(400, description="message_id is required.")
-    edited = body.get("content")
-    msg = update_bridge_message(bridge_id, msg_id, status="sent",
-                                content=(edited.strip() if isinstance(edited, str) and edited.strip() else None))
+    # NB: body.get("content") is deliberately NOT applied — send-as-generated only.
+    msg = update_bridge_message(bridge_id, msg_id, status="sent")
     if not msg:
         abort(404, description="Unknown message id.")
     enqueue_outbound(content=msg["content"], channel_id=bridge.get("channel_id"),
