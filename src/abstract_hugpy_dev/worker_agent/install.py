@@ -82,16 +82,23 @@ def _install_systemd_user(opts) -> str:
     os.makedirs(unit_dir, exist_ok=True)
     unit_path = os.path.join(unit_dir, _SERVICE_NAME + ".service")
     exec_start = " ".join(_worker_argv(opts))
-    env_lines = "\n".join(f'Environment="{k}={v}"' for k, v in _env_for(opts).items())
+    # Use systemd's %h home specifier for the engine-dir default so the unit is
+    # portable across users (no baked-in /home/<user> path).
+    env_lines = "\n".join(f'Environment="{k}={v}"'
+                          for k, v in _env_for(opts, home="%h").items())
     unit = (
         "[Unit]\n"
-        "Description=hugpy GPU worker\n"
-        "After=network-online.target\n\n"
+        f"Description=hugpy worker ({opts.name})\n"
+        "After=network-online.target\n"
+        "Wants=network-online.target\n\n"
         "[Service]\n"
         "Type=simple\n"
         f"{env_lines}\n"
         f"ExecStart={exec_start}\n"
-        "Restart=always\n"
+        # on-failure (NOT always): a deliberate operator block/revoke makes the
+        # agent exit 0 and it must STAY stopped — Restart=always would fight the
+        # operator by respawning a blocked worker. A non-zero crash still restarts.
+        "Restart=on-failure\n"
         "RestartSec=5\n\n"
         "[Install]\n"
         "WantedBy=default.target\n"
@@ -101,6 +108,16 @@ def _install_systemd_user(opts) -> str:
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
     subprocess.run(["systemctl", "--user", "enable", "--now", _SERVICE_NAME + ".service"],
                    check=False)
+    # Linger keeps the per-user systemd manager (and this unit) alive after logout
+    # and across reboots without an active login session. Without it the worker
+    # dies at logout — the classic "it stopped overnight" failure.
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+    linger_cmd = ["loginctl", "enable-linger"] + ([user] if user else [])
+    linger = subprocess.run(linger_cmd, check=False)
+    if linger.returncode != 0:
+        print("WARNING: `loginctl enable-linger` failed — this worker will STOP at "
+              "logout and will NOT survive a reboot. Fix it with:\n"
+              f"  sudo loginctl enable-linger {user or '$USER'}", file=sys.stderr)
     return f"systemd user unit installed: {unit_path} (systemctl --user status {_SERVICE_NAME})"
 
 
@@ -146,8 +163,33 @@ def _install_schtasks(opts) -> str:
     return f"scheduled task '{_SERVICE_NAME}' created (Task Scheduler, runs at logon): {launcher}"
 
 
-def _env_for(opts) -> dict:
+def _env_for(opts, home: Optional[str] = None) -> dict:
+    """The unit/agent environment block. ``home`` is the home-dir token used for
+    defaulted paths — an expanded path on launchd/schtasks, systemd's ``%h``
+    specifier for the systemd user unit (portable across users)."""
+    if home is None:
+        home = os.path.expanduser("~")
     env = {"WORKER_CENTRAL_URL": opts.central}
+    if getattr(opts, "name", None):
+        env["WORKER_NAME"] = opts.name
+    if getattr(opts, "port", None):
+        env["WORKER_PORT"] = str(opts.port)
+    # Native llama.cpp engine location: llama-server (vision GGUFs) resolves here
+    # and the slot child derives its LD_LIBRARY_PATH from it, so ALWAYS set it —
+    # a bare install otherwise silently uses the per-OS data dir the setup doc
+    # never mentions. Flag-overridable via --engine-dir.
+    env["HUGPY_ENGINE_DIR"] = getattr(opts, "engine_dir", None) or os.path.join(
+        home, "hugpy-worker", "engine")
+    # Register but don't auto-serve: the operator turns models on from the
+    # console. ``off`` is the fleet default; --serve-mode overrides.
+    if getattr(opts, "serve_mode", None):
+        env["DEFAULT_SERVE_MODE"] = opts.serve_mode
+    # Enrollment token (single-purpose per box, revocable) — lets the worker
+    # register when central requires enrollment.
+    if getattr(opts, "enroll_token", None):
+        env["WORKER_ENROLL_TOKEN"] = opts.enroll_token
+    # Zero-copy model storage root (optional): a box mounting central's volume
+    # points here and provisioning becomes a no-op file check.
     if opts.storage:
         env["DEFAULT_ROOT"] = opts.storage
     return env
@@ -187,6 +229,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--models", default=os.environ.get("WORKER_MODELS"))
     p.add_argument("--storage", default=os.environ.get("DEFAULT_ROOT"),
                    help="local model storage root (default: per-OS data dir)")
+    p.add_argument("--storage-root", dest="storage_root", default=None,
+                   help="alias for --storage: DEFAULT_ROOT / zero-copy model root")
+    # Env-block completeness (mirrors the systemd unit the setup doc documents).
+    p.add_argument("--engine-dir", default=os.environ.get("HUGPY_ENGINE_DIR"),
+                   help="native llama.cpp engine dir where llama-server + slot-child "
+                        "libs resolve (default: ~/hugpy-worker/engine, %%h in the unit)")
+    p.add_argument("--serve-mode", default=os.environ.get("DEFAULT_SERVE_MODE", "off"),
+                   choices=("off", "on"),
+                   help="DEFAULT_SERVE_MODE: register but don't auto-serve (off, default)")
+    p.add_argument("--enroll-token", default=os.environ.get("WORKER_ENROLL_TOKEN"),
+                   help="single-purpose enrollment token minted on central "
+                        "(POST /llm/enroll-tokens)")
     # Role / RPC backend — forwarded to the agent so a shard backend can be
     # persisted by the installer (mirrors the agent's own WORKER_* env fallbacks).
     p.add_argument("--role", default=os.environ.get("WORKER_ROLE", "worker"),
@@ -225,6 +279,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if not opts.central:
         p.error("--central is required (or set WORKER_CENTRAL_URL)")
+    # --storage-root is the canonical alias; when given it wins over --storage.
+    if getattr(opts, "storage_root", None):
+        opts.storage = opts.storage_root
     if not opts.storage:
         opts.storage = os.path.join(data_dir(), "worker_storage")
 

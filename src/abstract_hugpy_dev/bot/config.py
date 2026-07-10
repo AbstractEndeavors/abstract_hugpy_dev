@@ -27,6 +27,10 @@ from ..central import central_base_url
 HUGPY_BASE_URL = central_base_url()
 DEFAULT_MODEL_KEY = os.getenv("DEFAULT_MODEL_KEY") or None
 GUILD_ID = int(os.getenv("GUILD_ID")) if os.getenv("GUILD_ID") else None
+# The operator's Discord user id. Escalation choice-clicks are fail-closed to
+# this user: if unset (None) no one can answer via the buttons/select — the
+# question stays answerable by text. Mirror of the GUILD_ID idiom above.
+OPERATOR_DISCORD_ID = int(os.getenv("OPERATOR_DISCORD_ID")) if os.getenv("OPERATOR_DISCORD_ID") else None
 
 
 def _env_flag(name: str, default: bool = False) -> bool:

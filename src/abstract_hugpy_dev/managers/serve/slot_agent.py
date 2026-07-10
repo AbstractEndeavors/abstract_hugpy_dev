@@ -469,6 +469,18 @@ class Slot:
             env = dict(os.environ)
             if self.gpu is not None:
                 env["CUDA_VISIBLE_DEVICES"] = str(self.gpu)
+            # A from-source llama-server links against sibling .so files under the
+            # engine dir (libllama/libggml/…). Prepend those to the child's
+            # LD_LIBRARY_PATH so it loads without a unit-level env hack (the ae
+            # 2026-07-06 manual fix, now derived from HUGPY_ENGINE_DIR in code).
+            # Additive + Linux-only + no-op unless the engine dir is overridden.
+            try:
+                from ...engine.resolve import ld_library_path_with_engine
+                _ld = ld_library_path_with_engine(env.get("LD_LIBRARY_PATH"))
+                if _ld:
+                    env["LD_LIBRARY_PATH"] = _ld
+            except Exception:  # noqa: BLE001 — never block a load on lib-path derivation
+                pass
             self.proc = subprocess.Popen(argv, env=env)
             self.model_key = model_key
             self.loaded_at = self.last_used = time.time()

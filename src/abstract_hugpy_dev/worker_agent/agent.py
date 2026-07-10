@@ -2908,6 +2908,71 @@ def env_status() -> dict:
     return info
 
 
+# ── install-shape detection (central-side drift detection) ──────────────────
+# What SHAPE this worker is installed in, so central can flag boxes that drifted
+# from the canonical installer (a hand-rolled unit, a bare process from the wrong
+# venv, a stray system unit). Additive heartbeat field — older centrals ignore it.
+#
+# Canonical unit name is the product-named `hugpy-worker.service`;
+# `abstract-hugpy-worker.service` is the recognized LEGACY alias (hand-written
+# units the setup doc used to document). Both count as canonical.
+_CANONICAL_UNITS = {"hugpy-worker.service", "abstract-hugpy-worker.service"}
+_INSTALL_SHAPE: "dict | None" = None
+
+
+def _detect_systemd_unit() -> "str | None":
+    """This process's systemd unit from ``/proc/self/cgroup`` (its last
+    ``*.service`` path component), or ``None``. Best-effort — any read/parse
+    failure returns ``None`` and never raises."""
+    try:
+        with open("/proc/self/cgroup", "r", encoding="utf-8") as fh:
+            data = fh.read()
+    except Exception:  # noqa: BLE001
+        return None
+    for tok in reversed(data.replace("/", "\n").split("\n")):
+        tok = tok.strip()
+        if tok.endswith(".service"):
+            return tok
+    return None
+
+
+def _compute_install_shape(*, invocation_id, unit, prefix, executable) -> dict:
+    """Pure install-shape logic (inputs -> the reported dict). Factored out so
+    the canonical truth-table is testable without touching /proc or systemd."""
+    via_systemd = bool(invocation_id)
+    venv = (prefix or "").rstrip("/")
+    canonical = bool(via_systemd
+                     and unit in _CANONICAL_UNITS
+                     and venv.endswith("hugpy-worker/venv"))
+    return {"unit": unit, "via_systemd": via_systemd,
+            "venv": prefix, "python": executable, "canonical": canonical}
+
+
+def _install_shape() -> dict:
+    """Cached install-shape for the heartbeat:
+    ``{unit, via_systemd, venv, python, canonical}``.
+
+    Computed ONCE (a running process's unit/venv don't change). Fully defensive:
+    on any failure it returns a well-formed dict with null/false fields so a
+    detection bug can never break the heartbeat.
+    """
+    global _INSTALL_SHAPE
+    if _INSTALL_SHAPE is not None:
+        return _INSTALL_SHAPE
+    try:
+        shape = _compute_install_shape(
+            invocation_id=os.environ.get("INVOCATION_ID"),
+            unit=_detect_systemd_unit(),
+            prefix=sys.prefix,
+            executable=sys.executable,
+        )
+    except Exception:  # noqa: BLE001 — detection must never break the heartbeat
+        shape = {"unit": None, "via_systemd": False,
+                 "venv": None, "python": None, "canonical": False}
+    _INSTALL_SHAPE = shape
+    return shape
+
+
 def _heartbeat_loop(client: CentralClient, state: WorkerState, args) -> None:
     while True:
         time.sleep(args.heartbeat)
@@ -2942,6 +3007,7 @@ def _heartbeat_loop(client: CentralClient, state: WorkerState, args) -> None:
                     "slots": _slots,
                     "allocations": _allocations(_slots),
                     "storage": _worker_storage(state),
+                    "install": _install_shape(),
                 },
             )
             # Adopt any assignment change made in the UI + pre-provision it.

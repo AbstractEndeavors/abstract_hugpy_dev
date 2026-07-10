@@ -58,3 +58,72 @@ def cli_bin() -> Optional[str]:
 
 def have_native_engine() -> bool:
     return server_bin() is not None
+
+
+# --------------------------------------------------------------------------- #
+# Shared-library path for spawned native binaries                             #
+# --------------------------------------------------------------------------- #
+# A from-source ``llama-server`` links against sibling ``.so`` files (libllama,
+# libggml, libggml-cuda …) that live NEXT to the binary — not in a system lib
+# dir. When the agent spawns a slot child (or a native --mmproj/--rpc server)
+# the child must find those on its loader path or it dies with
+# "libggml.so: cannot open shared object file". On ae (2026-07-06) this was
+# patched by hand as a unit-level LD_LIBRARY_PATH; deriving it from the engine
+# dir in code makes the fix travel with the package instead.
+def engine_lib_dirs() -> List[str]:
+    """Existing directories that may hold the native llama.cpp shared libs,
+    derived from the engine dir (``HUGPY_ENGINE_DIR``/``LLAMA_CPP_DIR``).
+
+    Returns ``[]`` when no engine-dir override is set — we do NOT guess the
+    per-OS default, so a box with a system/PATH llama-server (its libs already
+    resolvable) is left untouched. Only dirs that exist are returned.
+    """
+    if not (env_value("HUGPY_ENGINE_DIR") or env_value("LLAMA_CPP_DIR")):
+        return []
+    root = engine_dir()
+    # The engine dir itself + the usual binary/lib locations: a prebuilt release
+    # zip unpacks .so at the top level or under lib/; a from-source cmake build
+    # co-locates them with the binaries under build/bin (and sometimes build/lib).
+    cands = [
+        root,
+        os.path.join(root, "lib"),
+        os.path.join(root, "bin"),
+        os.path.join(root, "build", "bin"),
+        os.path.join(root, "build", "lib"),
+    ]
+    # Any other ``lib`` dir shallowly under root or build/ (cmake variants).
+    for base in (root, os.path.join(root, "build")):
+        try:
+            for name in os.listdir(base):
+                cands.append(os.path.join(base, name, "lib"))
+        except OSError:
+            pass
+    out: List[str] = []
+    seen = set()
+    for d in cands:
+        if d not in seen and os.path.isdir(d):
+            seen.add(d)
+            out.append(d)
+    return out
+
+
+def ld_library_path_with_engine(current: Optional[str] = None) -> Optional[str]:
+    """Prepend the engine lib dirs (:func:`engine_lib_dirs`) to an
+    ``LD_LIBRARY_PATH`` value, skipping any already present.
+
+    Returns ``current`` unchanged when there is nothing to add (no engine-dir
+    override, dirs already present, or non-Linux where LD_LIBRARY_PATH is inert).
+    None-safe: a ``None`` input with dirs to add yields just the new dirs joined.
+    """
+    import sys
+    if not sys.platform.startswith("linux"):
+        return current
+    dirs = engine_lib_dirs()
+    if not dirs:
+        return current
+    parts = [p for p in (current or "").split(os.pathsep) if p]
+    have = set(parts)
+    new = [d for d in dirs if d not in have]
+    if not new:
+        return current
+    return os.pathsep.join(new + parts)

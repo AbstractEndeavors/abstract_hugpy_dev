@@ -15,6 +15,202 @@ log = logging.getLogger(__name__)
 COGS = (".cogs.chat", ".cogs.tools", ".cogs.ml", ".cogs.ops")
 
 
+# ── keeper escalations: clickable operator choices ────────────────────────
+# An escalation outbound may carry `options` (labels). The bot renders them as
+# buttons (≤5) or a select menu (>5) whose custom_id encodes the routing:
+#     esc:<target>:<msg>:<idx>   (button, idx = option index)
+#     esc:<target>:<msg>:sel     (select, chosen value = option index)
+# `target` is the outbound's channel_id (or user_id for a DM); `msg` is the
+# outbox message id (uuid4 hex). Because the custom_id carries a *dynamic* msg
+# id, we use discord.ui.DynamicItem so a click still resolves after a restart —
+# the item type is re-registered in setup_hook and re-parses the id from the
+# message. The chosen label is recovered from the message's own component
+# payload (not the custom_id), which likewise survives a restart. The click is
+# posted back INBOUND via central's /discord/inbox so it appears to
+# `hugpy-escalate replies` exactly like a typed reply.
+
+def _iter_leaf_components(message):
+    """Yield each leaf component (Button/SelectMenu) of a message, flattening
+    the action-row wrappers."""
+    for row in (getattr(message, "components", None) or []):
+        children = getattr(row, "children", None)
+        if children is None:
+            yield row
+        else:
+            for child in children:
+                yield child
+
+
+def _label_from_message(message, custom_id, chosen_value=None):
+    """Recover the chosen label from the message's own component payload — this
+    survives a bot restart (the label lives in the message, not the custom_id).
+    Button: match custom_id, read `.label`. Select: find the option whose
+    `.value == chosen_value` and read that option's `.label`."""
+    for comp in _iter_leaf_components(message):
+        if getattr(comp, "custom_id", None) != custom_id:
+            continue
+        options = getattr(comp, "options", None)
+        if options is not None and chosen_value is not None:
+            for opt in options:
+                if str(getattr(opt, "value", "")) == str(chosen_value):
+                    return getattr(opt, "label", None)
+        label = getattr(comp, "label", None)
+        if label:
+            return label
+    return None
+
+
+def _all_components_disabled(message) -> bool:
+    comps = list(_iter_leaf_components(message))
+    if not comps:
+        return False
+    return all(getattr(c, "disabled", False) for c in comps)
+
+
+def _disabled_view_from_message(message):
+    """A View mirroring the message's components with every item disabled, so the
+    ack edit leaves the choice visible but un-clickable. None on failure (the
+    caller then edits with no view — the ✓ text still lands)."""
+    try:
+        view = discord.ui.View.from_message(message)
+        for item in view.children:
+            try:
+                item.disabled = True
+            except Exception:
+                pass
+        return view
+    except Exception:
+        return None
+
+
+async def _record_escalation_choice(interaction, *, target, msg_id, custom_id,
+                                     chosen_value=None, fallback_label=""):
+    """Shared click handler for escalation buttons/selects. Operator-gated,
+    idempotent, acks by disabling the controls, and relays the chosen label back
+    inbound. Guarded so a malformed click never crashes the gateway."""
+    bot = interaction.client
+    try:
+        # 1. Operator gate — fail closed.
+        op_id = getattr(config, "OPERATOR_DISCORD_ID", None)
+        if op_id is None:
+            await interaction.response.send_message(
+                "Escalation controls aren't configured (operator gate not set).",
+                ephemeral=True)
+            return
+        if interaction.user.id != op_id:
+            await interaction.response.send_message(
+                "This escalation isn't yours to answer.", ephemeral=True)
+            return
+
+        # 2. Chosen label, recovered from the message payload (restart-safe).
+        label = _label_from_message(interaction.message, custom_id,
+                                    chosen_value=chosen_value) or fallback_label
+
+        # 3. Idempotency (best-effort in-memory + the message's own disabled state).
+        answered = getattr(bot, "_answered_escalations", None)
+        if answered is None:
+            answered = bot._answered_escalations = set()
+        if msg_id in answered or _all_components_disabled(interaction.message):
+            await interaction.response.send_message(
+                "That escalation was already recorded.", ephemeral=True)
+            return
+        answered.add(msg_id)
+
+        # 4. Ack: edit the message, disabling all controls.
+        view = _disabled_view_from_message(interaction.message)
+        base = interaction.message.content or ""
+        await interaction.response.edit_message(
+            content=f"{base}\n\n✓ you chose **{label}**", view=view)
+
+        # 5. Relay the choice back INBOUND via the existing path (channel-based).
+        #    For a DM/user target this is a harmless no-op on central
+        #    (bridge_for_channel returns None -> bridged:false); escalations use a
+        #    channel, so the channel path is the one that lands as direction="in"
+        #    and trips `hugpy-escalate replies` + keeper-notify.
+        try:
+            author = getattr(interaction.user, "display_name", None) or str(interaction.user)
+            await bot.hugpy.relay_inbound(channel_id=int(target), author=author,
+                                          content=label)
+        except Exception:
+            log.warning("escalation inbound relay failed for msg %s", msg_id, exc_info=True)
+    except Exception:
+        log.warning("escalation click handling failed (custom_id=%s)", custom_id, exc_info=True)
+
+
+class EscalationButton(discord.ui.DynamicItem[discord.ui.Button],
+                       template=r"esc:(?P<target>\d+):(?P<msg>[0-9a-f]+):(?P<idx>\d+)"):
+    def __init__(self, target: int, msg: str, idx: int, label: str = ""):
+        self.target = target
+        self.msg = msg
+        self.idx = idx
+        super().__init__(
+            discord.ui.Button(
+                label=(label or f"Option {idx + 1}")[:80],
+                style=discord.ButtonStyle.primary,
+                custom_id=f"esc:{target}:{msg}:{idx}",
+            )
+        )
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(int(match["target"]), match["msg"], int(match["idx"]),
+                   label=getattr(item, "label", "") or "")
+
+    async def callback(self, interaction):
+        await _record_escalation_choice(
+            interaction, target=self.target, msg_id=self.msg,
+            custom_id=self.item.custom_id,
+            fallback_label=getattr(self.item, "label", "") or "")
+
+
+class EscalationSelect(discord.ui.DynamicItem[discord.ui.Select],
+                       template=r"esc:(?P<target>\d+):(?P<msg>[0-9a-f]+):sel"):
+    def __init__(self, target: int, msg: str, options=None):
+        self.target = target
+        self.msg = msg
+        super().__init__(
+            discord.ui.Select(
+                custom_id=f"esc:{target}:{msg}:sel",
+                placeholder="Choose one…",
+                min_values=1, max_values=1,
+                options=options or [discord.SelectOption(label="…", value="0")],
+            )
+        )
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        opts = list(getattr(item, "options", None) or [])
+        return cls(int(match["target"]), match["msg"], options=opts or None)
+
+    async def callback(self, interaction):
+        try:
+            chosen_value = interaction.data["values"][0]
+        except (KeyError, IndexError, TypeError):
+            chosen_value = None
+        await _record_escalation_choice(
+            interaction, target=self.target, msg_id=self.msg,
+            custom_id=self.item.custom_id, chosen_value=chosen_value,
+            fallback_label=str(chosen_value or ""))
+
+
+def _build_escalation_view(options, target, msg_id) -> "discord.ui.View":
+    """Render option labels as buttons (≤5) or a single select (>5, cap 25)."""
+    view = discord.ui.View(timeout=None)
+    labels = [str(o) for o in options]
+    if len(labels) <= 5:
+        for idx, label in enumerate(labels):
+            view.add_item(EscalationButton(int(target), msg_id, idx, label=label))
+    else:
+        if len(labels) > 25:
+            log.warning("escalation msg %s has %d options; truncating to 25 for "
+                        "the select menu", msg_id, len(labels))
+            labels = labels[:25]
+        opts = [discord.SelectOption(label=lbl[:100], value=str(i))
+                for i, lbl in enumerate(labels)]
+        view.add_item(EscalationSelect(int(target), msg_id, options=opts))
+    return view
+
+
 class HugpyBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
@@ -25,8 +221,15 @@ class HugpyBot(commands.Bot):
         self.hugpy = HugpyClient(config.HUGPY_BASE_URL)
         self.prefs = PrefsStore()
         self._bridged: set[str] = set()   # channel ids wired to a console session
+        # outbox message ids whose escalation choice we've already recorded
+        # (best-effort in-memory idempotency; the message's own disabled state is
+        # the durable guard across a restart).
+        self._answered_escalations: set[str] = set()
 
     async def setup_hook(self) -> None:
+        # Register the escalation click handlers so button/select clicks resolve
+        # even after a restart (their custom_ids carry a dynamic outbox msg id).
+        self.add_dynamic_items(EscalationButton, EscalationSelect)
         for cog in COGS:
             await self.load_extension(cog, package=__package__)
         if config.GUILD_ID:
@@ -239,12 +442,28 @@ class HugpyBot(commands.Bot):
         if not content:
             return
         channel_id, user_id = m.get("channel_id"), m.get("user_id")
+        # Optional clickable choices (keeper escalation). Absent/empty -> the send
+        # is byte-for-byte the plain-text path below (view stays None).
+        options = m.get("options")
+        view = None
+        if isinstance(options, list) and options:
+            try:
+                view = _build_escalation_view(options, channel_id or user_id, m["id"])
+            except Exception:
+                log.warning("could not build escalation view for %s", m.get("id"), exc_info=True)
+                view = None
         try:
             if channel_id:
                 channel = self.get_channel(int(channel_id)) or await self.fetch_channel(int(channel_id))
-                await channel.send(content)
+                if view is not None:
+                    await channel.send(content, view=view)
+                else:
+                    await channel.send(content)
             elif user_id:
                 user = self.get_user(int(user_id)) or await self.fetch_user(int(user_id))
-                await user.send(content)
+                if view is not None:
+                    await user.send(content, view=view)
+                else:
+                    await user.send(content)
         except Exception:
             log.warning("could not deliver outbound discord message %s", m.get("id"), exc_info=True)

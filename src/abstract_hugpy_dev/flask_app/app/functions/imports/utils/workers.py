@@ -840,6 +840,7 @@ class WorkerStore:
         slots: Optional[List[Dict[str, Any]]] = None,
         allocations: Optional[List[Dict[str, Any]]] = None,
         storage: Optional[Dict[str, Any]] = None,
+        install: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Mark a worker alive and refresh its live GPU / loaded-model stats."""
         with self._transaction() as workers:
@@ -911,6 +912,12 @@ class WorkerStore:
                 # in _public_view via storage_proposal (which overlays the fields
                 # the worker can't know: last_picked + the budget).
                 worker["storage"] = storage
+            if install is not None:
+                # Install-shape (uniform-install drift detection): {unit,
+                # via_systemd, venv, python, canonical}. Stored verbatim and
+                # spread through _public_view (via **worker); the console badges
+                # a non-canonical install off it.
+                worker["install"] = install
             if caps is not None:
                 worker["caps"] = caps
                 # Worker-side config is the hard ceiling: if its caps tightened

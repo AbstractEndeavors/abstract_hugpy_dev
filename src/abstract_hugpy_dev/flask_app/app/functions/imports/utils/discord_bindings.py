@@ -235,7 +235,8 @@ class DiscordBindingStore:
 
     # -- outbox (model -> channel push) ------------------------------------
     def enqueue_outbound(self, *, content: str, channel_id=None, user_id=None,
-                         binding_id: Optional[str] = None) -> Dict[str, Any]:
+                         binding_id: Optional[str] = None,
+                         options: Optional[list] = None) -> Dict[str, Any]:
         channel_id = _norm_id(channel_id)
         user_id = _norm_id(user_id)
         with self._transaction() as doc:
@@ -256,6 +257,12 @@ class DiscordBindingStore:
                 "created_at": time.time(),
                 "delivered": False,
             }
+            # Only stamp `options` when there's a non-empty list, so an ordinary
+            # outbound keeps its exact historical shape (no `options` key) and the
+            # bot's plain-text delivery path is unaffected. When present, the bot
+            # renders these labels as clickable choices (buttons ≤5 / select >5).
+            if isinstance(options, list) and options:
+                msg["options"] = options
             doc["outbox"].append(msg)
         return dict(msg)
 
@@ -411,7 +418,8 @@ class DiscordBindingStore:
     def append_message(self, bridge_id: str, *, direction: str, source: str,
                        content: str, author: Optional[str] = None,
                        status: str = "sent",
-                       attachments: Optional[List[Dict[str, Any]]] = None) -> Optional[Dict[str, Any]]:
+                       attachments: Optional[List[Dict[str, Any]]] = None,
+                       options: Optional[list] = None) -> Optional[Dict[str, Any]]:
         msg = {
             "id": uuid.uuid4().hex,
             "bridge_id": bridge_id,
@@ -425,6 +433,12 @@ class DiscordBindingStore:
             "status": status,         # "sent" | "pending" (awaiting operator) | "rejected"
             "ts": time.time(),
         }
+        # Interactive-escalation nicety: when the outbound offered clickable
+        # choices, mirror the labels into the transcript so the console shows
+        # what was asked. Only stamped when non-empty, so an ordinary message
+        # keeps its exact historical shape (no `options` key).
+        if isinstance(options, list) and options:
+            msg["options"] = options
         with self._transaction() as doc:
             bridge = next((b for b in doc["bridges"] if b.get("id") == bridge_id), None)
             if bridge is None:

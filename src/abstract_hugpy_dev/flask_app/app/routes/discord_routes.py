@@ -551,6 +551,35 @@ def discord_session_messages(token):
     return jsonify({"messages": get_bridge_messages(bridge["id"], since)})
 
 
+def _validate_options(raw):
+    """Validate an optional `options` payload for an interactive escalation.
+
+    Returns None when absent (byte-for-byte the old plain-text behaviour), or a
+    normalised list of 1..5 stripped label strings. Aborts 400 on any violation.
+    Discord allows at most 5 buttons per action row; the >5 (select-menu) case is
+    a bot-render concern, so this scoped session verb caps at 5 to keep an
+    escalation answerable as a single button row."""
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        abort(400, description="options must be a list of strings.")
+    if not raw:
+        abort(400, description="options must be a non-empty list (omit it for a plain message).")
+    if len(raw) > 5:
+        abort(400, description="at most 5 options.")
+    clean = []
+    for opt in raw:
+        if not isinstance(opt, str):
+            abort(400, description="each option must be a string.")
+        label = opt.strip()
+        if not label:
+            abort(400, description="options must not be empty.")
+        if len(label) > 80:
+            abort(400, description="each option must be at most 80 chars.")
+        clean.append(label)
+    return clean
+
+
 @discord_bp.route("/discord/session/<token>/send", methods=["POST"])
 def discord_session_send(token):
     s = _session_or_404(token)
@@ -560,11 +589,16 @@ def discord_session_send(token):
         abort(400, description="content is required.")
     if len(content) > _SESSION_MSG_LIMIT:
         abort(413, description=f"content exceeds {_SESSION_MSG_LIMIT} chars — split it.")
+    options = _validate_options(body.get("options"))
     author = (body.get("author") or s.get("author") or s.get("label") or "session").strip()
     bridge = bridge_for_channel(s["channel_id"])
     msg = None
     if bridge:  # record in the transcript so other session holders see it
-        msg = append_bridge_message(bridge["id"], direction="out", source="session",
-                                    content=content, author=author)
-    enqueue_outbound(content=content, channel_id=s["channel_id"])
+        kwargs = {"direction": "out", "source": "session",
+                  "content": content, "author": author}
+        if options is not None:
+            # transcript-only nicety; the store may drop unknown kwargs — harmless.
+            kwargs["options"] = options
+        msg = append_bridge_message(bridge["id"], **kwargs)
+    enqueue_outbound(content=content, channel_id=s["channel_id"], options=options)
     return jsonify({"ok": True, "message": msg}), 201

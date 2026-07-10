@@ -323,6 +323,11 @@ class HeartbeatRequest(BaseModel):
     # pre-feature agents -> the proposal has no per-model inventory (monitoring
     # only). NB: model-root disk, DISTINCT from the SSD hot-cache.
     storage: dict | None = None
+    # Install-shape (uniform-install drift detection): {unit, via_systemd, venv,
+    # python, canonical}. Computed once on the worker. Absent on older agents ->
+    # the console simply shows no install badge. Stored verbatim; the console
+    # flags a non-canonical install from it.
+    install: dict | None = None
 
 
 class AssignRequest(BaseModel):
@@ -345,6 +350,19 @@ def workers_list():
         w["version_ok"] = (required is None
                            or w.get("pkg_version") == required)
     return jsonify(rows)
+
+
+@worker_bp.route("/llm/workers/required-version", methods=["GET"])
+def workers_required_version():
+    """Public: the package version central wants workers to converge to.
+
+    Unauthenticated by design — the bootstrap queries this BEFORE a worker
+    exists (to pick which pip version to install) and it leaks nothing: the same
+    value already rides every register/heartbeat reply. ``null`` when central
+    pins no version (workers then track latest). Static path, so it takes routing
+    priority over ``/llm/workers/<worker_id>``.
+    """
+    return jsonify({"required_pkg_version": required_pkg_version()})
 
 
 @worker_bp.route("/llm/queue", methods=["GET"])
@@ -462,6 +480,7 @@ def workers_heartbeat(worker_id):
         slots=body.slots,
         allocations=body.allocations,
         storage=body.storage,
+        install=body.install,
     )
     if worker is None:
         # The agent thinks it's registered but central forgot it (restart,
