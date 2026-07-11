@@ -1,6 +1,6 @@
-"""REAL Wan VACE runner (B-3 + identity-lock) — the studio's weight-backed VACE
-executor over diffusers' unified control path, IMPORT-SAFE and GRACEFULLY-DEGRADING
-now. It serves THREE conditioning modes off the same pipeline
+"""REAL Wan VACE runner (B-3 + identity-lock + extend) — the studio's weight-backed
+VACE executor over diffusers' unified control path, IMPORT-SAFE and GRACEFULLY-
+DEGRADING now. It serves FOUR conditioning modes off the same pipeline
 (``WanVACEPipeline``, diffusers 0.39):
 
   * v2v restyle (``source_video``): decode the source clip to per-frame control
@@ -13,6 +13,12 @@ now. It serves THREE conditioning modes off the same pipeline
   * optional control still (``control_image`` + ``control_kind`` pose|depth|sketch):
     a single still repeated across the frame count as the ``video=`` control channel
     for composition blocking when there is no source_video.
+  * VACE-EXTEND (``vace_context_frames``, studio-movie splice motion-carry): carry
+    MOTION across a movie splice by conditioning on the parent clip's TRAILING frames
+    instead of a single still. Drives the diffusers video+mask EXTEND idiom — ``video``
+    is the kept context prefix + black placeholders, ``mask`` is black(keep) over the
+    context and white(generate) over the rest, so the model continues the parent's
+    motion rather than restarting from one frame.
 
 Historically it only restyled/enhanced an existing clip (e.g. a movie-tier output).
 
@@ -136,16 +142,19 @@ def _preflight(manifest: RenderManifest) -> StageError | None:
     mirror ``wan_i2v._preflight``.
 
     A VACE render is DEFINED by at least one conditioning input:
-      * ``source_video``     -> v2v restyle (the historical path);
-      * ``reference_images`` -> id_lock (reference-to-video identity); REQUIRED for
+      * ``source_video``        -> v2v restyle (the historical path);
+      * ``reference_images``    -> id_lock (reference-to-video identity); REQUIRED for
         the ID_LOCK capability;
-      * ``control_image``    -> a still control (pose/depth/sketch) for composition.
+      * ``control_image``       -> a still control (pose/depth/sketch) for composition;
+      * ``vace_context_frames`` -> VACE-EXTEND (studio-movie splice motion-carry): the
+        parent clip's trailing frames as the KEPT prefix of a video+mask extension.
     A render carrying none of these is a spec error — REFERENCE_MISSING for an
     id_lock request (the flagship path), else SOURCE_MISSING (v2v / other VACE)."""
     # --- SPEC: at least one conditioning input; id_lock REQUIRES reference(s) ---
     source = _resolve_source(manifest)
     refs = tuple(getattr(manifest, "reference_images", ()) or ())
     control = getattr(manifest, "control_image", "") or ""
+    ctx_frames = tuple(getattr(manifest, "vace_context_frames", ()) or ())
     is_id_lock = (manifest.capability == Capability.ID_LOCK)
 
     if is_id_lock and not refs:
@@ -156,13 +165,21 @@ def _preflight(manifest: RenderManifest) -> StageError | None:
             "supply at least one reference_image",
             (("model_id", manifest.model_id), ("capability", manifest.capability.value)),
         )
-    if source is None and not refs and not control:
+    if source is None and not refs and not control and not ctx_frames:
         return StageError(
             ErrorCode.REFERENCE_MISSING if is_id_lock else ErrorCode.SOURCE_MISSING,
             "VACE render carries no conditioning input — supply a source_video "
-            "(v2v restyle), reference_images (id_lock), or a control_image",
+            "(v2v restyle), reference_images (id_lock), a control_image, or "
+            "vace_context_frames (extend)",
             (("model_id", manifest.model_id), ("capability", manifest.capability.value)),
         )
+    for f in ctx_frames:
+        if not os.path.isfile(f):
+            return StageError(
+                ErrorCode.SOURCE_MISSING,
+                f"VACE-extend context frame not found on disk: {f}",
+                (("vace_context_frame", f), ("model_id", manifest.model_id)),
+            )
     if source is not None and not os.path.isfile(source):
         return StageError(
             ErrorCode.SOURCE_MISSING,
@@ -291,6 +308,41 @@ def _read_control_frames(
 
 
 # --------------------------------------------------------------------------- #
+# VACE-EXTEND channels (pure; PIL-only, no heavy deps) — the video+mask idiom
+# --------------------------------------------------------------------------- #
+def _build_vace_extend_channels(context_pils, n_frames: int, width: int, height: int):
+    """Build the diffusers ``WanVACEPipeline`` ``video`` + ``mask`` EXTEND channels from
+    the parent's trailing context frames — carry MOTION across a movie splice by keeping
+    the context frames and generating the rest. Returns ``(video, mask)``, each a list of
+    PIL RGB frames of length ``n_frames``:
+
+      * ``video`` = the K kept context frames (positions 0..K-1) + (n_frames-K) BLACK
+        placeholders for the positions to GENERATE (their pixels are irrelevant — the
+        mask marks them reactive, so the model synthesizes them).
+      * ``mask``  = K BLACK frames (KEEP, mask value 0 -> the pipeline's "inactive"
+        conditioning latents) + (n_frames-K) WHITE frames (GENERATE, mask value 1 ->
+        "reactive").
+
+    GROUNDED IN THE INSTALLED API (diffusers 0.39):
+      * ``WanVACEPipeline.prepare_video_latents`` binarizes ``mask`` (``mask > 0.5 -> 1``)
+        and splits ``inactive = video*(1-mask)`` (KEPT) vs ``reactive = video*mask``
+        (GENERATED);
+      * ``preprocess_conditions`` maps a PIL image ``[0,255] -> [-1,1] -> [0,1]``, so a
+        BLACK mask frame lands at 0 (keep) and a WHITE mask frame at 1 (generate).
+    Hence black=keep(context), white=generate. The caller guarantees ``0 < K < n_frames``.
+    """
+    from PIL import Image  # house dep; lazy to honor the module's import discipline
+
+    k = len(context_pils)
+    n_gen = n_frames - k
+    black = Image.new("RGB", (width, height), (0, 0, 0))
+    white = Image.new("RGB", (width, height), (255, 255, 255))
+    video = list(context_pils) + [black] * n_gen   # kept context prefix + to-generate
+    mask = [black] * k + [white] * n_gen           # keep the context, generate the rest
+    return video, mask
+
+
+# --------------------------------------------------------------------------- #
 # The runner
 # --------------------------------------------------------------------------- #
 def run_wan_vace(
@@ -374,6 +426,10 @@ def run_wan_vace(
     reference_images = tuple(getattr(manifest, "reference_images", ()) or ())
     control_image = getattr(manifest, "control_image", "") or ""
     control_kind = getattr(manifest, "control_kind", "") or ""
+    # VACE-EXTEND: the parent clip's trailing context frames (studio-movie splice
+    # motion-carry). When present, the render is an EXTENSION — the context frames are
+    # the KEPT prefix of a video+mask idiom, the rest is generated (see below).
+    vace_context_frames = tuple(getattr(manifest, "vace_context_frames", ()) or ())
     compute_dtype = torch.bfloat16
     quant_config = _bnb_config(manifest.precision, BitsAndBytesConfig, torch)
     seed = manifest.seeds.global_seed
@@ -432,7 +488,35 @@ def run_wan_vace(
         from PIL import Image
         vace_call: dict = {}
         control_frames_repeated = 0
-        if source_video:
+        extend_context_frames = 0
+        extend_generated_frames = 0
+        if vace_context_frames:
+            # VACE-EXTEND: carry motion across a movie splice by CONDITIONING on the
+            # parent's trailing frames instead of a single still. Load the K context frames
+            # and build the diffusers video+mask extend channels (see
+            # _build_vace_extend_channels for the installed-API grounding).
+            K = len(vace_context_frames)
+            if K >= n_frames:
+                return Err(StageError(
+                    ErrorCode.IO_ERROR,
+                    f"vace-extend context ({K} frames) leaves no room to generate within "
+                    f"num_frames={n_frames}",
+                    (("content_hash", content_hash), ("model_id", manifest.model_id))))
+            ctx_pils: list = []
+            for f in vace_context_frames:
+                try:
+                    ctx_pils.append(
+                        Image.open(f).convert("RGB").resize((width, height), Image.LANCZOS))
+                except Exception as exc:  # noqa: BLE001 — bad context frame is input data
+                    return Err(StageError(
+                        ErrorCode.IO_ERROR,
+                        f"could not load vace-extend context frame {f}: {exc}",
+                        (("vace_context_frame", f),)))
+            vace_call["video"], vace_call["mask"] = _build_vace_extend_channels(
+                ctx_pils, n_frames, width, height)
+            extend_context_frames = K
+            extend_generated_frames = n_frames - K
+        elif source_video:
             src_frame_dir = tempfile.mkdtemp(prefix=".srcframes-", dir=out_dir)
             control_frames, stderr_tail = _read_control_frames(
                 source_video, width, height, n_frames, src_frame_dir)
@@ -574,6 +658,13 @@ def run_wan_vace(
             # recorded so the static-vs-per-frame control semantics are never silent.
             prov["control_kind"] = control_kind
             prov["control_frames_repeated"] = control_frames_repeated
+        if vace_context_frames:
+            # VACE-EXTEND honesty: record HOW the splice motion was carried — how many
+            # parent frames were KEPT as the conditioning prefix (mask=0) and how many
+            # frames were GENERATED (mask=1). Sidecar-only; never a content-hash input.
+            prov["vace_extend"] = True
+            prov["extend_context_frames"] = extend_context_frames
+            prov["extend_generated_frames"] = extend_generated_frames
         atomic_write_text(
             os.path.join(out_dir, _PROVENANCE_NAME),
             json.dumps(prov, indent=2, sort_keys=True))

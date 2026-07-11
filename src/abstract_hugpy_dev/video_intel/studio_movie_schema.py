@@ -68,6 +68,26 @@ _MIN_CFG, _MAX_CFG = 0.0, 20.0
 # ``studio.job._DEFAULT_VRAM_BUDGET_GB``.
 _DEFAULT_VRAM_BUDGET_GB = 0.5
 
+# JOINT MODE — how a segment is spliced onto its parent at the branch point:
+#   * "still"       (default, backward-compatible): condition the segment's i2v render
+#                   on ONE frame (the branch still). Motion is NOT carried across the
+#                   splice — the historical behavior.
+#   * "vace_extend": carry MOTION across the splice by conditioning on the parent's
+#                   TRAILING ``context_frames`` frames through the VACE video+mask
+#                   extend idiom (the runner routes the segment through the VACE path).
+# goal 0 (the root) has no parent, so it MUST be "still" (there is nothing to extend
+# from) — enforced in the factory.
+_VALID_JOINT_MODES = frozenset({"still", "vace_extend"})
+_DEFAULT_JOINT_MODE = "still"
+
+# CONTEXT FRAMES — how many trailing parent frames condition a ``vace_extend`` splice
+# (movie-level default; a node MAY override). Bounded: >=1 (a splice needs at least one
+# context frame) and <= the ceiling below (a generous cap kept well under the VACE
+# model's 81-frame clip so an extension always has room to GENERATE new frames after
+# the kept context). Only consulted for ``vace_extend`` joints; ignored for "still".
+_DEFAULT_CONTEXT_FRAMES = 8
+_MIN_CONTEXT_FRAMES, _MAX_CONTEXT_FRAMES = 1, 32
+
 
 @dataclass(frozen=True)
 class StudioMovieGoal:
@@ -93,6 +113,15 @@ class StudioMovieGoal:
         steps / cfg        optional per-segment sampler overrides; when None the
                            movie-level value (or the bound model's family default)
                            is used.
+        joint_mode         how this segment is spliced onto its parent: "still"
+                           (default — condition on ONE branch frame, motion NOT carried)
+                           or "vace_extend" (condition on the parent's trailing
+                           ``context_frames`` frames via the VACE video+mask extend
+                           idiom, carrying motion). goal 0 (the root) MUST be "still".
+        context_frames     optional per-segment override of how many trailing parent
+                           frames condition a ``vace_extend`` splice; None ⇒ the
+                           movie-level ``context_frames``. Only consulted when
+                           ``joint_mode == "vace_extend"``.
     """
     segment_id: str
     prompt: str
@@ -103,6 +132,8 @@ class StudioMovieGoal:
     model_id: Optional[str] = None
     steps: Optional[int] = None
     cfg: Optional[float] = None
+    joint_mode: str = _DEFAULT_JOINT_MODE
+    context_frames: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -132,6 +163,10 @@ class StudioMovieSpec:
         time_budget_s    optional wall-clock budget the runner owns itself (the
                          single-daemon bus has no timeout/reaper), honored BETWEEN
                          segments — mirrors ``MovieSpec.time_budget_s``.
+        context_frames   movie-level default number of trailing parent frames that
+                         condition a ``vace_extend`` splice (a node may override via
+                         its own ``context_frames``). Only consulted for vace_extend
+                         joints; ignored by "still" joints.
     """
     goals: Tuple[StudioMovieGoal, ...]
     width: int
@@ -147,6 +182,7 @@ class StudioMovieSpec:
     out_root: Optional[str] = None
     start_image: Optional[MediaRef] = None
     time_budget_s: Optional[int] = None
+    context_frames: int = _DEFAULT_CONTEXT_FRAMES
 
 
 def _check_steps_cfg(where: str, steps, cfg) -> None:
@@ -166,6 +202,16 @@ def _check_steps_cfg(where: str, steps, cfg) -> None:
                 f"got {cfg!r}")
 
 
+def _check_context_frames(where: str, value) -> None:
+    """Shared context_frames range guard (movie-level + per-node). bool is an int
+    subclass — reject it explicitly. Raises LOCALLY (caller error at construction)."""
+    if not isinstance(value, int) or isinstance(value, bool) \
+            or not (_MIN_CONTEXT_FRAMES <= value <= _MAX_CONTEXT_FRAMES):
+        raise ValueError(
+            f"{where} context_frames must be an int in "
+            f"[{_MIN_CONTEXT_FRAMES}, {_MAX_CONTEXT_FRAMES}]; got {value!r}")
+
+
 def make_studio_movie(
     goals: Tuple[StudioMovieGoal, ...],
     width: int,
@@ -181,6 +227,7 @@ def make_studio_movie(
     out_root: Optional[str] = None,
     start_image: Optional[MediaRef] = None,
     time_budget_s: Optional[int] = None,
+    context_frames: int = _DEFAULT_CONTEXT_FRAMES,
 ) -> StudioMovieSpec:
     """Validate every field and build the frozen ``StudioMovieSpec``. Raises
     ``ValueError``/``TypeError`` LOCALLY on any structural violation — a
@@ -199,6 +246,10 @@ def make_studio_movie(
         i>0 goals[i].parent_segment_id == goals[i-1].segment_id. This is the ONLY
         rule that must relax for a real take-tree; the node shape already carries
         the parent pointer, so sibling divergence needs no schema change.
+      * JOINT MODE: every node's ``joint_mode`` is "still" or "vace_extend"; goal 0
+        (the root, no parent) MUST be "still" — there is nothing to extend from.
+      * CONTEXT FRAMES: the movie-level + any per-node ``context_frames`` is an int in
+        [1, 32] (a splice needs >=1 context frame; the cap keeps room to generate).
 
     Also the reconstruction path used by the bus deserializer — goals are rebuilt
     into ``StudioMovieGoal`` (and ``start_image`` through ``make_media_ref``) before
@@ -239,6 +290,7 @@ def make_studio_movie(
                                           and time_budget_s > 0):
         raise ValueError(
             f"time_budget_s must be a positive int or None; got {time_budget_s!r}")
+    _check_context_frames("movie-level", context_frames)
 
     # ---- per-node validation + linear-chain enforcement (v0) ----
     seen_ids: set = set()
@@ -268,6 +320,15 @@ def make_studio_movie(
                 f"goals[{gi}].model_id must be a non-empty string or None; got {g.model_id!r}")
         _check_steps_cfg(f"goals[{gi}]", g.steps, g.cfg)
 
+        # JOINT MODE: "still" (default) or "vace_extend". goal 0 (the root) has no
+        # parent to extend from, so it MUST be "still" (enforced below).
+        if not (isinstance(g.joint_mode, str) and g.joint_mode in _VALID_JOINT_MODES):
+            raise ValueError(
+                f"goals[{gi}].joint_mode must be one of {sorted(_VALID_JOINT_MODES)}; "
+                f"got {g.joint_mode!r}")
+        if g.context_frames is not None:
+            _check_context_frames(f"goals[{gi}]", g.context_frames)
+
         # LINEAR CHAIN (v0): the root has no parent; every later node's parent is the
         # node right before it. The one rule a real take-tree relaxes.
         if gi == 0:
@@ -275,6 +336,10 @@ def make_studio_movie(
                 raise ValueError(
                     f"goals[0].parent_segment_id must be None (the root has no parent); "
                     f"got {g.parent_segment_id!r}")
+            if g.joint_mode != _DEFAULT_JOINT_MODE:
+                raise ValueError(
+                    f"goals[0].joint_mode must be {_DEFAULT_JOINT_MODE!r} (the root has no "
+                    f"parent to extend from); got {g.joint_mode!r}")
         else:
             if g.parent_segment_id != prev_id:
                 raise ValueError(
@@ -298,6 +363,7 @@ def make_studio_movie(
         out_root=out_root,
         start_image=start_image,
         time_budget_s=time_budget_s,
+        context_frames=context_frames,
     )
 
 
@@ -314,6 +380,8 @@ def _goal_from_dict(d: dict) -> StudioMovieGoal:
         model_id=d.get("model_id"),
         steps=d.get("steps"),
         cfg=d.get("cfg"),
+        joint_mode=d.get("joint_mode", _DEFAULT_JOINT_MODE),
+        context_frames=d.get("context_frames"),
     )
 
 
@@ -342,4 +410,5 @@ def studio_movie_from_dict(d: dict) -> StudioMovieSpec:
         out_root=d.get("out_root"),
         start_image=ref,
         time_budget_s=d.get("time_budget_s"),
+        context_frames=d.get("context_frames", _DEFAULT_CONTEXT_FRAMES),
     )

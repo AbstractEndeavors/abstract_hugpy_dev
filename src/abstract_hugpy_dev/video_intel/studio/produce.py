@@ -156,6 +156,7 @@ def produce_clip(
     reference_images: tuple[str, ...] | None = None,
     control_image: str | None = None,
     control_kind: str | None = None,
+    vace_context_frames: tuple[str, ...] | None = None,
     should_cancel: Callable[[], bool] | None = None,
 ) -> Result[Artifact, StageError]:
     """Resolve ``request``, build its manifest, and run the bound runner.
@@ -228,6 +229,13 @@ def produce_clip(
         reference_images=tuple(reference_images or ()),
         control_image=control_image or "",
         control_kind=control_kind or "",
+        # VACE-EXTEND temporal conditioning (studio-movie splice motion-carry): the
+        # parent clip's trailing context frames, threaded into the manifest for the VACE
+        # runner to build the diffusers video+mask extend idiom. CARRIED for every
+        # capability (the VACE runner CONSUMES it; others ignore it), but — unlike the
+        # other conditioning inputs — NOT part of the content_hash (see the field docstring
+        # on RenderManifest). None -> ().
+        vace_context_frames=tuple(vace_context_frames or ()),
     )
 
     runner = _DISPATCH.get((binding.framework, binding.task))

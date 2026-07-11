@@ -27,11 +27,13 @@ from __future__ import annotations
 
 import os
 import json
+import time
 import base64
 import inspect
 import asyncio
 import logging
-from typing import Any, Callable, Dict, Optional
+import threading
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .imports import (
     TokenEvent, DoneEvent, ErrorEvent, StatusEvent,
@@ -51,6 +53,11 @@ _spill_provider: Optional[Callable[[str, str], dict]] = None
 # when a model should be SHARDED across the GPU pool, else None to fall through
 # to ordinary whole-model selection. None by default ⇒ zero effect on routing.
 _placement_provider: Optional[Callable[[str], Optional[dict]]] = None
+# Cap-aware relay reroute (concurrency hardening 2026-07-11). Returns the ranked
+# list of ONLINE workers holding a model, so the in-flight gate can reroute
+# around a worker that is at its advertised in-process concurrency cap. None ⇒
+# the gate only ever considers the primary pick (older web layer / standalone).
+_worker_candidates_provider: Optional[Callable[..., List[dict]]] = None
 
 
 def set_worker_provider(pick_fn: Callable, spill_fn: Optional[Callable] = None) -> None:
@@ -72,6 +79,20 @@ def set_placement_provider(place_fn: Optional[Callable]) -> None:
     global _placement_provider
     _placement_provider = place_fn
     logger.info("placement provider registered: %s", getattr(place_fn, "__name__", place_fn))
+
+
+def set_worker_candidates_provider(candidates_fn: Optional[Callable]) -> None:
+    """Register the cap-aware reroute list provider (web -> core), optional.
+
+    ``candidates_fn(model_key, pool) -> list[worker dict]`` returns the ranked
+    online workers holding the model (no routing side effects). The relay gate
+    consults it to find an alternative when the primary pick is at its in-process
+    concurrency cap. Unregistered ⇒ the gate degrades to primary-only.
+    """
+    global _worker_candidates_provider
+    _worker_candidates_provider = candidates_fn
+    logger.info("worker candidates provider registered: %s",
+                getattr(candidates_fn, "__name__", candidates_fn))
 
 
 def get_worker_provider() -> Optional[Callable]:
@@ -125,6 +146,296 @@ def _spill_for(worker_id: Optional[str], model_key: str) -> dict:
         return _spill_provider(worker_id, model_key) or {}
     except Exception:
         return {}
+
+
+# ---------------------------------------------------------------------------
+# Cap-aware relay admission (concurrency hardening — the central half).
+#
+# The worker gate (worker_agent.gen_gate) stops a SINGLE box from letting
+# concurrent requests race a non-reentrant in-process runner and crash. Central
+# does the complementary thing: it never FIRES a relay that would enter a busy
+# in-process runner in the first place. It tracks how many relays are in flight
+# per (worker, model), respects the worker's advertised in-process concurrency
+# cap, reroutes to another online worker holding the model when the primary is
+# full, waits briefly for a slot to free, and only then returns an honest busy
+# error — so a burst serializes (or degrades honestly) instead of core-dumping a
+# worker or piling up unboundedly.
+#
+# v0 honesty (deliberate): the in-flight counter is per-GUNICORN-PROCESS (a
+# module global). With N gunicorn worker processes each gates its own relays, so
+# the fleet-wide per-(worker,model) concurrency can exceed the cap by up to N-1.
+# That is still a hard bound (never unbounded) AND the per-worker gen_gate is the
+# authoritative backstop that actually prevents the crash. Cross-process exact
+# accounting can later ride the comms SQLite mirror (the same store jobs use);
+# it is intentionally NOT built here. A worker whose model is SLOT-served is not
+# gated centrally at all (its llama-server child schedules concurrency itself).
+# ---------------------------------------------------------------------------
+
+_INFLIGHT: Dict[Tuple[str, str], int] = {}
+_INFLIGHT_LOCK = threading.Lock()
+
+
+def _gate_disabled() -> bool:
+    return os.environ.get("HUGPY_CENTRAL_GATE", "").strip().lower() in (
+        "off", "0", "false", "no",
+    )
+
+
+def _gate_wait_s() -> float:
+    """Bounded wait for a busy (worker, model) slot to free before giving up."""
+    try:
+        return max(0.0, float(os.environ.get("HUGPY_CENTRAL_GATE_WAIT_S", "30")))
+    except (TypeError, ValueError):
+        return 30.0
+
+
+class WorkerBusyError(RuntimeError):
+    """No worker holding the model has in-process capacity within the bounded wait.
+
+    The honest 429/503 the caller surfaces (route maps it to a status). Carries
+    the busy worker's name/id, the model, and its in-flight count so the message
+    names exactly what is saturated.
+    """
+
+    def __init__(self, worker: Optional[dict], model_key: Optional[str], in_flight: int):
+        self.worker = worker or {}
+        self.model_key = model_key
+        self.in_flight = int(in_flight)
+        self.worker_name = self.worker.get("name") or self.worker.get("id") or "worker"
+        super().__init__(self.stream_message())
+
+    def stream_message(self) -> str:
+        return (f"worker_busy: {self.worker_name} is at its in-process concurrency "
+                f"limit for {self.model_key} ({self.in_flight} in flight) and no "
+                f"other worker holding it is free — retry shortly")
+
+    def as_error(self) -> Dict[str, Any]:
+        return {"error": {
+            "code": "worker_busy",
+            "message": self.stream_message(),
+            "worker": self.worker_name,
+            "worker_id": self.worker.get("id"),
+            "model": self.model_key,
+            "in_flight": self.in_flight,
+        }}
+
+
+def _advertised_cap(worker: Optional[dict]) -> int:
+    """The worker's advertised safe in-process concurrency for a model.
+
+    Reads ``serving_limits.in_process_max_concurrency``. ABSENT (an older agent
+    that predates the field) → 1: a llama.cpp ``Llama`` context and an in-process
+    transformers model serialize per model, so 1 is the crash-safe legacy
+    assumption. A non-positive advertised value is floored to 1 — 'unlimited'
+    in-process concurrency is exactly the crash, never honored.
+    """
+    lim = (worker or {}).get("serving_limits") or {}
+    n = lim.get("in_process_max_concurrency")
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return 1
+    return max(1, n)
+
+
+def _model_slot_served(worker: Optional[dict], model_key: str) -> bool:
+    """True when ``model_key`` is currently seated in a SLOT child on this worker.
+
+    Then the worker's llama-server / llama_cpp.server child schedules concurrency
+    itself and central must NOT apply the in-process cap. Best-effort over the
+    heartbeat ``slots``/``allocations`` snapshot; any doubt → False (apply the
+    cap — over-gating a slot model is a small latency cost, under-gating an
+    in-process model is a crash).
+    """
+    if not worker or not model_key:
+        return False
+    keys = set()
+    for s in (worker.get("slots") or []):
+        if isinstance(s, dict) and s.get("model_key") and s.get("healthy"):
+            keys.add(str(s["model_key"]))
+    for a in (worker.get("allocations") or []):
+        if isinstance(a, dict) and a.get("kind") == "slot" and a.get("model_key"):
+            keys.add(str(a["model_key"]))
+    if not keys:
+        return False
+    if model_key in keys:
+        return True
+    tail = str(model_key).split("/")[-1]
+    return any(tail == k.split("/")[-1] for k in keys)
+
+
+def _effective_cap(worker: Optional[dict], model_key: str) -> Optional[int]:
+    """The in-process concurrency cap to enforce for (worker, model), or None to
+    NOT gate (the model is slot-served — its child schedules itself)."""
+    if _model_slot_served(worker, model_key):
+        return None
+    return _advertised_cap(worker)
+
+
+def _inflight_try_acquire(worker_id: str, model_key: str, cap: int) -> bool:
+    key = (worker_id, model_key)
+    with _INFLIGHT_LOCK:
+        cur = _INFLIGHT.get(key, 0)
+        if cur < cap:
+            _INFLIGHT[key] = cur + 1
+            return True
+        return False
+
+
+def _inflight_release(worker_id: str, model_key: str) -> None:
+    key = (worker_id, model_key)
+    with _INFLIGHT_LOCK:
+        cur = _INFLIGHT.get(key, 0)
+        if cur <= 1:
+            _INFLIGHT.pop(key, None)
+        else:
+            _INFLIGHT[key] = cur - 1
+
+
+def _inflight_count(worker_id: str, model_key: str) -> int:
+    with _INFLIGHT_LOCK:
+        return _INFLIGHT.get((worker_id, model_key), 0)
+
+
+def _candidates(model_key: str, pool: Optional[str] = None) -> List[dict]:
+    """Ranked online workers holding the model (reroute list), or [] if no
+    provider / any failure — the gate then considers only the primary."""
+    if _worker_candidates_provider is None:
+        return []
+    try:
+        try:
+            return _worker_candidates_provider(model_key, pool) or []
+        except TypeError:
+            return _worker_candidates_provider(model_key) or []
+    except Exception as exc:  # never let reroute break a request
+        logger.warning("candidates provider failed for %s: %s", model_key, exc)
+        return []
+
+
+_NOOP_RELEASE = lambda: None  # noqa: E731 — a tiny sentinel is clearer inline
+
+
+class _RelaySlot:
+    """A reserved relay admission: which worker to hit, its spill, and the
+    release that returns the in-flight permit. ``release()`` is idempotent."""
+
+    __slots__ = ("worker", "spill", "_release", "_released")
+
+    def __init__(self, worker, spill, release):
+        self.worker = worker
+        self.spill = spill
+        self._release = release
+        self._released = False
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        try:
+            self._release()
+        except Exception:  # noqa: BLE001 — release must never raise into a finally
+            logger.exception("relay slot release failed")
+
+
+def _try_reserve(worker: Optional[dict], spill, model_key: str,
+                 viable: Optional[Callable[[dict], bool]]) -> Optional[_RelaySlot]:
+    """Reserve an in-flight relay slot on ``worker`` for ``model_key``.
+
+    Returns a _RelaySlot on success, or None when the worker is ineligible
+    (``viable`` predicate — e.g. vision capability) or already at its in-process
+    cap. A slot-served model is uncapped (reserved with a no-op release).
+    """
+    if not worker:
+        return None
+    if viable is not None and not viable(worker):
+        return None
+    cap = _effective_cap(worker, model_key)
+    if cap is None:                       # slot-served — the child schedules itself
+        return _RelaySlot(worker, spill, _NOOP_RELEASE)
+    wid = worker.get("id") or ""
+    if _inflight_try_acquire(wid, model_key, cap):
+        return _RelaySlot(worker, spill, lambda: _inflight_release(wid, model_key))
+    return None
+
+
+def _reserve_once(model_key: str, pool: Optional[str], primary_worker: dict,
+                  primary_spill, viable: Optional[Callable[[dict], bool]]) -> Optional[_RelaySlot]:
+    """One admission pass, no wait: the primary pick first, then any other online
+    worker holding the model that has room (cap-aware reroute). None if all full.
+    Fast on the happy path (primary reserve is lock-only); only a reroute touches
+    the candidates provider (a cached registry read)."""
+    slot = _try_reserve(primary_worker, primary_spill, model_key, viable)
+    if slot is not None:
+        return slot
+    primary_id = (primary_worker or {}).get("id")
+    for alt in _candidates(model_key, pool):
+        if alt.get("id") == primary_id:
+            continue
+        slot = _try_reserve(alt, _spill_for(alt.get("id"), model_key),
+                            model_key, viable)
+        if slot is not None:
+            logger.info("relay reroute: %s at cap for %s -> %s (cap-aware)",
+                        primary_id, model_key, alt.get("id"))
+            return slot
+    return None
+
+
+def _busy(primary_worker: dict, model_key: str) -> "WorkerBusyError":
+    return WorkerBusyError(primary_worker, model_key,
+                           _inflight_count((primary_worker or {}).get("id") or "",
+                                           model_key))
+
+
+def _acquire_relay_slot(model_key: str, pool: Optional[str], primary_worker: dict,
+                        primary_spill, *, viable: Optional[Callable[[dict], bool]] = None,
+                        wait_s: Optional[float] = None) -> _RelaySlot:
+    """SYNC cap-aware admission (tests + any synchronous caller).
+
+    Admit one relay under the cap, rerouting to another holder or WAITING briefly
+    (small blocking sleeps) for a slot to free; exhausted → WorkerBusyError. The
+    caller MUST ``release()`` the returned slot when the relay (incl. the whole
+    stream) finishes. Do NOT call this from the async runner path — a blocking
+    sleep would stall the shared event loop; that path uses the async variant.
+    See the module note for the v0 per-process honesty caveat.
+    """
+    if _gate_disabled():
+        return _RelaySlot(primary_worker, primary_spill, _NOOP_RELEASE)
+    deadline = time.monotonic() + (_gate_wait_s() if wait_s is None else wait_s)
+    while True:
+        slot = _reserve_once(model_key, pool, primary_worker, primary_spill, viable)
+        if slot is not None:
+            return slot
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _busy(primary_worker, model_key)
+        time.sleep(min(0.1, remaining))
+
+
+async def _acquire_relay_slot_async(model_key: str, pool: Optional[str],
+                                    primary_worker: dict, primary_spill, *,
+                                    viable: Optional[Callable[[dict], bool]] = None,
+                                    wait_s: Optional[float] = None) -> _RelaySlot:
+    """ASYNC cap-aware admission for DelegatingRunner.run/stream.
+
+    Identical policy to the sync variant, but the bounded wait YIELDS the shared
+    event loop (``await asyncio.sleep``) rather than blocking it: central drives
+    every relay on one long-lived loop thread (async_runtime), so a blocking
+    sleep here would freeze the request currently HOLDING the slot — it could
+    never finish and free the slot, deadlocking the wait. Yielding lets the
+    holder keep generating and release, so the waiter is admitted the moment a
+    slot frees (or times out honestly).
+    """
+    if _gate_disabled():
+        return _RelaySlot(primary_worker, primary_spill, _NOOP_RELEASE)
+    deadline = time.monotonic() + (_gate_wait_s() if wait_s is None else wait_s)
+    while True:
+        slot = _reserve_once(model_key, pool, primary_worker, primary_spill, viable)
+        if slot is not None:
+            return slot
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _busy(primary_worker, model_key)
+        await asyncio.sleep(min(0.1, remaining))
 
 
 # ---------------------------------------------------------------------------
@@ -454,12 +765,23 @@ def make_delegating_runner(framework: str, task: str):
             return self._local
 
         async def run(self, req):
-            worker, spill_override = _select(self.model_key, getattr(req, "pool", None))
+            pool = getattr(req, "pool", None)
+            worker, spill_override = _select(self.model_key, pool)
             if worker and _vision_task and not _worker_vision_capable(worker):
                 logger.info("worker %s doesn't advertise vision (engine.supports_vision); "
                             "serving %s where vision actually works instead",
                             worker.get("id"), self.model_key)
                 worker = None
+            slot = None
+            if worker:
+                # Cap-aware admission: never fire a relay that would enter a busy
+                # in-process runner. Reroutes to another holder or waits briefly;
+                # WorkerBusyError (honest 429/503) surfaces rather than crashing a
+                # worker or degrading a worker-assigned model onto central.
+                _viable = _worker_vision_capable if _vision_task else None
+                slot = await _acquire_relay_slot_async(self.model_key, pool, worker,
+                                                       spill_override, viable=_viable)
+                worker, spill_override = slot.worker, slot.spill
             if worker:
                 payload = _worker_payload(task, req, self.model_key, worker.get("id"),
                                           spill_override=spill_override)
@@ -478,6 +800,16 @@ def make_delegating_runner(framework: str, task: str):
                                 f"set HUGPY_LOCAL_FALLBACK=always to allow)") from exc
                         logger.warning("worker run failed (%s); running %s locally",
                                        exc, self.model_key)
+                    finally:
+                        # Release the in-flight permit the moment the relay ends
+                        # (success, raise, or fallthrough-to-local) — never hold it
+                        # across the local fallback below.
+                        if slot is not None:
+                            slot.release()
+                elif slot is not None:
+                    # Unbuildable payload (e.g. oversized inline file) — release
+                    # and fall through to local, same as before the gate existed.
+                    slot.release()
             # Per-box "never serve locally" policy: no worker took this request
             # (none selected, or one failed with fallback allowed), and this box
             # hosts no models — refuse with a clear error instead of loading the
@@ -492,83 +824,107 @@ def make_delegating_runner(framework: str, task: str):
             return result
 
         async def stream(self, req, cancel_event=None):
-            worker, spill_override = _select(self.model_key, getattr(req, "pool", None))
+            pool = getattr(req, "pool", None)
+            worker, spill_override = _select(self.model_key, pool)
             if worker and _vision_task and not _worker_vision_capable(worker):
                 logger.info("worker %s doesn't advertise vision (engine.supports_vision); "
                             "serving %s where vision actually works instead",
                             worker.get("id"), self.model_key)
                 worker = None
+            slot = None
+            if worker:
+                # Cap-aware admission (see run()). WorkerBusyError is surfaced as
+                # an honest error event — a worker-assigned model must NOT degrade
+                # onto central just because every holder is momentarily saturated.
+                _viable = _worker_vision_capable if _vision_task else None
+                try:
+                    slot = await _acquire_relay_slot_async(self.model_key, pool, worker,
+                                                           spill_override, viable=_viable)
+                except WorkerBusyError as busy:
+                    yield ErrorEvent(request_id=req.request_id,
+                                     message=busy.stream_message())
+                    return
+                worker, spill_override = slot.worker, slot.spill
             if worker:
                 payload = _worker_payload(task, req, self.model_key, worker.get("id"),
                                           spill_override=spill_override)
                 if payload is not None:
-                    # Announce the allocation up front — the chat banner shows
-                    # this. A pre-output failure falls through and re-announces
-                    # "local" below, so the banner ends on the actual server.
-                    yield _alloc_status(req.request_id, worker)
-                    produced_tokens = False
-                    wname = worker.get("name") or worker.get("id") or "worker"
+                    # try/finally releases the in-flight permit when the worker
+                    # relay ends by ANY path — terminal return, break-to-local, or
+                    # exception — so it is never held across the local fallback.
                     try:
-                        async for ev in _worker_stream(worker, payload, req.request_id):
-                            etype = getattr(ev, "type", None)
-                            if etype == "error":
-                                # A worker that errors AFTER streaming tokens can't
-                                # be replayed locally (would duplicate output) — so
-                                # surface it as interrupted. A worker that errors
-                                # BEFORE any token used to degrade to local — but a
-                                # worker-ASSIGNED model running on central is a
-                                # policy violation (and a CPU meltdown for big
-                                # models), so by default the worker's error is
-                                # surfaced instead (see _local_fallback_allowed).
+                        # Announce the allocation up front — the chat banner shows
+                        # this. A pre-output failure falls through and re-announces
+                        # "local" below, so the banner ends on the actual server.
+                        yield _alloc_status(req.request_id, worker)
+                        produced_tokens = False
+                        wname = worker.get("name") or worker.get("id") or "worker"
+                        try:
+                            async for ev in _worker_stream(worker, payload, req.request_id):
+                                etype = getattr(ev, "type", None)
+                                if etype == "error":
+                                    # A worker that errors AFTER streaming tokens can't
+                                    # be replayed locally (would duplicate output) — so
+                                    # surface it as interrupted. A worker that errors
+                                    # BEFORE any token used to degrade to local — but a
+                                    # worker-ASSIGNED model running on central is a
+                                    # policy violation (and a CPU meltdown for big
+                                    # models), so by default the worker's error is
+                                    # surfaced instead (see _local_fallback_allowed).
+                                    if produced_tokens:
+                                        yield ErrorEvent(request_id=req.request_id,
+                                                         message=f"worker {wname}: stream interrupted: {ev.message}")
+                                        return
+                                    if not _local_fallback_allowed():
+                                        yield ErrorEvent(
+                                            request_id=req.request_id,
+                                            message=f"worker {wname} failed before output: "
+                                                    f"{ev.message} (local fallback disabled "
+                                                    f"for worker-assigned models)")
+                                        return
+                                    logger.warning("worker %s errored before output (%s); "
+                                                   "running %s locally", worker.get("id"),
+                                                   ev.message, self.model_key)
+                                    break  # -> local fallback below
+                                yield ev
+                                if etype == "token":
+                                    produced_tokens = True
+                                elif etype == "done":
+                                    return  # worker completed (even if empty) — terminal
+                            else:
+                                # Stream ended with no done/error marker.
                                 if produced_tokens:
-                                    yield ErrorEvent(request_id=req.request_id,
-                                                     message=f"worker {wname}: stream interrupted: {ev.message}")
                                     return
                                 if not _local_fallback_allowed():
                                     yield ErrorEvent(
                                         request_id=req.request_id,
-                                        message=f"worker {wname} failed before output: "
-                                                f"{ev.message} (local fallback disabled "
-                                                f"for worker-assigned models)")
+                                        message=f"worker {wname} produced no output "
+                                                f"(local fallback disabled for "
+                                                f"worker-assigned models)")
                                     return
-                                logger.warning("worker %s errored before output (%s); "
-                                               "running %s locally", worker.get("id"),
-                                               ev.message, self.model_key)
-                                break  # -> local fallback below
-                            yield ev
-                            if etype == "token":
-                                produced_tokens = True
-                            elif etype == "done":
-                                return  # worker completed (even if empty) — terminal
-                        else:
-                            # Stream ended with no done/error marker.
+                                logger.warning("worker %s produced no output; running %s locally",
+                                               worker.get("id"), self.model_key)
+                        except Exception as exc:
                             if produced_tokens:
+                                # Stream already started — don't replay it locally.
+                                yield ErrorEvent(request_id=req.request_id,
+                                                 message=f"worker {wname}: stream interrupted: {exc}")
                                 return
                             if not _local_fallback_allowed():
                                 yield ErrorEvent(
                                     request_id=req.request_id,
-                                    message=f"worker {wname} produced no output "
-                                            f"(local fallback disabled for "
-                                            f"worker-assigned models)")
+                                    message=f"worker {wname} unreachable/failed: {exc} "
+                                            f"(local fallback disabled for worker-"
+                                            f"assigned models; set "
+                                            f"HUGPY_LOCAL_FALLBACK=always to allow)")
                                 return
-                            logger.warning("worker %s produced no output; running %s locally",
-                                           worker.get("id"), self.model_key)
-                    except Exception as exc:
-                        if produced_tokens:
-                            # Stream already started — don't replay it locally.
-                            yield ErrorEvent(request_id=req.request_id,
-                                             message=f"worker {wname}: stream interrupted: {exc}")
-                            return
-                        if not _local_fallback_allowed():
-                            yield ErrorEvent(
-                                request_id=req.request_id,
-                                message=f"worker {wname} unreachable/failed: {exc} "
-                                        f"(local fallback disabled for worker-"
-                                        f"assigned models; set "
-                                        f"HUGPY_LOCAL_FALLBACK=always to allow)")
-                            return
-                        logger.warning("worker offload failed (%s); running %s locally",
-                                       exc, self.model_key)
+                            logger.warning("worker offload failed (%s); running %s locally",
+                                           exc, self.model_key)
+                    finally:
+                        if slot is not None:
+                            slot.release()
+                elif slot is not None:
+                    slot.release()
             # Per-box "never serve locally" policy: no worker took this request
             # and this box hosts no models — surface a clear error instead of
             # streaming from a locally-loaded model. Default off === today's

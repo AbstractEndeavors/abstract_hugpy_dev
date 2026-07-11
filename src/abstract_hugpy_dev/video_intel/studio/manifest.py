@@ -83,6 +83,7 @@ def _build_manifest(
     reference_images: tuple[str, ...] = (),
     control_image: str = "",
     control_kind: str = "",
+    vace_context_frames: tuple[str, ...] = (),
 ) -> RenderManifest:
     """Validate every field, then build the frozen manifest. Raises ``ValueError``
     LOCALLY on any structural violation. Shared by ``make_render_manifest`` (the
@@ -218,6 +219,19 @@ def _build_manifest(
         raise ValueError(
             f"control_kind must be a string or None; got {type(control_kind).__name__}")
 
+    # VACE-EXTEND context frames (movie splice motion-carry): None/absent -> (); each
+    # must be a str. ORDER PRESERVED (oldest -> newest, ending at the branch frame). A
+    # caller threading a list (from JSON) is coerced to a tuple so the frozen manifest
+    # stays hashable + order-stable. NOT part of the content_hash (see the field docstring
+    # on RenderManifest) — carried for the runner + provenance sidecar only.
+    if vace_context_frames is None:
+        vace_context_frames = ()
+    vace_context_frames = tuple(vace_context_frames)
+    for i, f in enumerate(vace_context_frames):
+        if not isinstance(f, str):
+            raise ValueError(
+                f"vace_context_frames[{i}] must be a str; got {type(f).__name__}")
+
     return RenderManifest(
         render_id=render_id,
         capability=capability,
@@ -242,6 +256,7 @@ def _build_manifest(
         reference_images=reference_images,
         control_image=control_image,
         control_kind=control_kind,
+        vace_context_frames=vace_context_frames,
     )
 
 
@@ -268,6 +283,7 @@ def make_render_manifest(
     reference_images: tuple[str, ...] = (),
     control_image: str = "",
     control_kind: str = "",
+    vace_context_frames: tuple[str, ...] = (),
 ) -> RenderManifest:
     """Build a validated ``RenderManifest`` from a resolved ``ModelBinding`` and a
     resolved ``StudioEnv``.
@@ -324,6 +340,8 @@ def make_render_manifest(
         reference_images=tuple(reference_images),
         control_image=control_image,
         control_kind=control_kind,
+        # --- VACE-extend temporal context (movie splice motion-carry); NOT hashed ---
+        vace_context_frames=tuple(vace_context_frames),
     )
 
 
@@ -384,6 +402,10 @@ def render_manifest_to_dict(m: RenderManifest) -> dict:
         "reference_images": list(m.reference_images),
         "control_image": m.control_image,
         "control_kind": m.control_kind,
+        # VACE-extend context frames: recorded in the sidecar (provenance/round-trip),
+        # even though NOT a content_hash input, so a rehydrated manifest reconstructs the
+        # exact conditioning the runner consumed.
+        "vace_context_frames": list(m.vace_context_frames),
         "provenance": (
             None if m.provenance is None else {
                 "operator": m.provenance.operator,
@@ -479,4 +501,7 @@ def render_manifest_from_dict(d: dict) -> RenderManifest:
         reference_images=tuple(d.get("reference_images", ())),
         control_image=d.get("control_image", ""),
         control_kind=d.get("control_kind", ""),
+        # VACE-extend context: tolerate manifests serialized before this field existed
+        # (absent -> ()).
+        vace_context_frames=tuple(d.get("vace_context_frames", ())),
     )

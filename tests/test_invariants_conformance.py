@@ -108,6 +108,8 @@ from abstract_hugpy_dev.video_intel.gen_schema import make_generate_image, text_
 from abstract_hugpy_dev.video_intel.scene_schema import make_generate_scene, GenerateSceneSpec  # noqa: E402
 from abstract_hugpy_dev.video_intel.movie_schema import make_movie, GoalInterval, MovieSpec     # noqa: E402
 from abstract_hugpy_dev.video_intel.studio.job import make_studio_i2v          # noqa: E402
+from abstract_hugpy_dev.video_intel.studio_movie_schema import (               # noqa: E402
+    make_studio_movie, StudioMovieGoal)
 
 # the OTHER job plane (JobError reconciled by Task 2; cancel-plane divergence remains)
 from abstract_hugpy_dev.comms.jobs import (                                   # noqa: E402
@@ -142,6 +144,9 @@ def _minimal_specs() -> dict:
             goals=(GoalInterval(0, 3, "a cat"),), model_id="sd-turbo",
             width=64, height=64, steps=2, guidance=0.0, fps=8, assemble=False),
         "studio_i2v": make_studio_i2v(width=64, height=64, fps=8, seed=1),
+        "generate_studio_movie": make_studio_movie(
+            goals=(StudioMovieGoal(segment_id="s0", prompt="a cat"),),
+            width=64, height=64, fps=8),
     }
 
 

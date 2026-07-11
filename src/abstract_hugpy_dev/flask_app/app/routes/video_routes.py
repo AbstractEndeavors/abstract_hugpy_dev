@@ -61,6 +61,7 @@ from abstract_hugpy_dev.video_intel.scene_schema import make_generate_scene
 from abstract_hugpy_dev.video_intel.movie_schema import GoalInterval, make_movie
 from abstract_hugpy_dev.video_intel.studio.job import make_studio_i2v
 from abstract_hugpy_dev.video_intel.studio_movie_schema import (
+    _DEFAULT_CONTEXT_FRAMES as _DEFAULT_MOVIE_CONTEXT_FRAMES,
     StudioMovieGoal,
     make_studio_movie,
 )
@@ -635,6 +636,12 @@ def video_studio_movie():
             model_id=g.get("model_id"),
             steps=g.get("steps"),
             cfg=g.get("cfg"),
+            # JOINT MODE + context frames (VACE-extend splice motion-carry). joint_mode
+            # defaults to "still" (absent/null/"" -> "still"); a bad non-empty value / a
+            # root vace_extend / an out-of-range context_frames is a clean 400 via
+            # make_studio_movie's validation below.
+            joint_mode=(g.get("joint_mode") or "still"),
+            context_frames=g.get("context_frames"),
         ))
         prev_id = seg_id
 
@@ -682,6 +689,9 @@ def video_studio_movie():
             out_root=body.get("out_root"),
             start_image=start_ref,
             time_budget_s=body.get("time_budget_s"),
+            # Movie-level default trailing-frame count for vace_extend splices (a node may
+            # override via its own context_frames). Absent -> the schema default (8).
+            context_frames=body.get("context_frames", _DEFAULT_MOVIE_CONTEXT_FRAMES),
         )
     except (ValueError, TypeError) as exc:  # bad node / geometry / chain = 400
         return jsonify({"error": str(exc)}), 400

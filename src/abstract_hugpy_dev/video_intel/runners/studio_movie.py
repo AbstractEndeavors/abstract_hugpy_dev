@@ -11,11 +11,24 @@ NLE-ROW SEMANTICS. A studio movie is ``[segment 0 | segment 1 | …]``: an order
 strip of studio ``produce_clip`` outputs conjoined at splice points. Per segment,
 in timeline order:
   a. Segment 0 renders t2v (or i2v when a movie-level ``start_image`` is given).
-     Each LATER segment renders i2v, conditioned on ONE still — the **branch
-     frame** of the PREVIOUS segment's clip (``branch_frame: int | null``; null ⇒
-     the parent's LAST frame). The still is extracted with ffmpeg (a frame-accurate
-     ``select=eq(n\\,B)`` pluck) and handed to ``produce_clip`` as the i2v
-     ``start_image``.
+     Each LATER segment is spliced onto its parent per its ``joint_mode``:
+       * "still" (default, backward-compatible): render i2v, conditioned on ONE still
+         — the **branch frame** of the PREVIOUS segment's clip (``branch_frame:
+         int | null``; null ⇒ the parent's LAST frame). The still is extracted with
+         ffmpeg (a frame-accurate ``select=eq(n\\,B)`` pluck) and handed to
+         ``produce_clip`` as the i2v ``start_image``. Motion is NOT carried.
+       * "vace_extend": carry MOTION across the splice — extract the parent's TRAILING
+         ``context_frames`` frames (``[branch-K+1 .. branch]``, clamped) and route the
+         render through the VACE path (capability "v2v" -> Task.VACE_CONTROL) with those
+         frames as the temporal conditioning. The VACE runner builds the diffusers
+         video+mask extend idiom (kept context prefix + generated tail), so the segment
+         CONTINUES the parent's motion instead of restarting from one frame. The child's
+         first K output frames RECONSTRUCT the context and are DROPPED at assembly (see
+         ASSEMBLY below) so no frame double-plays. A vace_extend segment routes to a real
+         VACE model, so its per-segment vram budget is raised to the VACE floor
+         (``_VACE_EXTEND_MIN_BUDGET_GB``); on a GPU-less box it returns the VACE runner's
+         graceful Err (NO_GPU/DEPS_MISSING/WEIGHTS_MISSING) — an HONEST per-segment error,
+         NEVER a silent fallback to still-mode.
   b. The render goes through the SAME studio boundary the single-clip bus job uses:
      ``runners.studio_i2v.run_produce_clip`` (router -> manifest -> runner ->
      content-addressed clip). RESUME is content-addressed INSIDE ``produce_clip``:
@@ -42,9 +55,18 @@ inclusive); a null branch resolves to the parent's LAST frame, so the parent pla
 in FULL. The LEAF segment (no child) plays in full. Concat is ffmpeg's concat
 DEMUXER over the (uniformly re-encoded) contribution clips.
 
+VACE-EXTEND OVERLAP (assembly). The parent-trim math above is UNCHANGED: the parent
+still plays ``[0 .. branch]`` and the child still "starts at the branch frame". But a
+``vace_extend`` child's output INCLUDES its first K frames as a RECONSTRUCTION of the
+parent's trailing context (the kept mask=0 prefix). Those K frames overlap the parent's
+tail, so they are DROPPED from the CHILD's head at concat (``context_drop = K`` frames):
+the child contributes ``[K .. end]``, its first NEWLY-generated frame (index K) splices
+directly onto the parent's branch frame — no frame double-plays. (A "still" child has
+``context_drop = 0`` — nothing dropped, today's behavior byte-identical.)
+
 ``movie.json`` sidecar records the full node list + per-joint
-``{branch_frame, trim_frames}`` + a DRIFT note: i2v-still conditioning carries a
-frame, NOT motion — VACE-extend is the planned upgrade.
+``{branch_frame, trim_frames, mode, context_frames}`` (``mode`` labels each splice
+"still" vs "vace_extend" so the UI can show it honestly) + a DRIFT note.
 
 DRIFT / v0 simplifications (also in ``studio_movie_schema``'s header + the report):
   * one movie-level tier (``vram_budget_gb``) applied to every segment;
@@ -93,9 +115,22 @@ logger = logging.getLogger(__name__)
 # every segment clip + the final movie.mp4 is cataloged like any other media output.
 STUDIO_MOVIE_ROOT = os.path.join(DEFAULT_ROOT, "video_intel", "studio_movies")
 
-_DRIFT_NOTE = ("i2v-still conditioning: each segment is conditioned on ONE frame of "
-               "its parent's clip — motion is NOT carried across the splice; "
-               "VACE-extend is the planned upgrade.")
+_DRIFT_NOTE = ("still-mode splices condition each segment on ONE frame of its parent — "
+               "motion is NOT carried across the splice. A joint's "
+               "joint_mode='vace_extend' carries motion via VACE-extend (conditioning on "
+               "the parent's trailing context_frames through the diffusers video+mask "
+               "extend idiom) instead of a single still.")
+
+# A ``vace_extend`` segment routes through the VACE path (Task.VACE_CONTROL), which is
+# served ONLY by real Wan-VACE models — the cheapest, wan2.1-vace-1.3b, needs ~6GB
+# (INT8 @ <=480p). A still segment stays on the movie's (often tiny/synthetic) budget,
+# so a vace_extend segment RAISES its own per-segment budget to this floor to actually
+# REACH the VACE model — never a silent downgrade to still-mode (that dishonesty is
+# banned). On a GPU-less box the render then returns the VACE runner's graceful
+# DEPS_MISSING/NO_GPU/WEIGHTS_MISSING (an honest per-segment Err), not a synthetic clip.
+# NOTE: vace-1.3b tops out at 480p, so a movie wider/taller than 832x480 surfaces an
+# honest VRAM_EXCEEDED (a bigger VACE model needs a bigger movie budget).
+_VACE_EXTEND_MIN_BUDGET_GB = 6.0
 
 
 # --------------------------------------------------------------------------- #
@@ -131,6 +166,32 @@ def _extract_frame_at(clip_path: str, frame_index: int, dest_png: str) -> "tuple
     return ok, (result.stderr or "")[-500:]
 
 
+def _extract_context_frames(
+    clip_path: str, branch_index: int, k: int, dest_dir: str
+) -> "tuple[list[str] | None, str, list[int]]":
+    """Pluck the parent clip's TRAILING context window for a ``vace_extend`` splice:
+    frames ``[branch_index-k+1 .. branch_index]`` (inclusive, oldest -> newest), CLAMPED
+    at 0. Writes them as ordered PNGs (``ctx_000.png`` = oldest) into ``dest_dir`` via the
+    same frame-accurate ``select=eq(n,IDX)`` pluck the branch still uses.
+
+    The number extracted is ``min(k, branch_index + 1)`` — a branch too early to have k
+    frames behind it yields the fewer frames actually available (never a crash). Returns
+    ``(paths | None, stderr_tail, indices)``; None signals an errors-as-data ffmpeg
+    failure. ``indices`` is the exact 0-based source frame indices extracted (in order),
+    so the caller/manifest records precisely which parent frames carried the motion."""
+    start = max(0, int(branch_index) - int(k) + 1)
+    indices = list(range(start, int(branch_index) + 1))   # inclusive, oldest -> newest
+    os.makedirs(dest_dir, exist_ok=True)
+    paths: "list[str]" = []
+    for pos, idx in enumerate(indices):
+        dest = os.path.join(dest_dir, f"ctx_{pos:03d}.png")
+        ok, tail = _extract_frame_at(clip_path, idx, dest)
+        if not ok:
+            return None, tail, indices
+        paths.append(dest)
+    return paths, "", indices
+
+
 def _trim_clip(src_mp4: str, dst_mp4: str, n_frames: int, fps: int) -> "tuple[bool, str]":
     """Re-encode the FIRST ``n_frames`` frames of ``src_mp4`` into ``dst_mp4``.
 
@@ -147,6 +208,43 @@ def _trim_clip(src_mp4: str, dst_mp4: str, n_frames: int, fps: int) -> "tuple[bo
         "-i", src_mp4,
         "-frames:v", str(int(n_frames)),
         "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-r", str(int(fps)),
+        "-movflags", "+faststart",
+        dst_mp4,
+    ]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    ok = (result.returncode == 0 and os.path.isfile(dst_mp4)
+          and os.path.getsize(dst_mp4) > 0)
+    return ok, (result.stderr or "")[-500:]
+
+
+def _slice_clip(src_mp4: str, dst_mp4: str, start_frame: int, n_frames: int,
+                fps: int) -> "tuple[bool, str]":
+    """Re-encode a WINDOW ``[start_frame, start_frame+n_frames)`` of ``src_mp4`` into
+    ``dst_mp4`` — the vace_extend head-drop path (drop a child's reconstructed context
+    prefix). Frame-accurate via a ``select='gte(n,START)'`` filter + ``setpts`` reset,
+    then ``-frames:v n`` on the kept stream. Same house H.264/yuv420p invocation as
+    ``_trim_clip`` so every contribution shares codec params (concat ``-c copy`` stays
+    valid). For ``start_frame <= 0`` it is exactly ``_trim_clip`` (first-n), so the
+    still-mode path never changes. Never raises on a plain ffmpeg failure."""
+    if int(start_frame) <= 0:
+        return _trim_clip(src_mp4, dst_mp4, n_frames, fps)
+    ffmpeg = resolve_bin("ffmpeg") or "ffmpeg"
+    os.makedirs(os.path.dirname(dst_mp4), exist_ok=True)
+    s = int(start_frame)
+    # select drops the leading window, setpts rebases timestamps to 0; -frames:v then
+    # counts the KEPT frames. NOTE: no ``-vsync 0`` here — it conflicts with the CFR
+    # ``-r`` on this ffmpeg (6.1) and aborts ("Invalid argument"); the default vsync +
+    # ``-r`` gives a clean CFR clip whose codec params match _trim_clip's (concat-safe).
+    vf = (f"select='gte(n\\,{s})',setpts=PTS-STARTPTS,"
+          "scale=trunc(iw/2)*2:trunc(ih/2)*2")
+    cmd = [
+        ffmpeg, "-y",
+        "-i", src_mp4,
+        "-vf", vf,
+        "-frames:v", str(int(n_frames)),
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
         "-r", str(int(fps)),
@@ -202,37 +300,53 @@ def _assemble_movie(movie_root: str, work_dir: str, seg_records: "list[dict]",
     if not completed:
         return assembly
 
-    # Per-joint trim record + each segment's contribution frame count. A segment
-    # with a NEXT completed segment (its child, linear chain) is trimmed to
-    # child.resolved_branch + 1; the last completed segment plays FULL.
-    contributions: "list[tuple[str, int]]" = []   # (segment clip path, n frames)
+    # Per-joint trim record + each segment's contribution WINDOW [head_drop, tail_end).
+    #   * tail_end (the PARENT trim, UNCHANGED): a segment with a NEXT completed segment
+    #     (its child) plays to child.resolved_branch + 1; the last (leaf) plays FULL.
+    #   * head_drop (NEW, vace_extend only): a segment RENDERED via vace_extend has its
+    #     first ``context_drop`` frames as a RECONSTRUCTION of its parent's context (the
+    #     kept mask=0 prefix), which overlaps the parent's tail — so drop them from this
+    #     segment's head (context_drop=0 for a still segment, so it plays [0, tail_end)
+    #     exactly as before). The joint records the CHILD's splice ``mode`` so the UI can
+    #     label it "still" vs "vace_extend" honestly.
+    # (segment clip path, head_drop, n_frames)
+    contributions: "list[tuple[str, int, int]]" = []
     joints: "list[dict]" = []
     for p, rec in enumerate(completed):
+        head_drop = int(rec.get("context_drop") or 0)   # vace_extend reconstructed prefix
         if p + 1 < len(completed):
             child = completed[p + 1]
             rb = child["resolved_branch"]          # branch INTO this segment
-            trim_frames = int(rb) + 1
+            tail_end = int(rb) + 1
             joints.append({
                 "parent_segment_id": rec["segment_id"],
                 "child_segment_id": child["segment_id"],
                 "branch_frame": int(rb),
-                "trim_frames": trim_frames,
+                "trim_frames": tail_end,
+                # SPLICE MODE (child's): "still" or "vace_extend"; context_frames is the
+                # child's kept-context length (None for a still splice). The UI labels the
+                # splice from these — motion-carry is never silent.
+                "mode": child.get("joint_mode", "still"),
+                "context_frames": (child.get("context_frames")
+                                   if child.get("joint_mode") == "vace_extend" else None),
             })
         else:
-            trim_frames = int(rec["frames"])       # leaf: full clip
-        contributions.append((rec["clip_path"], trim_frames))
+            tail_end = int(rec["frames"])          # leaf: full clip
+        contributions.append((rec["clip_path"], head_drop, tail_end - head_drop))
 
-    # Materialize each contribution as a uniformly re-encoded clip in the work dir,
-    # then concat. Non-destructive: the source clips are never touched.
+    # Materialize each contribution as a uniformly re-encoded WINDOW in the work dir,
+    # then concat. Non-destructive: the source clips are never touched. A head_drop>0
+    # (vace_extend) window goes through _slice_clip; head_drop==0 is the historical
+    # first-n _trim_clip (byte-identical still-mode path).
     os.makedirs(work_dir, exist_ok=True)
     contrib_paths: "list[str]" = []
     total = 0
     try:
-        for i, (src, n) in enumerate(contributions):
+        for i, (src, head_drop, n) in enumerate(contributions):
             dst = os.path.join(work_dir, f"contrib_{i:02d}.mp4")
-            ok, tail = _trim_clip(src, dst, n, fps)
+            ok, tail = _slice_clip(src, dst, head_drop, n, fps)
             if not ok:
-                logger.warning("studio movie %s: contribution trim %d FAILED "
+                logger.warning("studio movie %s: contribution slice %d FAILED "
                                "(non-fatal): %s", job_id, i, tail)
                 # keep whatever we could stitch before this failure
                 break
@@ -260,9 +374,10 @@ def _assemble_movie(movie_root: str, work_dir: str, seg_records: "list[dict]",
 def _write_movie_json(movie_root: str, spec: StudioMovieSpec, seg_records: "list[dict]",
                       assembly: "dict", job_id: str, partial: bool) -> "dict":
     """(Over)write ``<movie_root>/movie.json`` — the full node list + per-joint
-    ``{branch_frame, trim_frames}`` + assembly + drift note. Returns the manifest
-    dict (for ``JobResult.movie``). Best-effort — never raises across the job
-    boundary."""
+    ``{branch_frame, trim_frames, mode, context_frames}`` (``mode`` labels each splice
+    "still" vs "vace_extend"; ``context_frames`` is the vace kept-context length) +
+    assembly + drift note. Returns the manifest dict (for ``JobResult.movie``).
+    Best-effort — never raises across the job boundary."""
     manifest = {
         "kind": "studio_movie",
         "drift": _DRIFT_NOTE,
@@ -372,10 +487,19 @@ def run_generate_studio_movie(spec: StudioMovieSpec, job_id: str) -> JobResult:
 
         seg_out_root = os.path.join(movie_root, f"segment_{seg_i:02d}")
 
-        # ---- decide this segment's conditioning still + capability ----
-        # segment 0: i2v from the movie start_image if given, else t2v. Later
-        # segments: i2v from the parent clip's BRANCH FRAME (null -> last frame).
+        # ---- decide this segment's conditioning + capability + joint mode ----
+        # segment 0: i2v from the movie start_image if given, else t2v (no parent to
+        # splice). Later segments splice onto their parent per goal.joint_mode:
+        #   * "still": i2v conditioned on ONE branch frame (start_image). No motion carry.
+        #   * "vace_extend": v2v (VACE) conditioned on the parent's TRAILING context
+        #     frames — motion is carried across the splice (see below).
         resolved_branch = None
+        start_image = None
+        vace_context_frames = None
+        seg_joint_mode = "still"
+        seg_context_frames = 0          # how many parent frames carried the motion (K)
+        seg_context_drop = 0            # frames DROPPED from THIS segment's head at assembly
+        seg_budget = spec.vram_budget_gb
         if seg_i == 0:
             start_image = spec.start_image.uri if spec.start_image is not None else None
             capability = "i2v" if start_image else "t2v"
@@ -392,17 +516,47 @@ def run_generate_studio_movie(spec: StudioMovieSpec, job_id: str) -> JobResult:
                              f"{raw!r} -> resolved {resolved_branch} is outside the "
                              f"parent clip's [0, {prev_frames}) frames"),
                     retryable=False)))
-            branch_png = os.path.join(seg_out_root, "branch.png")
-            _emit("branching", {"segment_id": goal.segment_id, "branch_frame": resolved_branch})
-            ok, tail = _extract_frame_at(prev_clip_path, resolved_branch, branch_png)
-            if not ok:
-                return _partial_return(JobResult(job_id, ok=False, error=JobError(
-                    code="branch_frame_extract_failed",
-                    message=(f"segment {seg_i} ({goal.segment_id!r}): could not extract "
-                             f"branch frame {resolved_branch} from the parent clip: {tail}"),
-                    retryable=False)))
-            start_image = branch_png
-            capability = "i2v"
+            seg_joint_mode = goal.joint_mode
+            if seg_joint_mode == "vace_extend":
+                # VACE-EXTEND: extract the parent's trailing K frames [branch-K+1 .. branch]
+                # (clamped) and route the segment through the VACE path (capability "v2v" ->
+                # Task.VACE_CONTROL). The child's first K output frames RECONSTRUCT this
+                # context and are dropped at assembly (context_drop) so no frame double-plays.
+                # RAISE the per-segment budget to the VACE floor so a real VACE model
+                # actually binds (a still segment stays on the movie's tiny/synthetic
+                # budget) — this is REQUIRED to reach the VACE path, NOT a silent downgrade.
+                k = goal.context_frames if goal.context_frames is not None else spec.context_frames
+                ctx_dir = os.path.join(seg_out_root, "context")
+                _emit("branching", {"segment_id": goal.segment_id, "branch_frame": resolved_branch,
+                                    "mode": "vace_extend", "context_frames": k})
+                paths, tail, idxs = _extract_context_frames(
+                    prev_clip_path, resolved_branch, k, ctx_dir)
+                if paths is None:
+                    return _partial_return(JobResult(job_id, ok=False, error=JobError(
+                        code="context_frame_extract_failed",
+                        message=(f"segment {seg_i} ({goal.segment_id!r}, joint_mode=vace_extend): "
+                                 f"could not extract context frames {idxs} from the parent "
+                                 f"clip: {tail}"),
+                        retryable=False)))
+                vace_context_frames = tuple(paths)
+                seg_context_frames = len(paths)     # actual K extracted = min(k, branch+1)
+                seg_context_drop = len(paths)        # the child reconstructs these -> drop at assembly
+                seg_budget = max(spec.vram_budget_gb, _VACE_EXTEND_MIN_BUDGET_GB)
+                capability = "v2v"
+            else:
+                # STILL (default, backward-compatible): condition on ONE branch frame (i2v).
+                branch_png = os.path.join(seg_out_root, "branch.png")
+                _emit("branching", {"segment_id": goal.segment_id,
+                                    "branch_frame": resolved_branch, "mode": "still"})
+                ok, tail = _extract_frame_at(prev_clip_path, resolved_branch, branch_png)
+                if not ok:
+                    return _partial_return(JobResult(job_id, ok=False, error=JobError(
+                        code="branch_frame_extract_failed",
+                        message=(f"segment {seg_i} ({goal.segment_id!r}): could not extract "
+                                 f"branch frame {resolved_branch} from the parent clip: {tail}"),
+                        retryable=False)))
+                start_image = branch_png
+                capability = "i2v"
 
         # ---- deterministic per-segment seed (node override wins) ----
         seg_seed = goal.seed if goal.seed is not None else (spec.seed + seg_i)
@@ -414,7 +568,7 @@ def run_generate_studio_movie(spec: StudioMovieSpec, job_id: str) -> JobResult:
         seg_spec = make_studio_i2v(
             capability=capability,
             width=spec.width, height=spec.height, fps=spec.fps,
-            vram_budget_gb=spec.vram_budget_gb,
+            vram_budget_gb=seg_budget,   # bumped to the VACE floor for a vace_extend joint
             seed=seg_seed,
             out_root=seg_out_root,
             start_image=start_image,
@@ -424,6 +578,8 @@ def run_generate_studio_movie(spec: StudioMovieSpec, job_id: str) -> JobResult:
             steps=(goal.steps if goal.steps is not None else spec.steps),
             cfg=(goal.cfg if goal.cfg is not None else spec.cfg),
             model_id=(goal.model_id if goal.model_id is not None else spec.model_id),
+            # VACE-EXTEND temporal conditioning (None for a still/i2v/t2v segment).
+            vace_context_frames=vace_context_frames,
         )
 
         segments_meta[seg_i].update(status="generating")
@@ -432,12 +588,31 @@ def run_generate_studio_movie(spec: StudioMovieSpec, job_id: str) -> JobResult:
 
         result = run_produce_clip(seg_spec, should_cancel)
         if result.is_err():
-            # An expected per-segment failure (unroutable, mid-render CANCELLED, IO)
-            # fails the whole movie — DATA, never a raise. Save the completed segments
-            # so far + carry the partial pointer (original error preserved).
+            # An expected per-segment failure (unroutable, mid-render CANCELLED, IO, or a
+            # vace_extend segment's graceful NO_GPU/DEPS_MISSING/WEIGHTS_MISSING on a
+            # GPU-less box) fails the whole movie — DATA, never a raise, NEVER a silent
+            # fallback to still-mode. The JobError is ENRICHED with WHICH segment + joint
+            # mode failed, and the failed node is recorded in movie.json (status="failed").
             segments_meta[seg_i].update(status="failed")
-            return _partial_return(JobResult(
-                job_id, ok=False, error=_stage_error_to_job_error(result.error)))
+            je = _stage_error_to_job_error(result.error)
+            seg_records.append({
+                "index": seg_i,
+                "segment_id": goal.segment_id,
+                "parent_segment_id": goal.parent_segment_id,
+                "prompt": goal.prompt,
+                "capability": capability,
+                "joint_mode": seg_joint_mode,
+                "context_frames": seg_context_frames,
+                "resolved_branch": resolved_branch,
+                "vram_budget_gb": seg_budget,
+                "status": "failed",
+                "error": {"code": je.code, "message": je.message},
+            })
+            return _partial_return(JobResult(job_id, ok=False, error=JobError(
+                code=je.code,
+                message=(f"segment {seg_i} ({goal.segment_id!r}, joint_mode={seg_joint_mode}, "
+                         f"capability={capability}): {je.message}"),
+                retryable=je.retryable)))
 
         art = result.unwrap()
         # Catalog the WHOLE clip (never trimmed) as a video MediaRef on outputs.
@@ -453,6 +628,15 @@ def run_generate_studio_movie(spec: StudioMovieSpec, job_id: str) -> JobResult:
             "seed": seg_seed,
             "branch_frame": goal.branch_frame,          # the AUTHORED value (may be null)
             "resolved_branch": resolved_branch,          # frame index into the PARENT (None for root)
+            # JOINT MODE honesty: how this segment was spliced onto its parent + the
+            # motion-carry conditioning. context_frames = parent frames KEPT as the VACE
+            # extend prefix (0 for still); context_drop = frames the assembler drops from
+            # THIS segment's head so the reconstructed context never double-plays (0 for
+            # still). vram_budget_gb = the EFFECTIVE per-segment budget (bumped for vace).
+            "joint_mode": seg_joint_mode,
+            "context_frames": seg_context_frames,
+            "context_drop": seg_context_drop,
+            "vram_budget_gb": seg_budget,
             "clip_path": art.path,
             "clip_uri": ref.uri,
             "frames": art.frames,

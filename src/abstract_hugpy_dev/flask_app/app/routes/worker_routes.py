@@ -205,6 +205,15 @@ class RegisterRequest(BaseModel):
     # (WORKER_ENV_TIER); versions are read from the env itself. Models mapped to
     # a tier (HUGPY_MODEL_ENV_TIERS) route only to workers advertising it.
     env: dict | None = None
+    # Concurrency-hardening capability (2026-07-11). serving_limits =
+    # {"in_process_max_concurrency": N} — safe concurrent entrants into an
+    # in-process runner (central gates relays to it; absent -> assume 1).
+    # slot_capable = a native crash-isolated llama-server is resolvable;
+    # slot_incapable_reason explains a False (e.g. no engine binary, in-process
+    # fallback). None on older agents -> the field is simply absent on the row.
+    serving_limits: dict | None = None
+    slot_capable: bool | None = None
+    slot_incapable_reason: str | None = None
 
 
 # Hostnames/IPs a worker might self-report that are NOT reachable from central.
@@ -328,6 +337,13 @@ class HeartbeatRequest(BaseModel):
     # the console simply shows no install badge. Stored verbatim; the console
     # flags a non-canonical install from it.
     install: dict | None = None
+    # Concurrency-hardening capability (2026-07-11) — see RegisterRequest.
+    # serving_limits.in_process_max_concurrency gates central's relays;
+    # slot_capable/slot_incapable_reason surface a box silently serving
+    # in-process. None on older agents -> legacy-safe (cap 1, no badge).
+    serving_limits: dict | None = None
+    slot_capable: bool | None = None
+    slot_incapable_reason: str | None = None
 
 
 class AssignRequest(BaseModel):
@@ -432,6 +448,9 @@ def workers_register():
         pool=body.pool,
         caps=body.caps,
         env=body.env,
+        serving_limits=body.serving_limits,
+        slot_capable=body.slot_capable,
+        slot_incapable_reason=body.slot_incapable_reason,
     )
     if worker.get("admission") == "blocked":
         # Operator evicted this worker; 403 tells the agent to stop, not respawn.
@@ -508,6 +527,9 @@ def workers_heartbeat(worker_id):
         allocations=body.allocations,
         storage=body.storage,
         install=body.install,
+        serving_limits=body.serving_limits,
+        slot_capable=body.slot_capable,
+        slot_incapable_reason=body.slot_incapable_reason,
     )
     if worker is None:
         # The agent thinks it's registered but central forgot it (restart,

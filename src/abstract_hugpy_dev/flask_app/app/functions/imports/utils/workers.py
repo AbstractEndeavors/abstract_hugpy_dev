@@ -709,6 +709,9 @@ class WorkerStore:
         pool: Optional[str] = None,
         caps: Optional[Dict[str, Any]] = None,
         env: Optional[Dict[str, Any]] = None,
+        serving_limits: Optional[Dict[str, Any]] = None,
+        slot_capable: Optional[bool] = None,
+        slot_incapable_reason: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Add a worker (or re-register an existing one by id/url).
 
@@ -755,6 +758,14 @@ class WorkerStore:
                     existing["caps"] = caps
                 if env is not None:
                     existing["env"] = env
+                # Concurrency-hardening capability (2026-07-11). Stored verbatim;
+                # _public_view spreads them onto /llm/workers rows. A None from an
+                # older agent leaves the field untouched (legacy-safe).
+                if serving_limits is not None:
+                    existing["serving_limits"] = serving_limits
+                if slot_capable is not None:
+                    existing["slot_capable"] = slot_capable
+                    existing["slot_incapable_reason"] = slot_incapable_reason
                 # Only a NON-EMPTY declared pool re-asserts on re-register, so an
                 # operator-set pool isn't wiped by a worker that doesn't declare
                 # WORKER_POOL (which sends ""). Declaring workers still win.
@@ -796,6 +807,13 @@ class WorkerStore:
                 "ram_total": ram_total,
                 "engine": engine,
                 "caps": caps,
+                # Concurrency-hardening capability (2026-07-11): safe in-process
+                # concurrency + whether the box can seat a native crash-isolated
+                # slot. None on a pre-feature agent -> central assumes cap 1 and
+                # shows no slot badge. See remote._advertised_cap / _public_view.
+                "serving_limits": serving_limits,
+                "slot_capable": slot_capable,
+                "slot_incapable_reason": slot_incapable_reason,
                 # Runtime-env capability: {"tier": "stable"|"edge"|..., versions}.
                 # Read from the worker's own venv, so it's truth not config claim.
                 "env": env,
@@ -841,6 +859,9 @@ class WorkerStore:
         allocations: Optional[List[Dict[str, Any]]] = None,
         storage: Optional[Dict[str, Any]] = None,
         install: Optional[Dict[str, Any]] = None,
+        serving_limits: Optional[Dict[str, Any]] = None,
+        slot_capable: Optional[bool] = None,
+        slot_incapable_reason: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """Mark a worker alive and refresh its live GPU / loaded-model stats."""
         with self._transaction() as workers:
@@ -924,6 +945,15 @@ class WorkerStore:
                 # below an operator limit, re-clamp the stored limit now.
                 if worker.get("limits"):
                     worker["limits"] = _clamp_limits(worker["limits"], caps)
+            # Concurrency-hardening capability (2026-07-11) — refreshed every beat
+            # so the console/gate see live truth (a worker that installs the engine
+            # binary flips slot_capable within one heartbeat). Legacy-safe: a None
+            # from an older agent leaves the fields absent (central assumes cap 1).
+            if serving_limits is not None:
+                worker["serving_limits"] = serving_limits
+            if slot_capable is not None:
+                worker["slot_capable"] = slot_capable
+                worker["slot_incapable_reason"] = slot_incapable_reason
             if pool and pool.strip():   # non-empty only — see register() note
                 worker["pool"] = pool.strip()
             return _public_view(worker)
@@ -1233,6 +1263,37 @@ class WorkerStore:
                 chosen = stored
         return _public_view(chosen)
 
+    def candidates_for_model(self, model_key: str,
+                             pool: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Ranked ONLINE workers that can serve ``model_key`` — the cap-aware
+        relay router's alternatives list (concurrency hardening 2026-07-11).
+
+        Same eligibility + ranking as ``pick_for_model`` (warm, then GPU, then
+        least-recently-picked), but WITHOUT the ``last_picked`` write: central's
+        in-flight gate iterates this to reroute around a worker that is at its
+        advertised in-process concurrency cap, and re-stamping every candidate on
+        each probe would corrupt the round-robin. Online only — a reroute target
+        must be live right now (the stale-heartbeat fallback pick_for_model does
+        is for last-resort primary selection, not for spreading concurrent load).
+        """
+        candidates = self.workers_for_model(model_key, online_only=True, pool=pool)
+        if not candidates:
+            return []
+        required = required_pkg_version()
+        if required:
+            matched = [w for w in candidates if w.get("pkg_version") == required]
+            if matched:
+                candidates = matched
+
+        def _rank(w: Dict[str, Any]):
+            warm = model_key in (w.get("loaded_models") or [])
+            return (0 if warm else 1,
+                    0 if _has_usable_gpu(w) else 1,
+                    w.get("last_picked", 0),
+                    w.get("id", ""))
+
+        return sorted(candidates, key=_rank)
+
 
 worker_store = WorkerStore()
 
@@ -1311,6 +1372,12 @@ def worker_storage_view(worker_id: str) -> Optional[Dict[str, Any]]:
 
 def pick_worker_for_model(model_key: str, pool: Optional[str] = None) -> Optional[Dict[str, Any]]:
     return worker_store.pick_for_model(model_key, pool=pool)
+
+
+def candidates_for_model(model_key: str, pool: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Ranked online workers holding ``model_key`` — the relay gate's reroute
+    list (see WorkerStore.candidates_for_model). No routing side effects."""
+    return worker_store.candidates_for_model(model_key, pool=pool)
 
 
 def fleet_snapshot() -> list:
@@ -1423,6 +1490,16 @@ try:
     # Allocator-driven sharding. No-op until a model is opted in via
     # HUGPY_SHARD_MODELS, so it never affects ordinary routing by default.
     _set_placement_provider(placement_for_model)
+    # Cap-aware relay reroute (concurrency hardening 2026-07-11): the core gate
+    # asks this for alternative online workers when the primary is at its
+    # advertised in-process concurrency cap. Optional in older cores — guarded.
+    try:
+        from ......managers.resolvers.remote import set_worker_candidates_provider
+        set_worker_candidates_provider(candidates_for_model)
+    except Exception as _exc2:  # older core without the seam — gate degrades to primary-only
+        import logging as _logging
+        _logging.getLogger(__name__).info(
+            "candidates provider not registered (older core): %s", _exc2)
 except Exception as _exc:  # never let registration break importing the pool
     import logging as _logging
     _logging.getLogger(__name__).warning("worker provider registration failed: %s", _exc)

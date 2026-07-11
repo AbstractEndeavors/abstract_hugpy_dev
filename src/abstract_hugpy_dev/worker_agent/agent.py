@@ -52,6 +52,12 @@ from flask import Flask, request, jsonify, Response, stream_with_context
 logger = logging.getLogger("abstract_hugpy_dev.worker_agent")
 from .imports import *
 from ..central import central_base_url
+# Per-model in-process generation gate (concurrency hardening). Light module —
+# no heavy deps at import; slot-awareness imports the runner stack lazily. It
+# serializes entry into an in-process llama.cpp/transformers runner per model so
+# concurrent requests can't race the same non-reentrant native context and SEGV
+# the whole worker (the computron 2026-07-11 core-dump class).
+from . import gen_gate
 # request_id -> asyncio.Event, so POST /infer/cancel can stop an in-flight
 # stream mid-generation. Populated by _stream_sync, tripped by the cancel route.
 # Cancellation now rides the shared comms JobStore (attach_cancel/cancel) —
@@ -1697,7 +1703,17 @@ def build_app(state: "WorkerState") -> Flask:
         try:
             _apply_spill(payload.pop("spill", None))
             _ensure_present(payload, state.central_url)
-            return jsonify(_run_once(payload))
+            # Per-model generation gate: serialize entry into an in-process
+            # (llama.cpp/transformers) runner so concurrent /infer calls can't
+            # race the same non-reentrant native context and crash the worker.
+            # No-op for a slot-backed model (its child schedules itself). On a
+            # bounded-wait timeout this raises ModelBusy -> honest 503 below.
+            with gen_gate.gate_for_payload(payload):
+                return jsonify(_run_once(payload))
+        except gen_gate.ModelBusy as busy:
+            # Honest structured busy — the runner is at capacity, not broken.
+            return jsonify(busy.as_error(
+                {"id": state.worker_id, "name": state.name})), 503
         except Exception as exc:  # noqa: BLE001
             import traceback
             tb = traceback.format_exc()
@@ -1720,12 +1736,29 @@ def build_app(state: "WorkerState") -> Flask:
         # as the first SSE event so the client can cancel this exact request.
         req_id = str(payload.pop("request_id", "") or uuid.uuid4().hex)
 
+        # Per-model generation gate, acquired BEFORE the streaming Response so a
+        # busy in-process runner is refused with a real HTTP 503 (not a mid-body
+        # SSE surprise). The bounded wait blocks here (that IS the honest queue).
+        # The token is then held for the WHOLE life of the stream and released in
+        # the generator's finally — a streamed response occupies the runner until
+        # its last token. No-op token for a slot-backed model. See gen_gate.
+        try:
+            gate_token = gen_gate.acquire_for_payload(payload)
+        except gen_gate.ModelBusy as busy:
+            return jsonify(busy.as_error(
+                {"id": state.worker_id, "name": state.name})), 503
+
         def _generate():
-            yield _sse({"type": "request", "request_id": req_id})
-            # Stream provisioning progress first (download from central/HF), then
-            # generation with auto-continuation. Both emit SSE lines already.
-            yield from _ensure_present_streaming(payload, state.central_url)
-            yield from _stream_sync(payload, request_id=req_id)
+            try:
+                yield _sse({"type": "request", "request_id": req_id})
+                # Stream provisioning progress first (download from central/HF),
+                # then generation with auto-continuation. Both emit SSE lines.
+                yield from _ensure_present_streaming(payload, state.central_url)
+                yield from _stream_sync(payload, request_id=req_id)
+            finally:
+                # Release on normal end, error, OR client disconnect (Flask closes
+                # the generator) — the gate must never leak a permit.
+                gate_token.release()
 
         return Response(
             stream_with_context(_generate()),
@@ -3007,6 +3040,55 @@ def _install_shape() -> dict:
     return shape
 
 
+def _serving_limits() -> dict:
+    """Per-worker safe concurrency for IN-PROCESS serving, advertised to central.
+
+    ``in_process_max_concurrency`` is the number of requests that may enter an
+    in-process (llama.cpp / transformers) model runner at once — the per-model
+    generation gate's limit. Default 1 (native contexts serialize). Central reads
+    this to gate its relays: a worker that omits it (older agent) is assumed 1.
+    """
+    return {"in_process_max_concurrency": gen_gate.concurrency_limit()}
+
+
+def _slot_capability() -> dict:
+    """Whether this box can seat a NATIVE, crash-isolated llama-server slot.
+
+    ``slot_capable`` is the engine-binary truth: a resolvable native
+    ``llama-server`` (HUGPY_ENGINE_DIR / LLAMA_SERVER_BIN / PATH). When absent,
+    slot seating falls back to the in-process ``llama_cpp.server`` child (text
+    only — vision GGUF is refused) or, with SLOT_COUNT=0, to the in-process
+    runner outright. Either way the box is serving non-native, which
+    central/console must SEE in EVERY heartbeat — that silence is exactly
+    computron's 2026-07-11 condition (slots implied, no usable engine binary).
+    Fully defensive: any probe failure reports slot_incapable with the reason and
+    never breaks the heartbeat.
+    """
+    try:
+        from ..engine.resolve import server_bin
+        binpath = server_bin()
+    except Exception as exc:  # noqa: BLE001 — capability probe must never break a beat
+        return {"slot_capable": False,
+                "slot_incapable_reason": f"engine probe failed: "
+                                         f"{type(exc).__name__}: {exc}"}
+    if binpath:
+        return {"slot_capable": True, "slot_incapable_reason": None}
+    try:
+        from ..managers.serve.slots import slots_enabled, _slot_count
+        n = _slot_count()
+        slotted = slots_enabled()
+    except Exception:  # noqa: BLE001
+        n, slotted = 0, False
+    reason = ("no native llama-server binary resolvable (set HUGPY_ENGINE_DIR / "
+              "LLAMA_SERVER_BIN or run `hugpy install-engine`)")
+    if slotted:
+        reason += (f"; the {n} configured slot(s) fall back to the in-process "
+                   "llama_cpp.server child — text only, vision GGUF is refused")
+    else:
+        reason += "; SLOT_COUNT=0, so this worker serves models in-process (gated)"
+    return {"slot_capable": False, "slot_incapable_reason": reason}
+
+
 def _heartbeat_loop(client: CentralClient, state: WorkerState, args) -> None:
     while True:
         time.sleep(args.heartbeat)
@@ -3042,6 +3124,12 @@ def _heartbeat_loop(client: CentralClient, state: WorkerState, args) -> None:
                     "allocations": _allocations(_slots),
                     "storage": _worker_storage(state),
                     "install": _install_shape(),
+                    # Concurrency hardening (2026-07-11): advertise this box's
+                    # safe in-process concurrency + whether it can seat a native
+                    # crash-isolated slot, so central can gate relays and the
+                    # console can badge a worker that's silently serving in-process.
+                    "serving_limits": _serving_limits(),
+                    **_slot_capability(),
                 },
             )
             # Adopt any assignment change made in the UI + pre-provision it.
@@ -3081,6 +3169,12 @@ def _register(client: CentralClient, state: WorkerState, args) -> None:
         "pool": os.environ.get("WORKER_POOL", ""),
         "caps": _local_caps(),
         "env": env_status(),
+        # Concurrency hardening (2026-07-11): advertise safe in-process
+        # concurrency + native-slot capability from the first contact, so central
+        # gates correctly and the console badges an in-process-serving box even
+        # before the first heartbeat.
+        "serving_limits": _serving_limits(),
+        **_slot_capability(),
     }
     try:
         worker = client.register(payload)

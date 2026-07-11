@@ -173,6 +173,23 @@ class RenderManifest:
     # ("pose"|"depth"|"sketch"), "" when unused.
     control_image: str = ""
     control_kind: str = ""
+    # VACE-EXTEND temporal conditioning (studio-movie splice motion-carry): the ORDERED
+    # abs paths of the parent clip's TRAILING context frames (oldest -> newest, ending
+    # at + including the branch frame). When non-empty, the VACE runner builds the
+    # diffusers video+mask EXTEND idiom — these frames are the KEPT prefix (mask=0) and
+    # the remaining num_frames-K positions are GENERATED (mask=1), carrying motion across
+    # the splice instead of restarting from a single still. () = not an extend render.
+    #
+    # DELIBERATELY EXCLUDED FROM canonical_inputs()/content_hash (see below): unlike the
+    # VACE runner's other conditioning inputs (source_video/reference_images/
+    # control_image, which ARE hashed), these frames are extracted by the movie runner to
+    # a JOB-SPECIFIC path (<movie_root>/segment_NN/context/). Hashing that path would
+    # defeat same-job resume and needlessly re-address every existing clip. This mirrors
+    # how the i2v ``start_image`` conditions a render without being hashed; the movie
+    # runner's out_root isolation (each segment under segment_NN) provides resume
+    # correctness. Carried in the manifest so the runner can consume it + the sidecar can
+    # record it (provenance), just never as a content-hash input.
+    vace_context_frames: tuple[str, ...] = ()
 
     def canonical_inputs(self) -> dict:
         """Everything that changes the output; nothing that is mere metadata.
@@ -230,6 +247,12 @@ class RenderManifest:
             # Optional VACE control channel (composition blocking): canonical when set.
             "control_image": self.control_image,
             "control_kind": self.control_kind,
+            # NOTE: ``vace_context_frames`` is DELIBERATELY absent here (not a content-hash
+            # input) — it is extracted to a job-specific path by the movie runner, so
+            # hashing it would break same-job resume + re-address every clip. It conditions
+            # the render like the (also-unhashed) i2v start_image; resume correctness comes
+            # from the movie runner's per-segment out_root isolation. See the field's
+            # docstring on RenderManifest.
         }
 
     def content_hash(self) -> str:

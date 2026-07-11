@@ -112,6 +112,14 @@ class StudioI2VSpec:
     # source_video. Both None = no control. CANONICAL when set.
     control_image: Optional[str] = None
     control_kind: Optional[str] = None
+    # VACE-EXTEND temporal conditioning (studio-movie splice motion-carry): the ORDERED
+    # abs paths of a parent clip's trailing context frames (oldest -> newest). Set ONLY
+    # by the studio-movie runner for a ``vace_extend`` joint — it extracts these and
+    # routes the segment through the VACE path (capability "v2v") so the render CONTINUES
+    # the parent's motion instead of restarting from a single still. () = not an extend
+    # render (every non-movie caller). Threaded into the manifest for the VACE runner;
+    # NOT part of the render content_hash (see RenderManifest.vace_context_frames).
+    vace_context_frames: tuple[str, ...] = ()
 
 
 def make_studio_i2v(
@@ -134,6 +142,7 @@ def make_studio_i2v(
     reference_images: Optional[tuple] = None,
     control_image: Optional[str] = None,
     control_kind: Optional[str] = None,
+    vace_context_frames: Optional[tuple] = None,
 ) -> StudioI2VSpec:
     """Validate every field and build the frozen ``StudioI2VSpec``. Raises
     ``ValueError``/``TypeError`` LOCALLY on any structural violation (house
@@ -221,6 +230,22 @@ def make_studio_i2v(
             "control_image and control_kind must be set together (a control still needs "
             "a kind, and a kind needs a still) or both omitted")
 
+    # VACE-EXTEND context frames: None -> (); coerce a list/tuple to a tuple (so an
+    # asdict->json->from_dict round-trip lands a tuple). Each must be a non-empty string.
+    # Existence is the movie runner's job (it extracts them); this is a structural check.
+    if vace_context_frames is None:
+        vace_context_frames = ()
+    if isinstance(vace_context_frames, (list, tuple)):
+        vace_context_frames = tuple(vace_context_frames)
+    else:
+        raise ValueError(
+            f"vace_context_frames must be a list/tuple of paths or None; "
+            f"got {vace_context_frames!r}")
+    for i, f in enumerate(vace_context_frames):
+        if not (isinstance(f, str) and f.strip()):
+            raise ValueError(
+                f"vace_context_frames[{i}] must be a non-empty string; got {f!r}")
+
     resolved_out = out_root if (isinstance(out_root, str) and out_root.strip()) \
         else DEFAULT_CLIPS_ROOT
 
@@ -243,6 +268,7 @@ def make_studio_i2v(
         reference_images=reference_images,
         control_image=control_image,
         control_kind=control_kind,
+        vace_context_frames=vace_context_frames,
     )
 
 
@@ -270,6 +296,7 @@ def studio_i2v_from_dict(d: dict) -> StudioI2VSpec:
         reference_images=d.get("reference_images"),
         control_image=d.get("control_image"),
         control_kind=d.get("control_kind"),
+        vace_context_frames=d.get("vace_context_frames"),
     )
 
 

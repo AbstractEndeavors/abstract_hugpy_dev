@@ -227,6 +227,12 @@ def v1_chat_completions():
         return _openai_error(f"{type(exc).__name__}: {exc}", 500, "api_error")
 
     if error_message and not text_parts:
+        # Cap-aware relay gate (concurrency hardening): a busy in-process runner
+        # is not a fault — every holder of the model is momentarily at its safe
+        # concurrency limit. Answer 503 (retryable) so a batch client backs off
+        # instead of treating it as a hard error.
+        if "worker_busy" in error_message or "model_busy" in error_message:
+            return _openai_error(error_message, 503, "server_busy")
         status = 404 if "Unknown model" in error_message else 500
         return _openai_error(error_message, status, "api_error")
 

@@ -193,6 +193,10 @@ def run_produce_clip(spec, should_cancel):
         reference_images=getattr(spec, "reference_images", None),
         control_image=getattr(spec, "control_image", None),
         control_kind=getattr(spec, "control_kind", None),
+        # VACE-EXTEND: the parent clip's trailing context frames (studio-movie splice
+        # motion-carry). Carried into the manifest; the VACE runner builds the video+mask
+        # extend idiom from them. getattr keeps older spec dicts (no field) working.
+        vace_context_frames=getattr(spec, "vace_context_frames", None),
         should_cancel=should_cancel,
     )
 
