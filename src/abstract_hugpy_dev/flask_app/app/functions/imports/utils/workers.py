@@ -1051,6 +1051,27 @@ class WorkerStore:
             return {}
         return dict(worker.get("spill_by_model", {}).get(model_key, {}))
 
+    def set_load_report(self, worker_id: str, model_key: str,
+                        report: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Record the outcome of a warm/probe attempt for (worker, model).
+
+        ``report`` is the worker's /probe response ({ok, fit, vram_used, error, …})
+        plus a ``ts`` stamp, or a synthesized {ok: False, error} when the probe
+        HTTP call itself failed. ``None`` clears the entry (e.g. on unassign).
+        Stored under ``load_reports[model_key]`` on the worker record so the
+        console can say WHY a model stayed cold instead of showing a silent
+        no-op activate."""
+        with self._transaction() as workers:
+            worker = workers.get(worker_id)
+            if worker is None:
+                return None
+            reports = worker.setdefault("load_reports", {})
+            if report is None:
+                reports.pop(model_key, None)
+            else:
+                reports[model_key] = report
+            return _public_view(worker)
+
     # -- queries ------------------------------------------------------------
     def get(self, worker_id: str) -> Optional[Dict[str, Any]]:
         worker = self._load().get(worker_id)
@@ -1261,7 +1282,13 @@ def assign_model(worker_id: str, model_key: str,
 
 
 def unassign_model(worker_id: str, model_key: str) -> Optional[Dict[str, Any]]:
+    worker_store.set_load_report(worker_id, model_key, None)
     return worker_store.unassign_model(worker_id, model_key)
+
+
+def set_load_report(worker_id: str, model_key: str,
+                    report: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    return worker_store.set_load_report(worker_id, model_key, report)
 
 
 def spill_for(worker_id: str, model_key: str) -> Dict[str, Any]:

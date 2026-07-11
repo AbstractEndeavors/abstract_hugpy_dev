@@ -77,6 +77,34 @@ def _stamp(destination: str, key: str, model: dict[str, Any]) -> None:
         print(f"  [warn] could not write hugpy.json: {exc}")
 
 
+def _fetch_mmproj_sidecars(repo_id: str, destination: str) -> None:
+    """Best-effort pull of any mmproj/projector GGUF sidecars from ``repo_id``.
+
+    Vision GGUFs are useless for images without their CLIP projector, and the
+    sidecar is routinely overlooked when a model is registered by single
+    ``filename`` — the model then loads fine but silently answers text-blind.
+    So every GGUF download tries these patterns; repos without sidecars (the
+    common, text-only case) match nothing and this is a no-op. Never raises:
+    a missing projector should surface at serve time (probe/vision honesty),
+    not break the weights download that just succeeded."""
+    from ..src.utils import find_mmproj
+    try:
+        if find_mmproj(destination):
+            return  # already have one beside the weights
+        snapshot_download(
+            repo_id=repo_id,
+            allow_patterns=["*mmproj*.gguf", "*mm-proj*.gguf",
+                            "*mm_proj*.gguf", "*projector*.gguf"],
+            local_dir=destination,
+            local_dir_use_symlinks=False,
+        )
+        got = find_mmproj(destination)
+        if got:
+            print(f"  auto-downloaded vision projector sidecar: {os.path.basename(got)}")
+    except Exception as exc:
+        print(f"  mmproj sidecar check skipped ({type(exc).__name__}: {exc})")
+
+
 def download_one(model: dict[str, Any],root: str=None,model_key=None, dry_run: bool = False) -> None:
     
     hub_id = model.get("hub_id")
@@ -118,6 +146,7 @@ def download_one(model: dict[str, Any],root: str=None,model_key=None, dry_run: b
                 local_dir_use_symlinks=False,
             )
             print(f"  downloaded file: {filename}")
+            _fetch_mmproj_sidecars(repo_id, destination)
             _stamp(destination, model_key, model)
             return
 
@@ -129,6 +158,7 @@ def download_one(model: dict[str, Any],root: str=None,model_key=None, dry_run: b
                 local_dir_use_symlinks=False,
             )
             print(f"  downloaded pattern: {include}")
+            _fetch_mmproj_sidecars(repo_id, destination)
             _stamp(destination, model_key, model)
             return
 
@@ -288,6 +318,12 @@ def ensure_model(key: str, root: str = DEFAULT_ROOT) -> str:
             pass
     try:
         snapshot_download(**download_kwargs)
+
+        # Vision GGUFs need their mmproj projector beside the weights; a
+        # filename/include entry that omits it produces a text-blind model.
+        # No-op for repos without sidecars (the common text-only case).
+        if getattr(cfg, "framework", None) == "gguf":
+            _fetch_mmproj_sidecars(repo_id, path)
 
         write_hugpy_marker(
             path,

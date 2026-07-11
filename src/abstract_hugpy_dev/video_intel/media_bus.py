@@ -36,6 +36,7 @@ from .media_schema import make_media_ref
 from .movie_schema import GoalInterval, make_movie
 from .scene_schema import make_generate_scene
 from .studio.job import studio_i2v_from_dict
+from .studio_movie_schema import studio_movie_from_dict
 from .result_schema import JobResult
 from .runners import DISPATCH
 
@@ -198,6 +199,9 @@ SPEC_DESERIALIZERS: Dict[str, Callable[[dict], object]] = {
     # B2 (closes manifest.py TODO(P0-3)): the studio i2v spec rehydrates through
     # its own validate-at-construction factory (studio.job.studio_i2v_from_dict).
     "studio_i2v": studio_i2v_from_dict,
+    # Studio movie — the take-tree spec rehydrates through its own
+    # validate-at-construction factory (studio_movie_schema.studio_movie_from_dict).
+    "generate_studio_movie": studio_movie_from_dict,
 }
 
 

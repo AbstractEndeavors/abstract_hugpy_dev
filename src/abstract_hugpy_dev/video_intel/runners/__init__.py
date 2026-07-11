@@ -25,6 +25,10 @@ from .scene import run_generate_scene
 # module top is dependency-light (studio/numpy imports are lazy inside the runner),
 # so this import can never break app boot.
 from .studio_i2v import run_studio_i2v
+# Studio movie — the fat orchestrator that renders an ordered strip of studio clips
+# INLINE through the produce_clip spine. Import-safe like studio_i2v (studio/numpy
+# imports stay lazy inside the runner), so this never breaks app boot.
+from .studio_movie import run_generate_studio_movie
 
 DISPATCH = {
     ("ffmpeg", "crop"): run_crop,
@@ -34,4 +38,5 @@ DISPATCH = {
     ("diffusers", "generate_scene"): run_generate_scene,
     ("diffusers", "generate_movie"): run_generate_movie,
     ("studio", "i2v"): run_studio_i2v,
+    ("studio", "movie"): run_generate_studio_movie,
 }

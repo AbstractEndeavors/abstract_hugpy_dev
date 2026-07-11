@@ -57,7 +57,7 @@ TERMINAL_STATUSES = frozenset(("done", "cancelled", "failed"))
 # media so chat/download terminal cross-process behavior is unchanged (their
 # terminal rows still show only via each process's local ~600s retention).
 MEDIA_KINDS = ("crop", "frame_extract", "generate_scene",
-               "generate_movie", "studio_i2v")
+               "generate_movie", "studio_i2v", "generate_studio_movie")
 
 # Old JOBSTATUS names (and activity.py's view states) -> canonical.
 _LEGACY_STATUS = {

@@ -16,6 +16,7 @@ from .gen_schema import GenerateImageSpec
 from .movie_schema import MovieSpec
 from .scene_schema import GenerateSceneSpec
 from .studio.job import StudioI2VSpec
+from .studio_movie_schema import StudioMovieSpec
 
 
 @dataclass(frozen=True)
@@ -43,4 +44,10 @@ JOB_REGISTRY = {
     # runner_key ("studio","i2v") is DISTINCT from the other frameworks; the runner
     # (runners/studio_i2v.py) resolves a StudioEnv and delegates to produce_clip.
     "studio_i2v": JobSpec("studio_i2v", StudioI2VSpec, ("studio", "i2v"), "gpu", 3600),
+    # Studio movie = an ordered strip of studio clips conjoined at splice points (an
+    # NLE row). The fat orchestrator (runners/studio_movie.py) renders each segment
+    # INLINE through the same produce_clip spine as studio_i2v, so its wall-clock is
+    # (segments × per-clip) — a longer timeout, mirroring generate_movie.
+    "generate_studio_movie": JobSpec(
+        "generate_studio_movie", StudioMovieSpec, ("studio", "movie"), "gpu", 14400),
 }

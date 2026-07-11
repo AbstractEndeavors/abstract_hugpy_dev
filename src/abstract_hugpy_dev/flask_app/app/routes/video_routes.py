@@ -60,6 +60,10 @@ from abstract_hugpy_dev.video_intel.gen_schema import (
 from abstract_hugpy_dev.video_intel.scene_schema import make_generate_scene
 from abstract_hugpy_dev.video_intel.movie_schema import GoalInterval, make_movie
 from abstract_hugpy_dev.video_intel.studio.job import make_studio_i2v
+from abstract_hugpy_dev.video_intel.studio_movie_schema import (
+    StudioMovieGoal,
+    make_studio_movie,
+)
 from abstract_hugpy_dev.video_intel.chains import (
     resolve_video_parts,
     resolve_video_parts_scene,
@@ -573,6 +577,115 @@ def video_studio_i2v():
     except (ValueError, TypeError) as exc:  # bad geometry / capability / overrides = 400
         return jsonify({"error": str(exc)}), 400
     job_id = media_bus.enqueue("studio_i2v", spec)
+    return jsonify({"job_id": job_id}), 200
+
+
+# --------------------------------------------------------------------------- #
+# 2d''') POST /video/studio/movie — a STUDIO MOVIE (an ordered strip of studio
+#        clips conjoined at splice points, like an NLE row) via the studio spine.
+#        Mirrors /video/studio/i2v: parse body -> build the validated
+#        StudioMovieSpec (a take-tree of segment NODES) -> media_bus.enqueue ->
+#        {job_id}. The job runs through runners/studio_movie.py, which renders each
+#        segment INLINE through the same produce_clip spine and stitches the strip
+#        (non-destructive trims honored at concat). Query it exactly like any other
+#        media job: GET /video/jobs/<job_id>.
+#
+#        Ergonomics: a goal's segment_id auto-fills to "seg_NN" and its
+#        parent_segment_id auto-chains to the previous node when omitted, so a
+#        minimal body ({"goals":[{"prompt":...},{"prompt":..., "branch_frame":10}]})
+#        forms a valid LINEAR chain. An explicitly-supplied id/parent is passed
+#        through and re-validated by make_studio_movie (a broken chain -> 400).
+# --------------------------------------------------------------------------- #
+@video_bp.route("/video/studio/movie", methods=["POST"])
+def video_studio_movie():
+    body = request.get_json(silent=True) or {}
+    # resolution nested ({"resolution": {...}}) or flat top-level keys (nested wins),
+    # mirroring the i2v route. Sane studio defaults so a minimal POST still renders.
+    res = body.get("resolution") if isinstance(body.get("resolution"), dict) else {}
+    width = res.get("width", body.get("width"))
+    height = res.get("height", body.get("height"))
+    fps = res.get("fps", body.get("fps"))
+    width = 512 if width is None else width
+    height = 512 if height is None else height
+    fps = 24 if fps is None else fps
+
+    goals_in = body.get("goals")
+    if not isinstance(goals_in, list) or not goals_in:
+        return jsonify({"error": "goals must be a non-empty list of segment nodes"}), 400
+
+    # Build the take-tree nodes, auto-filling segment_id + the linear parent chain
+    # when omitted (an explicit value is passed through + re-validated in the factory).
+    goals = []
+    prev_id = None
+    for i, g in enumerate(goals_in):
+        if not isinstance(g, dict):
+            return jsonify({"error": f"goals[{i}] must be an object"}), 400
+        seg_id = g.get("segment_id") or f"seg_{i:02d}"
+        if i == 0:
+            parent = g.get("parent_segment_id")  # None expected; factory enforces root
+        else:
+            parent = g.get("parent_segment_id", prev_id)
+        goals.append(StudioMovieGoal(
+            segment_id=seg_id,
+            prompt=g.get("prompt"),
+            parent_segment_id=parent,
+            branch_frame=g.get("branch_frame"),
+            negative=g.get("negative"),
+            seed=g.get("seed"),
+            model_id=g.get("model_id"),
+            steps=g.get("steps"),
+            cfg=g.get("cfg"),
+        ))
+        prev_id = seg_id
+
+    # SEGMENT 0 conditioning still (optional): a jail-resolved + image-classified
+    # start_image path, OR a start_image_asset_id resolved via the media catalog.
+    # A jail-escaping / nonexistent / non-image target is a clean 4xx here rather
+    # than a deferred runner failure. When absent, segment 0 renders t2v.
+    start_ref = None
+    start_image = body.get("start_image")
+    start_asset_id = body.get("start_image_asset_id")
+    if start_image is None and start_asset_id:
+        start_image = _resolve_asset_uri(start_asset_id)
+        if start_image is None:
+            return jsonify(
+                {"error": f"start_image_asset_id not found in catalog: {start_asset_id!r}"}), 404
+    if start_image is not None:
+        rp = _jail_resolve(start_image)
+        if rp is None:
+            return jsonify({"error": "start_image outside storage jail"}), 400
+        if not os.path.isfile(rp):
+            return jsonify({"error": "start_image not found"}), 404
+        try:
+            start_ref = media_store.ingest(rp, kind_hint="image")
+        except Exception as exc:  # unreadable / not a real image = bad input
+            return jsonify(
+                {"error": f"start_image is not a readable media file: {exc}"}), 400
+        if start_ref.kind != "image":
+            return jsonify(
+                {"error": f"start_image is not an image (classified as {start_ref.kind})"}), 400
+
+    try:
+        spec = make_studio_movie(
+            goals=tuple(goals),
+            width=width,
+            height=height,
+            fps=fps,
+            vram_budget_gb=body.get("vram_budget_gb", 0.5),
+            seed=body.get("seed", 0),
+            # C-prompt: "negative_prompt" (canonical) with back-compat to "negative".
+            negative=body.get("negative_prompt", body.get("negative")),
+            model_id=body.get("model_id"),
+            steps=body.get("steps"),
+            cfg=body.get("cfg"),
+            project=body.get("project"),
+            out_root=body.get("out_root"),
+            start_image=start_ref,
+            time_budget_s=body.get("time_budget_s"),
+        )
+    except (ValueError, TypeError) as exc:  # bad node / geometry / chain = 400
+        return jsonify({"error": str(exc)}), 400
+    job_id = media_bus.enqueue("generate_studio_movie", spec)
     return jsonify({"job_id": job_id}), 200
 
 

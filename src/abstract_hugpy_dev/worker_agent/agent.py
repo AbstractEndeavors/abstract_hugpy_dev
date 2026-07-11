@@ -2130,13 +2130,47 @@ def _probe_model(model_key: str, state: "WorkerState") -> dict:
 
         after = _free_vram_bytes()
         used = (before - after) if (before is not None and after is not None) else None
+        # Which path actually took the load: a base_url means an HTTP child
+        # (slot or native llama-server); none means in-process llama-cpp-python.
+        base_url = (getattr(runner, "base_url", None)
+                    or getattr(getattr(runner, "runner", None), "base_url", None))
         result.update(
             ok=True,
             vram_free_after=after,
             vram_used=used,
+            path="http" if base_url else "in-process",
             # If GPU free memory dropped meaningfully, weights are on the GPU.
             fit=bool(used and used > 64 * 1024 * 1024),
         )
+        # Vision honesty: a vision GGUF served IN-PROCESS cannot decode images
+        # (the python binding fails to load the mmproj projector — the reason
+        # the native --mmproj server path exists). The load "succeeds" but
+        # every image turn silently degrades to text-only, so report the probe
+        # as FAILED with the actionable reason instead of ok:true.
+        if not base_url:
+            try:
+                from ..imports.src.utils import find_mmproj
+                from .imports import get_model_config, get_model_path
+                cfg = get_model_config(canonical)
+                tasks = list(getattr(cfg, "tasks", None) or [])
+                mpath = None
+                try:
+                    mpath = get_model_path(canonical)
+                except Exception:
+                    mpath = getattr(cfg, "dir", None)
+                is_vision = ("image-text-to-text" in tasks
+                             or bool(mpath and find_mmproj(str(mpath))))
+                if is_vision:
+                    result.update(
+                        ok=False, fit=False,
+                        error=("vision model loaded in-process (text-only — the "
+                               "python binding cannot load the mmproj projector), "
+                               "so images would be silently ignored. Provide a "
+                               "native llama-server (LLAMA_SERVER_BIN or `hugpy "
+                               "install-engine`) or a healthy slot child so the "
+                               "projector loads."))
+            except Exception:
+                pass  # capability check is advisory — never turn it into a probe crash
     except Exception as exc:
         result.update(ok=False, fit=False, error=f"{type(exc).__name__}: {exc}")
     return result

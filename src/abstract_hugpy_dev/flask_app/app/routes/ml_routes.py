@@ -245,6 +245,17 @@ def _run_ml(task: str):
     kwargs = {k: v for k, v in body.items()
               if not k.startswith("_") and v is not None}
     kwargs["task"] = task  # the route fixes the task (any client `task` ignored)
+    # Vision payload normalization: the prompt pipeline (and the GGUF chat
+    # runner's _attach_image) reads ``images`` (list of base64 / data URIs) or
+    # ``file`` (server path) — but this route's documented surface also takes
+    # ``image_b64``. Un-mapped it was silently DROPPED and the VL model
+    # answered text-blind ("I do not have access to visual information"), so
+    # fold it into ``images`` here. Callers already sending images/file are
+    # untouched.
+    if task == "image-text-to-text" and "images" not in kwargs:
+        b64 = kwargs.pop("image_b64", None)
+        if b64:
+            kwargs["images"] = [b64]
 
     # Effective pool: API-key-bound pool / explicit override always wins. With
     # neither, most ML tasks default to the reserved ML pool (so they never

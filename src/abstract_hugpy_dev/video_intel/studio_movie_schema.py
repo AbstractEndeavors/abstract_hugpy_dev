@@ -1,0 +1,345 @@
+"""Studio-movie schema — an ordered strip of REAL studio clips conjoined at splice
+points, like a single NLE timeline ROW: ``[segment 0 | segment 1 | …]``.
+
+A studio movie is a SEQUENCE OF STUDIO CLIPS (produce_clip outputs), not a
+frame-timeline like ``movie_schema`` (which tiles ``[0, total)`` with scene
+segments). Each segment is one studio render:
+
+  * Segment 0 renders t2v (or i2v when a movie-level ``start_image`` is given).
+  * Each LATER segment renders i2v, conditioned on ONE still — the **branch frame**
+    of the PREVIOUS segment's clip (``branch_frame: int | null``; null ⇒ the
+    parent's LAST frame). Motion is not carried across the splice (still
+    conditioning only); VACE-extend is the planned upgrade.
+
+NON-DESTRUCTIVE. Clip files stay WHOLE. A mid-frame branch means the assembled
+movie uses the parent clip only UP TO the branch frame — the trim is METADATA
+(recorded per joint, honored at concat time), never a re-render of the parent.
+
+TAKE-TREE DATA MODEL (grows without rework). Segments are stored as a list of
+NODES ``{segment_id, parent_segment_id, branch_frame, prompt, …}``. TODAY the
+chain is LINEAR — each node's ``parent_segment_id`` is the previous node's
+``segment_id`` and assembly walks that single path — and ``make_studio_movie``
+ENFORCES that linearity (see below). Sibling divergences from the same parent
+(a real take-tree) become possible LATER with no schema change: the node shape
+already carries the parent pointer, so only the validator's linear-chain rule and
+the assembly walk need to relax.
+
+House style mirrors ``movie_schema`` / ``studio.job``: a frozen spec + frozen
+node, a validating factory whose raises are LOCAL to construction (a structurally
+invalid spec is caller error caught at the boundary, never carried across the
+bus), and asdict-friendly, JSON-safe fields so the bus round-trips it through
+``studio_movie_from_dict`` (reconstruct + RE-VALIDATE).
+
+V0 SIMPLIFICATIONS (stated here + in the runner header + the report):
+  * TIER IS MOVIE-LEVEL. ``vram_budget_gb`` (the synthetic-vs-real tier selector)
+    is a single movie-level value applied to every segment. Per-segment tier
+    selection is planned growth.
+  * GEOMETRY IS UNIFORM. ``width`` / ``height`` / ``fps`` are movie-level because
+    the segments concat into one row (the assembler needs matching geometry).
+  * ``model_id`` / ``steps`` / ``cfg`` are movie-level defaults, but a node MAY
+    OVERRIDE them per segment (honored when set — not dead fields). ``negative``
+    and ``seed`` are likewise per-segment-overridable over the movie default.
+  * NO PER-SEGMENT DURATION/FRAMES FIELD. ``StudioI2VSpec`` itself carries none —
+    clip length is a pure function of the manifest (``fps * 2`` seconds, capped by
+    the bound model), derived by the studio spine — so this schema faithfully
+    mirrors it and adds no dead length knob. ``branch_frame`` is therefore bounded
+    by the parent clip's ACTUAL frame count, checkable only at RUN time (the schema
+    validates ``branch_frame >= 0``; ``branch_frame < parent_frames`` is a runtime
+    error-as-data from the runner).
+
+No pathlib anywhere. os.path only (there is none here — pure data).
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional, Tuple
+
+from .media_schema import MediaRef, make_media_ref
+
+# Sampler-override sanity ranges — mirror ``studio.job``'s bounds so a movie spec
+# rejects the same out-of-range steps/cfg the single-clip route does (one denoise
+# vocabulary across the studio surface). steps<1 is a no-op denoise; a huge count
+# or cfg is almost always a typo. cfg 0 is valid (unguided).
+_MIN_STEPS, _MAX_STEPS = 1, 100
+_MIN_CFG, _MAX_CFG = 0.0, 20.0
+
+# Movie-level tier default: below the smallest real i2v footprint so the router
+# binds the SYNTHETIC spine (a GPU-less box produces a clip), mirroring
+# ``studio.job._DEFAULT_VRAM_BUDGET_GB``.
+_DEFAULT_VRAM_BUDGET_GB = 0.5
+
+
+@dataclass(frozen=True)
+class StudioMovieGoal:
+    """One NODE on the studio movie's take-tree.
+
+        segment_id         stable id of this segment's node (non-empty, unique in
+                           the movie). The parent pointer + assembly key.
+        prompt             the text this segment renders (non-empty).
+        parent_segment_id  the node this segment branches FROM. None ⇒ this is the
+                           root (segment 0). TODAY it must be the PREVIOUS node's
+                           segment_id (linear chain); the field already models a
+                           tree for future sibling divergence.
+        branch_frame       the frame INDEX of the parent's clip this segment is
+                           conditioned on (>= 0). None ⇒ the parent's LAST frame.
+                           Bounds against the parent's real frame count are a
+                           RUN-time check (the schema only enforces >= 0).
+        negative           optional per-segment negative prompt; when None the
+                           movie-level ``negative`` is used.
+        seed               optional per-segment seed; when None the runner derives
+                           a deterministic one (movie seed + segment index).
+        model_id           optional per-segment model pin; when None the movie-level
+                           ``model_id`` is used (v0: usually None -> auto-pick).
+        steps / cfg        optional per-segment sampler overrides; when None the
+                           movie-level value (or the bound model's family default)
+                           is used.
+    """
+    segment_id: str
+    prompt: str
+    parent_segment_id: Optional[str] = None
+    branch_frame: Optional[int] = None
+    negative: Optional[str] = None
+    seed: Optional[int] = None
+    model_id: Optional[str] = None
+    steps: Optional[int] = None
+    cfg: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class StudioMovieSpec:
+    """Frozen currency of a ``generate_studio_movie`` bus job. Built ONLY via
+    ``make_studio_movie`` (validate-at-construction); the bus rehydrates it via
+    ``studio_movie_from_dict``, which re-validates through the same factory. Every
+    field is JSON-safe (primitives + a nested ``MediaRef`` / ``StudioMovieGoal``
+    tuple) so ``asdict`` -> ``json.dumps`` round-trips cleanly.
+
+        goals            the ORDERED tuple of take-tree nodes (>=1). goals[0] is the
+                         root; today goals[i>0].parent_segment_id == goals[i-1].segment_id.
+        width/height/fps movie geometry (uniform across segments — they concat).
+        vram_budget_gb   the movie-level tier selector (synthetic vs. real).
+        seed             base seed; a node with no seed uses ``seed + index``.
+        negative         movie-level default negative (a node may override).
+        model_id         movie-level default model pin (a node may override; None
+                         = router auto-pick).
+        steps/cfg        movie-level default sampler overrides (a node may override;
+                         None = the bound model's family default).
+        project          optional human auto-archive NAME (non-canonical metadata).
+        out_root         output location (a dir under the media-store root); None
+                         resolves to the studio-movie default in the runner.
+        start_image      optional conditioning still for SEGMENT 0 (a MediaRef of
+                         kind 'image'); when present segment 0 renders i2v from it,
+                         else t2v.
+        time_budget_s    optional wall-clock budget the runner owns itself (the
+                         single-daemon bus has no timeout/reaper), honored BETWEEN
+                         segments — mirrors ``MovieSpec.time_budget_s``.
+    """
+    goals: Tuple[StudioMovieGoal, ...]
+    width: int
+    height: int
+    fps: int
+    vram_budget_gb: float = _DEFAULT_VRAM_BUDGET_GB
+    seed: int = 0
+    negative: Optional[str] = None
+    model_id: Optional[str] = None
+    steps: Optional[int] = None
+    cfg: Optional[float] = None
+    project: Optional[str] = None
+    out_root: Optional[str] = None
+    start_image: Optional[MediaRef] = None
+    time_budget_s: Optional[int] = None
+
+
+def _check_steps_cfg(where: str, steps, cfg) -> None:
+    """Shared steps/cfg range guard (movie-level + per-node). bool is an int
+    subclass — reject it explicitly. Raises LOCALLY (caller error at construction)."""
+    if steps is not None:
+        if not isinstance(steps, int) or isinstance(steps, bool) \
+                or not (_MIN_STEPS <= steps <= _MAX_STEPS):
+            raise ValueError(
+                f"{where} steps must be an int in [{_MIN_STEPS}, {_MAX_STEPS}] or None; "
+                f"got {steps!r}")
+    if cfg is not None:
+        if not isinstance(cfg, (int, float)) or isinstance(cfg, bool) \
+                or not (_MIN_CFG <= cfg <= _MAX_CFG):
+            raise ValueError(
+                f"{where} cfg must be a number in [{_MIN_CFG}, {_MAX_CFG}] or None; "
+                f"got {cfg!r}")
+
+
+def make_studio_movie(
+    goals: Tuple[StudioMovieGoal, ...],
+    width: int,
+    height: int,
+    fps: int,
+    vram_budget_gb: float = _DEFAULT_VRAM_BUDGET_GB,
+    seed: int = 0,
+    negative: Optional[str] = None,
+    model_id: Optional[str] = None,
+    steps: Optional[int] = None,
+    cfg: Optional[float] = None,
+    project: Optional[str] = None,
+    out_root: Optional[str] = None,
+    start_image: Optional[MediaRef] = None,
+    time_budget_s: Optional[int] = None,
+) -> StudioMovieSpec:
+    """Validate every field and build the frozen ``StudioMovieSpec``. Raises
+    ``ValueError``/``TypeError`` LOCALLY on any structural violation — a
+    structurally-invalid spec is caller error caught at the boundary, never carried
+    across the bus. Runtime policy failures (an unroutable request, a branch_frame
+    past the parent's real length) are NOT validated here; they surface as
+    errors-as-data from the runner.
+
+    Take-tree invariants (the load-bearing ones):
+      * ``goals`` is non-empty;
+      * every ``segment_id`` is a non-empty string, UNIQUE across the movie;
+      * every ``prompt`` is a non-empty string;
+      * every ``branch_frame`` is None or an int >= 0 (a negative index is caller
+        error; the < parent_frames upper bound is a run-time check — see header);
+      * LINEAR CHAIN (v0): goals[0].parent_segment_id is None (the root), and for
+        i>0 goals[i].parent_segment_id == goals[i-1].segment_id. This is the ONLY
+        rule that must relax for a real take-tree; the node shape already carries
+        the parent pointer, so sibling divergence needs no schema change.
+
+    Also the reconstruction path used by the bus deserializer — goals are rebuilt
+    into ``StudioMovieGoal`` (and ``start_image`` through ``make_media_ref``) before
+    this is called.
+    """
+    goals = tuple(goals)
+    if not goals:
+        raise ValueError("make_studio_movie requires at least one StudioMovieGoal")
+
+    # ---- movie-level geometry / tier / sampler ----
+    for name, val in (("width", width), ("height", height), ("fps", fps)):
+        if not isinstance(val, int) or isinstance(val, bool) or val <= 0:
+            raise ValueError(f"{name} must be a positive int; got {val!r}")
+    if not isinstance(vram_budget_gb, (int, float)) or isinstance(vram_budget_gb, bool) \
+            or vram_budget_gb <= 0:
+        raise ValueError(f"vram_budget_gb must be a positive number; got {vram_budget_gb!r}")
+    if not isinstance(seed, int) or isinstance(seed, bool):
+        raise ValueError(f"seed must be an int; got {seed!r}")
+    if negative is not None and not isinstance(negative, str):
+        raise ValueError(f"negative must be a string or None; got {negative!r}")
+    if model_id is not None and not (isinstance(model_id, str) and model_id.strip()):
+        raise ValueError(f"model_id must be a non-empty string or None; got {model_id!r}")
+    _check_steps_cfg("movie-level", steps, cfg)
+    if project is not None and not isinstance(project, str):
+        raise ValueError(f"project must be a string or None; got {project!r}")
+    project = (project.strip() or None) if isinstance(project, str) else None
+    if out_root is not None and not (isinstance(out_root, str) and out_root.strip()):
+        raise ValueError(f"out_root must be a non-empty string or None; got {out_root!r}")
+    if start_image is not None:
+        if not isinstance(start_image, MediaRef):
+            raise ValueError(
+                f"start_image must be a MediaRef or None; got {type(start_image).__name__}")
+        if start_image.kind != "image":
+            raise ValueError(
+                f"start_image must be an image MediaRef; got kind={start_image.kind!r}")
+    if time_budget_s is not None and not (isinstance(time_budget_s, int)
+                                          and not isinstance(time_budget_s, bool)
+                                          and time_budget_s > 0):
+        raise ValueError(
+            f"time_budget_s must be a positive int or None; got {time_budget_s!r}")
+
+    # ---- per-node validation + linear-chain enforcement (v0) ----
+    seen_ids: set = set()
+    prev_id: Optional[str] = None
+    for gi, g in enumerate(goals):
+        if not isinstance(g, StudioMovieGoal):
+            raise ValueError(f"goals[{gi}] must be a StudioMovieGoal; got {type(g).__name__}")
+        if not (isinstance(g.segment_id, str) and g.segment_id.strip()):
+            raise ValueError(f"goals[{gi}].segment_id must be a non-empty string")
+        if g.segment_id in seen_ids:
+            raise ValueError(f"goals[{gi}].segment_id={g.segment_id!r} is not unique")
+        seen_ids.add(g.segment_id)
+        if not (isinstance(g.prompt, str) and g.prompt.strip()):
+            raise ValueError(f"goals[{gi}].prompt must be a non-empty string")
+        if g.branch_frame is not None:
+            if not (isinstance(g.branch_frame, int) and not isinstance(g.branch_frame, bool)
+                    and g.branch_frame >= 0):
+                raise ValueError(
+                    f"goals[{gi}].branch_frame must be an int >= 0 or None; "
+                    f"got {g.branch_frame!r}")
+        if g.negative is not None and not isinstance(g.negative, str):
+            raise ValueError(f"goals[{gi}].negative must be a string or None; got {g.negative!r}")
+        if g.seed is not None and (not isinstance(g.seed, int) or isinstance(g.seed, bool)):
+            raise ValueError(f"goals[{gi}].seed must be an int or None; got {g.seed!r}")
+        if g.model_id is not None and not (isinstance(g.model_id, str) and g.model_id.strip()):
+            raise ValueError(
+                f"goals[{gi}].model_id must be a non-empty string or None; got {g.model_id!r}")
+        _check_steps_cfg(f"goals[{gi}]", g.steps, g.cfg)
+
+        # LINEAR CHAIN (v0): the root has no parent; every later node's parent is the
+        # node right before it. The one rule a real take-tree relaxes.
+        if gi == 0:
+            if g.parent_segment_id is not None:
+                raise ValueError(
+                    f"goals[0].parent_segment_id must be None (the root has no parent); "
+                    f"got {g.parent_segment_id!r}")
+        else:
+            if g.parent_segment_id != prev_id:
+                raise ValueError(
+                    f"goals[{gi}].parent_segment_id must be the previous node's segment_id "
+                    f"{prev_id!r} (linear chain for now; tree branching is planned growth); "
+                    f"got {g.parent_segment_id!r}")
+        prev_id = g.segment_id
+
+    return StudioMovieSpec(
+        goals=goals,
+        width=width,
+        height=height,
+        fps=fps,
+        vram_budget_gb=float(vram_budget_gb),
+        seed=seed,
+        negative=negative,
+        model_id=model_id,
+        steps=steps,
+        cfg=(float(cfg) if cfg is not None else None),
+        project=project,
+        out_root=out_root,
+        start_image=start_image,
+        time_budget_s=time_budget_s,
+    )
+
+
+def _goal_from_dict(d: dict) -> StudioMovieGoal:
+    """Rebuild ONE take-tree node from its ``asdict`` form (shape only; the full
+    invariant check runs in ``make_studio_movie``)."""
+    return StudioMovieGoal(
+        segment_id=d.get("segment_id"),
+        prompt=d.get("prompt"),
+        parent_segment_id=d.get("parent_segment_id"),
+        branch_frame=d.get("branch_frame"),
+        negative=d.get("negative"),
+        seed=d.get("seed"),
+        model_id=d.get("model_id"),
+        steps=d.get("steps"),
+        cfg=d.get("cfg"),
+    )
+
+
+def studio_movie_from_dict(d: dict) -> StudioMovieSpec:
+    """Rebuild a ``StudioMovieSpec`` from its ``asdict`` form, THROUGH the validating
+    factory (mirrors ``studio.job.studio_i2v_from_dict`` / ``movie_schema``'s
+    deserialize-then-revalidate) so a rehydrated spec is re-checked, never trusted
+    blind. Registered in ``media_bus.SPEC_DESERIALIZERS`` under the name
+    ``"generate_studio_movie"``."""
+    raw_goals = d.get("goals") or ()
+    goals = tuple(_goal_from_dict(g) for g in raw_goals)
+    start_image = d.get("start_image")
+    ref = make_media_ref(**start_image) if isinstance(start_image, dict) else None
+    return make_studio_movie(
+        goals=goals,
+        width=d["width"],
+        height=d["height"],
+        fps=d["fps"],
+        vram_budget_gb=d.get("vram_budget_gb", _DEFAULT_VRAM_BUDGET_GB),
+        seed=d.get("seed", 0),
+        negative=d.get("negative"),
+        model_id=d.get("model_id"),
+        steps=d.get("steps"),
+        cfg=d.get("cfg"),
+        project=d.get("project"),
+        out_root=d.get("out_root"),
+        start_image=ref,
+        time_budget_s=d.get("time_budget_s"),
+    )

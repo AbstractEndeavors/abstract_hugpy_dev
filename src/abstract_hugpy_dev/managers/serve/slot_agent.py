@@ -322,6 +322,20 @@ def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None,
         # Same /v1 surface, so the slot proxy needs no changes. No --cpu-mask
         # equivalent (threads + the unit's cgroup govern CPU); vision models
         # stay on the native/in-process path (no --mmproj here).
+        #
+        # Vision GGUF: REFUSE rather than seat. llama_cpp.server cannot load
+        # the mmproj projector, so a seated vision model would answer every
+        # image turn text-blind with no error anywhere. The raised reason
+        # propagates verbatim to central's slot-refusal log and load_reports,
+        # and get_llama_runner falls through to the native/in-process path.
+        from ...imports.src.utils import find_mmproj
+        if find_mmproj(path):
+            raise RuntimeError(
+                f"{model_key}: vision model (mmproj sidecar present) but this "
+                "box has no native llama-server (LLAMA_SERVER_BIN) — the "
+                "llama_cpp.server fallback cannot load the projector, images "
+                "would be silently ignored. Install/point to a llama-server "
+                "build (`hugpy install-engine`) to seat vision models.")
         import sys as _sys
         argv = [
             _sys.executable, "-m", "llama_cpp.server",

@@ -365,6 +365,33 @@ def workers_required_version():
     return jsonify({"required_pkg_version": required_pkg_version()})
 
 
+@worker_bp.route("/llm/workers/install.sh", methods=["GET"])
+@worker_bp.route("/llm/workers/bootstrap.sh", methods=["GET"])
+def workers_install_sh():
+    """Public: serve the packaged worker bootstrap so a bare box enrolls with
+
+        curl -fsSL https://dev.hugpy.ai/api/llm/workers/install.sh \
+            | bash -s -- --name <box> --token <enroll-token>
+
+    (--central defaults to THIS central via the sed below.) Unauthenticated by
+    design, same rationale as required-version: it runs BEFORE a worker exists,
+    and the script is public code straight out of the PyPI package — the enroll
+    token, not the script, is the credential. The operator reached for exactly
+    this URL on 2026-07-10 before it existed; now it does.
+    """
+    import re
+    from importlib import resources
+    script = (resources.files("abstract_hugpy_dev.worker_agent")
+              .joinpath("bootstrap.sh").read_text(encoding="utf-8"))
+    # Default --central to the central actually serving this script, so the
+    # curl|bash one-liner needs only --name and --token.
+    base = (request.host_url or "").rstrip("/")
+    if base:
+        script = re.sub(r'^CENTRAL="[^"]*"', f'CENTRAL="{base}"',
+                        script, count=1, flags=re.M)
+    return Response(script, mimetype="text/x-shellscript")
+
+
 @worker_bp.route("/llm/queue", methods=["GET"])
 def llm_queue():
     """Live in-flight chat queue (waiting/active) for the console activity view."""
@@ -1189,6 +1216,14 @@ def workers_load(worker_id):
     url = base + "/probe/" + body.model_key
 
     def _warm():
+        # Best-effort warm, but NEVER silent: the probe outcome (the worker's
+        # {ok, fit, error, …} — or the transport failure reaching it) lands in
+        # the registry as load_reports[model_key], where the console shows WHY
+        # a model stayed cold. Before this, every failure mode here looked
+        # identical to success ("activate does nothing").
+        import time as _time
+        from ..functions.imports.utils.workers import set_load_report
+        report: dict = {"ts": _time.time()}
         try:
             if redownload:
                 # Wipe the model's files on the worker + re-pull from central BEFORE
@@ -1196,9 +1231,19 @@ def workers_load(worker_id):
                 # background thread — the request never blocks.
                 httpx.post(base + "/models/redownload",
                            json={"model_key": body.model_key}, timeout=3600.0)
-            httpx.post(url, timeout=900.0)  # worker loads synchronously; can be slow
+            r = httpx.post(url, timeout=900.0)  # worker loads synchronously; can be slow
+            try:
+                report.update(r.json())
+            except Exception:
+                report.update(ok=r.is_success,
+                              error=None if r.is_success else f"HTTP {r.status_code}")
+        except Exception as exc:
+            report.update(ok=False, error=f"{type(exc).__name__}: {exc}")
+        try:
+            set_load_report(worker_id, body.model_key, report)
         except Exception:
-            pass  # best-effort — lazy-load on first inference covers a warm failure
+            logger.exception("warm: could not record load report for %s on %s",
+                             body.model_key, worker_id)
 
     threading.Thread(target=_warm, name=f"warm-{worker_id[:8]}", daemon=True).start()
     note = ("redownloading (wipe + re-pull from central) then warming on the worker"
