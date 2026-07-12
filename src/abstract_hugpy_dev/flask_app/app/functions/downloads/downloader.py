@@ -1,14 +1,58 @@
 from .imports import *
 def model_status(model: dict) -> dict:
+    # route_destination now RESOLVES through every historical layout, so
+    # `destination` is the real on-disk dir when one exists (flat or a legacy
+    # task path), not a task reconstruction that pointed at an empty twin.
     destination = route_destination(model)              # was model_destination(...)
     marker = os.path.join(destination, HUGPY_MARKER)    # was install_marker(...)
-    if os.path.exists(marker):
+
+    # PRESENCE HONESTY (operator-locked 2026-07-11): a dir with COMPLETE weights
+    # is installed even if it has no hugpy.json marker yet (the AEON case: three
+    # good quants on disk, no marker -> used to read "partial"). GGUF counts as
+    # installed when ANY complete quant is present (model_looks_downloaded's
+    # any-quant semantics); the config.json + mmproj/vision gates are unchanged.
+    complete = False
+    try:
+        from abstract_hugpy_dev.imports.config.main import model_looks_downloaded
+        complete = bool(model_looks_downloaded(destination, _status_cfg(model)))
+    except Exception:  # noqa: BLE001 — never break the feed over a presence probe
+        complete = False
+
+    if complete or os.path.exists(marker):
         status = "installed"
     elif os.path.exists(destination) and os.listdir(destination):
         status = "partial"
     else:
         status = "not_installed"
-    return {"status": status, "destination": destination, "installed_marker": marker}
+
+    out = {"status": status, "destination": destination, "installed_marker": marker}
+
+    # A pinned `filename` that isn't among the installed quants is a WARNING
+    # surfaced on the /models feed — NOT a "partial" status (the model still
+    # serves off another complete quant). None when there's nothing to warn about.
+    try:
+        from abstract_hugpy_dev.imports.apis.reconcile import pinned_filename_present
+        if status == "installed" and pinned_filename_present(
+                destination, _status_cfg(model)) is False:
+            out["filename_warning"] = (
+                f"pinned filename {model.get('filename')!r} is not among the "
+                f"installed quants; serving off another quant")
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def _status_cfg(model: dict):
+    """A minimal cfg shim for model_looks_downloaded from a registry/manifest
+    dict — only framework/filename/include/primary_task/tasks are read."""
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        framework=model.get("framework"),
+        filename=model.get("filename"),
+        include=model.get("include"),
+        primary_task=model.get("primary_task") or model.get("task"),
+        tasks=model.get("tasks"),
+    )
 
 def write_install_marker(destination: str, model_key: str, model: dict[str, Any]) -> None:
     # The marker IS the authoritative hugpy.json declared-identity read back by

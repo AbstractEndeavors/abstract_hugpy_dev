@@ -187,6 +187,27 @@ def discover_models_state():
     return jsonify(_read_discover_state())
 
 
+# ── Store reconcile (the flattening migration) ────────────────────────────
+# Flattens the store to models/<runtime>/<owner>/<repo>: moves each repo's
+# COMPLETE copy into the flat path, merges complements (an mmproj twin),
+# ARCHIVES losers + .part orphans (never deletes), updates the registry +
+# markers. MONITOR-FIRST: body {"apply": false} (the default) returns the full
+# plan and touches NOTHING; {"apply": true} executes. Operator-token gated like
+# the other mutating store ops. The full JSON report is also written next to the
+# discovery report (reconcile_report[.dry].json) for the keeper to review.
+@llm_bp.route("/models/reconcile", methods=["POST"])
+def reconcile_store_route():
+    body = request.get_json(silent=True) or {}
+    apply = bool(body.get("apply", False))
+    from ....imports.apis.reconcile import reconcile_store
+    from ....imports.src.constants.constants import MODELS_DISCOVERY_PATH
+    suffix = "reconcile_report.json" if apply else "reconcile_report.dry.json"
+    report_path = os.path.join(os.path.dirname(str(MODELS_DISCOVERY_PATH)), suffix)
+    report = reconcile_store(apply=apply, report_path=report_path)
+    report["report_path"] = report_path
+    return jsonify(report), (200 if apply else 202)
+
+
 @llm_bp.route("/models/<model_key>", methods=["GET"])
 def get_model(model_key):
     manifest = get_models_dict(dict_return=True)

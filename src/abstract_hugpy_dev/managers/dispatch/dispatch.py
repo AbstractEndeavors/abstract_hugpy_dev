@@ -61,8 +61,29 @@ def loading_model_keys() -> List[str]:
         return sorted(_BUILDING)
 
 
-# Per-model last-request time — the residency sweep's idle clock (a model with
-# residency="on-demand" is evicted after on_demand_ttl_s of no requests).
+# ---------------------------------------------------------------------------
+# Residency policy — CONTENTION-based LRU (operator doctrine, locked 2026-07-11).
+#
+# Doctrine: "The likelihood of one model being queried having another
+# consecutive query is high — this is the M.O. of hugpy. Resources should
+# facilitate keeping models hot; models should spend the least possible time
+# 'loading'." So an on-demand model loads on call and STAYS resident until
+# another load actually NEEDS its resources; then the least-recently-used
+# on-demand resident yields. static/pinned residents NEVER yield.
+#
+# 2026-07-11 DRIFT CORRECTION: this used to be a CLOCK — the worker's residency
+# sweep evicted any on-demand resident after on_demand_ttl_s of no requests
+# (default 900s), so a model that had just answered a chat was gone minutes
+# later and the next chat paid a full reload. That contradicted the doctrine and
+# the console's own residency tooltip ("holds its slot until another model needs
+# the seat"). The idle clock is now OPT-IN (worker_agent._residency_sweep_once:
+# it runs only when the operator explicitly sets on_demand_ttl_s); the DEFAULT
+# trigger is memory contention — ensure_headroom_for_load(), below.
+# ---------------------------------------------------------------------------
+
+# Per-model last-request time — the LRU key. touch_model() fires on every served
+# request (execute_prompt / execute_prompt_stream); the least-recently touched
+# on-demand resident is the first to yield under contention.
 _LAST_USED: Dict[str, float] = {}
 
 
@@ -75,11 +96,118 @@ def last_used_snapshot() -> Dict[str, float]:
     return dict(_LAST_USED)
 
 
+# ---------------------------------------------------------------------------
+# Contention hooks — registered by the worker agent; None on bare central.
+#
+# dispatch is shared code and must not import worker_agent (the dependency runs
+# the other way). So, mirroring managers.serve.slots.set_residency_lookup, the
+# worker registers the box-specific policy here at startup. Unset -> contention
+# eviction is a no-op: central does no local serving, and tests register their
+# own fakes. dispatch owns the LRU MECHANISM; the worker owns the fit MEASUREMENT.
+# ---------------------------------------------------------------------------
+_FIT_CHECK = None        # (model_key) -> bool: does loading it fit in current headroom?
+_EVICTABLE = None        # (model_key) -> bool: is it a yieldable on-demand in-process resident?
+_POST_EVICT = None       # () -> None: reclaim host RAM / CUDA cache after an eviction
+_CONTENTION_LOCK = threading.Lock()
+
+
+def set_fit_check(fn) -> None:
+    """Register the headroom fit-guard: ``fn(model_key) -> bool``, True when the
+    model fits in current headroom without yielding a resident. None disables
+    contention eviction (the bare-central / untested default)."""
+    global _FIT_CHECK
+    _FIT_CHECK = fn
+
+
+def set_evictable(fn) -> None:
+    """Register the yield predicate: ``fn(model_key) -> bool``, True for an
+    on-demand in-process resident that MAY yield (not static, not pinned, no
+    active gate permits, not slot-backed)."""
+    global _EVICTABLE
+    _EVICTABLE = fn
+
+
+def set_post_evict_hook(fn) -> None:
+    """Register a post-eviction reclaim (gc + malloc_trim + cuda empty_cache) so
+    the next headroom re-check sees the freed memory. None -> skipped."""
+    global _POST_EVICT
+    _POST_EVICT = fn
+
+
+def _next_lru_evictable(exclude: str) -> Optional[str]:
+    """The least-recently-used yieldable on-demand in-process resident, or None.
+
+    Candidates are the model_keys currently holding a runner in ``_INSTANCES``,
+    minus the model being loaded, minus everything the registered ``_EVICTABLE``
+    predicate rejects (static, pinned, gate-busy, slot-backed). Ordered by
+    ``_LAST_USED`` ascending — the coldest yields first. A never-touched resident
+    (warmed by the filler, never requested) sorts oldest and yields first, which
+    is exactly right."""
+    if _EVICTABLE is None:
+        return None
+    residents = {mk for (mk, _task) in loaded_model_keys()}
+    residents.discard(exclude)
+    cands = [mk for mk in residents if _EVICTABLE(mk)]
+    if not cands:
+        return None
+    cands.sort(key=lambda mk: _LAST_USED.get(mk, 0.0))
+    return cands[0]
+
+
+def ensure_headroom_for_load(model_key: str) -> List[str]:
+    """CONTENTION eviction — the default (clock-free) residency trigger.
+
+    Called right before a NEW runner is built (see ``_get_or_build_runner``).
+    While the registered fit-guard says the incoming model does NOT fit, yield
+    the least-recently-used on-demand resident one at a time — re-checking
+    headroom after each (the post-evict reclaim hook trims the freed host arena /
+    CUDA cache so the re-check actually sees the room) — until it fits or nothing
+    is left to yield.
+
+    A model with an in-flight generation (gate permits) is skipped, never ripped
+    out from under it — the next LRU candidate is chosen, and the busy one
+    becomes evictable only once its permits release. If nothing is yieldable, we
+    return and the load proceeds (or fails) EXACTLY as it does today: contention
+    only ADDS room, it never changes the too-big error envelope.
+
+    No-op on bare central / when no fit-guard is registered. Returns the list of
+    yielded model_keys (for logging + tests)."""
+    if _FIT_CHECK is None:
+        return []
+    evicted: List[str] = []
+    with _CONTENTION_LOCK:
+        while not _FIT_CHECK(model_key):
+            cand = _next_lru_evictable(exclude=model_key)
+            if cand is None:
+                break                        # nothing to yield -> load as today
+            logger.info("contention evict: yielding LRU on-demand resident %s to "
+                        "make room for %s (doctrine 2026-07-11: keep models hot, "
+                        "yield only under memory pressure)", cand, model_key)
+            try:
+                evict(cand)
+            except Exception:                # noqa: BLE001 — one bad evict must not wedge the load
+                logger.warning("contention evict of %s failed", cand, exc_info=True)
+                break
+            evicted.append(cand)
+            if _POST_EVICT is not None:
+                try:
+                    _POST_EVICT()            # trim so the next fit re-check sees the freed room
+                except Exception:            # noqa: BLE001
+                    logger.warning("post-evict reclaim failed", exc_info=True)
+    return evicted
+
+
 def _get_or_build_runner(res: Resolution) -> Runner:
     """Cache-coherent runner lookup. Double-checked locking under the cache lock."""
     cached = _INSTANCES.get(res.cache_key)
     if cached is not None:
         return cached
+
+    # Contention-based residency (doctrine 2026-07-11): a NEW in-process load may
+    # need room. Yield the LRU on-demand resident(s) BEFORE we build — done here,
+    # OUTSIDE _INSTANCES_LOCK, because evict() takes that lock too (holding it
+    # would deadlock). No-op on bare central (no fit-guard registered).
+    ensure_headroom_for_load(res.model_key)
 
     with _INSTANCES_LOCK:
         cached = _INSTANCES.get(res.cache_key)

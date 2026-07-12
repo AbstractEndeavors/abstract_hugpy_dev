@@ -118,6 +118,11 @@ _SENSITIVE = [
     # Disk discovery sweep — rebuilds the discovery report (walks the whole
     # model tree + hub enrichment); the GET state poll stays open.
     ({"POST"},                   re.compile(r"^/models/discover$")),
+    # Store reconcile (the flattening migration) — MOVES/ARCHIVES model dirs and
+    # rewrites the registry + markers when {"apply": true}. A mutating store op,
+    # same operator-only tier as discover/delete. The dry-run is also POST (it
+    # writes a plan report), so the whole route is gated.
+    ({"POST"},                   re.compile(r"^/models/reconcile$")),
 ]
 
 _SESSION_CACHE: dict[str, tuple[bool, float]] = {}

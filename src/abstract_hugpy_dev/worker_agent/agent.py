@@ -1921,17 +1921,36 @@ def build_app(state: "WorkerState") -> Flask:
                 return jsonify({"ok": False, "error": {
                     "code": "BadValue", "message": "slot_count must be 0..16"}}), 400
             settings["slot_count"] = n
-        for _tkey in ("on_demand_ttl_s", "reconcile_interval_s"):
-            if _tkey in body:
+        if "on_demand_ttl_s" in body:
+            # OPT-IN idle reclamation (doctrine 2026-07-11). The DEFAULT residency
+            # trigger is memory contention, not a clock — so on_demand_ttl_s is
+            # ABSENT by default and null/0 CLEARS it (idle sweep off; contention
+            # alone governs residency; the heartbeat then reports it as null).
+            val = body["on_demand_ttl_s"]
+            if val in (None, "", 0, "0"):
+                settings.pop("on_demand_ttl_s", None)
+            else:
                 try:
-                    tval = int(body[_tkey])
+                    tval = int(val)
                 except (TypeError, ValueError):
                     return jsonify({"ok": False, "error": {
-                        "code": "BadValue", "message": f"{_tkey} must be an integer"}}), 400
+                        "code": "BadValue",
+                        "message": "on_demand_ttl_s must be an integer, or null to disable idle reclamation"}}), 400
                 if not 60 <= tval <= 86400:
                     return jsonify({"ok": False, "error": {
-                        "code": "BadValue", "message": f"{_tkey} must be 60..86400"}}), 400
-                settings[_tkey] = tval
+                        "code": "BadValue",
+                        "message": "on_demand_ttl_s must be 60..86400 (or null to disable idle reclamation)"}}), 400
+                settings["on_demand_ttl_s"] = tval
+        if "reconcile_interval_s" in body:
+            try:
+                tval = int(body["reconcile_interval_s"])
+            except (TypeError, ValueError):
+                return jsonify({"ok": False, "error": {
+                    "code": "BadValue", "message": "reconcile_interval_s must be an integer"}}), 400
+            if not 60 <= tval <= 86400:
+                return jsonify({"ok": False, "error": {
+                    "code": "BadValue", "message": "reconcile_interval_s must be 60..86400"}}), 400
+            settings["reconcile_interval_s"] = tval
         if "residency" in body:
             # DEEP-MERGE per model key: {"model": "static"|null}. The default
             # tier is ON-DEMAND and is represented by NO stored entry — null,
@@ -2548,6 +2567,78 @@ def _pinned(model_key: str) -> bool:
     return bool((_RUNTIME_SETTINGS.get("pinned") or {}).get(model_key))
 
 
+# ---------------------------------------------------------------------------
+# Contention-based residency (doctrine 2026-07-11): the worker-side policy
+# registered onto dispatch's LRU mechanism (dispatch.set_fit_check /
+# set_evictable / set_post_evict_hook). An on-demand model stays hot until a NEW
+# load needs its memory; then the LRU on-demand resident yields.
+# ---------------------------------------------------------------------------
+def _incoming_need_bytes(model_key: str) -> "int | None":
+    """Best-effort bytes the incoming model's weights will want (× a small
+    headroom factor), resolved from its on-disk size the same way the loader does
+    (route_destination + weight-file sum, cached by dispatch). None when the size
+    is unknown — the fit-guard then fails OPEN (never blocks an unmeasurable
+    load)."""
+    try:
+        from ..imports import route_destination
+        from ..imports.config.main import get_model_config
+        from ..managers.dispatch.dispatch import _dir_size_detail
+        cfg = get_model_config(model_key, dict_return=True)
+        path = route_destination(cfg)
+        detail = _dir_size_detail(path) if path else {}
+        weight = detail.get("weight_bytes") or detail.get("model_bytes")
+        return int(weight * 1.15) if weight else None
+    except Exception:  # noqa: BLE001 — best-effort; unknown size -> fail open
+        return None
+
+
+def _worker_fit_check(model_key: str) -> bool:
+    """Contention fit-guard (dispatch.set_fit_check). True when the incoming load
+    fits in current headroom WITHOUT yielding a resident; False = memory pressure
+    -> yield the LRU on-demand resident.
+
+    GPU box: the newcomer wants to be GPU-resident (hot), so it fits when free
+    VRAM holds its weights. If a GPU is present but VRAM can't, that's the
+    contention that yields an idle on-demand resident to keep the newcomer on the
+    GPU (doctrine: minimize load time, keep models hot); when nothing is left to
+    yield the loop stops and the normal autofit path spills to CPU exactly as
+    today. CPU-only box: contention is on RAM. Fails OPEN when the size or both
+    pools are unmeasurable — an unmeasurable load proceeds exactly as today."""
+    need = _incoming_need_bytes(model_key)
+    if not need:
+        return True
+    fv = _free_vram_bytes()
+    if fv is not None:
+        return fv >= need
+    fr = _free_ram_bytes()
+    if fr is not None:
+        return fr >= need
+    return True
+
+
+def _worker_evictable(model_key: str) -> bool:
+    """Contention yield predicate (dispatch.set_evictable). A model may yield its
+    in-process residency ONLY if it is on-demand, not pinned, has NO in-flight
+    generation (gate permits), and isn't slot-backed (a slot child's weights live
+    in another process — dropping the proxy frees nothing here and breaks the
+    seat). static/pinned NEVER yield; a model mid-generation is skipped (the next
+    LRU is chosen) and becomes evictable only once its gate permits release."""
+    if _residency(model_key) == "static" or _pinned(model_key):
+        return False
+    try:
+        if gen_gate.in_flight(model_key) > 0:
+            return False
+    except Exception:  # noqa: BLE001 — can't tell -> don't yield a possibly-busy model
+        return False
+    try:
+        from ..managers.llama.runners.get import slot_backed_model_keys
+        if model_key in (slot_backed_model_keys() or set()):
+            return False
+    except Exception:  # noqa: BLE001 — can't tell slot-backing -> allow (in-process default)
+        pass
+    return True
+
+
 def _prune_stale_residency(state: "WorkerState") -> None:
     """Tiers v3 lazy cleanup: residency overrides are ASSIGNMENT-scoped unless
     pinned. 🔒 static (and ⏲ on-demand) last while the model stays assigned;
@@ -2654,9 +2745,15 @@ def _effective_config() -> dict:
         n = _slot_count()
     except Exception:
         n = None
+    # Idle reclamation is OPT-IN (doctrine 2026-07-11): report the TTL as null
+    # when the operator hasn't set it, so the console shows the honest "off"
+    # (contention-only residency) instead of a phantom 900s clock.
+    _ttl_set = "on_demand_ttl_s" in _RUNTIME_SETTINGS
     out = {"slot_count": n,
            "slot_count_source": _SETTINGS_SOURCE.get("slot_count", "default"),
-           "on_demand_ttl_s": int(_RUNTIME_SETTINGS.get("on_demand_ttl_s", 900))}
+           "on_demand_ttl_s": (int(_RUNTIME_SETTINGS["on_demand_ttl_s"])
+                               if _ttl_set else None),
+           "on_demand_ttl_s_source": "settings" if _ttl_set else "default"}
     if _RUNTIME_SETTINGS.get("residency"):
         out["residency"] = dict(_RUNTIME_SETTINGS["residency"])
     if _RUNTIME_SETTINGS.get("pinned"):
@@ -2753,16 +2850,26 @@ def _slot_occupants(strict: bool = False) -> set:
 
 
 def _residency_sweep_once(started_at: float) -> None:
-    """One pass of the TTL sweep (factored out of the loop so it's testable).
+    """One pass of the idle TTL sweep — OPT-IN since 2026-07-11 (factored out of
+    the loop so it's testable).
 
-    v3 final semantics: the sweep applies ONLY to IN-PROCESS residents. The
-    default policy is on-demand, so any non-static in-process model idle
-    longer than on_demand_ttl_s is evicted (dispatch.evict cascades to the
-    llama singleton — RAM/VRAM actually frees; the op-style slot-less box
-    keeps this behavior). SLOT occupants are EXEMPT: slots stay filled
-    (slice 9) and a seat changes hands only via LRU promotion or explicit
-    unload. Static never yields anywhere."""
-    ttl = int(_RUNTIME_SETTINGS.get("on_demand_ttl_s", 900))
+    DOCTRINE (operator-locked 2026-07-11): keep models hot. An on-demand model
+    stays resident until a NEW load needs its memory — then the LRU on-demand
+    resident yields (dispatch.ensure_headroom_for_load). That CONTENTION trigger,
+    not a clock, is the default. This idle sweep is the OPT-IN reclamation path:
+    it runs ONLY when the operator has explicitly set on_demand_ttl_s (present in
+    _RUNTIME_SETTINGS). Absent -> return immediately; contention alone governs
+    residency, so a model that just answered a chat is NOT torn down minutes
+    later (the drift this correction fixes).
+
+    When enabled, the sweep applies ONLY to IN-PROCESS residents: any non-static
+    one idle longer than on_demand_ttl_s is evicted (dispatch.evict cascades to
+    the llama singleton — RAM/VRAM actually frees). SLOT occupants are EXEMPT
+    (slots stay filled — slice 9 — and a seat changes hands only via LRU
+    promotion or explicit unload). Static never yields anywhere."""
+    if "on_demand_ttl_s" not in _RUNTIME_SETTINGS:
+        return                              # idle reclamation off -> contention only
+    ttl = int(_RUNTIME_SETTINGS["on_demand_ttl_s"])
     from ..managers.dispatch.dispatch import (
         last_used_snapshot, evict)
     seated = _slot_occupants()
@@ -2850,8 +2957,10 @@ def _fill_empty_slots(state: "WorkerState") -> None:
 
 
 def _residency_sweep_loop(state: "WorkerState") -> None:
-    """Residency maintenance every 60s: fill empty slots (slice 9), then
-    TTL-yield idle in-process on-demand residents."""
+    """Residency maintenance every 60s: fill empty slots (slice 9), then run the
+    idle TTL sweep — which is a no-op unless the operator opted into
+    on_demand_ttl_s (contention governs residency by default; see
+    _residency_sweep_once and dispatch.ensure_headroom_for_load)."""
     started_at = time.time()
     while True:
         time.sleep(60.0)
@@ -3383,6 +3492,22 @@ def main(argv: list[str] | None = None) -> int:
         set_residency_lookup(_residency)
     except Exception as _exc:  # noqa: BLE001
         logger.warning("slot eviction policy not registered: %s", _exc)
+
+    # Contention-based residency (doctrine 2026-07-11): an on-demand model stays
+    # resident until a NEW load needs its memory — then the LRU on-demand
+    # resident yields (never static / pinned / gate-busy / slot-backed). dispatch
+    # owns the LRU mechanism; the worker registers the box-specific fit-guard +
+    # yield predicate + a post-evict trim so each headroom re-check sees the
+    # freed memory. See dispatch.ensure_headroom_for_load; the old idle clock
+    # (_residency_sweep_once) is now opt-in behind on_demand_ttl_s.
+    try:
+        from ..managers.dispatch.dispatch import (set_fit_check, set_evictable,
+                                                  set_post_evict_hook)
+        set_fit_check(_worker_fit_check)
+        set_evictable(_worker_evictable)
+        set_post_evict_hook(_trim_host_ram)
+    except Exception as _exc:  # noqa: BLE001
+        logger.warning("contention residency hooks not registered: %s", _exc)
 
     # Worker-local slot pool (SLOT_COUNT; settings > env > default).
     _supervise_slots()

@@ -143,28 +143,180 @@ def _existing_sibling_task_dir(root: str, runtime: str, hub_path: str) -> str | 
     return None
 
 
-def route_destination(model: dict, root: str = DEFAULT_ROOT) -> str:
-    # An already-resolved on-disk dir (recorded by discovery) is authoritative: a
-    # model's task may have been content-corrected AWAY from the task folder its
-    # files physically sit in, so the real path beats a task reconstruction.
-    _dir = model.get("dir")
-    if _dir and os.path.isdir(_dir):
-        return _dir
-    hub_id    = model.get("hub_id") or model.get("name") or model.get("folder") or ""
-    framework = (model.get("framework") or "").strip()
-    task      = resolve_task(model)
-    hub_path  = safe_path_part(hub_id)
+# ---------------------------------------------------------------------------
+# Storage layout — operator-locked 2026-07-11: FLAT.
+#
+#   models/<runtime>/<owner>/<repo>        (datasets keep datasets/<owner>/<repo>)
+#
+# The task segment DIED. It baked derived, mutable, PLURAL metadata (a model
+# advertises many tasks) into an IMMUTABLE path — which produced task-twin dirs
+# (the same repo under text-generation AND image-text-to-text), sticky wrong-task
+# discovery, empty re-routed dirs with the weights stranded in legacy misc/, and
+# the "redownload models that are ready" complaints. Task/framework now live
+# ONLY in the registry + the per-dir hugpy.json marker. route_destination() emits
+# the flat path for ALL new work; resolve_model_dir() reads THROUGH every
+# historical layout so a model already on disk under an old task path is never
+# re-downloaded, mis-flagged, or 404'd — during OR after the migration.
+# ---------------------------------------------------------------------------
 
-    if task == "dataset":
+# Runtime families = the top storage segment. "misc" is the catch-all runtime
+# (comfy + any odd loader); "safetensors" is a historical family kept for reads.
+RUNTIME_FAMILIES = ("gguf", "transformers", "misc", "safetensors")
+
+
+def _hub_path_of(model: dict) -> str:
+    return safe_path_part(
+        model.get("hub_id") or model.get("name") or model.get("folder") or "")
+
+
+def flat_destination(model: dict, root: str = DEFAULT_ROOT) -> str:
+    """The FLAT write target — models/<runtime>/<owner>/<repo> — where ALL new
+    downloads land. No task segment. Single source of truth for the new layout;
+    datasets keep their own top-level home (unchanged)."""
+    hub_path = _hub_path_of(model)
+    if resolve_task(model) == "dataset":
         return os.path.join(root, "datasets", hub_path)
-
-    runtime = runtime_folder(framework, hub_id,
+    runtime = runtime_folder(model.get("framework") or "", hub_path,
                              include=model.get("include"),
                              filename=model.get("filename"))
-    dest = os.path.join(root, "models", runtime, safe_path_part(task), hub_path)
-    if os.path.isdir(dest):
-        return dest
-    # Reconstructed path isn't there — the files may sit under the download-time
-    # task folder. Prefer an existing sibling over a path that doesn't exist; a
-    # genuinely new download has no sibling, so it correctly falls back to `dest`.
-    return _existing_sibling_task_dir(root, runtime, hub_path) or dest
+    return os.path.join(root, "models", runtime, hub_path)
+
+
+def _routing_as_cfg(model: dict):
+    """A minimal cfg shim for model_looks_downloaded from a bare routing dict
+    (which carries no ModelConfig). Only the fields the completeness gate reads
+    matter: framework (the gguf branch), filename/include (pin + vision), and
+    primary_task/tasks (the vision-needs-mmproj gate)."""
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        framework=model.get("framework"),
+        filename=model.get("filename"),
+        include=model.get("include"),
+        primary_task=model.get("primary_task") or model.get("task"),
+        tasks=model.get("tasks"),
+    )
+
+
+def legacy_task_dirs(hub_path: str, runtime: str, root: str = DEFAULT_ROOT) -> list:
+    """Every task-based legacy dir on disk holding this repo under ``runtime``:
+    models/<runtime>/<task>/<owner>/<repo>. The task segment is globbed, so this
+    finds task-twins (the same repo under several task folders) without knowing
+    the task set in advance. Sorted for a deterministic order."""
+    import glob as _glob
+    pattern = os.path.join(root, "models", runtime, "*", hub_path)
+    return sorted(d for d in _glob.glob(pattern) if os.path.isdir(d))
+
+
+def candidate_model_dirs(model: dict, root: str = DEFAULT_ROOT) -> list:
+    """ORDERED list of every dir this model's files might occupy, best-layout
+    first — the read-through search order AND the reconcile survey set:
+
+      1. the entry's recorded on-disk dir (discovery ground truth): ``dir``,
+         then MODELS_HOME/``folder``;
+      2. the FLAT path models/<runtime>/<owner>/<repo>;
+      3. legacy task dirs models/<runtime>/<task>/<owner>/<repo> — the model's
+         advertised primary_task first, then the rest, deterministically;
+      4. the same across the OTHER runtime families (a repo mis-filed under a
+         different family, or a text gguf vs. its vision twin).
+
+    De-duplicated, order-preserving. Dirs need NOT exist — callers test."""
+    hub_path = _hub_path_of(model)
+    task = resolve_task(model)
+    out: list = []
+    seen: set = set()
+
+    def _add(d):
+        if d and d not in seen:
+            seen.add(d)
+            out.append(d)
+
+    if task == "dataset":
+        _add(os.path.join(root, "datasets", hub_path))
+        return out
+
+    rec = model.get("dir")
+    if rec:
+        _add(rec)
+    folder = model.get("folder")
+    if folder:
+        _add(folder if os.path.isabs(folder)
+             else os.path.join(root, "models", folder))
+
+    primary_runtime = runtime_folder(model.get("framework") or "", hub_path,
+                                     include=model.get("include"),
+                                     filename=model.get("filename"))
+    families = [primary_runtime] + [f for f in RUNTIME_FAMILIES
+                                    if f != primary_runtime]
+    for fam in families:
+        _add(os.path.join(root, "models", fam, hub_path))        # flat
+        legacy = legacy_task_dirs(hub_path, fam, root)           # task-based
+        legacy.sort(key=lambda d: (0 if os.sep + task + os.sep in d else 1, d))
+        for d in legacy:
+            _add(d)
+    return out
+
+
+def _safe_complete(directory: str, cfg) -> bool:
+    """``model_looks_downloaded``, guarded and re-entrancy-safe.
+
+    route_destination is also called DURING import-time registry construction
+    (models_config's ``MODEL_REGISTRY = get_models_dict()`` -> comfy sweep ->
+    route_destination), at which point ``config.main`` is only PARTIALLY
+    initialized on the current import stack. Importing it there would re-enter a
+    half-built module. So we use the rich ``model_looks_downloaded`` ONLY when
+    ``config.main`` is ALREADY fully loaded in sys.modules (always true at
+    runtime — it defines DEFAULT_PATHS, imported by the whole package), and fall
+    back to a weak "exists and non-empty" signal otherwise. Every REAL
+    resolution (loads, /models, reconcile) runs at runtime and gets the rich
+    verdict; the weak fallback only ever serves the import-time sweep, which
+    doesn't need read-through. Never raises into a resolve."""
+    try:
+        import sys as _sys
+        main_name = __name__.rsplit(".", 3)[0] + ".config.main"  # imports.config.main
+        main_mod = _sys.modules.get(main_name)
+        mld = getattr(main_mod, "model_looks_downloaded", None) if main_mod is not None else None
+        if mld is not None:
+            return bool(mld(directory, cfg))
+    except Exception:
+        pass
+    try:
+        return os.path.isdir(directory) and bool(os.listdir(directory))
+    except OSError:
+        return False
+
+
+def resolve_model_dir(model: dict, root: str = DEFAULT_ROOT, cfg=None,
+                      require_complete: bool = True):
+    """Read-through resolver — the ONE place that turns a routing/config into the
+    real on-disk dir, checking the FLAT layout first, then EVERY legacy layout
+    (see candidate_model_dirs). Returns the first dir that passes
+    ``model_looks_downloaded``. This is the guarantee that a model downloaded
+    under an OLD task path is never re-downloaded or 404'd during (or after) the
+    migration. Loaders/provisioners route through it.
+
+      require_complete=True  -> first COMPLETE dir, else None.
+      require_complete=False -> first COMPLETE dir, else the first EXISTING dir
+                                (so resume/delete/status act on the real partial
+                                files, never orphaning them), else the flat write
+                                target for a genuinely-new download.
+    """
+    _cfg = cfg if cfg is not None else _routing_as_cfg(model)
+    cands = candidate_model_dirs(model, root)
+    for d in cands:
+        if os.path.isdir(d) and _safe_complete(d, _cfg):
+            return d
+    if require_complete:
+        return None
+    for d in cands:
+        if os.path.isdir(d):
+            return d
+    return flat_destination(model, root)
+
+
+def route_destination(model: dict, root: str = DEFAULT_ROOT) -> str:
+    """THE single path chokepoint. Reads resolve through every historical layout
+    (flat + legacy task dirs + misc/other families); a genuinely-new download
+    with nothing on disk gets the FLAT target models/<runtime>/<owner>/<repo>.
+    Kept single-positional-arg compatible (root optional) — every call site and
+    the worker-side re-export depend on that shape."""
+    return resolve_model_dir(model, root, require_complete=False)

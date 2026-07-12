@@ -243,6 +243,30 @@ def model_looks_downloaded(path: str, cfg: Optional[ModelConfig] = None) -> bool
 
 
 
+def _resolved_local(key: str, cfg, local: str) -> str:
+    """The folder-based path, unless it isn't complete AND a copy exists under
+    another (legacy/flat) layout — then the read-through resolver's dir. This
+    routes the imagegen/embed/keywords/summarizer LOAD path (via DEFAULT_PATHS)
+    through the same resolver ensure_model uses, so a model on disk under an OLD
+    task path is never 404'd into a re-download during the store flattening."""
+    try:
+        if model_looks_downloaded(local, cfg):
+            return local
+        from ..src.constants.paths import resolve_model_dir
+        routing = {
+            "hub_id": getattr(cfg, "hub_id", None),
+            "framework": getattr(cfg, "framework", None),
+            "filename": getattr(cfg, "filename", None),
+            "include": getattr(cfg, "include", None),
+            "primary_task": getattr(cfg, "primary_task", None),
+            "tasks": getattr(cfg, "tasks", None),
+            "folder": getattr(cfg, "folder", None),
+        }
+        return resolve_model_dir(routing, cfg=cfg) or local
+    except Exception:  # noqa: BLE001 — never raise into resolution
+        return local
+
+
 def resolve_model_source(key: str) -> str:
     cfg = get_model_config(key)
     local = get_model_path(key)
@@ -252,6 +276,9 @@ def resolve_model_source(key: str) -> str:
         raise FileNotFoundError(
             f"MODEL_{key.upper()}={env_override} was set but path does not exist"
         )
+
+    # Read through every historical layout before concluding "not downloaded".
+    local = _resolved_local(key, cfg, local)
 
     if cfg.framework == "gguf":
         if not model_looks_downloaded(local, cfg):

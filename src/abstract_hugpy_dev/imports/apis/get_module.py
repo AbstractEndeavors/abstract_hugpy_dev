@@ -380,6 +380,18 @@ def discover_models(save_json: bool = True, verbose: bool = True, use_hub: bool 
         if gguf:
             row["filename"] = os.path.relpath(gguf, directory)
 
+        # De-tasking (operator-locked 2026-07-11): task is DERIVED metadata that
+        # lives in the marker/registry/hub — never baked as truth from the path.
+        # In the flat layout there IS no task segment, so a dir with no marker
+        # and no hub/config task yields task=None here. Flag such a dir
+        # `needs_classification` (rather than silently committing a path guess)
+        # so the console can prompt for a real task. A task sourced ONLY from the
+        # legacy layout path (a not-yet-migrated task dir) is likewise flagged —
+        # its path-derived task is provisional until the marker confirms it.
+        task_src = meta_sources.get("primary_task") or meta_sources.get("tasks")
+        if row.get("primary_task") is None or task_src in (None, "layout_path"):
+            row["needs_classification"] = True
+
         rows.append((name, owner, row))
         if verbose:
             print(f"[enrich] {hub_id}: {meta_sources}")
