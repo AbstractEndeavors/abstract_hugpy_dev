@@ -96,7 +96,15 @@ def get_model_path(key: str):
         return env_override
     cfg = get_model_config(key)
     path = os.path.join(MODELS_HOME,cfg.folder)
-    return path
+    # Read-through (2026-07-12 hotfix): cfg.folder is CENTRAL's layout — after
+    # the store flattening it names the FLAT dir, but a worker's files may
+    # still sit under a legacy task path. Without the resolver here, every
+    # presence check (provision.model_is_local) and loader that builds its
+    # path from this function declared migrated models "missing" fleet-wide,
+    # and the reconcile loops re-pull-stormed central (503s / broken pipes /
+    # failed chats). _resolved_local returns the folder path when complete,
+    # else the first complete dir under any historical layout.
+    return _resolved_local(key, cfg, path)
 
 
 def get_gguf_file(path: str, cfg: ModelConfig, prefer: Optional[str] = None) -> Optional[str]:
