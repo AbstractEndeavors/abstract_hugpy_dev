@@ -48,6 +48,32 @@ class ImageGenRequest(BaseModel):
     image_path: Optional[str] = None       # init image; rides remote._PATH_KEYS inliner
     strength: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     num_images: int = Field(default=1, ge=1, le=4)
+    # --- ID-LOCK (identity-locked STILLs) additive fields ---
+    # The image sibling of the studio VIDEO arm's id_lock (Wan-VACE reference-to-
+    # video): give reference image(s) of a subject and generate NEW stills that
+    # hold the identity, via ComfyUI's IP-Adapter (video_intel.studio.enums:
+    # AttentionMethod.IP_ADAPTER — "ID-2 (b): zero-train reference embedding"). Read
+    # ONLY by the comfy runner + its IPAdapter graph; every diffusers runner ignores
+    # them. All absent -> today's behaviour EXACTLY (plain text2img / img2img).
+    #
+    # reference_images: jailed abs paths of the subject reference still(s), in order
+    # (at most _MAX_REFERENCE_IMAGES; the builder jail-resolves + count-checks them).
+    # A comfy worker (127.0.0.1) can't see central's UPLOADS_HOME, so the offload
+    # transport carries the BYTES in reference_images_b64 instead — remote._worker_
+    # payload reads the paths, base64s them into reference_images_b64, and DROPS the
+    # unreachable paths (mirrors VisionAnalysisRequest.image_b64, which likewise
+    # carries bytes on the schema for offload). The comfy runner prefers b64 when
+    # present, else uploads straight from the paths (the in-process / worker-local
+    # case). NB: this is a request FIELD, not remote._PATH_KEYS single-file inlining
+    # — the latter handles one path via the worker's _materialize_file, and a
+    # multi-image rematerializer there is out of this slice's agent.py scope.
+    reference_images: Optional[List[str]] = Field(default=None, max_length=4)
+    reference_images_b64: Optional[List[str]] = Field(default=None, max_length=4)
+    # id_strength -> the IPAdapter apply node's `weight` (how hard the reference
+    # embedding pulls the sample toward the subject). 0 = ignore the reference,
+    # 1 = maximal identity hold; ~0.6 is the balanced default. None on the wire is
+    # coerced to the default by the builder so the graph always has a concrete weight.
+    id_strength: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     # b64 in the result is what lets HTTP callers (the discord bot) fetch the
     # bytes without a second round-trip; set False for in-process callers that
     # only want the saved paths.

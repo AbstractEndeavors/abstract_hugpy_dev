@@ -94,21 +94,15 @@ _DETERMINISTIC_ML = {"document-extraction", "url-extraction"}
 # Per-amenity dependency probe -> the extra that provides it. Reported by GET /ml
 # so the UI shows enabled tools vs a clean "enable with abstract_hugpy_dev[X]"
 # affordance — WITHOUT importing the heavy dep (find_spec only; phone-clean).
-ML_DEP = {
-    "transcribe": ("whisper", "audio"),
-    "summarize":  ("transformers", "transformers"),
-    "keywords":   ("keybert", "keywords"),
-    "embed":      ("sentence_transformers", "embed"),
-    "similarity": ("sentence_transformers", "embed"),
-    "vision":     ("llama_cpp", "engine"),
-    "imagine":    ("diffusers", "imagegen"),
-    "extract":    ("pdfplumber", "extract"),
-    "fetch":      ("bs4", "web"),
-    "depth":      ("transformers", "transformers"),
-    "detect":     ("transformers", "transformers"),
-    "classify":   ("transformers", "transformers"),
-    "segment":    ("transformers", "transformers"),
-}
+#
+# DERIVED (not hand-copied) from the canonical task->dependency map in
+# managers.task_deps, joined through ML_TASKS so this route-keyed view and the
+# WORKER's task-keyed ``task_capabilities`` advertisement can never drift on which
+# module powers which task. (2026-07-11: the drift is exactly what let requests
+# reach workers that couldn't run the task and fail at request time.)
+from abstract_hugpy_dev.managers.task_deps import TASK_DEPS
+ML_DEP = {name: TASK_DEPS[task] for name, task in ML_TASKS.items()
+          if task in TASK_DEPS}
 
 
 def _have(mod: str) -> bool:

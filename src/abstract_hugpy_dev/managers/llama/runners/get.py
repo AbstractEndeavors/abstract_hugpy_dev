@@ -125,6 +125,37 @@ def get_llama_runner(model_key: str) -> "LlamaCppBaseRunner":
         return runner
 
 
+def _require_profile_ready(model_key: str) -> "dict | None":
+    """Env-profiles (stage 1) gate for the slot seat path.
+
+    Returns the profile decision ``{'name','state','bin',...}`` when a dependency
+    profile is attributed to ``model_key`` and is READY (the caller ships
+    ``opts['profile_bin']`` so the slot child launches from that venv), or None
+    when the model has no profile (base behavior, untouched).
+
+    RAISES ``LocalEngineUnavailable`` when a profile is attributed but NOT ready
+    (materializing/error) — a profiled model must NEVER fall back to the shared
+    venv (that would reintroduce the exact dependency conflict the profile
+    isolates). The message is errors-as-data naming the profile + its state.
+    """
+    try:
+        from ...serve import profiles
+        resolve = profiles.resolve_model(model_key)
+    except Exception:  # noqa: BLE001 — profiles unavailable -> base behavior
+        return None
+    if not resolve:
+        return None
+    if resolve.get("state") != "ready":
+        detail = f": {resolve.get('error')}" if resolve.get("error") else ""
+        raise LocalEngineUnavailable(
+            f"model {model_key!r} is attributed to dependency profile "
+            f"{resolve.get('name')!r}, which is {resolve.get('state')}{detail} — "
+            "the model will seat once the profile finishes materializing; it will "
+            "NOT fall back to the shared venv (that would reintroduce the "
+            "dependency conflict the profile isolates)")
+    return resolve
+
+
 def _build_runner(model_key: str) -> "LlamaCppBaseRunner":
     # Per-box "never serve locally" policy: every branch below is a LOCAL serve
     # (slot spawn, native --mmproj/--rpc llama-server spawn, or in-process
@@ -136,6 +167,13 @@ def _build_runner(model_key: str) -> "LlamaCppBaseRunner":
     if no_local_serving():
         raise LocalEngineUnavailable(local_serving_error(
             model_key, detail="local GGUF serving is disabled on this box"))
+
+    # Env-profiles (stage 1): if this model is attributed to a dependency profile,
+    # resolve it up front. A non-ready profile RAISES here (propagates — never
+    # caught by the slot-fallback try below, so a profiled model never silently
+    # serves from the shared venv). A ready profile rides into the slot seat as
+    # opts['profile_bin'] so the child launches from the profile venv.
+    _profile = _require_profile_ready(model_key)
 
     # Cross-machine shard lead: a spill override set HUGPY_RPC_SERVERS, meaning
     # the allocator pooled remote GPUs for this load. The 0.3.x python binding
@@ -226,6 +264,14 @@ def _build_runner(model_key: str) -> "LlamaCppBaseRunner":
                             pass
                 except Exception:
                     opts = None
+                # Env-profiles (stage 1): a ready profile's venv bin dir rides to
+                # the slot so its child launches from that venv (python-child
+                # interpreter swap + PATH prefer). The slot is a separate process
+                # that can't read the agent's settings, so it arrives as an opt.
+                if _profile is not None and _profile.get("bin"):
+                    opts = opts or {}
+                    opts["profile_bin"] = _profile["bin"]
+                    opts["profile"] = _profile.get("name")
                 sep = SlotPool().endpoint_for(model_key, opts=opts)
                 if sep:
                     logger.info("get_llama_runner: %s -> slot %s (loaded on demand)",
@@ -233,11 +279,33 @@ def _build_runner(model_key: str) -> "LlamaCppBaseRunner":
                     return LlamaCppRunner(model_key, base_url=sep)
                 logger.warning("get_llama_runner: every slot is busy with another "
                                "model — %s falls back to in-process", model_key)
+        except LocalEngineUnavailable:
+            raise                     # profile refusal must never fall back
         except Exception as exc:
+            # A profiled model must not silently drop to the shared-venv in-process
+            # path when its slot seat fails — surface it as errors-as-data instead.
+            if _profile is not None:
+                raise LocalEngineUnavailable(
+                    f"model {model_key!r} needs dependency profile "
+                    f"{_profile.get('name')!r} but the slot seat failed "
+                    f"({type(exc).__name__}: {exc}) — refusing the shared-venv "
+                    "in-process fallback") from exc
             # endpoint_for surfaces the slot agent's preflight reason verbatim
             # (e.g. "needs ~42 GB RAM (all shards) but only 12 GB available").
             logger.warning("get_llama_runner: slot load refused for %s: %s — "
                            "falling back", model_key, exc)
+        # Env-profiles (stage 1): a profiled model must seat in a slot from its
+        # profile venv. If we reach here it's ready but unseatable (SLOT_COUNT=0 /
+        # slots disabled, or every slot busy) — refuse rather than drop to the
+        # shared-venv in-process/vision path. Stage 1 serves profiled models only
+        # via slot children; the in-process consumer arrives with stage 3.
+        if _profile is not None:
+            raise LocalEngineUnavailable(
+                f"model {model_key!r} needs dependency profile "
+                f"{_profile.get('name')!r} (ready) but no slot could seat it "
+                "(SLOT_COUNT=0 / slots disabled, or all slots busy) — stage 1 "
+                "serves profiled models only via slot children; refusing the "
+                "shared-venv in-process fallback")
         # Vision GGUFs: the in-process llama-cpp-python multimodal handler fails to
         # load the projector ("Failed to load mtmd context from <mmproj>"). A native
         # llama-server --mmproj loads it C-side and serves images correctly, so spawn/

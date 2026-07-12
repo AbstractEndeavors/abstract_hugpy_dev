@@ -158,7 +158,7 @@ Runner = remote.make_delegating_runner(fw, task)
 runner = Runner(types.SimpleNamespace(model_key=MODEL))
 
 _reset()
-remote._select = lambda mk, pool=None: (dict(W1), {})
+remote._select = lambda mk, pool=None, task=None: (dict(W1), {})
 remote.set_worker_candidates_provider(lambda mk, pool=None: [dict(W1)])
 remote._inflight_try_acquire("w1", MODEL, 1)  # saturate the only holder
 

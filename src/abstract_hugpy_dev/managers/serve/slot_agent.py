@@ -186,8 +186,18 @@ def _ensure_present(model_key, central_url):
 
 
 def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None,
-               path=None, gpu_mem_gib=None, cpu_mem_gib=None):
-    """argv for the child llama-server + the resolved (ngl, ctx, threads, cpus)."""
+               path=None, gpu_mem_gib=None, cpu_mem_gib=None, profile_bin=None):
+    """argv for the child llama-server + the resolved (ngl, ctx, threads, cpus).
+
+    ``profile_bin`` (env-profiles stage 1): when the agent seats a model
+    attributed to a dependency profile, it hands the profile venv's bin dir here.
+    The PYTHON-launched child (``python -m llama_cpp.server`` — the fallback when
+    no native llama-server binary exists) is then spawned from THAT venv's
+    interpreter instead of the agent's, isolating the model's extra deps at the
+    process seam. The native-binary child is unaffected in argv (its binary is
+    resolved by the engine resolver); its PATH still prefers the profile bin via
+    the child env (see ``Slot.load``), so a profile-shipped binary would win.
+    """
     from .serve import (
         _model_file_for, _ctx_for, get_model_config,
         LLAMA_SERVER_BIN, DEFAULT_LLAMA_THREADS,
@@ -337,8 +347,16 @@ def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None,
                 "would be silently ignored. Install/point to a llama-server "
                 "build (`hugpy install-engine`) to seat vision models.")
         import sys as _sys
+        # Env-profiles (stage 1): launch this python child from the profile
+        # venv's interpreter when one is attributed (raises errors-as-data if the
+        # profile venv python is missing — never a silent shared-venv fallback).
+        from . import profiles as _profiles
+        child_py = _profiles.child_python(profile_bin, _sys.executable)
+        if profile_bin:
+            logger.info("slot %s: %s uses dependency profile venv %s (child %s)",
+                        SLOT_ID, model_key, profile_bin, child_py)
         argv = [
-            _sys.executable, "-m", "llama_cpp.server",
+            child_py, "-m", "llama_cpp.server",
             "--model", path,
             "--host", "127.0.0.1", "--port", str(SLOT_CHILD_PORT),
             "--n_gpu_layers", str(ngl), "--n_ctx", str(ctx),
@@ -361,6 +379,8 @@ class Slot:
         self.threads = None
         self.cpus = None
         self.gpu = None
+        self.profile_bin = None      # env-profiles (stage 1): the profile venv
+        # bin dir this model's child launches from (None = shared venv default).
         self.expected_bytes = None
         self.loaded_at = 0.0
         self.last_used = 0.0
@@ -425,6 +445,7 @@ class Slot:
                                "clearing the stale claim", SLOT_ID, self.model_key)
                 self.model_key = self.ngl = self.ctx = None
                 self.threads = self.cpus = self.gpu = self.expected_bytes = None
+                self.profile_bin = None
                 self.proc = None
         finally:
             self.lock.release()
@@ -445,6 +466,7 @@ class Slot:
             "threads": self.threads,
             "cpus": self.cpus,
             "gpu": self.gpu,
+            "profile_bin": self.profile_bin,   # env-profiles: child's venv, or None
             "allowed_cpus": _allowed_cpus(),   # kernel-enforced dedicated cores
             "loaded_at": self.loaded_at,
             "last_used": self.last_used,
@@ -462,17 +484,19 @@ class Slot:
     # -- lifecycle ---------------------------------------------------------
     def load(self, model_key, n_gpu_layers=None, ctx=None, threads=None,
              cpus=None, gpu=None, path=None, gpu_mem_gib=None,
-             cpu_mem_gib=None) -> dict:
+             cpu_mem_gib=None, profile_bin=None) -> dict:
         with self.lock:
             if self.model_key == model_key and self.healthy():
                 self.last_used = time.time()
                 return self.status()
 
             self._kill()
+            self.profile_bin = profile_bin or None
             (argv, self.ngl, self.ctx, self.threads, self.cpus,
              self.child_kind) = _build_cmd(
                 model_key, n_gpu_layers, ctx, threads, cpus, path=path,
-                gpu_mem_gib=gpu_mem_gib, cpu_mem_gib=cpu_mem_gib)
+                gpu_mem_gib=gpu_mem_gib, cpu_mem_gib=cpu_mem_gib,
+                profile_bin=self.profile_bin)
             # per-load GPU pin overrides the slot's MAIN_GPU default
             self.gpu = gpu if gpu not in (None, "") else MAIN_GPU
             self.expected_bytes = _model_expected_bytes(model_key)
@@ -494,6 +518,15 @@ class Slot:
                 if _ld:
                     env["LD_LIBRARY_PATH"] = _ld
             except Exception:  # noqa: BLE001 — never block a load on lib-path derivation
+                pass
+            # Env-profiles (stage 1): activate the profile venv for the CHILD only
+            # — prepend its bin dir to PATH (a profile-shipped binary wins) and set
+            # VIRTUAL_ENV. The agent process is never touched; only this child runs
+            # from the profile. No-op without a profile.
+            try:
+                from . import profiles as _profiles
+                env = _profiles.child_env(env, self.profile_bin)
+            except Exception:  # noqa: BLE001 — never block a load on env derivation
                 pass
             self.proc = subprocess.Popen(argv, env=env)
             self.model_key = model_key
@@ -527,6 +560,7 @@ class Slot:
             self._kill()
             self.model_key = self.ngl = self.ctx = None
             self.threads = self.cpus = self.gpu = self.expected_bytes = None
+            self.profile_bin = None
             return self.status()
 
     def _kill(self):
@@ -577,7 +611,8 @@ def build_app():
                                      body.get("cpus"), body.get("gpu"),
                                      path=body.get("path"),
                                      gpu_mem_gib=body.get("gpu_mem_gib"),
-                                     cpu_mem_gib=body.get("cpu_mem_gib")))
+                                     cpu_mem_gib=body.get("cpu_mem_gib"),
+                                     profile_bin=body.get("profile_bin")))
         except Exception as exc:  # noqa: BLE001
             return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
 

@@ -672,6 +672,47 @@ def video_studio_movie():
             return jsonify(
                 {"error": f"start_image is not an image (classified as {start_ref.kind})"}), 400
 
+    # IDENTITY LOCK (id_lock): movie-level subject reference image(s). When present the movie
+    # is an IDENTITY MOVIE — the runner renders EVERY segment capability id_lock (Wan-VACE
+    # reference-to-video) so the locked subject carries across scene changes. Accept EITHER a
+    # list of jailed "reference_images" paths OR "reference_image_asset_ids" (resolved via the
+    # media catalog). Each is jail-resolved + ffprobe/PIL-classified as an IMAGE (a non-image /
+    # jail-escaping / missing target is a clean 4xx here, not a deferred runner failure). Up to
+    # 4 (all consumed by diffusers 0.39). Mirrors /video/studio/i2v's reference handling.
+    reference_images_in = body.get("reference_images")
+    reference_asset_ids = body.get("reference_image_asset_ids")
+    if reference_images_in is None and isinstance(reference_asset_ids, list):
+        reference_images_in = []
+        for aid in reference_asset_ids:
+            uri = _resolve_asset_uri(aid)
+            if uri is None:
+                return jsonify(
+                    {"error": f"reference_image_asset_id not found in catalog: {aid!r}"}), 404
+            reference_images_in.append(uri)
+    resolved_refs: list = []
+    if reference_images_in is not None:
+        if not isinstance(reference_images_in, list):
+            return jsonify({"error": "reference_images must be a list of paths"}), 400
+        if len(reference_images_in) > 4:
+            return jsonify({"error": "at most 4 reference_images are accepted"}), 400
+        for raw in reference_images_in:
+            if not isinstance(raw, str) or not raw.strip():
+                return jsonify({"error": "each reference_image must be a non-empty path"}), 400
+            rp = _jail_resolve(raw)
+            if rp is None:
+                return jsonify({"error": "reference_image outside storage jail"}), 400
+            if not os.path.isfile(rp):
+                return jsonify({"error": "reference_image not found"}), 404
+            try:
+                iref = media_store.ingest(rp, kind_hint="image")
+            except Exception as exc:  # unreadable / not a real image = bad input
+                return jsonify(
+                    {"error": f"reference_image is not a readable media file: {exc}"}), 400
+            if iref.kind != "image":
+                return jsonify(
+                    {"error": f"reference_image is not an image (classified as {iref.kind})"}), 400
+            resolved_refs.append(iref.uri)
+
     try:
         spec = make_studio_movie(
             goals=tuple(goals),
@@ -692,6 +733,9 @@ def video_studio_movie():
             # Movie-level default trailing-frame count for vace_extend splices (a node may
             # override via its own context_frames). Absent -> the schema default (8).
             context_frames=body.get("context_frames", _DEFAULT_MOVIE_CONTEXT_FRAMES),
+            # IDENTITY LOCK: the validated reference image uris (jail-resolved + image-classified
+            # above). Non-empty -> an identity movie (every segment renders id_lock).
+            reference_images=tuple(resolved_refs),
         )
     except (ValueError, TypeError) as exc:  # bad node / geometry / chain = 400
         return jsonify({"error": str(exc)}), 400

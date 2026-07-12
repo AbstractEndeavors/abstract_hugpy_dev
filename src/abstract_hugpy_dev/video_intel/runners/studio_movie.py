@@ -26,9 +26,27 @@ in timeline order:
          first K output frames RECONSTRUCT the context and are DROPPED at assembly (see
          ASSEMBLY below) so no frame double-plays. A vace_extend segment routes to a real
          VACE model, so its per-segment vram budget is raised to the VACE floor
-         (``_VACE_EXTEND_MIN_BUDGET_GB``); on a GPU-less box it returns the VACE runner's
+         (``_VACE_MIN_BUDGET_GB``); on a GPU-less box it returns the VACE runner's
          graceful Err (NO_GPU/DEPS_MISSING/WEIGHTS_MISSING) — an HONEST per-segment error,
          NEVER a silent fallback to still-mode.
+       * "cut": a HARD SCENE CUT — NO frame carry at all. No branch still / context window
+         is extracted; the child is a FRESH render of its own prompt. The parent is NOT
+         trimmed (it plays in FULL) and assembly records the joint as ``{mode:"cut"}``.
+
+     IDENTITY MOVIE (movie-level ``reference_images`` set) — the operator's "take that id
+     and use it for a video: her on the beach, then playing volleyball". When the movie
+     carries reference image(s), EVERY segment (segment 0 included) renders capability
+     ``id_lock`` (Wan-VACE reference-to-video) with those references, so the locked SUBJECT
+     carries across every scene change. The per-segment budget is raised to the shared
+     ``_VACE_MIN_BUDGET_GB`` floor (id_lock routes through the VACE path, exactly like
+     vace_extend). The joint behavior is UNCHANGED per mode — a "still" joint still extracts
+     the branch frame and trims the parent, a "cut" joint still carries no frame — but the
+     RENDER of each segment is now reference-conditioned. On the VACE path the i2v
+     ``start_image`` (a "still" joint's branch frame) is ACCEPTED but UNUSED (the runner
+     conditions on the references, not a single still) — so for an identity movie the
+     REFERENCES win the conditioning; the branch frame governs only the parent TRIM at
+     assembly. There is no synthetic id_lock tier, so an identity movie on a GPU-less box
+     surfaces the VACE runner's graceful per-segment Err (see ``_VACE_MIN_BUDGET_GB``).
   b. The render goes through the SAME studio boundary the single-clip bus job uses:
      ``runners.studio_i2v.run_produce_clip`` (router -> manifest -> runner ->
      content-addressed clip). RESUME is content-addressed INSIDE ``produce_clip``:
@@ -119,18 +137,29 @@ _DRIFT_NOTE = ("still-mode splices condition each segment on ONE frame of its pa
                "motion is NOT carried across the splice. A joint's "
                "joint_mode='vace_extend' carries motion via VACE-extend (conditioning on "
                "the parent's trailing context_frames through the diffusers video+mask "
-               "extend idiom) instead of a single still.")
+               "extend idiom) instead of a single still. A joint_mode='cut' is a HARD "
+               "scene cut: no frame carry, the parent plays in full. With movie-level "
+               "reference_images set (an identity movie) every segment renders id_lock so "
+               "the subject carries across scene changes even though no pixels do — on the "
+               "VACE path the references win the conditioning (an i2v branch still is "
+               "accepted but unused; it governs only the parent trim).")
 
-# A ``vace_extend`` segment routes through the VACE path (Task.VACE_CONTROL), which is
-# served ONLY by real Wan-VACE models — the cheapest, wan2.1-vace-1.3b, needs ~6GB
-# (INT8 @ <=480p). A still segment stays on the movie's (often tiny/synthetic) budget,
-# so a vace_extend segment RAISES its own per-segment budget to this floor to actually
-# REACH the VACE model — never a silent downgrade to still-mode (that dishonesty is
-# banned). On a GPU-less box the render then returns the VACE runner's graceful
-# DEPS_MISSING/NO_GPU/WEIGHTS_MISSING (an honest per-segment Err), not a synthetic clip.
-# NOTE: vace-1.3b tops out at 480p, so a movie wider/taller than 832x480 surfaces an
-# honest VRAM_EXCEEDED (a bigger VACE model needs a bigger movie budget).
-_VACE_EXTEND_MIN_BUDGET_GB = 6.0
+# The SHARED Wan-VACE budget floor. Two segment kinds route through the VACE path
+# (Task.VACE_CONTROL), which is served ONLY by real Wan-VACE models — the cheapest,
+# wan2.1-vace-1.3b, needs ~6GB (INT8 @ <=480p):
+#   * a ``vace_extend`` splice (motion-carry across a join), and
+#   * EVERY segment of an IDENTITY MOVIE (movie-level ``reference_images`` -> capability
+#     ``id_lock`` -> Task.VACE_CONTROL reference-to-video).
+# A plain still/i2v/t2v segment stays on the movie's (often tiny/synthetic) budget, so a
+# VACE-bound segment RAISES its own per-segment budget to this floor to actually REACH the
+# VACE model — never a silent downgrade (that dishonesty is banned). On a GPU-less box the
+# render then returns the VACE runner's graceful DEPS_MISSING/NO_GPU/WEIGHTS_MISSING (an
+# honest per-segment Err), not a synthetic clip — IDENTICAL to the single-clip id_lock
+# path. There is NO synthetic id_lock/VACE tier BY DESIGN (no synthetic model declares
+# id_lock), so an identity movie is a real-box render; the honest GPU-less result is a
+# graceful Err. NOTE: vace-1.3b tops out at 480p, so a movie wider/taller than 832x480
+# surfaces an honest VRAM_EXCEEDED (a bigger VACE model needs a bigger movie budget).
+_VACE_MIN_BUDGET_GB = 6.0
 
 
 # --------------------------------------------------------------------------- #
@@ -301,14 +330,16 @@ def _assemble_movie(movie_root: str, work_dir: str, seg_records: "list[dict]",
         return assembly
 
     # Per-joint trim record + each segment's contribution WINDOW [head_drop, tail_end).
-    #   * tail_end (the PARENT trim, UNCHANGED): a segment with a NEXT completed segment
-    #     (its child) plays to child.resolved_branch + 1; the last (leaf) plays FULL.
-    #   * head_drop (NEW, vace_extend only): a segment RENDERED via vace_extend has its
-    #     first ``context_drop`` frames as a RECONSTRUCTION of its parent's context (the
-    #     kept mask=0 prefix), which overlaps the parent's tail — so drop them from this
-    #     segment's head (context_drop=0 for a still segment, so it plays [0, tail_end)
-    #     exactly as before). The joint records the CHILD's splice ``mode`` so the UI can
-    #     label it "still" vs "vace_extend" honestly.
+    #   * tail_end (the PARENT trim): a segment with a NEXT completed segment (its child)
+    #     plays to child.resolved_branch + 1 for a still/vace_extend child; a "cut" child
+    #     carries NO frame, so its parent plays in FULL (tail_end = the parent's frames — no
+    #     trim). The last (leaf) segment plays FULL.
+    #   * head_drop (vace_extend only): a segment RENDERED via vace_extend has its first
+    #     ``context_drop`` frames as a RECONSTRUCTION of its parent's context (the kept
+    #     mask=0 prefix), which overlaps the parent's tail — so drop them from this segment's
+    #     head (context_drop=0 for a still/cut segment, so it plays [0, tail_end) exactly as
+    #     before). The joint records the CHILD's splice ``mode`` so the UI can label it
+    #     "still" / "vace_extend" / "cut" honestly.
     # (segment clip path, head_drop, n_frames)
     contributions: "list[tuple[str, int, int]]" = []
     joints: "list[dict]" = []
@@ -316,20 +347,36 @@ def _assemble_movie(movie_root: str, work_dir: str, seg_records: "list[dict]",
         head_drop = int(rec.get("context_drop") or 0)   # vace_extend reconstructed prefix
         if p + 1 < len(completed):
             child = completed[p + 1]
-            rb = child["resolved_branch"]          # branch INTO this segment
-            tail_end = int(rb) + 1
-            joints.append({
-                "parent_segment_id": rec["segment_id"],
-                "child_segment_id": child["segment_id"],
-                "branch_frame": int(rb),
-                "trim_frames": tail_end,
-                # SPLICE MODE (child's): "still" or "vace_extend"; context_frames is the
-                # child's kept-context length (None for a still splice). The UI labels the
-                # splice from these — motion-carry is never silent.
-                "mode": child.get("joint_mode", "still"),
-                "context_frames": (child.get("context_frames")
-                                   if child.get("joint_mode") == "vace_extend" else None),
-            })
+            child_mode = child.get("joint_mode", "still")
+            if child_mode == "cut":
+                # SCENE CUT: no frame carry -> the parent plays in FULL (no trim). The joint
+                # records mode="cut" with branch_frame=None (a cut conditions on no frame) and
+                # trim_frames = the parent's full length (the spliced-row math reads a joint
+                # whose trim == full as an untrimmed block; see movieTimeline.deriveRow).
+                tail_end = int(rec["frames"])
+                joints.append({
+                    "parent_segment_id": rec["segment_id"],
+                    "child_segment_id": child["segment_id"],
+                    "branch_frame": None,
+                    "trim_frames": tail_end,
+                    "mode": "cut",
+                    "context_frames": None,
+                })
+            else:
+                rb = child["resolved_branch"]          # branch INTO this segment
+                tail_end = int(rb) + 1
+                joints.append({
+                    "parent_segment_id": rec["segment_id"],
+                    "child_segment_id": child["segment_id"],
+                    "branch_frame": int(rb),
+                    "trim_frames": tail_end,
+                    # SPLICE MODE (child's): "still" or "vace_extend"; context_frames is the
+                    # child's kept-context length (None for a still splice). The UI labels the
+                    # splice from these — motion-carry is never silent.
+                    "mode": child_mode,
+                    "context_frames": (child.get("context_frames")
+                                       if child_mode == "vace_extend" else None),
+                })
         else:
             tail_end = int(rec["frames"])          # leaf: full clip
         contributions.append((rec["clip_path"], head_drop, tail_end - head_drop))
@@ -385,6 +432,10 @@ def _write_movie_json(movie_root: str, spec: StudioMovieSpec, seg_records: "list
         "width": spec.width,
         "height": spec.height,
         "vram_budget_gb": spec.vram_budget_gb,
+        # IDENTITY LOCK: the movie-level subject references (empty for a plain movie). When
+        # non-empty every segment rendered capability id_lock (see each segment's capability).
+        "id_lock": bool(spec.reference_images),
+        "reference_images": list(spec.reference_images),
         "segments": seg_records,
         "joints": assembly.get("joints", []),
         "assembly": {
@@ -488,22 +539,45 @@ def run_generate_studio_movie(spec: StudioMovieSpec, job_id: str) -> JobResult:
         seg_out_root = os.path.join(movie_root, f"segment_{seg_i:02d}")
 
         # ---- decide this segment's conditioning + capability + joint mode ----
-        # segment 0: i2v from the movie start_image if given, else t2v (no parent to
-        # splice). Later segments splice onto their parent per goal.joint_mode:
+        # IDENTITY MOVIE (movie-level reference_images set): EVERY segment renders capability
+        # id_lock (Wan-VACE reference-to-video) so the locked SUBJECT carries across scene
+        # changes; the per-segment budget is raised to the shared VACE floor (id_lock routes
+        # through the VACE path, exactly like vace_extend). The per-mode JOINT behavior is
+        # UNCHANGED (a still joint still extracts + trims, a cut carries no frame) — only the
+        # RENDER is now reference-conditioned. On the VACE path an i2v start_image is ACCEPTED
+        # but UNUSED (the runner conditions on the references), so for an id-movie the
+        # REFERENCES win; a still joint's branch frame governs only the parent TRIM at assembly.
+        # Otherwise (PLAIN movie): segment 0 is i2v (movie start_image) else t2v; a later
+        # segment splices onto its parent per goal.joint_mode:
         #   * "still": i2v conditioned on ONE branch frame (start_image). No motion carry.
-        #   * "vace_extend": v2v (VACE) conditioned on the parent's TRAILING context
-        #     frames — motion is carried across the splice (see below).
+        #   * "vace_extend": v2v (VACE) conditioned on the parent's TRAILING context frames.
+        #   * "cut": a HARD scene cut — no frame carry; a FRESH render, parent plays in FULL.
+        id_refs = tuple(spec.reference_images or ())
+        is_id_movie = bool(id_refs)
         resolved_branch = None
         start_image = None
         vace_context_frames = None
         seg_joint_mode = "still"
         seg_context_frames = 0          # how many parent frames carried the motion (K)
         seg_context_drop = 0            # frames DROPPED from THIS segment's head at assembly
-        seg_budget = spec.vram_budget_gb
+        # An id-movie segment (id_lock) routes through VACE -> raise to the shared VACE floor.
+        seg_budget = (max(spec.vram_budget_gb, _VACE_MIN_BUDGET_GB)
+                      if is_id_movie else spec.vram_budget_gb)
         if seg_i == 0:
+            # Root: id_lock in an id-movie (the references define the render); else i2v from
+            # the movie start_image, else t2v. In an id-movie the movie start_image is
+            # ACCEPTED but the VACE runner ignores it (references win) — carried for provenance.
             start_image = spec.start_image.uri if spec.start_image is not None else None
-            capability = "i2v" if start_image else "t2v"
+            capability = "id_lock" if is_id_movie else ("i2v" if start_image else "t2v")
+        elif goal.joint_mode == "cut":
+            # SCENE CUT: no frame carry at all — no branch resolve / extraction. The child is a
+            # FRESH render (id_lock in an id-movie so the subject carries, else t2v). The parent
+            # plays in FULL: resolved_branch stays None so assembly does NOT trim it.
+            seg_joint_mode = "cut"
+            _emit("branching", {"segment_id": goal.segment_id, "mode": "cut"})
+            capability = "id_lock" if is_id_movie else "t2v"
         else:
+            # still / vace_extend splice onto the parent at a branch frame.
             # branch_frame null -> the parent's LAST frame (prev_frames - 1).
             raw = goal.branch_frame
             resolved_branch = (prev_frames - 1) if raw is None else int(raw)
@@ -525,6 +599,7 @@ def run_generate_studio_movie(spec: StudioMovieSpec, job_id: str) -> JobResult:
                 # RAISE the per-segment budget to the VACE floor so a real VACE model
                 # actually binds (a still segment stays on the movie's tiny/synthetic
                 # budget) — this is REQUIRED to reach the VACE path, NOT a silent downgrade.
+                # In an id-movie the references ALSO ride along (identity + motion-carry both).
                 k = goal.context_frames if goal.context_frames is not None else spec.context_frames
                 ctx_dir = os.path.join(seg_out_root, "context")
                 _emit("branching", {"segment_id": goal.segment_id, "branch_frame": resolved_branch,
@@ -541,10 +616,13 @@ def run_generate_studio_movie(spec: StudioMovieSpec, job_id: str) -> JobResult:
                 vace_context_frames = tuple(paths)
                 seg_context_frames = len(paths)     # actual K extracted = min(k, branch+1)
                 seg_context_drop = len(paths)        # the child reconstructs these -> drop at assembly
-                seg_budget = max(spec.vram_budget_gb, _VACE_EXTEND_MIN_BUDGET_GB)
+                seg_budget = max(spec.vram_budget_gb, _VACE_MIN_BUDGET_GB)
                 capability = "v2v"
             else:
-                # STILL (default, backward-compatible): condition on ONE branch frame (i2v).
+                # STILL (default, backward-compatible): condition on ONE branch frame. In an
+                # id-movie the render is id_lock (the references) + this branch still, which the
+                # VACE runner ACCEPTS but IGNORES (references win) — the still governs only the
+                # parent TRIM at assembly. In a plain movie it is the historical i2v.
                 branch_png = os.path.join(seg_out_root, "branch.png")
                 _emit("branching", {"segment_id": goal.segment_id,
                                     "branch_frame": resolved_branch, "mode": "still"})
@@ -556,7 +634,7 @@ def run_generate_studio_movie(spec: StudioMovieSpec, job_id: str) -> JobResult:
                                  f"branch frame {resolved_branch} from the parent clip: {tail}"),
                         retryable=False)))
                 start_image = branch_png
-                capability = "i2v"
+                capability = "id_lock" if is_id_movie else "i2v"
 
         # ---- deterministic per-segment seed (node override wins) ----
         seg_seed = goal.seed if goal.seed is not None else (spec.seed + seg_i)
@@ -580,6 +658,10 @@ def run_generate_studio_movie(spec: StudioMovieSpec, job_id: str) -> JobResult:
             model_id=(goal.model_id if goal.model_id is not None else spec.model_id),
             # VACE-EXTEND temporal conditioning (None for a still/i2v/t2v segment).
             vace_context_frames=vace_context_frames,
+            # IDENTITY LOCK: the movie-level subject references, passed on EVERY segment of an
+            # id-movie (capability id_lock) so the locked subject carries across scene changes.
+            # None for a plain movie.
+            reference_images=(id_refs if is_id_movie else None),
         )
 
         segments_meta[seg_i].update(status="generating")

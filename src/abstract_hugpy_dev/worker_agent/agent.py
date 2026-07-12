@@ -46,6 +46,7 @@ import threading
 import subprocess
 import urllib.request
 import urllib.error
+import weakref
 
 from flask import Flask, request, jsonify, Response, stream_with_context
 
@@ -1209,6 +1210,233 @@ def _supervise_slots() -> None:
     logger.info("slot supervisor: managing %d slot(s) via llama_cpp.server children", n)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Restart mechanism (2026-07-12 incident class — CODE_GAPS "2026-07-12" item 3)
+# ═══════════════════════════════════════════════════════════════════════════
+# Two real incidents (computron restart-loop 160→219; op's 403 dueling-worker
+# saga) traced to os.execv under systemd: execv KEEPS this PID but the way the
+# agent re-exec'd left systemd believing the service died, so Restart= respawned
+# a FRESH process that collided with the still-listening old image on :9100
+# ("Address already in use") and restart-looped while the orphan kept heart-
+# beating. The fix: UNDER SYSTEMD, never execv — release resources cleanly and
+# EXIT with a distinct code so systemd's Restart= respawns exactly ONE properly-
+# tracked process. STANDALONE (no systemd), execv in place is still correct and
+# is kept as-is.
+#
+# Exit-code convention: a wanted restart exits _RESTART_EXIT_CODE (a distinct
+# NON-ZERO). Non-zero matters because the canonical unit is `Restart=on-failure`
+# (install.py) — a zero exit would NOT respawn there; a non-zero one does, and it
+# also respawns under the field boxes' hand-rolled `Restart=always`. It is
+# deliberately DIFFERENT from _terminal_exit's exit 0 (a 401/403 eviction that
+# must STAY stopped under on-failure).
+_RESTART_EXIT_CODE = 42
+# Bound on how long a restart waits for in-flight generations to drain before it
+# stops honoring them and exits anyway (never hangs forever). Read defensively so
+# a malformed env value can never break the agent import.
+try:
+    _RESTART_DRAIN_TIMEOUT_S = max(
+        0.0, float(os.environ.get("HUGPY_WORKER_RESTART_DRAIN_S", "30")))
+except (TypeError, ValueError):
+    _RESTART_DRAIN_TIMEOUT_S = 30.0
+# Set the instant a restart is requested, so background loops (heartbeat self-
+# update, reconcile, provision kicks) stop scheduling NEW work into a process
+# that's about to exit — belt-and-suspenders against the "cannot schedule new
+# futures" spam (os._exit already skips the atexit teardown that raises it).
+_RESTART_EVENT = threading.Event()
+# Long-lived executors (e.g. provision's parallel-transfer pool) register here so
+# a restart can shut them down first. WeakSet: a finished pool drops out on GC.
+_ACTIVE_EXECUTORS: "weakref.WeakSet" = weakref.WeakSet()
+
+
+def restart_requested() -> bool:
+    """True once a restart is underway — background loops check this to stop
+    launching new transfers/updates into a process about to exit."""
+    return _RESTART_EVENT.is_set()
+
+
+def register_executor(ex) -> None:
+    """Register a long-lived executor so the restart path shuts it down first.
+    Best-effort/defensive: a bad object is simply ignored (never breaks a pull)."""
+    try:
+        _ACTIVE_EXECUTORS.add(ex)
+    except Exception:  # noqa: BLE001 — registration must never break the caller
+        pass
+
+
+def _parent_is_systemd() -> bool:
+    """True when this process's PARENT is the systemd manager — i.e. systemd
+    fork()+exec()'d us directly, so we are a service's MainPID. PID 1 for a
+    system unit; the `systemd --user` process for a user unit (computron/op run
+    user units). Reading /proc/<ppid>/comm is Linux-only and best-effort."""
+    ppid = os.getppid()
+    if ppid == 1:
+        return True
+    try:
+        with open(f"/proc/{ppid}/comm", "r", encoding="utf-8") as fh:
+            return fh.read().strip() == "systemd"
+    except OSError:
+        return False
+
+
+def _under_systemd() -> bool:
+    """True iff THIS process is the MainPID of a systemd service — i.e. exiting
+    will make systemd's Restart= respawn a fresh, cgroup-tracked process (so the
+    restart path must EXIT, not execv).
+
+    Why not just INVOCATION_ID / NOTIFY_SOCKET (the usual signals): both env vars
+    AND the `.service` cgroup are INHERITED by every descendant of a systemd
+    service. A worker launched inside another service's tree — a test under
+    station-keeper.service, a shell under a login scope — would falsely read
+    "systemd" and os._exit() out from under itself. So the signal is confirmed by
+    the PARENT: systemd launches a service's MainPID directly, so our parent is
+    the manager; a descendant's parent is a shell / the ancestor daemon instead.
+    This correctly reads True on the already-deployed field units (no unit-file
+    change needed) and False for tests/standalone runs.
+
+    Explicit override: HUGPY_WORKER_SYSTEMD=1/0 forces the decision — the
+    canonical unit MAY set =1 to be unambiguous; tests set 0/1 to pin a branch.
+    """
+    forced = os.environ.get("HUGPY_WORKER_SYSTEMD")
+    if forced is not None and forced.strip() != "":
+        return forced.strip().lower() in ("1", "true", "yes", "on")
+    if not (os.environ.get("INVOCATION_ID") or os.environ.get("NOTIFY_SOCKET")):
+        return False
+    return _parent_is_systemd()
+
+
+def _drain_generations(timeout_s: float) -> float:
+    """Bounded wait for in-flight in-process generations to finish before a
+    restart. Polls the gen-gate's TOTAL active permits; returns the seconds
+    waited once they hit 0 or ``timeout_s`` elapses — never hangs, and never
+    interrupts a native call (we wait for it to release the gate, up to the
+    bound, then proceed). Semantics: honor active generations for up to
+    ``timeout_s`` (default 30s), then exit regardless (systemd respawns; a client
+    mid-stream sees the connection drop, exactly as any restart)."""
+    start = time.monotonic()
+    deadline = start + max(0.0, timeout_s)
+    while True:
+        try:
+            active = gen_gate.total_in_flight()
+        except Exception:  # noqa: BLE001 — can't measure -> don't block the restart
+            active = 0
+        if active <= 0 or time.monotonic() >= deadline:
+            if active > 0:
+                logger.warning("restart drain: %d generation(s) still in flight "
+                               "after %.1fs — exiting anyway", active, timeout_s)
+            return round(time.monotonic() - start, 3)
+        time.sleep(0.2)
+
+
+def _shutdown_executors() -> None:
+    """Shut down registered long-lived executors BEFORE exit, so a still-running
+    transfer/reconcile thread can't race into 'cannot schedule new futures'.
+    Bounded (wait=False) and best-effort; cancels queued futures where the
+    runtime supports it (py>=3.9)."""
+    for ex in list(_ACTIVE_EXECUTORS):
+        try:
+            ex.shutdown(wait=False, cancel_futures=True)
+        except TypeError:            # cancel_futures added in 3.9
+            try:
+                ex.shutdown(wait=False)
+            except Exception:  # noqa: BLE001
+                pass
+        except Exception:  # noqa: BLE001 — one bad executor must not block the rest
+            pass
+
+
+def _close_http_server(state) -> bool:
+    """Release the listening socket (:9100) so the respawned process can bind
+    without an 'Address already in use' collision. Returns True if a server
+    handle was closed. Best-effort: server_close() only closes the listening
+    socket fd (safe whether or not serve_forever is running) — we do NOT call
+    shutdown() here, which would block forever if serve_forever never started
+    (registration-time self-update, tests). os._exit frees the fd regardless;
+    this makes the release explicit and testable."""
+    srv = getattr(state, "http_server", None)
+    if srv is None:
+        return False
+    try:
+        srv.server_close()
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _prepare_restart(state, *, reason: str, mode: str,
+                     kill_slots: bool, drain_timeout_s: "float | None" = None) -> dict:
+    """Perform the clean-shutdown steps for a restart and RETURN the plan.
+
+    This does the WORK (flag, drain, executor shutdown, slot teardown, socket
+    release) but never exits/execs — the seam (``_restart``) applies the plan's
+    mode. Split out so the shutdown sequence is unit-testable without terminating
+    the test process.
+
+    ``mode``: 'exit'  — systemd: caller os._exit(plan['exit_code']); Restart=
+                        respawns a fresh, cgroup-tracked process.
+              'execv' — standalone: caller execs in place (image replaced).
+    """
+    if drain_timeout_s is None:
+        drain_timeout_s = _RESTART_DRAIN_TIMEOUT_S
+    _RESTART_EVENT.set()                                   # 1. stop new work
+    plan: dict = {"reason": reason, "mode": mode,
+                  "exit_code": _RESTART_EXIT_CODE if mode == "exit" else None,
+                  "steps": ["shutdown_flag"]}
+    plan["drained_wait_s"] = _drain_generations(drain_timeout_s)   # 2. drain
+    plan["steps"].append("drained")
+    _shutdown_executors()                                          # 3. executors
+    plan["steps"].append("executors")
+    # 4. Slot children. Under 'exit' they must go: systemd's default
+    # KillMode=control-group tears down the whole cgroup on respawn anyway, so a
+    # clean terminate here beats an abrupt SIGKILL, and the fresh agent respawns
+    # them. Under 'execv' we only kill when asked (self-update: an orphaned slot
+    # would keep serving OLD code) — a plain re-exec ADOPTS live slots to avoid a
+    # blip, exactly as today.
+    if mode == "exit" or kill_slots:
+        _kill_slots()
+        plan["steps"].append("slots")
+    # 5. Listening socket. Only for 'exit' (execv relies on CLOEXEC to drop it,
+    # then re-binds fresh — the standalone path kept as today).
+    if mode == "exit":
+        plan["socket_closed"] = _close_http_server(state)
+        plan["steps"].append("socket")
+    return plan
+
+
+def _restart(state, *, reason: str, reexec_fn, kill_slots: bool = False) -> None:
+    """Apply a restart: clean shutdown, then EXIT (systemd) or execv (standalone).
+
+    ``reexec_fn`` is resolved by the caller at SCHEDULE time (see
+    ``_schedule_restart``) so a monkeypatched ``procutil.reexec`` is honored and a
+    late-firing timer can never call the real ``os.execv`` after a test restored
+    it. Under systemd this arg is unused (we os._exit instead)."""
+    mode = "exit" if _under_systemd() else "execv"
+    plan = _prepare_restart(state, reason=reason, mode=mode, kill_slots=kill_slots)
+    if mode == "exit":
+        logger.info("restart(%s): clean shutdown done %s — exiting %d for systemd "
+                    "respawn", reason, plan["steps"], plan["exit_code"])
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:  # noqa: BLE001
+            pass
+        os._exit(plan["exit_code"])
+    logger.info("restart(%s): standalone re-exec in place %s", reason, plan["steps"])
+    reexec_fn()
+
+
+def _schedule_restart(state, reason: str, *, kill_slots: bool = False,
+                      delay: float = 0.5) -> None:
+    """Ack-first restart used by the /ops handlers: schedule ``_restart`` to run
+    AFTER the caller sends its HTTP ack (the drain must not block the response).
+    ``procutil.reexec`` is resolved NOW so a monkeypatched no-op is captured in
+    the timer closure (test safety) and the standalone path honors it."""
+    from .._platform.procutil import reexec
+    threading.Timer(
+        delay,
+        lambda: _restart(state, reason=reason, reexec_fn=reexec, kill_slots=kill_slots),
+    ).start()
+
+
 def _apply_spill(spill: dict | None) -> None:
     """Translate a per-request spill override dict into the env vars the spill
     module reads. Only set keys that were provided; the model loads lazily, so
@@ -1790,10 +2018,12 @@ def build_app(state: "WorkerState") -> Flask:
 
     @app.route("/ops/restart", methods=["POST"])
     def ops_restart():
-        # Respond first, then re-exec: the caller needs the ack before the
-        # process replaces itself. Persistent worker-id -> same registry row.
-        from .._platform.procutil import reexec
-        threading.Timer(0.5, reexec).start()
+        # Respond first, then restart: the caller needs the ack before the
+        # process cycles. Under systemd this EXITS (Restart= respawns a fresh,
+        # cgroup-tracked process — never the os.execv orphan that squatted :9100
+        # and restart-looped); standalone re-execs in place. Persistent worker-id
+        # -> same registry row.
+        _schedule_restart(state, "ops/restart")
         return jsonify({"ok": True, "restarting": True,
                         "worker_id": state.worker_id})
 
@@ -1851,8 +2081,11 @@ def build_app(state: "WorkerState") -> Flask:
             return jsonify({"ok": False, "error": {
                 "code": type(exc).__name__, "message": str(exc)}}), 502
         if rc == 0:
-            from .._platform.procutil import reexec
-            threading.Timer(0.5, reexec).start()
+            # kill_slots: a fresh version is installed — any orphaned slot child
+            # would keep serving the OLD code (the adoption probe can't tell
+            # versions apart), so tear them down and let the fresh agent respawn
+            # them on the new code. Same discipline as the heartbeat self-update.
+            _schedule_restart(state, "ops/update", kill_slots=True)
             return jsonify({"ok": True, "installed": f"{args.pkg_name}=={target}",
                             "restarting": True})
         return jsonify({"ok": False, "error": {
@@ -2011,10 +2244,102 @@ def build_app(state: "WorkerState") -> Flask:
                     "code": "BadValue",
                     "message": "comfy_url must be an http(s) URL with a host "
                                "(e.g. https://comfy.example.ai), or null"}}), 400
+        if "hot_cache_root" in body:
+            # Per-worker attribution of the HOT-CACHE tier's root (the box-local
+            # NVMe LRU cache of the main catalog — managers/serve/hot_cache.py,
+            # which reads HUGPY_HOT_CACHE_ROOT live). This ONLY names WHERE the
+            # tier lives on this box (e.g. ae -> /mnt/hot990/hugpy-hot-cache); the
+            # tier stays an automatic LRU cache and the SHARED store stays the
+            # source of truth. null/"" CLEARS it (revert to the env base, else the
+            # tier is off) — same idiom as on_demand_ttl_s. A set value is checked
+            # SHAPE-ONLY (must be an absolute path), mirroring comfy_url's URL
+            # check: a not-yet-mounted root is accepted here and hot_cache.enabled()
+            # disables the tier gracefully until it exists, so config never blocks
+            # on a mount that is about to appear.
+            hcr = body["hot_cache_root"]
+            if hcr in (None, ""):
+                settings.pop("hot_cache_root", None)
+            elif isinstance(hcr, str) and os.path.isabs(hcr.strip()):
+                settings["hot_cache_root"] = hcr.strip().rstrip("/") or "/"
+            else:
+                return jsonify({"ok": False, "error": {
+                    "code": "BadValue",
+                    "message": "hot_cache_root must be an absolute path "
+                               "(e.g. /mnt/hot990/hugpy-hot-cache), or null to clear"}}), 400
+        if "profiles" in body:
+            # Env-profiles (stage 1): {"<name>": {"packages": [str,...]} | null}.
+            # DEEP-MERGE per profile; null/{}/"" clears one. Names slug-safe;
+            # packages a NON-EMPTY list of non-empty strings. A profile = a named
+            # venv (materialized in the background at boot — see main()) that a
+            # profiled model's SLOT CHILD launches from, isolating extra deps from
+            # the shared venv. The agent itself never installs into it.
+            from ..managers.serve import profiles as _profiles_mod
+            if not isinstance(body["profiles"], dict):
+                return jsonify({"ok": False, "error": {
+                    "code": "BadValue",
+                    "message": 'profiles must be {"<name>": {"packages": [str,...]}} '
+                               "(or null per name to clear)"}}), 400
+            pmerged = dict(settings.get("profiles") or {})
+            for name, spec in body["profiles"].items():
+                if not _profiles_mod.slug_ok(name):
+                    return jsonify({"ok": False, "error": {
+                        "code": "BadValue",
+                        "message": f"profile name {name!r} must be slug-safe "
+                                   "(letters/digits then . _ - , max 64 chars)"}}), 400
+                if spec in (None, {}, ""):
+                    pmerged.pop(name, None)
+                    continue
+                if not isinstance(spec, dict):
+                    return jsonify({"ok": False, "error": {
+                        "code": "BadValue",
+                        "message": f"profiles[{name!r}] must be an object with a "
+                                   "packages list, or null to clear"}}), 400
+                pkgs = spec.get("packages")
+                if (not isinstance(pkgs, list) or not pkgs
+                        or not all(isinstance(p, str) and p.strip() for p in pkgs)):
+                    return jsonify({"ok": False, "error": {
+                        "code": "BadValue",
+                        "message": f"profiles[{name!r}].packages must be a non-empty "
+                                   "list of non-empty strings"}}), 400
+                pmerged[name] = {"packages": [p.strip() for p in pkgs]}
+            if pmerged:
+                settings["profiles"] = pmerged
+            else:
+                settings.pop("profiles", None)
+        if "model_profiles" in body:
+            # Model->profile ATTRIBUTION (stage 1): {"<model_key>": "<name>" |
+            # null}. DEEP-MERGE; null/"" clears an attribution. The name is
+            # slug-safe but need NOT already exist (the two keys can arrive in
+            # either order across relay calls; a dangling attribution reports
+            # honestly and refuses to seat until the profile is declared+ready).
+            from ..managers.serve import profiles as _profiles_mod
+            if not isinstance(body["model_profiles"], dict):
+                return jsonify({"ok": False, "error": {
+                    "code": "BadValue",
+                    "message": 'model_profiles must be {"<model_key>": "<profile_name>"|null}'}}), 400
+            mmerged = dict(settings.get("model_profiles") or {})
+            for mk, pname in body["model_profiles"].items():
+                if pname in (None, ""):
+                    mmerged.pop(mk, None)
+                elif _profiles_mod.slug_ok(pname):
+                    mmerged[mk] = pname
+                else:
+                    return jsonify({"ok": False, "error": {
+                        "code": "BadValue",
+                        "message": f"model_profiles[{mk!r}] must be a slug-safe "
+                                   "profile name, or null to clear"}}), 400
+            if mmerged:
+                settings["model_profiles"] = mmerged
+            else:
+                settings.pop("model_profiles", None)
         _save_settings(args, settings)
-        logger.info("ops/config: persisted %s — re-exec to apply", settings)
-        from .._platform.procutil import reexec
-        threading.Timer(0.5, reexec).start()
+        logger.info("ops/config: persisted %s — restarting to apply", settings)
+        # Restart to re-project the settings over a clean base. Under systemd this
+        # EXITS and the fresh process gets the UNIT's env as the true base (so the
+        # env base-sentinels are unnecessary in that path); standalone re-execs
+        # and the sentinels carry the pre-projection base across the exec. Both
+        # lifecycles are documented at _apply_settings_env.
+        _schedule_restart(state, "ops/config apply")
         return jsonify({"ok": True, "settings": settings, "restarting": True})
 
     @app.route("/probe/<path:model_key>", methods=["POST", "GET"])
@@ -2252,6 +2577,10 @@ class WorkerState:
         # pre-provision downloads, so central (and the console) can show a %.
         self._provision_progress: dict[str, dict] = {}
         self._provision_lock = threading.Lock()
+        # The live werkzeug HTTP server (set in main() once bound). The restart
+        # path closes its listening socket to release :9100 cleanly before exit;
+        # None until the server is created (and in test clients that never bind).
+        self.http_server = None
 
     def provision_snapshot(self) -> dict:
         """A lock-safe copy of per-model download progress for the heartbeat."""
@@ -2301,6 +2630,10 @@ def _kick_provision(state: "WorkerState", model_key: str) -> None:
 
     Shared by assignment adoption and the UTIL-08 reconcile loop; the
     _provisioning guard makes concurrent kicks a no-op."""
+    if restart_requested():
+        # A restart is underway — don't spin up a NEW transfer pool into a process
+        # about to exit (it would only be torn down by _shutdown_executors).
+        return
     with state._provision_lock:
         if model_key in state._provisioning:
             return
@@ -2451,6 +2784,8 @@ def _reconcile_loop(state: "WorkerState") -> None:
     change; the _provisioning guard + single-flight lock keep it idempotent."""
     while True:
         time.sleep(max(60, int(_RUNTIME_SETTINGS.get("reconcile_interval_s", 600))))
+        if restart_requested():
+            return                      # stop scheduling transfers into an exit
         try:
             local = set(_models_local(state))
             for mk in list(state.assigned_models):
@@ -2521,13 +2856,21 @@ def _update_state_path(args) -> str:
 # shows truth.
 
 _SETTINGS_KEYS = {"slot_count", "residency", "on_demand_ttl_s",
-                  "reconcile_interval_s", "pinned", "comfy_url"}   # widen key by key
+                  "reconcile_interval_s", "pinned", "comfy_url",
+                  "hot_cache_root", "profiles", "model_profiles"}   # widen key by key
 _SETTINGS_SOURCE: dict = {}              # key -> "settings" | "env" | "default"
 _RUNTIME_SETTINGS: dict = {}             # the loaded settings, for live readers
 _COMFY_URL_BASE_ENV = "_HUGPY_COMFY_URL_BASE"  # sentinel: the pre-projection
 # COMFY_URL (systemd drop-in / env / none), captured once and carried across
 # os.execv so clearing the setting reverts to the real base, never the last
 # projected value.
+_ENV_HOT_CACHE_ROOT = "HUGPY_HOT_CACHE_ROOT"   # the env hot_cache.py reads live
+# (managers/serve/hot_cache.py::_root). Projecting the setting onto it is why the
+# tier needs NO code change to become a per-worker attributable setting.
+_HOT_CACHE_ROOT_BASE_ENV = "_HUGPY_HOT_CACHE_ROOT_BASE"  # sentinel: the pre-
+# projection HUGPY_HOT_CACHE_ROOT (drop-in / env / none), captured once and
+# carried across os.execv so clearing the setting reverts to the real base — the
+# exact same dance as _COMFY_URL_BASE_ENV.
 
 
 def _valid_comfy_url(cu: str) -> bool:
@@ -2565,6 +2908,30 @@ def _pinned(model_key: str) -> bool:
     pinned, files are never reaped, and residency overrides survive. (Reaper
     enforcement pending; advertised in the heartbeat config meanwhile.)"""
     return bool((_RUNTIME_SETTINGS.get("pinned") or {}).get(model_key))
+
+
+def _resolve_model_profile(model_key: str) -> "dict | None":
+    """Env-profiles (stage 1) resolver, registered onto managers.serve.profiles
+    so the runner spawn seam can decide without reading operator settings itself.
+
+    Reads the live ``model_profiles`` attribution + ``profiles`` manifest from
+    _RUNTIME_SETTINGS and returns, for an attributed model,
+    ``{'name','state','bin','error'}`` where ``state`` is ready|materializing|
+    error and ``bin`` is the profile venv's bin dir ONLY when ready (the value
+    the slot child's PATH/interpreter is built from). None when the model has no
+    profile — the base serving path is untouched."""
+    name = (_RUNTIME_SETTINGS.get("model_profiles") or {}).get(model_key)
+    if not name:
+        return None
+    spec = (_RUNTIME_SETTINGS.get("profiles") or {}).get(name) or {}
+    packages = spec.get("packages") or []
+    from ..managers.serve import profiles as _profiles
+    state = _profiles.state_for(name, packages)
+    out = {"name": name, "state": state,
+           "bin": _profiles.profile_bin_dir(name) if state == "ready" else None}
+    if state == "error":
+        out["error"] = (_profiles.read_state(name) or {}).get("error")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -2699,7 +3066,34 @@ def _save_settings(args, settings: dict) -> None:
 def _apply_settings_env(args) -> dict:
     """Project the settings file onto the env BEFORE anything reads it, so
     every existing consumer (managers.serve.slots._slot_count, …) sees the
-    operator's console-set values — and unit drop-ins lose, loudly."""
+    operator's console-set values — and unit drop-ins lose, loudly.
+
+    Runs ONCE at boot (main() calls it before the slot supervisor / any reader)
+    and is the ONLY projector — which is what makes the two restart lifecycles
+    below work.
+
+    ── Two restart lifecycles for the COMFY_URL / HUGPY_HOT_CACHE_ROOT sentinels ──
+    Those two settings are projected onto real env vars that live code reads
+    (COMFY_URL; managers/serve/hot_cache.py reads HUGPY_HOT_CACHE_ROOT). To let a
+    later CLEAR revert to the true drop-in/env BASE instead of leaking the last
+    projected value, the pre-projection base is captured once into a sentinel env
+    (_COMFY_URL_BASE_ENV / _HOT_CACHE_ROOT_BASE_ENV). Its lifecycle depends on how
+    the agent restarts (see the restart mechanism section):
+
+      * STANDALONE (os.execv): the exec INHERITS os.environ, so the projected
+        COMFY_URL and the sentinel both survive into the new image. The sentinel
+        is ESSENTIAL here — without it the next boot would recapture the already-
+        projected value as the "base" and a clear could never get back to the
+        real drop-in/env base. This is the dance the sentinels were built for.
+
+      * SYSTEMD (exit + respawn): the fresh process is started clean by systemd
+        with the UNIT's environment, so COMFY_URL/HUGPY_HOT_CACHE_ROOT are back to
+        their true base and NO sentinel is inherited. The sentinel is simply
+        recaptured from that clean base on this boot — harmless and correct
+        (base IS the env). So the sentinel is unnecessary in the systemd path but
+        does no harm; the ``if _X not in os.environ`` guards below make both
+        lifecycles converge to the same result.
+    """
     settings = _load_settings(args)
     _RUNTIME_SETTINGS.clear()
     _RUNTIME_SETTINGS.update(settings)
@@ -2735,6 +3129,38 @@ def _apply_settings_env(args) -> dict:
     else:
         os.environ.pop("COMFY_URL", None)         # no base -> 127.0.0.1:8188 default
         _SETTINGS_SOURCE["comfy_url"] = "default"
+    # HOT-CACHE ROOT — per-worker attribution of the box-local NVMe LRU tier.
+    # managers/serve/hot_cache.py reads HUGPY_HOT_CACHE_ROOT live, so projecting
+    # the setting ONTO that env is the whole mechanism (the tier code is
+    # untouched): resolution order becomes settings > env base > unset. Same
+    # base-sentinel dance as COMFY_URL so a later clear reverts to the true
+    # drop-in/env base instead of leaking the last projected value across execv.
+    if _HOT_CACHE_ROOT_BASE_ENV not in os.environ:
+        os.environ[_HOT_CACHE_ROOT_BASE_ENV] = os.environ.get(_ENV_HOT_CACHE_ROOT, "")
+    _hc_base = os.environ.get(_HOT_CACHE_ROOT_BASE_ENV, "")
+    if settings.get("hot_cache_root"):
+        os.environ[_ENV_HOT_CACHE_ROOT] = str(settings["hot_cache_root"])
+        _SETTINGS_SOURCE["hot_cache_root"] = "settings"
+        if _hc_base and _hc_base != os.environ[_ENV_HOT_CACHE_ROOT]:
+            logger.warning("settings override: HUGPY_HOT_CACHE_ROOT env/drop-in "
+                           "said %r but the operator's runtime settings say %r — "
+                           "settings win", _hc_base, settings["hot_cache_root"])
+        # Best-effort materialization at apply time. NEVER fatal: hot_cache.
+        # enabled() re-checks the root live on every use() and disables the tier
+        # gracefully if it is (or becomes) uncreatable, so a not-yet-mounted root
+        # never breaks the boot — the tier simply activates once it appears.
+        try:
+            os.makedirs(os.environ[_ENV_HOT_CACHE_ROOT], exist_ok=True)
+        except OSError as exc:
+            logger.warning("hot_cache_root %r not creatable yet (%s) — the hot "
+                           "tier stays off until the path exists",
+                           os.environ[_ENV_HOT_CACHE_ROOT], exc)
+    elif _hc_base:
+        os.environ[_ENV_HOT_CACHE_ROOT] = _hc_base    # revert to the drop-in/env base
+        _SETTINGS_SOURCE["hot_cache_root"] = "env"
+    else:
+        os.environ.pop(_ENV_HOT_CACHE_ROOT, None)     # no base -> tier off (unset)
+        _SETTINGS_SOURCE["hot_cache_root"] = "default"
     return settings
 
 
@@ -2761,6 +3187,26 @@ def _effective_config() -> dict:
     out["comfy_url"] = (os.environ.get("COMFY_URL")
                         or "http://127.0.0.1:8188").rstrip("/")
     out["comfy_url_source"] = _SETTINGS_SOURCE.get("comfy_url", "default")
+    # HOT-CACHE ROOT: the effective projected root ("" == unset == tier off, the
+    # honest reading — hot_cache has no fallback root, unlike comfy_url) + where
+    # the value came from, so a /llm/workers row carries the truth exactly as it
+    # does for slot_count. This ATTRIBUTES the root per worker; the tier itself is
+    # still an automatic LRU cache and the shared store is still the source of truth.
+    out["hot_cache_root"] = (os.environ.get(_ENV_HOT_CACHE_ROOT) or "").strip()
+    out["hot_cache_root_source"] = _SETTINGS_SOURCE.get("hot_cache_root", "default")
+    # Env-profiles (stage 1): the per-profile materialization state
+    # (ready|materializing|error) + the model->profile attribution map, so a
+    # /llm/workers row carries the truth — central routes a profiled model only
+    # once its profile reads ready. Present only when profiles are in play
+    # (mirrors residency/pinned). Defensive import: never break a beat.
+    if _RUNTIME_SETTINGS.get("profiles"):
+        try:
+            from ..managers.serve import profiles as _profiles
+            out["profiles"] = _profiles.report(_RUNTIME_SETTINGS["profiles"])
+        except Exception:  # noqa: BLE001 — heartbeat truth is best-effort
+            out["profiles"] = {}
+    if _RUNTIME_SETTINGS.get("model_profiles"):
+        out["model_profiles"] = dict(_RUNTIME_SETTINGS["model_profiles"])
     return out
 
 
@@ -2789,14 +3235,17 @@ _COMFY_CACHE: dict = {"at": 0.0, "value": {"available": False}}
 
 def _comfy_status() -> dict:
     """Probe the local ComfyUI (60s cache): {"available", "url", "version"?,
-    "vram_bytes"}. ``vram_bytes`` is ComfyUI's REAL GPU footprint from nvidia-smi
-    (per-process), or null — never on-disk checkpoint bytes (the 0.1.137 guard)."""
+    "checkpoints"?, "id_lock", "vram_bytes"}. ``vram_bytes`` is ComfyUI's REAL GPU
+    footprint from nvidia-smi (per-process), or null — never on-disk checkpoint
+    bytes (the 0.1.137 guard). ``id_lock`` is whether this comfy can do
+    identity-locked STILLs (the IPAdapter node pack is installed), so central's
+    routing gate + the console can see which boxes can do it."""
     now = time.time()
     if now - _COMFY_CACHE["at"] < 60.0:
         out = _COMFY_CACHE["value"]
     else:
         url = (os.environ.get("COMFY_URL") or "http://127.0.0.1:8188").rstrip("/")
-        out = {"available": False, "url": url}
+        out = {"available": False, "url": url, "id_lock": False}
         try:
             import httpx
             r = httpx.get(url + "/system_stats", timeout=2.0)
@@ -2818,6 +3267,15 @@ def _comfy_status() -> dict:
                         out["checkpoints"] = ckpts[:50]
                 except Exception:  # noqa: BLE001 — list is best-effort
                     pass
+                # ID-LOCK capability: probe the SAME object_info API for the
+                # IPAdapter node classes, via the comfy runner's own detector so
+                # the node-class contract lives in ONE place (never forks from the
+                # request-time gate). Rides this 60s presence cache.
+                try:
+                    from ..managers.comfy.comfy_runner import comfy_has_ipadapter
+                    out["id_lock"] = comfy_has_ipadapter(url)
+                except Exception:  # noqa: BLE001 — probe/import miss: not capable
+                    out["id_lock"] = False
         except Exception:  # noqa: BLE001 — not installed / not running
             pass
         _COMFY_CACHE.update(at=now, value=out)
@@ -2990,7 +3448,7 @@ def _save_update_state(args, state: dict) -> None:
         pass
 
 
-def _self_update_if_needed(required: str | None, args) -> None:
+def _self_update_if_needed(required: str | None, args, state=None) -> None:
     """Install central's required package version and re-exec, if we're behind.
 
     Source of the bytes: PyPI by default (where ``sync.trigger`` publishes), since
@@ -3030,12 +3488,15 @@ def _self_update_if_needed(required: str | None, args) -> None:
     if rc == 0:
         logger.info("self-update installed %s==%s; restarting agent",
                     args.pkg_name, required)
-        # Terminate supervised slots BEFORE re-exec: orphaned slots would be
-        # adopted by the new agent and keep serving the OLD code forever.
-        # The fresh agent respawns them on the new version.
-        _kill_slots()
+        # Restart onto the new code. Under systemd this EXITS (Restart= respawns
+        # a fresh, properly-tracked process — never the os.execv orphan that
+        # squatted :9100). kill_slots=True: an orphaned slot child would keep
+        # serving the OLD code forever (the adoption probe can't tell versions
+        # apart), so the restart tears them down and the fresh agent respawns
+        # them on the new version. Runs on the register/heartbeat thread — no
+        # HTTP ack to send, so restart synchronously (does not return).
         from .._platform.procutil import reexec
-        reexec()
+        _restart(state, reason="self-update", reexec_fn=reexec, kill_slots=True)
     else:
         logger.warning("self-update failed (pip rc=%s); staying on %s",
                        rc, installed or "(none)")
@@ -3198,6 +3659,66 @@ def _slot_capability() -> dict:
     return {"slot_capable": False, "slot_incapable_reason": reason}
 
 
+# Per-task capability honesty (2026-07-11). Yesterday three requests reached
+# workers whose canonical venv lacks an optional ML dep (sentence-transformers,
+# openai-whisper, keybert) and failed AT REQUEST TIME ("sentence-transformers is
+# required…", whisper NoneType). Central routes by model assignment alone, so it
+# had no way to know a box couldn't run the task. We advertise a per-task map from
+# the SAME find_spec probe central's /ml readiness uses, and central skips a worker
+# that says False for the request's task (workers_for_model). Legacy agents omit
+# the field -> central assumes capable (no regression).
+
+# whisper needs a REAL import probe: find_spec("whisper") can be True yet
+# `import whisper` die under numba/numpy>=2.5 (yesterday's third incident), so the
+# find_spec-only base map would over-advertise ASR. We do ONE guarded real import,
+# TTL-cached so the ~15s heartbeat stays cheap AND an /ops/pip fix is re-detected
+# within the TTL instead of needing a worker restart.
+_WHISPER_PROBE_TTL_S = 300.0
+_WHISPER_PROBE: dict = {"ok": None, "at": 0.0}
+
+
+def _whisper_importable() -> bool:
+    """Whether ``import whisper`` actually SUCCEEDS on this box (TTL-cached).
+
+    Fast path: if whisper isn't even resolvable, return False without importing.
+    Otherwise do a guarded real import (the find_spec-insufficient special case)
+    and cache the result for ``_WHISPER_PROBE_TTL_S`` so heartbeats stay cheap.
+    """
+    from ..managers.task_deps import have
+    if not have("whisper"):
+        return False
+    now = time.time()
+    cached = _WHISPER_PROBE.get("ok")
+    if cached is not None and (now - _WHISPER_PROBE.get("at", 0.0)) < _WHISPER_PROBE_TTL_S:
+        return cached
+    try:
+        import whisper  # noqa: F401 — REAL probe: numba/numpy>=2.5 landmine (2026-07-11)
+        ok = True
+    except Exception as exc:  # noqa: BLE001 — any import failure = ASR unavailable
+        logger.info("whisper is installed but `import whisper` failed (%s: %s); "
+                    "advertising automatic-speech-recognition UNAVAILABLE so central "
+                    "won't route ASR here", type(exc).__name__, exc)
+        ok = False
+    _WHISPER_PROBE["ok"] = ok
+    _WHISPER_PROBE["at"] = now
+    return ok
+
+
+def _task_capabilities() -> dict:
+    """``{task: bool}`` this worker can actually run, advertised to central.
+
+    Built from the shared canonical task->dependency map (managers.task_deps) with
+    the SAME find_spec probe central's /ml readiness uses — cheap, no heavy imports
+    — then overlaid with the whisper real-import special case. Central gates
+    routing on it (workers_for_model): a box missing an optional ML dep never gets
+    that task's requests, instead of failing them at request time.
+    """
+    from ..managers.task_deps import task_capabilities as _base_task_caps
+    caps = _base_task_caps()
+    caps["automatic-speech-recognition"] = _whisper_importable()
+    return caps
+
+
 def _heartbeat_loop(client: CentralClient, state: WorkerState, args) -> None:
     while True:
         time.sleep(args.heartbeat)
@@ -3239,14 +3760,18 @@ def _heartbeat_loop(client: CentralClient, state: WorkerState, args) -> None:
                     # console can badge a worker that's silently serving in-process.
                     "serving_limits": _serving_limits(),
                     **_slot_capability(),
+                    # Per-task capability honesty (2026-07-11): which /ml tasks
+                    # this box can actually run, so central won't route a task
+                    # whose optional dep is missing here (workers_for_model gate).
+                    "task_capabilities": _task_capabilities(),
                 },
             )
             # Adopt any assignment change made in the UI + pre-provision it.
             _sync_assignment(state, worker)
             # Adopt central's resource limits (min of central + local config).
             _apply_central_limits(worker)
-            # Converge to central's required package version (re-execs on update).
-            _self_update_if_needed((worker or {}).get("required_pkg_version"), args)
+            # Converge to central's required package version (restarts on update).
+            _self_update_if_needed((worker or {}).get("required_pkg_version"), args, state)
         except WorkerRejected as exc:
             _terminal_exit(exc)   # does not return
         except urllib.error.HTTPError as exc:
@@ -3284,6 +3809,9 @@ def _register(client: CentralClient, state: WorkerState, args) -> None:
         # before the first heartbeat.
         "serving_limits": _serving_limits(),
         **_slot_capability(),
+        # Per-task capability honesty (2026-07-11): advertised from first contact
+        # so central's routing gate is correct before the first heartbeat.
+        "task_capabilities": _task_capabilities(),
     }
     try:
         worker = client.register(payload)
@@ -3297,8 +3825,8 @@ def _register(client: CentralClient, state: WorkerState, args) -> None:
     _sync_assignment(state, worker)
     _apply_central_limits(worker)
     logger.info("registered as worker id=%s serving models=%s", state.worker_id, worker.get("models"))
-    # Converge to central's required package version before serving (re-execs).
-    _self_update_if_needed(worker.get("required_pkg_version"), args)
+    # Converge to central's required package version before serving (restarts).
+    _self_update_if_needed(worker.get("required_pkg_version"), args, state)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -3493,6 +4021,22 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as _exc:  # noqa: BLE001
         logger.warning("slot eviction policy not registered: %s", _exc)
 
+    # Env-profiles (stage 1): register the model->profile resolver the runner
+    # spawn seam consumes, then KICK materialization of every declared profile
+    # not yet ready for its manifest. Materialization is slow (pip) so it runs in
+    # the background via a registered executor (register_executor) — a restart
+    # shuts it down cleanly, and a profiled model only routes/seats once its
+    # profile reads ready in the heartbeat. Boot-driven so the restart-based
+    # /ops/config apply re-kicks idempotently (a ready profile is a no-op; a
+    # changed manifest re-materializes). Fully additive to the boot path.
+    try:
+        from ..managers.serve import profiles as _profiles
+        _profiles.set_model_resolver(_resolve_model_profile)
+        _profiles.materialize_all(_RUNTIME_SETTINGS.get("profiles") or {},
+                                  register=register_executor)
+    except Exception as _exc:  # noqa: BLE001 — profiles must never break boot
+        logger.warning("env-profiles not initialized: %s", _exc)
+
     # Contention-based residency (doctrine 2026-07-11): an on-demand model stays
     # resident until a NEW load needs its memory — then the LRU on-demand
     # resident yields (never static / pinned / gate-busy / slot-backed). dispatch
@@ -3562,7 +4106,14 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("worker inference server listening on %s (advertising %s)",
                 f"{args.host}:{args.port}", state.url)
     state.args = args   # the /ops endpoints need pkg_name/pkg_index/id_file
-    build_app(state).run(host=args.host, port=args.port, threaded=True)
+    # Build the server explicitly (instead of Flask's app.run) so the restart
+    # path holds a handle to close the listening socket cleanly before exit —
+    # releasing :9100 so systemd's respawned process binds without a collision.
+    # make_server binds immediately, so state.http_server is set before we block.
+    from werkzeug.serving import make_server
+    state.http_server = make_server(args.host, args.port, build_app(state),
+                                    threaded=True)
+    state.http_server.serve_forever()
     return 0
 
 

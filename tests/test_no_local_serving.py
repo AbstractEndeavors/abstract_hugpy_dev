@@ -95,7 +95,7 @@ Runner = remote.make_delegating_runner(framework, task)
 runner = Runner(types.SimpleNamespace(model_key="test-model"))
 
 # Force "no worker selected" without touching the provider seam.
-remote._select = lambda mk, pool=None: (None, None)
+remote._select = lambda mk, pool=None, task=None: (None, None)
 
 req = types.SimpleNamespace(request_id="rid-1", pool=None)
 

@@ -69,16 +69,32 @@ _MIN_CFG, _MAX_CFG = 0.0, 20.0
 _DEFAULT_VRAM_BUDGET_GB = 0.5
 
 # JOINT MODE — how a segment is spliced onto its parent at the branch point:
-#   * "still"       (default, backward-compatible): condition the segment's i2v render
-#                   on ONE frame (the branch still). Motion is NOT carried across the
-#                   splice — the historical behavior.
+#   * "still"       (default, backward-compatible): condition the segment's render on ONE
+#                   frame (the branch still). Motion is NOT carried across the splice —
+#                   the historical behavior.
 #   * "vace_extend": carry MOTION across the splice by conditioning on the parent's
 #                   TRAILING ``context_frames`` frames through the VACE video+mask
 #                   extend idiom (the runner routes the segment through the VACE path).
-# goal 0 (the root) has no parent, so it MUST be "still" (there is nothing to extend
-# from) — enforced in the factory.
-_VALID_JOINT_MODES = frozenset({"still", "vace_extend"})
+#   * "cut"         (SCENE CUT — no frame carry at all): the child is a FRESH render of its
+#                   own prompt, spliced with a HARD cut. The parent is NOT trimmed (it plays
+#                   in FULL) and NO branch still / context window is extracted — a cut
+#                   carries no frame. In an IDENTITY MOVIE (movie-level ``reference_images``
+#                   set) the child is a fresh id_lock render so the SUBJECT carries across
+#                   the scene change even though no pixels do; in a plain movie it is a hard
+#                   cut between two independent scenes. Because a cut carries no frame it is
+#                   INCOMPATIBLE with ``branch_frame`` / ``context_frames`` (both must be
+#                   None) — enforced in the factory.
+# goal 0 (the root) has no parent, so it MUST be "still" (there is nothing to splice onto)
+# — enforced in the factory (so "cut" and "vace_extend" are valid only on goals >= 1).
+_VALID_JOINT_MODES = frozenset({"still", "vace_extend", "cut"})
 _DEFAULT_JOINT_MODE = "still"
+
+# IDENTITY LOCK (id_lock) — movie-level subject reference images. When set, EVERY segment
+# renders capability ``id_lock`` (Wan-VACE reference-to-video), so the locked SUBJECT
+# carries across scene changes (the operator's "take that id and use it for a video — her
+# on the beach, then playing volleyball"). Mirrors ``studio.job``'s ``_MAX_REFERENCE_IMAGES``
+# (diffusers 0.39 consumes each as a prepended VACE reference latent). () = a plain movie.
+_MAX_REFERENCE_IMAGES = 4
 
 # CONTEXT FRAMES — how many trailing parent frames condition a ``vace_extend`` splice
 # (movie-level default; a node MAY override). Bounded: >=1 (a splice needs at least one
@@ -114,10 +130,13 @@ class StudioMovieGoal:
                            movie-level value (or the bound model's family default)
                            is used.
         joint_mode         how this segment is spliced onto its parent: "still"
-                           (default — condition on ONE branch frame, motion NOT carried)
-                           or "vace_extend" (condition on the parent's trailing
+                           (default — condition on ONE branch frame, motion NOT carried),
+                           "vace_extend" (condition on the parent's trailing
                            ``context_frames`` frames via the VACE video+mask extend
-                           idiom, carrying motion). goal 0 (the root) MUST be "still".
+                           idiom, carrying motion), or "cut" (a HARD scene cut — no frame
+                           carry: the parent plays in FULL and the child is a fresh render;
+                           INCOMPATIBLE with ``branch_frame`` / ``context_frames``). goal 0
+                           (the root) MUST be "still".
         context_frames     optional per-segment override of how many trailing parent
                            frames condition a ``vace_extend`` splice; None ⇒ the
                            movie-level ``context_frames``. Only consulted when
@@ -167,6 +186,14 @@ class StudioMovieSpec:
                          condition a ``vace_extend`` splice (a node may override via
                          its own ``context_frames``). Only consulted for vace_extend
                          joints; ignored by "still" joints.
+        reference_images IDENTITY LOCK: the ORDERED tuple of jailed abs paths of the
+                         subject reference image(s). When NON-EMPTY the movie is an
+                         IDENTITY MOVIE — EVERY segment renders capability ``id_lock``
+                         (Wan-VACE reference-to-video) so the locked subject carries
+                         across every scene change. () = a plain movie (t2v/i2v/v2v as
+                         before). CANONICAL (the references define the identity). At most
+                         ``_MAX_REFERENCE_IMAGES``. Jail/existence/image-classification is
+                         the ROUTE's job (a runtime input check), like ``StudioI2VSpec``.
     """
     goals: Tuple[StudioMovieGoal, ...]
     width: int
@@ -183,6 +210,7 @@ class StudioMovieSpec:
     start_image: Optional[MediaRef] = None
     time_budget_s: Optional[int] = None
     context_frames: int = _DEFAULT_CONTEXT_FRAMES
+    reference_images: Tuple[str, ...] = ()
 
 
 def _check_steps_cfg(where: str, steps, cfg) -> None:
@@ -228,6 +256,7 @@ def make_studio_movie(
     start_image: Optional[MediaRef] = None,
     time_budget_s: Optional[int] = None,
     context_frames: int = _DEFAULT_CONTEXT_FRAMES,
+    reference_images: Optional[Tuple[str, ...]] = None,
 ) -> StudioMovieSpec:
     """Validate every field and build the frozen ``StudioMovieSpec``. Raises
     ``ValueError``/``TypeError`` LOCALLY on any structural violation — a
@@ -246,10 +275,14 @@ def make_studio_movie(
         i>0 goals[i].parent_segment_id == goals[i-1].segment_id. This is the ONLY
         rule that must relax for a real take-tree; the node shape already carries
         the parent pointer, so sibling divergence needs no schema change.
-      * JOINT MODE: every node's ``joint_mode`` is "still" or "vace_extend"; goal 0
-        (the root, no parent) MUST be "still" — there is nothing to extend from.
+      * JOINT MODE: every node's ``joint_mode`` is "still", "vace_extend", or "cut"; goal
+        0 (the root, no parent) MUST be "still" — there is nothing to splice onto. A "cut"
+        node carries NO frame, so it is INCOMPATIBLE with ``branch_frame`` /
+        ``context_frames`` (both must be None) — rejected LOCALLY.
       * CONTEXT FRAMES: the movie-level + any per-node ``context_frames`` is an int in
         [1, 32] (a splice needs >=1 context frame; the cap keeps room to generate).
+      * REFERENCE IMAGES: movie-level ``reference_images`` is None/() or a tuple of
+        non-empty path strings, at most ``_MAX_REFERENCE_IMAGES`` (an identity movie).
 
     Also the reconstruction path used by the bus deserializer — goals are rebuilt
     into ``StudioMovieGoal`` (and ``start_image`` through ``make_media_ref``) before
@@ -292,6 +325,25 @@ def make_studio_movie(
             f"time_budget_s must be a positive int or None; got {time_budget_s!r}")
     _check_context_frames("movie-level", context_frames)
 
+    # ---- IDENTITY LOCK: movie-level reference images (structural check only) ----
+    # None -> (); coerce a list/tuple to a tuple (so an asdict->json->from_dict round-trip
+    # lands a tuple). Each must be a non-empty string; at most _MAX_REFERENCE_IMAGES. Jail /
+    # existence / image-classification is the ROUTE's job (mirrors StudioI2VSpec).
+    if reference_images is None:
+        reference_images = ()
+    if isinstance(reference_images, (list, tuple)):
+        reference_images = tuple(reference_images)
+    else:
+        raise ValueError(
+            f"reference_images must be a list/tuple of paths or None; got {reference_images!r}")
+    for ri, r in enumerate(reference_images):
+        if not (isinstance(r, str) and r.strip()):
+            raise ValueError(f"reference_images[{ri}] must be a non-empty string; got {r!r}")
+    if len(reference_images) > _MAX_REFERENCE_IMAGES:
+        raise ValueError(
+            f"at most {_MAX_REFERENCE_IMAGES} reference_images are accepted; "
+            f"got {len(reference_images)}")
+
     # ---- per-node validation + linear-chain enforcement (v0) ----
     seen_ids: set = set()
     prev_id: Optional[str] = None
@@ -328,6 +380,20 @@ def make_studio_movie(
                 f"got {g.joint_mode!r}")
         if g.context_frames is not None:
             _check_context_frames(f"goals[{gi}]", g.context_frames)
+        # CUT (scene cut) carries NO frame — a branch still / context window is meaningless
+        # for it, so branch_frame + context_frames MUST both be None (reject a body that
+        # sets them together with an explicit, clear message).
+        if g.joint_mode == "cut":
+            if g.branch_frame is not None:
+                raise ValueError(
+                    f"goals[{gi}].joint_mode='cut' carries no frame, so branch_frame must "
+                    f"be None (a scene cut does not condition on a parent frame); "
+                    f"got branch_frame={g.branch_frame!r}")
+            if g.context_frames is not None:
+                raise ValueError(
+                    f"goals[{gi}].joint_mode='cut' carries no frame, so context_frames must "
+                    f"be None (a scene cut extends no context); "
+                    f"got context_frames={g.context_frames!r}")
 
         # LINEAR CHAIN (v0): the root has no parent; every later node's parent is the
         # node right before it. The one rule a real take-tree relaxes.
@@ -364,6 +430,7 @@ def make_studio_movie(
         start_image=start_image,
         time_budget_s=time_budget_s,
         context_frames=context_frames,
+        reference_images=reference_images,
     )
 
 
@@ -411,4 +478,5 @@ def studio_movie_from_dict(d: dict) -> StudioMovieSpec:
         start_image=ref,
         time_budget_s=d.get("time_budget_s"),
         context_frames=d.get("context_frames", _DEFAULT_CONTEXT_FRAMES),
+        reference_images=d.get("reference_images"),
     )

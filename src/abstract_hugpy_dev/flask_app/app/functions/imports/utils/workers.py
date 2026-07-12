@@ -274,6 +274,53 @@ def _engine_unusable(worker: Dict[str, Any]) -> bool:
     return isinstance(eng, dict) and eng.get("installed") is False
 
 
+# Tasks whose worker capability is authoritatively gated ELSEWHERE and must NOT be
+# re-filtered by the find_spec-derived task_capabilities map:
+#   image-text-to-text — vision uses the stricter engine.supports_vision truth
+#     (llama.cpp mtmd build) enforced in resolvers.remote; a transformers-VL worker
+#     without llama_cpp would advertise this False and be wrongly skipped here.
+_TASK_CAP_GATE_EXCLUDE = {"image-text-to-text"}
+
+
+def _task_capable(worker: Dict[str, Any], task: Optional[str]) -> bool:
+    """Whether ``worker`` can run ``task`` per its advertised ``task_capabilities``.
+
+    Capability-honest, exactly like the engine/vision/tier gates: a worker is
+    skipped ONLY when it AFFIRMATIVELY advertises the task as unavailable — the
+    2026-07-11 request-time-failure class (a canonical venv missing
+    sentence-transformers / whisper / keybert). LEGACY workers (no
+    ``task_capabilities`` field) and tasks a worker doesn't enumerate are assumed
+    capable, so a pre-feature fleet routes exactly as before. A ``None`` task
+    (non-ML routing, e.g. video auto-pick) never gates, and vision defers to the
+    stricter engine gate (``_TASK_CAP_GATE_EXCLUDE``).
+    """
+    if not task or task in _TASK_CAP_GATE_EXCLUDE:
+        return True
+    caps = worker.get("task_capabilities")
+    if not isinstance(caps, dict) or task not in caps:
+        return True
+    return bool(caps.get(task))
+
+
+def _comfy_id_lock_capable(worker: Dict[str, Any]) -> bool:
+    """Whether ``worker``'s ComfyUI can do identity-locked STILLs — the
+    IPAdapter node pack is installed (``comfy.id_lock`` advertised True from the
+    agent's object_info probe).
+
+    STRICT / affirmative-only, DELIBERATELY UNLIKE ``_task_capable``'s
+    legacy-permissive default: an id_lock request must land on a box that PROVABLY
+    has the nodes, because silently degrading to a NON-locked image is forbidden
+    (WORKER-SETUP §5b / comfy_runner). A worker with no ``comfy`` block, comfy
+    unavailable, or ``id_lock`` != True does NOT qualify. There's no legacy fleet
+    to preserve here — id_lock is a brand-new capability, so "unknown" means "not
+    yet", not "assume yes".
+    """
+    comfy = worker.get("comfy")
+    if not isinstance(comfy, dict) or not comfy.get("available"):
+        return False
+    return bool(comfy.get("id_lock"))
+
+
 def _has_usable_gpu(worker: Dict[str, Any]) -> bool:
     """Whether the worker advertises a GPU with free VRAM (for efficiency ranking).
 
@@ -712,6 +759,7 @@ class WorkerStore:
         serving_limits: Optional[Dict[str, Any]] = None,
         slot_capable: Optional[bool] = None,
         slot_incapable_reason: Optional[str] = None,
+        task_capabilities: Optional[Dict[str, bool]] = None,
     ) -> Dict[str, Any]:
         """Add a worker (or re-register an existing one by id/url).
 
@@ -766,6 +814,11 @@ class WorkerStore:
                 if slot_capable is not None:
                     existing["slot_capable"] = slot_capable
                     existing["slot_incapable_reason"] = slot_incapable_reason
+                # Per-task capability honesty (2026-07-11) — stored verbatim, same
+                # legacy-safe idiom: a None from an older agent leaves any prior
+                # value untouched. Central's workers_for_model gate reads it.
+                if task_capabilities is not None:
+                    existing["task_capabilities"] = task_capabilities
                 # Only a NON-EMPTY declared pool re-asserts on re-register, so an
                 # operator-set pool isn't wiped by a worker that doesn't declare
                 # WORKER_POOL (which sends ""). Declaring workers still win.
@@ -814,6 +867,11 @@ class WorkerStore:
                 "serving_limits": serving_limits,
                 "slot_capable": slot_capable,
                 "slot_incapable_reason": slot_incapable_reason,
+                # Per-task capability honesty (2026-07-11): {task: bool} of the /ml
+                # tasks this box can actually run (find_spec probe + a real whisper
+                # import). None on a pre-feature agent -> central assumes capable so
+                # a legacy fleet routes unchanged. See workers_for_model / _task_capable.
+                "task_capabilities": task_capabilities,
                 # Runtime-env capability: {"tier": "stable"|"edge"|..., versions}.
                 # Read from the worker's own venv, so it's truth not config claim.
                 "env": env,
@@ -862,6 +920,7 @@ class WorkerStore:
         serving_limits: Optional[Dict[str, Any]] = None,
         slot_capable: Optional[bool] = None,
         slot_incapable_reason: Optional[str] = None,
+        task_capabilities: Optional[Dict[str, bool]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Mark a worker alive and refresh its live GPU / loaded-model stats."""
         with self._transaction() as workers:
@@ -954,6 +1013,11 @@ class WorkerStore:
             if slot_capable is not None:
                 worker["slot_capable"] = slot_capable
                 worker["slot_incapable_reason"] = slot_incapable_reason
+            # Per-task capability honesty (2026-07-11) — refreshed every beat so an
+            # /ops/pip that adds a missing dep flips the task True within one beat.
+            # Legacy-safe: a None from an older agent leaves the field absent.
+            if task_capabilities is not None:
+                worker["task_capabilities"] = task_capabilities
             if pool and pool.strip():   # non-empty only — see register() note
                 worker["pool"] = pool.strip()
             return _public_view(worker)
@@ -1121,11 +1185,15 @@ class WorkerStore:
         return storage_proposal(worker) if worker else None
 
     def workers_for_model(self, model_key: str, *, online_only: bool = True,
-                          pool: Optional[str] = None) -> List[Dict[str, Any]]:
+                          pool: Optional[str] = None,
+                          task: Optional[str] = None,
+                          require_comfy_id_lock: bool = False) -> List[Dict[str, Any]]:
         wanted = _match_keys(model_key)
         want_pool = (pool or "").strip()
         need_tier = env_tier_for_model(model_key)
         tier_skipped = 0
+        task_skipped = 0
+        id_lock_skipped = 0
         out = []
         for w in self.all():
             # Only admitted workers serve. Pending (awaiting operator approval) and
@@ -1167,6 +1235,24 @@ class WorkerStore:
             if _worker_env_tier(w) != need_tier:
                 tier_skipped += 1
                 continue
+            # Per-task capability gate (2026-07-11): skip a worker that
+            # AFFIRMATIVELY advertises it can't run this task (a canonical venv
+            # missing an optional ML dep — sentence-transformers / whisper /
+            # keybert). Legacy/unknown = capable, so a pre-feature fleet is
+            # untouched; a None task never gates. Same say-why idiom as the tier
+            # gate below.
+            if not _task_capable(w, task):
+                task_skipped += 1
+                continue
+            # ID-LOCK routing gate (identity-locked STILLs): an id_lock image
+            # request must land on a box whose ComfyUI PROVABLY has the IPAdapter
+            # nodes (comfy.id_lock). Affirmative-only — never route id_lock to a
+            # comfy-less / nodeless worker where it would fail at request time (or
+            # worse, tempt a silent non-locked fallback). Off (False) for every
+            # other request, so ordinary routing is untouched.
+            if require_comfy_id_lock and not _comfy_id_lock_capable(w):
+                id_lock_skipped += 1
+                continue
             out.append(w)
         if not out and tier_skipped:
             # The model HAS servers — they were excluded on env tier alone. Say
@@ -1177,11 +1263,35 @@ class WorkerStore:
                 "model %s requires env tier %r; %d otherwise-eligible worker(s) "
                 "skipped (none advertise that tier)",
                 model_key, need_tier, tier_skipped)
+        if not out and task_skipped:
+            # The model HAS servers — they were excluded on task capability alone
+            # (they advertise they can't run this task). Name the reason, or the
+            # operator sees only the downstream no-worker error with no cause.
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "model %s task %r: %d otherwise-eligible worker(s) skipped "
+                "(task unavailable — missing optional ML dependency on those boxes)",
+                model_key, task, task_skipped)
+        if not out and id_lock_skipped:
+            # The model HAS servers — every one was excluded because its ComfyUI
+            # lacks the IPAdapter node pack (comfy.id_lock False/absent). Name the
+            # cause so the operator installs it (WORKER-SETUP §5b) instead of
+            # seeing only the downstream no-worker error.
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "model %s id_lock: %d otherwise-eligible worker(s) skipped — no "
+                "box advertises comfy.id_lock (install ComfyUI_IPAdapter_plus + "
+                "weights per WORKER-SETUP §5b)", model_key, id_lock_skipped)
         return out
 
-    def pick_for_model(self, model_key: str, pool: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    def pick_for_model(self, model_key: str, pool: Optional[str] = None,
+                       task: Optional[str] = None,
+                       require_comfy_id_lock: bool = False) -> Optional[Dict[str, Any]]:
         """Choose an online worker to serve ``model_key`` (optionally within a
-        dedicated ``pool``).
+        dedicated ``pool``, and — when set — one that can run ``task``).
+
+        ``require_comfy_id_lock`` (set for identity-locked STILL requests) further
+        restricts to boxes whose ComfyUI advertises the IPAdapter nodes.
 
         Preference order:
             1. workers that already report the model as loaded (warm),
@@ -1190,14 +1300,18 @@ class WorkerStore:
         Returns ``None`` when no online worker (in the requested pool) is assigned
         to the model, which signals the caller to fall back to local execution.
         """
-        candidates = self.workers_for_model(model_key, online_only=True, pool=pool)
+        candidates = self.workers_for_model(
+            model_key, online_only=True, pool=pool, task=task,
+            require_comfy_id_lock=require_comfy_id_lock)
         if not candidates:
             # Fall back to assigned workers even with a stale heartbeat. Heartbeat
             # (worker->central) can time out when central is briefly slow, while
             # offload (central->worker) still works — so an assigned worker that
             # looks "offline" is often still serviceable. The stream proxy fails
             # fast to local if the worker is genuinely unreachable.
-            candidates = self.workers_for_model(model_key, online_only=False, pool=pool)
+            candidates = self.workers_for_model(
+                model_key, online_only=False, pool=pool, task=task,
+                require_comfy_id_lock=require_comfy_id_lock)
         if not candidates and (pool or "").strip():
             # PHANTOM-POOL RESCUE: a pool restriction only means something when the
             # pool exists. If NO registered worker carries this pool tag at all
@@ -1215,7 +1329,9 @@ class WorkerStore:
                 _logging.getLogger(__name__).info(
                     "pool %r has no registered workers; treating request "
                     "for %s as general (un-pooled)", want_pool, model_key)
-                return self.pick_for_model(model_key, pool=None)
+                return self.pick_for_model(
+                    model_key, pool=None, task=task,
+                    require_comfy_id_lock=require_comfy_id_lock)
         if not candidates:
             return None
 
@@ -1264,7 +1380,8 @@ class WorkerStore:
         return _public_view(chosen)
 
     def candidates_for_model(self, model_key: str,
-                             pool: Optional[str] = None) -> List[Dict[str, Any]]:
+                             pool: Optional[str] = None,
+                             task: Optional[str] = None) -> List[Dict[str, Any]]:
         """Ranked ONLINE workers that can serve ``model_key`` — the cap-aware
         relay router's alternatives list (concurrency hardening 2026-07-11).
 
@@ -1276,7 +1393,7 @@ class WorkerStore:
         must be live right now (the stale-heartbeat fallback pick_for_model does
         is for last-resort primary selection, not for spreading concurrent load).
         """
-        candidates = self.workers_for_model(model_key, online_only=True, pool=pool)
+        candidates = self.workers_for_model(model_key, online_only=True, pool=pool, task=task)
         if not candidates:
             return []
         required = required_pkg_version()
@@ -1370,14 +1487,19 @@ def worker_storage_view(worker_id: str) -> Optional[Dict[str, Any]]:
     return worker_store.storage_view(worker_id)
 
 
-def pick_worker_for_model(model_key: str, pool: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    return worker_store.pick_for_model(model_key, pool=pool)
+def pick_worker_for_model(model_key: str, pool: Optional[str] = None,
+                          task: Optional[str] = None,
+                          require_comfy_id_lock: bool = False) -> Optional[Dict[str, Any]]:
+    return worker_store.pick_for_model(
+        model_key, pool=pool, task=task,
+        require_comfy_id_lock=require_comfy_id_lock)
 
 
-def candidates_for_model(model_key: str, pool: Optional[str] = None) -> List[Dict[str, Any]]:
+def candidates_for_model(model_key: str, pool: Optional[str] = None,
+                         task: Optional[str] = None) -> List[Dict[str, Any]]:
     """Ranked online workers holding ``model_key`` — the relay gate's reroute
     list (see WorkerStore.candidates_for_model). No routing side effects."""
-    return worker_store.candidates_for_model(model_key, pool=pool)
+    return worker_store.candidates_for_model(model_key, pool=pool, task=task)
 
 
 def fleet_snapshot() -> list:

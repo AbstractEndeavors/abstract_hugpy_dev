@@ -214,6 +214,11 @@ class RegisterRequest(BaseModel):
     serving_limits: dict | None = None
     slot_capable: bool | None = None
     slot_incapable_reason: str | None = None
+    # Per-task capability honesty (2026-07-11): {task: bool} of the /ml tasks this
+    # box can actually run (find_spec probe + a real whisper import). Central skips
+    # a worker that says False for the request's task (workers_for_model). None on
+    # older agents -> the field is absent on the row (assumed capable, no regression).
+    task_capabilities: dict | None = None
 
 
 # Hostnames/IPs a worker might self-report that are NOT reachable from central.
@@ -344,6 +349,10 @@ class HeartbeatRequest(BaseModel):
     serving_limits: dict | None = None
     slot_capable: bool | None = None
     slot_incapable_reason: str | None = None
+    # Per-task capability honesty (2026-07-11) — see RegisterRequest. Refreshed
+    # every beat so an /ops/pip that adds a missing dep flips the task within one
+    # heartbeat. None on older agents -> field absent (assumed capable).
+    task_capabilities: dict | None = None
 
 
 class AssignRequest(BaseModel):
@@ -451,6 +460,7 @@ def workers_register():
         serving_limits=body.serving_limits,
         slot_capable=body.slot_capable,
         slot_incapable_reason=body.slot_incapable_reason,
+        task_capabilities=body.task_capabilities,
     )
     if worker.get("admission") == "blocked":
         # Operator evicted this worker; 403 tells the agent to stop, not respawn.
@@ -530,6 +540,7 @@ def workers_heartbeat(worker_id):
         serving_limits=body.serving_limits,
         slot_capable=body.slot_capable,
         slot_incapable_reason=body.slot_incapable_reason,
+        task_capabilities=body.task_capabilities,
     )
     if worker is None:
         # The agent thinks it's registered but central forgot it (restart,

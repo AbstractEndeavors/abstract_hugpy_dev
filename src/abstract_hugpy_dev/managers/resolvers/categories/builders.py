@@ -229,6 +229,83 @@ def _build_similarity_request(kwargs: Dict[str, Any], model_key: str) -> EmbedRe
     )
 
 
+# ID-LOCK reference stills: at most this many subject references per request.
+# Mirrors video_intel.studio.job._MAX_REFERENCE_IMAGES so the STILL arm and the
+# VIDEO arm agree on the ceiling (one vernacular — [[keeper-owns-nomenclature]]).
+_MAX_REFERENCE_IMAGES = 4
+
+
+def _is_within(path: str, root: str) -> bool:
+    """Whether ``path`` (realpath-resolved) sits under ``root`` — the SAME
+    realpath+commonpath jail check as ``video_intel.media_store._is_within``, so
+    the imagegen id_lock path enforces the storage jail identically to the studio
+    (video) id_lock path. Symlink-safe: it compares realpaths, so a symlink that
+    points OUT of the jail is rejected."""
+    try:
+        return os.path.commonpath([os.path.realpath(path),
+                                   os.path.realpath(root)]) == os.path.realpath(root)
+    except ValueError:                    # different drives / relative garbage
+        return False
+
+
+def _jailed_reference_images(kwargs: Dict[str, Any]):
+    """Resolve + jail + image-classify id_lock reference paths — CENTRAL-side.
+
+    ``None`` when absent (the plain, non-locked path). Otherwise a list of jailed
+    realpaths. Raises ``ValueError`` AS DATA on a jail escape / missing file /
+    non-image / over-count — the same structural discipline the studio id_lock
+    route uses (flask_app.../video_routes).
+
+    Runs only where the paths are REAL: on the worker's second builder pass the
+    unreachable paths have already been dropped (remote._worker_payload replaced
+    them with reference_images_b64), so ``reference_images`` is absent and this
+    returns ``None`` — the jail check never fires on a box that can't see them."""
+    raw = kwargs.get("reference_images")
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)) or not all(
+            isinstance(r, str) and r.strip() for r in raw):
+        raise ValueError(
+            "reference_images must be a list of non-empty path strings; "
+            f"got {raw!r}")
+    if len(raw) > _MAX_REFERENCE_IMAGES:
+        raise ValueError(
+            f"at most {_MAX_REFERENCE_IMAGES} reference_images are accepted; "
+            f"got {len(raw)}")
+    resolved = []
+    for i, p in enumerate(raw):
+        rp = os.path.realpath(p)
+        if not (_is_within(rp, UPLOADS_HOME) or _is_within(rp, DEFAULT_ROOT)):
+            raise ValueError(
+                f"reference_images[{i}] escapes the storage jail: {p!r}")
+        if not os.path.isfile(rp):
+            raise ValueError(f"reference_images[{i}] not found: {p!r}")
+        if derive_media_type(rp) != "image":
+            raise ValueError(
+                f"reference_images[{i}] is not an image "
+                f"({derive_media_type(rp)!r}): {os.path.basename(p)}")
+        resolved.append(rp)
+    return resolved
+
+
+def _apply_id_lock(out: Dict[str, Any], kwargs: Dict[str, Any]) -> None:
+    """Fold the id_lock (identity-locked STILL) fields onto a built imagegen
+    ``out`` dict — shared by the text2img and img2img builders so both reach the
+    comfy IPAdapter graph the same way. Absent reference_images -> nothing added,
+    so a plain request is byte-for-byte what it was before this slice."""
+    refs = _jailed_reference_images(kwargs)
+    if refs is not None:
+        out["reference_images"] = refs
+    # reference_images_b64 is the OFFLOAD transport (remote._worker_payload fills
+    # it from the paths); pass it through verbatim on the worker's builder pass.
+    if kwargs.get("reference_images_b64") is not None:
+        out["reference_images_b64"] = kwargs["reference_images_b64"]
+    if "id_strength" in kwargs:
+        out["id_strength"] = kwargs["id_strength"]
+
+
 def _build_imagegen_request(kwargs: Dict[str, Any], model_key: str) -> ImageGenRequest:
     prompt = kwargs.get("prompt") or kwargs.get("text")
     if prompt is None and kwargs.get("file"):
@@ -255,6 +332,9 @@ def _build_imagegen_request(kwargs: Dict[str, Any], model_key: str) -> ImageGenR
     # 'sampler' is the colloquial alias (matches presets.py's field name).
     if "sampler" in kwargs and "sampler_name" not in out:
         out["sampler_name"] = kwargs["sampler"]
+    # ID-LOCK: reference stills + id_strength (identity-locked STILL generation via
+    # the comfy IPAdapter graph). Absent -> unchanged text2img.
+    _apply_id_lock(out, kwargs)
     return ImageGenRequest(**out)
 
 
@@ -303,6 +383,9 @@ def _build_img2img_request(kwargs: Dict[str, Any], model_key: str) -> ImageGenRe
     # 'sampler' is the colloquial alias (matches presets.py's field name).
     if "sampler" in kwargs and "sampler_name" not in out:
         out["sampler_name"] = kwargs["sampler"]
+    # ID-LOCK: an init image AND reference stills can co-exist (identity-locked
+    # img2img). Absent reference_images -> unchanged img2img.
+    _apply_id_lock(out, kwargs)
     return ImageGenRequest(**out)
 
 

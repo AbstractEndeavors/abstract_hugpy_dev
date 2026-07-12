@@ -99,25 +99,41 @@ def get_worker_provider() -> Optional[Callable]:
     return _worker_provider
 
 
-def _pick_worker(model_key: str, pool: Optional[str] = None) -> Optional[dict]:
+def _pick_worker(model_key: str, pool: Optional[str] = None,
+                 task: Optional[str] = None,
+                 require_comfy_id_lock: bool = False) -> Optional[dict]:
     if _worker_provider is None:
         return None
     try:
-        # The provider may predate the pool arg — fall back to the 1-arg form.
-        try:
-            return _worker_provider(model_key, pool)
-        except TypeError:
-            return _worker_provider(model_key)
-    except Exception as exc:  # never let pool selection break a request
+        # The provider may predate the pool/task/id_lock args (a peer on older
+        # code) — widest form first, degrading to narrower ones on an arg-count
+        # TypeError. If an OLD provider drops require_comfy_id_lock, the comfy
+        # runner's request-time object_info probe is still the honest backstop
+        # (it fails as data on a nodeless comfy — never a silent non-locked image).
+        for _args in ((model_key, pool, task, require_comfy_id_lock),
+                      (model_key, pool, task), (model_key, pool), (model_key,)):
+            try:
+                return _worker_provider(*_args)
+            except TypeError:
+                continue
+        return None
+    except Exception as exc:  # never let pool/task selection break a request
         logger.warning("worker provider failed for %s: %s", model_key, exc)
         return None
 
 
-def _select(model_key: str, pool: Optional[str] = None) -> tuple[Optional[dict], Optional[dict]]:
+def _select(model_key: str, pool: Optional[str] = None,
+            task: Optional[str] = None,
+            require_comfy_id_lock: bool = False) -> tuple[Optional[dict], Optional[dict]]:
     """Choose where this request runs: ``(worker, spill_override)``.
 
     ``pool`` (when set) restricts selection to that dedicated worker pool, and a
     general request never lands on a pooled worker — see workers_for_model.
+    ``task`` (when set) additionally skips a worker that advertises it can't run
+    that task (a missing optional ML dep — the 2026-07-11 request-time-failure
+    class); legacy/unknown = capable. ``require_comfy_id_lock`` (set for an
+    identity-locked STILL request) restricts to boxes whose ComfyUI advertises
+    the IPAdapter nodes (STRICT — id_lock must never route to a nodeless comfy).
 
     First ask the placement provider — if it returns a shard plan, the lead
     worker + its rpc/tensor_split spill win. Otherwise fall back to ordinary
@@ -136,7 +152,7 @@ def _select(model_key: str, pool: Optional[str] = None) -> tuple[Optional[dict],
                         model_key, plan["worker"].get("id"),
                         (plan.get("spill") or {}).get("rpc_servers"))
             return plan["worker"], (plan.get("spill") or None)
-    return _pick_worker(model_key, pool), None
+    return _pick_worker(model_key, pool, task, require_comfy_id_lock), None
 
 
 def _spill_for(worker_id: Optional[str], model_key: str) -> dict:
@@ -297,16 +313,21 @@ def _inflight_count(worker_id: str, model_key: str) -> int:
         return _INFLIGHT.get((worker_id, model_key), 0)
 
 
-def _candidates(model_key: str, pool: Optional[str] = None) -> List[dict]:
+def _candidates(model_key: str, pool: Optional[str] = None,
+                task: Optional[str] = None) -> List[dict]:
     """Ranked online workers holding the model (reroute list), or [] if no
-    provider / any failure — the gate then considers only the primary."""
+    provider / any failure — the gate then considers only the primary. ``task``
+    (when set) keeps the reroute list task-capable, same as the primary pick."""
     if _worker_candidates_provider is None:
         return []
     try:
-        try:
-            return _worker_candidates_provider(model_key, pool) or []
-        except TypeError:
-            return _worker_candidates_provider(model_key) or []
+        # Widest form first (see _pick_worker), degrading on an arg-count TypeError.
+        for _args in ((model_key, pool, task), (model_key, pool), (model_key,)):
+            try:
+                return _worker_candidates_provider(*_args) or []
+            except TypeError:
+                continue
+        return []
     except Exception as exc:  # never let reroute break a request
         logger.warning("candidates provider failed for %s: %s", model_key, exc)
         return []
@@ -359,16 +380,18 @@ def _try_reserve(worker: Optional[dict], spill, model_key: str,
 
 
 def _reserve_once(model_key: str, pool: Optional[str], primary_worker: dict,
-                  primary_spill, viable: Optional[Callable[[dict], bool]]) -> Optional[_RelaySlot]:
+                  primary_spill, viable: Optional[Callable[[dict], bool]],
+                  task: Optional[str] = None) -> Optional[_RelaySlot]:
     """One admission pass, no wait: the primary pick first, then any other online
     worker holding the model that has room (cap-aware reroute). None if all full.
     Fast on the happy path (primary reserve is lock-only); only a reroute touches
-    the candidates provider (a cached registry read)."""
+    the candidates provider (a cached registry read). ``task`` keeps the reroute
+    list task-capable (same gate as the primary pick)."""
     slot = _try_reserve(primary_worker, primary_spill, model_key, viable)
     if slot is not None:
         return slot
     primary_id = (primary_worker or {}).get("id")
-    for alt in _candidates(model_key, pool):
+    for alt in _candidates(model_key, pool, task):
         if alt.get("id") == primary_id:
             continue
         slot = _try_reserve(alt, _spill_for(alt.get("id"), model_key),
@@ -388,7 +411,8 @@ def _busy(primary_worker: dict, model_key: str) -> "WorkerBusyError":
 
 def _acquire_relay_slot(model_key: str, pool: Optional[str], primary_worker: dict,
                         primary_spill, *, viable: Optional[Callable[[dict], bool]] = None,
-                        wait_s: Optional[float] = None) -> _RelaySlot:
+                        wait_s: Optional[float] = None,
+                        task: Optional[str] = None) -> _RelaySlot:
     """SYNC cap-aware admission (tests + any synchronous caller).
 
     Admit one relay under the cap, rerouting to another holder or WAITING briefly
@@ -402,7 +426,7 @@ def _acquire_relay_slot(model_key: str, pool: Optional[str], primary_worker: dic
         return _RelaySlot(primary_worker, primary_spill, _NOOP_RELEASE)
     deadline = time.monotonic() + (_gate_wait_s() if wait_s is None else wait_s)
     while True:
-        slot = _reserve_once(model_key, pool, primary_worker, primary_spill, viable)
+        slot = _reserve_once(model_key, pool, primary_worker, primary_spill, viable, task)
         if slot is not None:
             return slot
         remaining = deadline - time.monotonic()
@@ -414,7 +438,8 @@ def _acquire_relay_slot(model_key: str, pool: Optional[str], primary_worker: dic
 async def _acquire_relay_slot_async(model_key: str, pool: Optional[str],
                                     primary_worker: dict, primary_spill, *,
                                     viable: Optional[Callable[[dict], bool]] = None,
-                                    wait_s: Optional[float] = None) -> _RelaySlot:
+                                    wait_s: Optional[float] = None,
+                                    task: Optional[str] = None) -> _RelaySlot:
     """ASYNC cap-aware admission for DelegatingRunner.run/stream.
 
     Identical policy to the sync variant, but the bounded wait YIELDS the shared
@@ -429,7 +454,7 @@ async def _acquire_relay_slot_async(model_key: str, pool: Optional[str],
         return _RelaySlot(primary_worker, primary_spill, _NOOP_RELEASE)
     deadline = time.monotonic() + (_gate_wait_s() if wait_s is None else wait_s)
     while True:
-        slot = _reserve_once(model_key, pool, primary_worker, primary_spill, viable)
+        slot = _reserve_once(model_key, pool, primary_worker, primary_spill, viable, task)
         if slot is not None:
             return slot
         remaining = deadline - time.monotonic()
@@ -473,6 +498,34 @@ def _inline_file(payload: dict) -> bool:
         return False
 
 
+def _inline_reference_images(payload: dict) -> bool:
+    """Inline id_lock reference stills the worker's comfy (127.0.0.1) can't see.
+
+    Reads each ``reference_images`` path -> base64 into ``reference_images_b64``
+    and DROPS the unreachable paths. This is the LIST analogue of _inline_file:
+    the single-file _PATH_KEYS inliner + the worker's _materialize_file handle
+    exactly one path, and a multi-file rematerializer on the worker is out of
+    this slice's agent.py scope — so the reference bytes ride a request FIELD
+    (ImageGenRequest.reference_images_b64, like VisionAnalysisRequest.image_b64)
+    instead. Returns False (→ run local) if any reference is missing or too big;
+    True when there was nothing to inline or inlining succeeded."""
+    refs = payload.get("reference_images")
+    if not refs:
+        return True
+    b64s: list[str] = []
+    for p in refs:
+        try:
+            if not os.path.isfile(p) or os.path.getsize(p) > _MAX_WORKER_FILE_BYTES:
+                return False
+            with open(p, "rb") as fh:
+                b64s.append(base64.b64encode(fh.read()).decode("ascii"))
+        except OSError:
+            return False
+    payload["reference_images_b64"] = b64s
+    payload.pop("reference_images", None)     # paths the worker can't reach
+    return True
+
+
 def _worker_payload(task: str, req, model_key: str, worker_id: Optional[str],
                     spill_override: Optional[dict] = None) -> Optional[dict]:
     """JSON body for a worker /infer[/stream] call, built from a built req.
@@ -497,6 +550,8 @@ def _worker_payload(task: str, req, model_key: str, worker_id: Optional[str],
     if spill:
         payload["spill"] = spill
     if not _inline_file(payload):
+        return None
+    if not _inline_reference_images(payload):     # id_lock references (list)
         return None
     return payload
 
@@ -724,6 +779,18 @@ def _worker_vision_capable(worker: Optional[dict]) -> bool:
     return bool(eng.get("supports_vision"))
 
 
+def _worker_comfy_id_lock_capable(worker: Optional[dict]) -> bool:
+    """True only when the worker's ComfyUI AFFIRMATIVELY advertises the IPAdapter
+    node pack (comfy.available AND comfy.id_lock). The remote-side twin of
+    workers._comfy_id_lock_capable — used as the relay-reroute ``viable`` filter
+    so an identity-locked STILL never reroutes onto a nodeless comfy (mirrors how
+    vision uses _worker_vision_capable). STRICT: unknown/absent = not capable."""
+    comfy = (worker or {}).get("comfy")
+    if not isinstance(comfy, dict) or not comfy.get("available"):
+        return False
+    return bool(comfy.get("id_lock"))
+
+
 def make_delegating_runner(framework: str, task: str):
     """Dynamic worker-pool offload with local fallback, decided per request.
 
@@ -766,7 +833,17 @@ def make_delegating_runner(framework: str, task: str):
 
         async def run(self, req):
             pool = getattr(req, "pool", None)
-            worker, spill_override = _select(self.model_key, pool)
+            # ID-LOCK: a request carrying reference images (paths, or the b64
+            # offload transport) is an identity-locked STILL — it MUST land on a
+            # box whose comfy has the IPAdapter nodes. Gate selection + reroute on
+            # comfy.id_lock, exactly as vision gates on engine.supports_vision.
+            _id_lock = bool(getattr(req, "reference_images", None)
+                            or getattr(req, "reference_images_b64", None))
+            # Pass the id_lock constraint ONLY when it applies, so a plain request
+            # calls _select(mk, pool, task) byte-identically to before this slice
+            # (older _select overrides / mocks that predate the kwarg are untouched).
+            _sel_kw = {"require_comfy_id_lock": True} if _id_lock else {}
+            worker, spill_override = _select(self.model_key, pool, task, **_sel_kw)
             if worker and _vision_task and not _worker_vision_capable(worker):
                 logger.info("worker %s doesn't advertise vision (engine.supports_vision); "
                             "serving %s where vision actually works instead",
@@ -778,9 +855,12 @@ def make_delegating_runner(framework: str, task: str):
                 # in-process runner. Reroutes to another holder or waits briefly;
                 # WorkerBusyError (honest 429/503) surfaces rather than crashing a
                 # worker or degrading a worker-assigned model onto central.
-                _viable = _worker_vision_capable if _vision_task else None
+                _viable = (_worker_vision_capable if _vision_task
+                           else _worker_comfy_id_lock_capable if _id_lock
+                           else None)
                 slot = await _acquire_relay_slot_async(self.model_key, pool, worker,
-                                                       spill_override, viable=_viable)
+                                                       spill_override, viable=_viable,
+                                                       task=task)
                 worker, spill_override = slot.worker, slot.spill
             if worker:
                 payload = _worker_payload(task, req, self.model_key, worker.get("id"),
@@ -825,7 +905,7 @@ def make_delegating_runner(framework: str, task: str):
 
         async def stream(self, req, cancel_event=None):
             pool = getattr(req, "pool", None)
-            worker, spill_override = _select(self.model_key, pool)
+            worker, spill_override = _select(self.model_key, pool, task)
             if worker and _vision_task and not _worker_vision_capable(worker):
                 logger.info("worker %s doesn't advertise vision (engine.supports_vision); "
                             "serving %s where vision actually works instead",
@@ -839,7 +919,8 @@ def make_delegating_runner(framework: str, task: str):
                 _viable = _worker_vision_capable if _vision_task else None
                 try:
                     slot = await _acquire_relay_slot_async(self.model_key, pool, worker,
-                                                           spill_override, viable=_viable)
+                                                           spill_override, viable=_viable,
+                                                           task=task)
                 except WorkerBusyError as busy:
                     yield ErrorEvent(request_id=req.request_id,
                                      message=busy.stream_message())

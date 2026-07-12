@@ -172,6 +172,20 @@ def in_flight(model_key: str) -> int:
     return g.active() if g is not None else 0
 
 
+def total_in_flight() -> int:
+    """Total in-process generations currently executing across ALL models.
+
+    The sum of every gate's active entrant count — i.e. how many native
+    generate/stream calls are in flight this instant. The worker's restart path
+    uses this to DRAIN before exiting: a restart waits (bounded) for this to hit
+    0 so it never tears a native llama.cpp/transformers call out from under a
+    live request. Lock-safe against concurrent acquire/release.
+    """
+    with _reg_lock:
+        gates = list(_gates.values())
+    return sum(g.active() for g in gates)
+
+
 # ---------------------------------------------------------------------------
 # Slot awareness — a model seated in a slot child is NOT gated here.
 # ---------------------------------------------------------------------------

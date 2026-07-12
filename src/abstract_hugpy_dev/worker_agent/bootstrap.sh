@@ -102,6 +102,19 @@ fi
 say "pip install --upgrade '${SPEC}'"
 "$PIP_BIN" install --upgrade "$SPEC"
 
+# 4b. optional media-intelligence deps the canonical [engine] venv omits -----
+# On 2026-07-11 three /ml requests reached workers whose venv lacked these and
+# failed AT REQUEST TIME: feature-extraction/sentence-similarity died with
+# "sentence-transformers is required…", and transcription hit a whisper NoneType.
+# A THIRD failure was numpy 2.5 breaking numba so that `import whisper` itself
+# dies — hence the pin. Install them here so an enrolled worker can actually run
+# ASR / embeddings / keyword-extraction; central now also SKIPS a worker that
+# still can't (task_capabilities gate), but shipping the deps is the real fix.
+# NB: the agent's self-update uses `pip install -U --no-deps`, so it never
+# touches these — they persist across every version converge.
+say "installing media-intelligence deps (sentence-transformers, openai-whisper, keybert; numpy<2.5 for numba)"
+"$PIP_BIN" install --upgrade sentence-transformers openai-whisper keybert "numpy<2.5"
+
 # 5. write + enable the systemd unit via the canonical installer -----------
 # COMPAT: when central pins a version older than 0.1.164 the installed
 # installer predates --storage-root/--enroll-token (seen live: op, 2026-07-10,

@@ -896,6 +896,15 @@ def fetch_from_central(central_url: str, model_key: str, progress=None) -> bool:
     def _parallel(entries):
         units = _build_units(entries)
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            # Register this transfer pool so a restart shuts it down first (avoids
+            # racing a pending pull into 'cannot schedule new futures'). Lazy +
+            # defensive import: never couple a plain pull to the agent module or
+            # break it if that import isn't available (e.g. standalone provision).
+            try:
+                from .agent import register_executor
+                register_executor(pool)
+            except Exception:  # noqa: BLE001 — registration is best-effort
+                pass
             list(pool.map(_run_unit, units))
         _finalize(entries)
 
