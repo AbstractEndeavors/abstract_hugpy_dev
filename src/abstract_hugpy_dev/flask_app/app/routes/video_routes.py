@@ -792,6 +792,186 @@ def video_presets():
 
 
 # --------------------------------------------------------------------------- #
+# 2e-bis) POST /video/prompt/assist — LLM-backed helper for the studio's prompt
+#     input. Two modes:
+#       detail    expand/enrich the caller's DRAFT image prompt into a richer,
+#                 more vivid diffusion prompt (preserves the draft's subject
+#                 and intent — "draft" is required).
+#       generate  write a full, original image-generation prompt from
+#                 scratch; "draft", if given, is used only as a loose theme.
+#
+#     Routes through the exact SAME internal chat plane as /chat/stream and
+#     /prompt — managers.dispatch.execute_prompt via resolve() (see
+#     ../functions/chat/streaming.py:94 execute_chat_stream and
+#     ../routes/discord_routes.py:326 _generate_candidate for the two other
+#     callers of this same one-shot pattern). On THIS central
+#     (HUGPY_NO_LOCAL_SERVING=true, see managers/serve/policy.py) resolve()'s
+#     DelegatingRunner sends the completion to a live GPU worker; it never
+#     loads a model in-process here. No live worker / unreachable -> a clean
+#     502 via the same _friendly_stream_error mapping /chat/stream uses on a
+#     stream failure — never a 500, never a silent local load.
+# --------------------------------------------------------------------------- #
+# Default assist model. The operator asked for flux2-klein (2026-07-13), BUT on
+# THIS dev central flux2 does not resolve for inference: execute_prompt (and even
+# /v1/chat/completions) only know the 11 serve-configured models — the other ~100
+# manifest/discovered models (flux2-klein, the HunyuanVideo rewriter, etc.) are
+# catalog-only and 404 with "Unknown model_key". Defaulting to flux2 would make
+# every default call fail, so per the defaults-are-promises doctrine the default
+# is the best chat model that ACTUALLY resolves here: Qwen2.5-3B-Instruct-GGUF
+# (verified 200 + good prompt enrichment). A caller can still pass any key via
+# body["model"] — and once flux2 is serve-configured on the fleet this should
+# switch back to it. keeper 2026-07-13 (flux2 non-resolution flagged to operator).
+_DEFAULT_PROMPT_ASSIST_MODEL = "Qwen2.5-3B-Instruct-GGUF"
+
+_PROMPT_ASSIST_SYSTEM = (
+    "You are an expert image-prompt engineer. Return ONLY the final prompt "
+    "text — no preamble, no quotes, no explanation. Make it vivid, specific, "
+    "and suitable for a diffusion image model."
+)
+
+# Context-aware framing (operator 2026-07-13 "yes" to context-aware generation).
+# The caller may pass context.kind so a MOVIE/CLIP (video) gets motion/camera
+# phrasing while an IMAGE/SCENE (still) keeps diffusion phrasing. No context ->
+# the original still-image behavior, so old callers are unaffected.
+_PROMPT_ASSIST_KINDS = ("image", "scene", "movie", "clip")
+_PROMPT_ASSIST_VIDEO_KINDS = frozenset({"movie", "clip"})
+
+
+def _assist_framing(kind):
+    """Return (system_prompt, medium_noun) for the requested kind. Video kinds
+    ask for motion/camera; everything else (incl. None) keeps still-image
+    phrasing identical to the pre-context behavior."""
+    if kind in _PROMPT_ASSIST_VIDEO_KINDS:
+        return (
+            "You are an expert video-prompt engineer. Return ONLY the final "
+            "prompt text — no preamble, no quotes, no explanation. Make it "
+            "vivid and specific, describing subject, motion, camera movement, "
+            "and mood, suitable for a text-to-video model.",
+            "video-generation prompt",
+        )
+    return (_PROMPT_ASSIST_SYSTEM, "image-generation prompt")
+
+
+def _await_sync(value):
+    """Drive execute_prompt's (possibly) awaitable result from WSGI — the exact
+    same idiom prompt_routes._await_sync / discord_routes._await_sync use (each
+    module keeps its own copy rather than sharing a private helper cross-file).
+    Uses the process-wide async runtime (one long-lived loop), not a fresh
+    per-request loop — see _platform/async_runtime."""
+    import inspect
+    if not inspect.isawaitable(value):
+        return value
+    from abstract_hugpy_dev._platform import async_runtime
+    return async_runtime.run(value)
+
+
+def _prompt_assist_result_text(result) -> str:
+    """Best-effort text extraction — mirrors discord_routes._result_text so a
+    worker-relay dict, a pydantic ChatResult, or any other TaskResult-shaped
+    object all yield the same plain string."""
+    if isinstance(result, dict):
+        return result.get("text") or ""
+    for attr in ("model_dump", "to_dict", "dict"):
+        fn = getattr(result, attr, None)
+        if callable(fn):
+            try:
+                d = fn()
+                if isinstance(d, dict):
+                    return d.get("text") or ""
+            except TypeError:
+                continue
+    return getattr(result, "text", "") or ""
+
+
+@video_bp.route("/video/prompt/assist", methods=["POST"])
+def video_prompt_assist():
+    body = request.get_json(silent=True) or {}
+    mode = body.get("mode")
+    if mode not in ("detail", "generate"):
+        return jsonify({"error": 'mode must be "detail" or "generate"'}), 400
+
+    draft = body.get("draft")
+    if draft is not None and not isinstance(draft, str):
+        return jsonify({"error": "draft must be a string"}), 400
+    draft = draft.strip() if draft else ""
+    if mode == "detail" and not draft:
+        return jsonify({"error": 'draft is required for mode "detail"'}), 400
+
+    model_key = body.get("model") or _DEFAULT_PROMPT_ASSIST_MODEL
+    if not isinstance(model_key, str) or not model_key.strip():
+        return jsonify({"error": "model must be a non-empty string"}), 400
+
+    # Optional context so the assist is aware of WHAT is being generated
+    # (still image vs. a video clip/movie). Absent/empty -> still-image
+    # phrasing identical to the pre-context behavior (back-compat).
+    context = body.get("context") or {}
+    if not isinstance(context, dict):
+        return jsonify({"error": "context must be an object"}), 400
+    kind = context.get("kind")
+    if kind is not None and kind not in _PROMPT_ASSIST_KINDS:
+        return jsonify({
+            "error": "context.kind must be one of " + "|".join(_PROMPT_ASSIST_KINDS)
+        }), 400
+    hint = context.get("hint")
+    if hint is not None and not isinstance(hint, str):
+        return jsonify({"error": "context.hint must be a string"}), 400
+    hint = hint.strip() if hint else ""
+
+    system_prompt, medium = _assist_framing(kind)
+
+    if mode == "detail":
+        user = (
+            f"Expand this draft {medium} into a richer, more vivid, more "
+            "specific prompt. Preserve the subject and intent of the draft "
+            f"— add detail, don't replace it.\n\nDraft prompt: {draft}"
+        )
+    elif draft:
+        user = (f'Write one compelling, original {medium} using '
+                f'"{draft}" as a loose theme.')
+    else:
+        user = f"Write one compelling, original {medium} of your choosing."
+
+    if hint:
+        user += f"\n\nAdditional context to honor: {hint}"
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user},
+    ]
+
+    # Late imports (mirrors prompt_routes/discord_routes) — dodges circulars
+    # and keeps this module app-boot cheap when chat's plane isn't touched.
+    from ..functions.imports import execute_prompt
+    from ..functions.chat.streaming import _friendly_stream_error
+    try:
+        result = _await_sync(execute_prompt(
+            model_key=model_key,
+            messages=messages,
+            task="text-generation",
+            max_new_tokens=200,
+        ))
+    except (KeyError, ValueError, TypeError, FileNotFoundError) as exc:
+        # resolve()/builder validation errors (e.g. unknown model_key, or the
+        # model doesn't support text-generation) — the caller's to fix, same
+        # envelope /prompt uses for the identical exception set.
+        return jsonify({"error": str(exc).strip("'\"")}), 400
+    except Exception as exc:
+        # No live worker for this model / worker unreachable / no local engine
+        # — an actionable message via the same mapper /chat/stream uses,
+        # never a raw traceback, never a 500.
+        logger.exception("prompt/assist failed")
+        return jsonify({"error": _friendly_stream_error(exc)}), 502
+
+    ok = result.get("ok", True) if isinstance(result, dict) else getattr(result, "ok", True)
+    text = _prompt_assist_result_text(result).strip()
+    if not ok or not text:
+        err = result.get("error") if isinstance(result, dict) else getattr(result, "error", None)
+        return jsonify({"error": err or "assist produced no text"}), 502
+
+    return jsonify({"prompt": text, "model": model_key, "kind": kind}), 200
+
+
+# --------------------------------------------------------------------------- #
 # GPU-worker auto-pick — reuses the worker registry helpers (workers_for_model /
 # _has_usable_gpu / _worker_fit) that the /llm/workers/<id>/assign path uses, so
 # a preset lands on the same class of worker an operator would pick by hand.

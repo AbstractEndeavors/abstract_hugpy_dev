@@ -769,6 +769,38 @@ def _local_fallback_allowed() -> bool:
             in ("always", "1", "true", "yes", "on"))
 
 
+def _humanize_worker_error(wname: str, raw: str) -> str:
+    """Turn a raw worker/transport error into a clean, user-safe line.
+
+    A worker's llama-server failure arrives as an httpx status string that leaks
+    the worker's INTERNAL loopback URL and HTTP plumbing (e.g. ``Client error
+    '400 BAD REQUEST' for url 'http://127.0.0.1:8101/v1/chat/completions'``) —
+    noise to a user and an internal-topology leak. This was the /media "raw
+    HTML/CSS throws an error" report (2026-07-13): pasting code that OVERFLOWS
+    the model's context (code tokenizes ~2x denser than prose, so a modest paste
+    overflows) made the slot return 400, which was surfaced verbatim. Translate
+    the two common statuses and strip internal URLs for everything else.
+    """
+    import re
+    msg = str(raw or "").strip()
+    low = msg.lower()
+    if "400" in low and ("bad request" in low or "for url" in low):
+        return ("This request was rejected by the model server — most often "
+                "because the message is too long for the model's context window. "
+                "Code and markup use roughly twice the tokens of plain prose, so "
+                "even a modest paste can overflow. Try shortening it, or use a "
+                "larger-context model.")
+    if "503" in low or "service unavailable" in low:
+        return (f"The '{wname}' worker is still loading this model — give it a few "
+                f"seconds and send again.")
+    # generic: strip the internal loopback URL (and any wrapping quotes) + the
+    # MDN hint tail, keep the gist
+    msg = re.sub(r"(?:for url\s*)?['\"]?https?://127\.0\.0\.1:\d+\S*?['\"]?(?=\s|$)",
+                 "the model server", msg)
+    msg = re.sub(r"\s*For more information check:.*$", "", msg, flags=re.S).strip()
+    return f"The '{wname}' worker could not complete this request: {msg}".strip()
+
+
 def _worker_vision_capable(worker: Optional[dict]) -> bool:
     """True only when the worker AFFIRMATIVELY reports its llama.cpp build can run
     vision (mtmd) — engine.supports_vision. Central does not guess: it trusts what
@@ -954,14 +986,13 @@ def make_delegating_runner(framework: str, task: str):
                                     # surfaced instead (see _local_fallback_allowed).
                                     if produced_tokens:
                                         yield ErrorEvent(request_id=req.request_id,
-                                                         message=f"worker {wname}: stream interrupted: {ev.message}")
+                                                         message=f"{_humanize_worker_error(wname, ev.message)} "
+                                                                 f"(the reply was interrupted partway through)")
                                         return
                                     if not _local_fallback_allowed():
                                         yield ErrorEvent(
                                             request_id=req.request_id,
-                                            message=f"worker {wname} failed before output: "
-                                                    f"{ev.message} (local fallback disabled "
-                                                    f"for worker-assigned models)")
+                                            message=_humanize_worker_error(wname, ev.message))
                                         return
                                     logger.warning("worker %s errored before output (%s); "
                                                    "running %s locally", worker.get("id"),

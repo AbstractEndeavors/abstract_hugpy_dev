@@ -1925,7 +1925,19 @@ def _with_gguf(row, model_key):
 
 @worker_bp.route("/llm/serving/<model_key>", methods=["GET"])
 def serving_get(model_key):
-    row = spec_row(serve_spec_for(model_key))
+    # A serving STATUS poll must degrade, never 500. An unknown/stale model_key
+    # (e.g. a poller still asking about a deleted model like "Qwythos-…") made
+    # serve_spec_for -> get_model_config raise KeyError, which became an
+    # unhandled 500 on every poll; the console surfaced those 500s as repeated
+    # "blips". Answer a clean, cheap 404 instead (and never open a store for an
+    # unknown key). keeper 2026-07-13. [Note: an FD/EMFILE cascade was ruled out
+    # — journal showed 0 EMFILE that day, virtiofsd was at 1M FDs.]
+    try:
+        spec = serve_spec_for(model_key)
+    except KeyError:
+        return jsonify({"model_key": model_key, "known": False, "serving": False,
+                        "error": f"Unknown model: {model_key}"}), 404
+    row = spec_row(spec)
     row["override"] = get_override(model_key)
     _with_gguf(row, model_key)
     return jsonify(row)

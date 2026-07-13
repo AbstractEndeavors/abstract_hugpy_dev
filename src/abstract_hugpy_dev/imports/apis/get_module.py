@@ -431,23 +431,41 @@ def discover_models(save_json: bool = True, verbose: bool = True, use_hub: bool 
         discovered[key] = row
 
     if save_json:
-        # Shrink guard: a walk taken while the storage mount is degraded finds
-        # a fraction of the catalog; saving that would "disappear" models whose
-        # files still exist (2026-07-04: report collapsed to 2 entries vs 108
-        # dirs on disk). Keep the outgoing report as .prev whenever this walk
-        # found less than half of what the last one did — recovery is then a
-        # re-walk on healthy disk (POST /models/discover) or restoring .prev.
+        # Shrink guard: a walk taken while the storage mount is degraded (ae
+        # restart, virtiofs hiccup, or mid-migration with dirs in flight) finds
+        # only a fraction of the catalog. OVERWRITING the live report with that
+        # "disappears" models whose files still exist — the console then flips /
+        # under-counts (2026-07-04: collapsed to 2 vs 108 dirs; 2026-07-13:
+        # collapsed to 1 vs 193 dirs during the flat-migration + an ae bounce).
+        # The prior guard copied the good report to .prev but STILL wrote the
+        # shrunk set over the live file, so the poisoning happened anyway. Now we
+        # REFUSE the overwrite outright when the walk found <50% of a healthy
+        # prior: keep the live report untouched, stash the suspicious walk to
+        # .shrunk for inspection, and return the PRIOR data so the in-memory
+        # registry stays whole too. Recovery is an explicit re-walk on healthy
+        # disk (POST /models/discover); force a genuine shrink (mass deletion)
+        # with HUGPY_DISCOVERY_ALLOW_SHRINK=1.
+        _prior = None
         try:
-            import json as _json, shutil as _shutil
+            import json as _json
             with open(MODELS_DISCOVERY_PATH, "r", encoding="utf-8") as _fh:
                 _prior = _json.load(_fh)
-            if len(_prior) > 4 and len(discovered) < 0.5 * len(_prior):
-                _shutil.copy2(MODELS_DISCOVERY_PATH, MODELS_DISCOVERY_PATH + ".prev")
-                print(f"[discover] WARNING: walk found {len(discovered)} models "
-                      f"but the prior report had {len(_prior)} — storage mount "
-                      f"degraded? Prior report kept at "
-                      f"{MODELS_DISCOVERY_PATH}.prev")
         except (OSError, ValueError):
-            pass
+            _prior = None
+        _drastic = (isinstance(_prior, dict) and len(_prior) > 4
+                    and len(discovered) < 0.5 * len(_prior))
+        if _drastic and os.environ.get("HUGPY_DISCOVERY_ALLOW_SHRINK") != "1":
+            try:
+                safe_dump_to_file(data=discovered,
+                                  file_path=MODELS_DISCOVERY_PATH + ".shrunk")
+            except Exception:  # noqa: BLE001 — best-effort stash, never block
+                pass
+            print(f"[discover] REFUSED overwrite: walk found {len(discovered)} "
+                  f"models but the prior report had {len(_prior)} (>50% drop) — "
+                  f"storage mount degraded? Live report KEPT; suspicious walk "
+                  f"saved to {MODELS_DISCOVERY_PATH}.shrunk. Recover with a "
+                  f"re-walk on healthy disk (POST /models/discover); force a "
+                  f"real shrink with HUGPY_DISCOVERY_ALLOW_SHRINK=1.")
+            return _prior
         safe_dump_to_file(data=discovered, file_path=MODELS_DISCOVERY_PATH)
     return discovered

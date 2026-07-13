@@ -282,7 +282,13 @@ def discord_prefs_set():
 def model_meta_route(model_key):
     from abstract_hugpy_dev.imports.config.main import get_model_config
     from abstract_hugpy_dev.imports.config.models.model_meta import model_meta
-    cfg = get_model_config(model_key)
+    # get_model_config RAISES KeyError for an unknown key (the `is None` guard
+    # below only catches a returned-None). A picker polling this with a stale
+    # key must get a clean 404, never a 500. keeper 2026-07-13 (see serving_get).
+    try:
+        cfg = get_model_config(model_key)
+    except KeyError:
+        cfg = None
     if cfg is None:
         abort(404, description="Unknown model key.")
     vram = None
