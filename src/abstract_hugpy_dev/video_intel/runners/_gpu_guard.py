@@ -24,21 +24,49 @@ from ..result_schema import JobError, JobResult
 
 
 def guard_gpu_worker(model_id: str, job_id: str) -> Optional[JobResult]:
-    """Return a refusal JobResult when a fleet exists but no live worker serves
-    `model_id` (and the local override is off); else None (proceed)."""
-    # Per-box "never serve locally" policy: this box runs no in-process
-    # generation at all, even in a standalone/no-provider posture. Refuse before
-    # a multi-GB diffusion model can land on this CPU. HUGPY_VIDEOGEN_LOCAL=always
-    # still overrides for a deliberate local run. Default off === today's
-    # behavior. See managers.serve.policy.
+    """Return a refusal JobResult when no live worker serves `model_id` and this
+    box may not serve it locally; else None (proceed to normal routing).
+
+    ORDER MATTERS. Check for a LIVE WORKER first; apply the per-box
+    no-local-serving policy only as the fallback when none is found. The prior
+    version checked the policy FIRST, so on a central box (HUGPY_NO_LOCAL_SERVING)
+    it refused EVERY generation before routing could ever select a capable
+    worker — a model a worker was already serving (e.g. sd-turbo on a comfy box)
+    got refused despite a healthy fleet. This mirrors DelegatingRunner, which
+    enforces the same policy only AFTER a worker-selection attempt.
+    """
+    _videogen_local = (
+        os.environ.get("HUGPY_VIDEOGEN_LOCAL", "").strip().lower()
+        in ("always", "1", "true", "yes", "on"))
+
+    # 1) Is a live worker already serving this model? If so, never refuse here —
+    #    let resolve()/DelegatingRunner relay the job to it.
+    try:
+        from abstract_hugpy_dev.managers.resolvers.remote import get_worker_provider
+        provider = get_worker_provider()
+    except ImportError:
+        provider = None
+    live_worker = None
+    if provider is not None:
+        try:
+            try:
+                live_worker = provider(model_id, None)
+            except TypeError:   # provider may predate the pool arg
+                live_worker = provider(model_id)
+        except Exception:
+            live_worker = None  # a broken provider must not crash the runner
+    if live_worker is not None:
+        return None
+
+    # 2) No live worker. Per-box "never serve locally" policy: a central box runs
+    #    no in-process generation at all, even in a standalone/no-provider
+    #    posture. Refuse before a multi-GB diffusion model can land on this CPU.
+    #    HUGPY_VIDEOGEN_LOCAL=always still overrides. See managers.serve.policy.
     try:
         from abstract_hugpy_dev.managers.serve.policy import no_local_serving
         _policy_off = not no_local_serving()
     except Exception:
         _policy_off = True
-    _videogen_local = (
-        os.environ.get("HUGPY_VIDEOGEN_LOCAL", "").strip().lower()
-        in ("always", "1", "true", "yes", "on"))
     if not _policy_off and not _videogen_local:
         return JobResult(job_id, ok=False, error=JobError(
             code="local_serving_disabled",
@@ -50,31 +78,19 @@ def guard_gpu_worker(model_id: str, job_id: str) -> Optional[JobResult]:
             ),
             retryable=True,
         ))
-    try:
-        from abstract_hugpy_dev.managers.resolvers.remote import get_worker_provider
-        provider = get_worker_provider()
-    except ImportError:
-        provider = None
-    if provider is not None:
-        try:
-            try:
-                live_worker = provider(model_id, None)
-            except TypeError:   # provider may predate the pool arg
-                live_worker = provider(model_id)
-        except Exception:
-            live_worker = None  # a broken provider must not crash the runner
-        if live_worker is None and (
-            os.environ.get("HUGPY_VIDEOGEN_LOCAL", "").strip().lower()
-            not in ("always", "1", "true", "yes", "on")
-        ):
-            return JobResult(job_id, ok=False, error=JobError(
-                code="no_live_gpu_worker",
-                message=(
-                    f"no live GPU worker is serving {model_id!r} (worker "
-                    "offline or still warming); refusing local CPU generation "
-                    "on central. Retry shortly, or set HUGPY_VIDEOGEN_LOCAL="
-                    "always to permit in-process generation."
-                ),
-                retryable=True,
-            ))
+
+    # 3) A fleet exists (provider registered) but no live worker serves this
+    #    model — refuse rather than melt central with a CPU load. A bare
+    #    single-box deploy (no provider) keeps local generation — the product.
+    if provider is not None and not _videogen_local:
+        return JobResult(job_id, ok=False, error=JobError(
+            code="no_live_gpu_worker",
+            message=(
+                f"no live GPU worker is serving {model_id!r} (worker "
+                "offline or still warming); refusing local CPU generation "
+                "on central. Retry shortly, or set HUGPY_VIDEOGEN_LOCAL="
+                "always to permit in-process generation."
+            ),
+            retryable=True,
+        ))
     return None
