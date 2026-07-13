@@ -43,6 +43,12 @@ from dataclasses import asdict
 logging.disable(logging.INFO)  # silence the models_config registry chatter
 
 os.environ.setdefault("STUDIO_ALLOW_UNPINNED", "1")
+# These checks exercise the INLINE render (fake VACE seam / real GPU-less degrade) + the
+# assembly path — never delegation. Clear any ambient studio-worker env so a vace_extend
+# segment (real budget) never delegates to a live worker mid-test (this central runs with
+# HUGPY_STUDIO_WORKER set); per-segment offload has its OWN suite (test_studio_movie_offload.py).
+os.environ.pop("HUGPY_STUDIO_WORKER", None)
+os.environ.pop("HUGPY_STUDIO_FORCE_REMOTE", None)
 
 _SRC = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),

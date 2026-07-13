@@ -199,7 +199,13 @@ class StudioMovieSpec:
     width: int
     height: int
     fps: int
-    vram_budget_gb: float = _DEFAULT_VRAM_BUDGET_GB
+    # AUTOFIT tier. A number PINS the movie-level tier (applied to every segment). ``None``
+    # means AUTOFIT: a BLANK budget is sized per segment to the serving worker's MEASURED
+    # free VRAM at render time (see runners.studio_movie / render_clip) — never a
+    # guaranteed-fail low guess. The VACE floor bump (id_lock / vace_extend) applies only
+    # to an EXPLICIT budget; an autofit None flows through untouched (the resolved free VRAM
+    # already clears the floor on a real box, and a too-small box honestly Errs).
+    vram_budget_gb: Optional[float] = _DEFAULT_VRAM_BUDGET_GB
     seed: int = 0
     negative: Optional[str] = None
     model_id: Optional[str] = None
@@ -296,9 +302,14 @@ def make_studio_movie(
     for name, val in (("width", width), ("height", height), ("fps", fps)):
         if not isinstance(val, int) or isinstance(val, bool) or val <= 0:
             raise ValueError(f"{name} must be a positive int; got {val!r}")
-    if not isinstance(vram_budget_gb, (int, float)) or isinstance(vram_budget_gb, bool) \
-            or vram_budget_gb <= 0:
-        raise ValueError(f"vram_budget_gb must be a positive number; got {vram_budget_gb!r}")
+    # AUTOFIT: None is a LEGAL value (blank -> fit to the serving worker's free VRAM at
+    # render time). A NUMBER is the manual override and must be positive.
+    if vram_budget_gb is not None:
+        if not isinstance(vram_budget_gb, (int, float)) or isinstance(vram_budget_gb, bool) \
+                or vram_budget_gb <= 0:
+            raise ValueError(
+                f"vram_budget_gb must be a positive number or None (autofit); "
+                f"got {vram_budget_gb!r}")
     if not isinstance(seed, int) or isinstance(seed, bool):
         raise ValueError(f"seed must be an int; got {seed!r}")
     if negative is not None and not isinstance(negative, str):
@@ -419,7 +430,8 @@ def make_studio_movie(
         width=width,
         height=height,
         fps=fps,
-        vram_budget_gb=float(vram_budget_gb),
+        # AUTOFIT: keep None verbatim (resolved per segment at render time); else float.
+        vram_budget_gb=(float(vram_budget_gb) if vram_budget_gb is not None else None),
         seed=seed,
         negative=negative,
         model_id=model_id,

@@ -43,6 +43,95 @@ def _license_of(info) -> str | None:
         return getattr(card, "license", None)
 
 
+# ── uploader trust (curated, extensible — NOT an official HF signal) ─────────
+# HF exposes no "trust rating", so trust here is a hand-kept allowlist of who
+# published the repo. TIER-1 = the canonical FIRST-PARTY orgs that originate the
+# weights (a Llama from meta-llama, a FLUX from black-forest-labs — the real
+# thing, not a reupload). TIER-2 = reputable community REPACKAGERS/quantizers
+# whose GGUF/mirror repos are broadly relied on. Everyone else is untrusted (0):
+# not "bad", just unvetted. Match is on the repo OWNER (org), case-insensitive.
+# Add names here as the fleet's trusted sources grow — this is the one place.
+# Downloads/likes are deliberately NOT trust (they're gameable popularity); trust
+# outranks them so a canonical repo beats a more-liked fork with the same name.
+_TRUST_TIER1 = frozenset(s.lower() for s in (
+    # LLM / multimodal first-party
+    "meta-llama", "Qwen", "google", "google-bert", "mistralai", "deepseek-ai",
+    "microsoft", "openai", "openai-community", "nvidia", "HuggingFaceTB",
+    "HuggingFaceM4", "allenai", "tiiuae", "01-ai", "CohereForAI", "CohereLabs",
+    "ibm-granite", "databricks", "MiniMaxAI", "moonshotai", "zai-org", "THUDM",
+    "inclusionAI", "ByteDance-Seed", "rhymes-ai", "internlm", "baichuan-inc",
+    "facebook", "EleutherAI", "bigcode", "bigscience", "xai-org", "servicenow",
+    # image / video / audio first-party
+    "stabilityai", "black-forest-labs", "Wan-AI", "tencent", "genmo",
+    "Lightricks", "PixArt-alpha", "playgroundai", "Efficient-Large-Model",
+    "ByteDance", "Kwai-Kolors", "suno", "coqui", "laion", "openbmb",
+)) | frozenset()
+_TRUST_TIER2 = frozenset(s.lower() for s in (
+    # reputable community quantizers / mirrors (GGUF & friends)
+    "bartowski", "TheBloke", "unsloth", "city96", "mradermacher", "ggml-org",
+    "lmstudio-community", "NousResearch", "cognitivecomputations", "bullerwins",
+    "Mungert", "second-state", "QuantFactory", "MaziyarPanahi", "DevQuasar",
+    "bfloat16", "featherless-ai-quants", "legraphista", "nightmedia",
+    "calcuis", "Comfy-Org",
+))
+
+
+def _trust_tier(hub_id: str, author) -> int:
+    """2 = canonical first-party publisher, 1 = reputable repackager, 0 = unvetted.
+    Owner = explicit ``author`` if the Hub gave one, else the org before the '/'."""
+    org = (author or (hub_id or "").split("/", 1)[0] or "").lower()
+    if org in _TRUST_TIER1:
+        return 2
+    if org in _TRUST_TIER2:
+        return 1
+    return 0
+
+
+def _trust_label(tier: int):
+    """UI-facing label for a trust tier (None = unvetted, no badge)."""
+    return {2: "first-party", 1: "community"}.get(tier)
+
+
+def _relevance_score(q: str, hub_id: str, downloads: int, author=None) -> float:
+    """How well a repo matches the query, name-first, then WHO published it.
+
+    The model NAME (last path segment) carries the intent, so name matches
+    dominate. Among similarly-named repos — the "odd iterations" problem, where a
+    fork/requant shares the canonical name — UPLOADER TRUST breaks the tie (a
+    first-party org outranks a community repackager outranks an unknown), which
+    matters more than raw popularity. Downloads are only a faint last-resort
+    tiebreak (log-scaled, tiny weight); likes are ignored entirely. So trust and
+    name both push the canonical repo up, and a well-liked fork never wins on
+    likes alone. Case-insensitive. All local — no network."""
+    import difflib
+    import math
+    import re as _re
+    q = (q or "").lower().strip()
+    if not q:
+        return 0.0
+    hid = (hub_id or "").lower()
+    name = hid.rsplit("/", 1)[-1]
+    score = difflib.SequenceMatcher(None, q, name).ratio()   # 0..1 base
+    if name == q:
+        score += 3.0
+    elif name.startswith(q):
+        score += 2.0
+    elif q in name:
+        score += 1.0
+    elif q in hid:
+        score += 0.5
+    q_tok = {t for t in _re.split(r"[-_/\s.]+", q) if t}
+    n_tok = {t for t in _re.split(r"[-_/\s.]+", name) if t}
+    if q_tok and n_tok:
+        score += 0.5 * len(q_tok & n_tok) / len(q_tok)
+    # Trust: strong enough to reorder repos with equally-close names, but below an
+    # exact-name match — typing the exact repo name still lands it. tier1 +1.5,
+    # tier2 +0.75. This is the "trust over arbitrary likes" the operator asked for.
+    score += (0.75 * _trust_tier(hub_id, author))
+    score += 0.02 * math.log10((downloads or 0) + 10)        # faint popularity tiebreak
+    return score
+
+
 # ── search: list available HF repos ────────────────────────────────────────
 @search_bp.route("/search", methods=["GET"])
 def search_models():
@@ -51,25 +140,43 @@ def search_models():
     author = request.args.get("author")
     task = request.args.get("task")          # -> pipeline_tag
     library = request.args.get("library")    # -> filter
-    sort = request.args.get("sort", default="last_modified")
+    sort = request.args.get("sort")
     direction = request.args.get("direction", default=-1, type=int)  # client-side only now
     with_size = request.args.get("with_size", default="1") != "0"
 
-    if sort not in ("last_modified", "downloads", "likes", "created_at"):
+    # Default to name-RELEVANCE when the user typed a query — closest-name-first is
+    # what "search" should mean, and it eliminates sifting past odd fine-tuned
+    # iterations to find the canonical repo. Fall back to recency when just browsing.
+    if not sort:
+        sort = "relevance" if q else "last_modified"
+    relevance = (sort == "relevance")
+    if not relevance and sort not in ("last_modified", "downloads", "likes", "created_at"):
         sort = "last_modified"
 
+    # Relevance re-ranks locally, so pull a LARGER candidate pool (HF's own search
+    # order) and sort it by name closeness — but only enrich (per-repo size lookups)
+    # the trimmed top `limit`, so network cost stays the same as the old path.
+    pool_limit = min(max(limit * 5, 50), 200) if (relevance and q) else limit
     try:
-        models = api.list_models(
+        models = list(api.list_models(
             search=q or None,
             author=author,
             pipeline_tag=task or None,        # task is its own param
             filter=library or None,           # filter = library/tag
-            sort=sort,
-            limit=limit,
+            sort=(None if relevance else sort),
+            limit=pool_limit,
             full=False,
-        )
+        ))
     except Exception as exc:
         abort(502, description=f"Hugging Face request failed: {exc}")
+
+    if relevance and q:
+        models.sort(
+            key=lambda m: _relevance_score(
+                q, m.modelId, getattr(m, "downloads", 0) or 0,
+                getattr(m, "author", None)),
+            reverse=True)
+    models = models[:limit]
 
     results = []
     for model in models:
@@ -87,6 +194,8 @@ def search_models():
                 total_bytes=model_size(hub_id) if with_size else None,   # #2
                 last_modified=str(getattr(model, "last_modified", "")) or None,
                 created_at=str(getattr(model, "created_at", "")) or None,
+                trust=_trust_label(
+                    _trust_tier(hub_id, getattr(model, "author", None))),
             ).model_dump()
         )
 

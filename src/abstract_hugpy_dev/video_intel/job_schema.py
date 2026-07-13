@@ -17,6 +17,7 @@ from .movie_schema import MovieSpec
 from .scene_schema import GenerateSceneSpec
 from .studio.job import StudioI2VSpec
 from .studio_movie_schema import StudioMovieSpec
+from .identity_reconstruction_schema import IdentityReconstructionSpec
 
 
 @dataclass(frozen=True)
@@ -50,4 +51,10 @@ JOB_REGISTRY = {
     # (segments × per-clip) — a longer timeout, mirroring generate_movie.
     "generate_studio_movie": JobSpec(
         "generate_studio_movie", StudioMovieSpec, ("studio", "movie"), "gpu", 14400),
+    # Identity reconstruction (studio stage (b)) = an ORCHESTRATOR that renders one
+    # id_lock still per view INLINE through the same render_clip spine as studio_i2v,
+    # so its wall-clock is (views × per-clip) — a long timeout, mirroring the movies.
+    "identity_reconstruction": JobSpec(
+        "identity_reconstruction", IdentityReconstructionSpec,
+        ("identity", "reconstruction"), "gpu", 14400),
 }

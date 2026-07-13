@@ -37,6 +37,7 @@ from .movie_schema import GoalInterval, make_movie
 from .scene_schema import make_generate_scene
 from .studio.job import studio_i2v_from_dict
 from .studio_movie_schema import studio_movie_from_dict
+from .identity_reconstruction_schema import identity_reconstruction_from_dict
 from .result_schema import JobResult
 from .runners import DISPATCH
 
@@ -202,6 +203,9 @@ SPEC_DESERIALIZERS: Dict[str, Callable[[dict], object]] = {
     # Studio movie — the take-tree spec rehydrates through its own
     # validate-at-construction factory (studio_movie_schema.studio_movie_from_dict).
     "generate_studio_movie": studio_movie_from_dict,
+    # Identity reconstruction (studio stage (b)) — rehydrates through its own
+    # validate-at-construction factory (identity_reconstruction_from_dict).
+    "identity_reconstruction": identity_reconstruction_from_dict,
 }
 
 
@@ -255,6 +259,17 @@ def _ensure_db() -> None:
             # swallow the "duplicate column name" OperationalError.
             try:
                 conn.execute("ALTER TABLE media_jobs ADD COLUMN progress_json TEXT")
+            except sqlite3.OperationalError:
+                pass  # column already present (fresh CREATE or prior migration)
+            # Same idempotent migration, for the studio-clip ARCHIVE feature: DBs
+            # created before it lack archived_at. NULL = active (listed by GET
+            # /video/studio/clips); a REAL epoch timestamp = archived (hidden from
+            # that list, honest 410 from the per-id serve/detail routes). The clip's
+            # row and its bytes on disk are never touched by archiving — only this
+            # one column flips — so a pre-feature DB just starts every existing job
+            # off as active, which is the correct/only sane default.
+            try:
+                conn.execute("ALTER TABLE media_jobs ADD COLUMN archived_at REAL")
             except sqlite3.OperationalError:
                 pass  # column already present (fresh CREATE or prior migration)
         finally:
@@ -478,6 +493,95 @@ def is_cancelling(job_id: str) -> bool:
             "SELECT status FROM media_jobs WHERE job_id=?", (job_id,),
         ).fetchone()
         return bool(row) and row[0] == "cancelling"
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# Studio-clip ARCHIVE (never-delete doctrine) — fixes "removed clips just
+# reappear": GET /video/studio/clips is DB-driven (a media_jobs SELECT, not a
+# filesystem walk — see that route's header note), so "remove from the library"
+# is a mark this bus owns, not a client-only mutation the next ~6s poll undoes.
+# The row and the clip's bytes on disk are NEVER touched — archived_at is the
+# only thing that changes. Mirrors cancel()/is_cancelling()'s idiom: idempotent,
+# reports what happened via a dict rather than raising, single writer per call.
+# --------------------------------------------------------------------------- #
+def archive(job_id: str) -> dict:
+    """Archive a studio clip: sets archived_at (once) so the list query excludes
+    it. Scoped to name='studio_i2v' — this bus also carries every other job kind,
+    and archive is a studio-clips-library concept only. Idempotent: archiving an
+    already-archived clip is a clean NO-OP that reports the ORIGINAL archived_at
+    (never bumped) via `already=True`, not an error — a UI retry or a double
+    click must never surface as a failure. Returns {"job_id","found","archived",
+    "already","archived_at"}; found=False means no studio_i2v row exists for that
+    id (the route's 404)."""
+    _ensure_db()
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT archived_at FROM media_jobs WHERE job_id=? AND name='studio_i2v'",
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            return {"job_id": job_id, "found": False, "archived": False,
+                    "already": False, "archived_at": None}
+        existing = row[0]
+        if existing is not None:
+            return {"job_id": job_id, "found": True, "archived": True,
+                    "already": True, "archived_at": existing}
+        now = time.time()
+        conn.execute(
+            "UPDATE media_jobs SET archived_at=? "
+            "WHERE job_id=? AND name='studio_i2v' AND archived_at IS NULL",
+            (now, job_id),
+        )
+        return {"job_id": job_id, "found": True, "archived": True,
+                "already": False, "archived_at": now}
+    finally:
+        conn.close()
+
+
+def unarchive(job_id: str) -> dict:
+    """The honest counterpart to archive() — cheap to add, and it keeps the
+    archive a REVERSIBLE hide rather than a one-way trapdoor. Same idempotent
+    shape: unarchiving a clip that was never archived (or already unarchived) is
+    a clean no-op (`already=True`), not an error."""
+    _ensure_db()
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT archived_at FROM media_jobs WHERE job_id=? AND name='studio_i2v'",
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            return {"job_id": job_id, "found": False, "archived": False, "already": False}
+        existing = row[0]
+        if existing is None:
+            return {"job_id": job_id, "found": True, "archived": False, "already": True}
+        conn.execute(
+            "UPDATE media_jobs SET archived_at=NULL "
+            "WHERE job_id=? AND name='studio_i2v' AND archived_at IS NOT NULL",
+            (job_id,),
+        )
+        return {"job_id": job_id, "found": True, "archived": False, "already": False}
+    finally:
+        conn.close()
+
+
+def is_archived(job_id: str) -> bool:
+    """True if the studio clip carries an archived_at mark — checked by the
+    per-id serve/detail routes so a direct fetch of an archived clip answers
+    HONESTLY (410 'archived') instead of the generic 404 'never existed'.
+    Un-gated read (like is_cancelling); NOT scoped to name='studio_i2v' since
+    job_id is globally unique and archived_at is only ever set by archive()
+    above, which already enforces that scope."""
+    _ensure_db()
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT archived_at FROM media_jobs WHERE job_id=?", (job_id,),
+        ).fetchone()
+        return bool(row) and row[0] is not None
     finally:
         conn.close()
 

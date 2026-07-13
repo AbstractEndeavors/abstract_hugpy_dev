@@ -36,3 +36,7 @@ class ModelSearchResult(BaseModel):
     total_bytes: int | None = None
     last_modified: str | None = None
     created_at: str | None = None
+    # Uploader trust tier for the ranking/badge: "first-party" (canonical org),
+    # "community" (reputable repackager/quantizer), or None (unvetted). Curated
+    # allowlist, not an official HF signal — see search_routes._TRUST_TIER1/2.
+    trust: str | None = None

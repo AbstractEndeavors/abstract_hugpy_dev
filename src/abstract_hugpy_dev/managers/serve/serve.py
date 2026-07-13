@@ -67,7 +67,12 @@ LLAMA_SWAP_CONFIG = get_env_value("LLAMA_SWAP_CONFIG") or "/etc/llama-swap/confi
 LLAMA_SWAP_UNIT = get_env_value("LLAMA_SWAP_UNIT") or "llama-swap.service"
 LLAMA_SWAP_TTL = int(get_env_value("LLAMA_SWAP_TTL") or 600)   # on-demand unload, seconds
 
-DEFAULT_LLAMA_CTX = int(get_env_value("DEFAULT_LLAMA_CTX") or 4096)
+# Fallback context window for a served llama-server when neither the model
+# config nor DEFAULT_LLAMA_CTX (env) specifies one. Now matches the in-process
+# runner default DEFAULT_N_CTX (managers/llama/runners/src/imports/constants.py);
+# the previous 4096 silently truncated long outputs — the transcript overflowed,
+# the model lost its framing and looped with no stop. The env override wins.
+DEFAULT_LLAMA_CTX = int(get_env_value("DEFAULT_LLAMA_CTX") or 16384)
 DEFAULT_LLAMA_THREADS = int(get_env_value("DEFAULT_LLAMA_THREADS") or 6)
 # GPU offload for llama-server. -1 = put every layer on the GPU (the right
 # default for a CUDA-built llama-server); 0 = CPU only; N = first N layers.

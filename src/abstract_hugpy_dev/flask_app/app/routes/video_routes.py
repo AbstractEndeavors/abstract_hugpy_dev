@@ -35,6 +35,7 @@ from __future__ import annotations
 import dataclasses
 import mimetypes
 import os
+import secrets
 
 from flask import request, jsonify, send_file
 
@@ -44,7 +45,7 @@ from abstract_hugpy_dev.imports.src.constants.constants import (
     UPLOADS_HOME,
     DEFAULT_ROOT,
 )
-from abstract_hugpy_dev.video_intel import media_store, media_bus
+from abstract_hugpy_dev.video_intel import media_store, media_bus, identity_profiles
 from abstract_hugpy_dev.video_intel.media_schema import make_media_ref
 from abstract_hugpy_dev.video_intel.crop_schema import (
     SpatialRegion,
@@ -64,6 +65,10 @@ from abstract_hugpy_dev.video_intel.studio_movie_schema import (
     _DEFAULT_CONTEXT_FRAMES as _DEFAULT_MOVIE_CONTEXT_FRAMES,
     StudioMovieGoal,
     make_studio_movie,
+)
+from abstract_hugpy_dev.video_intel.identity_reconstruction_schema import (
+    DEFAULT_VIEWS as _DEFAULT_RECON_VIEWS,
+    make_identity_reconstruction,
 )
 from abstract_hugpy_dev.video_intel.chains import (
     resolve_video_parts,
@@ -140,6 +145,21 @@ def _resolve_asset_uri(asset_id):
                     and isinstance(o.get("uri"), str) and o["uri"]):
                 return o["uri"]
     return None
+
+
+def _autofit_vram_budget(raw):
+    """A BLANK/absent/null ``vram_budget_gb`` means AUTOFIT (return ``None``): the studio
+    render sizes the routing budget to the SERVING WORKER's measured free VRAM at render
+    time, rather than a low guess that is guaranteed to fail (operator doctrine 2026-07-12:
+    "if a model needs 14GB and it's blank, just do 14, otherwise a fail is 100% likely").
+    An EXPLICIT number is the manual override — passed through untouched (a bad value still
+    400s in the validating factory). None threads through the spec to render_clip, which
+    resolves it; no worker/VRAM data degrades to the historical synthetic default."""
+    if raw is None:
+        return None
+    if isinstance(raw, str) and not raw.strip():
+        return None
+    return raw
 
 
 # --------------------------------------------------------------------------- #
@@ -468,7 +488,14 @@ def video_studio_i2v():
     # the VACE capabilities (id_lock / v2v — the runners that consume them); rejected for
     # any other capability so a non-VACE runner can never silently ignore them.
     _REF_CAPS = {"id_lock", "v2v"}
-    reference_images_in = body.get("reference_images")
+    # UNIFIED IDENTITY (2026-07-12): an enqueue may name a saved identity profile
+    # instead of raw reference_images; the profile's curated set is canonical. Its
+    # OWN bounded block (a concurrent vram_budget_gb edit lives elsewhere in this
+    # route — keep these seams from entangling).
+    reference_images_in, _prof_err = _reference_images_from_body(body)
+    if _prof_err is not None:
+        _pl, _st = _prof_err
+        return jsonify(_pl), _st
     resolved_refs: list = []
     if reference_images_in is not None:
         if not isinstance(reference_images_in, list):
@@ -554,7 +581,9 @@ def video_studio_i2v():
             width=width,
             height=height,
             fps=fps,
-            vram_budget_gb=body.get("vram_budget_gb", 0.5),
+            # AUTOFIT: blank/absent/null -> None (size to the serving worker's free VRAM);
+            # an explicit number is the manual override (unchanged).
+            vram_budget_gb=_autofit_vram_budget(body.get("vram_budget_gb")),
             seed=body.get("seed", 0),
             out_root=body.get("out_root"),
             start_image=start_image,
@@ -679,7 +708,12 @@ def video_studio_movie():
     # media catalog). Each is jail-resolved + ffprobe/PIL-classified as an IMAGE (a non-image /
     # jail-escaping / missing target is a clean 4xx here, not a deferred runner failure). Up to
     # 4 (all consumed by diffusers 0.39). Mirrors /video/studio/i2v's reference handling.
-    reference_images_in = body.get("reference_images")
+    # UNIFIED IDENTITY (2026-07-12): accept identity_profile:<slug> (canonical) as an
+    # alternative to raw reference_images / reference_image_asset_ids. Own bounded block.
+    reference_images_in, _prof_err = _reference_images_from_body(body)
+    if _prof_err is not None:
+        _pl, _st = _prof_err
+        return jsonify(_pl), _st
     reference_asset_ids = body.get("reference_image_asset_ids")
     if reference_images_in is None and isinstance(reference_asset_ids, list):
         reference_images_in = []
@@ -719,7 +753,9 @@ def video_studio_movie():
             width=width,
             height=height,
             fps=fps,
-            vram_budget_gb=body.get("vram_budget_gb", 0.5),
+            # AUTOFIT: blank/absent/null -> None (each segment sizes to the serving worker's
+            # free VRAM at render time); an explicit number is the manual override.
+            vram_budget_gb=_autofit_vram_budget(body.get("vram_budget_gb")),
             seed=body.get("seed", 0),
             # C-prompt: "negative_prompt" (canonical) with back-compat to "negative".
             negative=body.get("negative_prompt", body.get("negative")),
@@ -1006,6 +1042,12 @@ def video_studio_clips():
     # path in the response — playback is by job_id through /video/studio/clip/<id>,
     # which owns the jail. Reads media_bus's own DB_PATH via a read-only connection
     # (mirrors media_bus.get's read); it does not mutate the bus or its schema.
+    #
+    # `archived_at IS NULL` excludes ARCHIVED clips (POST .../archive) — this is
+    # the fix for "removed clips just reappear": this list IS the catalog (it is
+    # DB-driven, not a filesystem walk), so a clip hidden here via media_bus.archive
+    # stays hidden across every poll, unlike the old client-only "remove" the UI
+    # used to do (which this same query's next 6s tick silently resurrected).
     import json as _json
     import sqlite3
 
@@ -1023,14 +1065,16 @@ def video_studio_clips():
         try:
             rows = conn.execute(
                 "SELECT job_id, status, result_json, created, updated "
-                "FROM media_jobs WHERE name='studio_i2v' "
+                "FROM media_jobs WHERE name='studio_i2v' AND archived_at IS NULL "
                 "ORDER BY updated DESC LIMIT ?",
                 (limit,),
             ).fetchall()
         finally:
             conn.close()
     except sqlite3.Error:
-        # No DB yet / transient lock -> an empty list is the honest answer.
+        # No DB yet / transient lock (or a not-yet-migrated archived_at column on
+        # a DB no write path has touched this process) -> an empty list is the
+        # honest answer, same posture as before this feature.
         rows = []
 
     for job_id, status, result_json, created, updated in rows:
@@ -1073,6 +1117,12 @@ def video_studio_clip(job_id):
     # Canonical clips root — imported LAZILY (mirrors the runner's lazy studio-spine
     # imports) so this module stays app-boot cheap and drift-free with studio.job.
     from abstract_hugpy_dev.video_intel.studio.job import DEFAULT_CLIPS_ROOT
+
+    # Archived clips are HIDDEN from GET /video/studio/clips but their bytes are
+    # NEVER deleted (never-delete doctrine) — a direct fetch by id gets an HONEST
+    # 410 naming "archived", not a bare 404 that reads as "this never existed".
+    if media_bus.is_archived(job_id):
+        return jsonify({"error": "clip archived", "archived": True}), 410
 
     view = media_bus.get(job_id)              # {"status","result",...} — unknown -> nulls
     result = view.get("result") if isinstance(view, dict) else None
@@ -1128,6 +1178,11 @@ def video_studio_clip_detail(job_id):
     import json as _json
     import sqlite3
     from abstract_hugpy_dev.video_intel.studio.job import DEFAULT_CLIPS_ROOT
+
+    # Same honest 410 as the stream route: an archived clip's row/manifest still
+    # exist (never-delete), but the expander should say "archived", not 404.
+    if media_bus.is_archived(job_id):
+        return jsonify({"error": "clip archived", "archived": True}), 410
 
     # Read the bus row read-only (mirrors /video/studio/clips) — spec_json carries the
     # REQUESTED params, result_json the outcome. Unknown id -> 404 (nothing to detail).
@@ -1227,6 +1282,47 @@ def video_studio_clip_detail(job_id):
     }), 200
 
 
+# --------------------------------------------------------------------------- #
+# 5c) POST /video/studio/clip/<job_id>/archive + /unarchive — the fix for
+#     "removed clips just reappear". GET /video/studio/clips (2j... above) is
+#     DB-driven, not a filesystem walk, so a real "remove" has to be a mark THAT
+#     query excludes — which is exactly what media_bus.archive does (see its
+#     header note). The clip's row and bytes on disk are NEVER touched; archiving
+#     only flips archived_at, so the never-delete doctrine holds trivially (there
+#     is no delete path to guard against). Idempotent by choice, not 409: a
+#     retried/double-clicked archive (the UI archives optimistically, see
+#     StudioPlane's Session-Library remove) must read as "already gone", never as
+#     a failure that would restore the row and show an error for nothing.
+# --------------------------------------------------------------------------- #
+@video_bp.route("/video/studio/clip/<job_id>/archive", methods=["POST"])
+def video_studio_clip_archive(job_id):
+    result = media_bus.archive(job_id)
+    if not result["found"]:
+        return jsonify({"ok": False, "error": "no studio job for that id"}), 404
+    return jsonify({
+        "ok": True,
+        "job_id": job_id,
+        "archived": True,
+        "already": result["already"],
+        "archived_at": result["archived_at"],
+    }), 200
+
+
+@video_bp.route("/video/studio/clip/<job_id>/unarchive", methods=["POST"])
+def video_studio_clip_unarchive(job_id):
+    # The honest counterpart — cheap to add, and it makes archive a REVERSIBLE
+    # hide rather than a one-way trapdoor.
+    result = media_bus.unarchive(job_id)
+    if not result["found"]:
+        return jsonify({"ok": False, "error": "no studio job for that id"}), 404
+    return jsonify({
+        "ok": True,
+        "job_id": job_id,
+        "archived": False,
+        "already": result["already"],
+    }), 200
+
+
 def _studio_manifest_view(m: dict, clip_path: str, output: dict) -> dict:
     """Compact projection of a render manifest.json for the clip-detail expander. The
     clip DIR name IS the content_hash (content-addressed storage), so we surface it from
@@ -1310,3 +1406,311 @@ def video_projects():
                 names.add(p)
 
     return jsonify({"projects": sorted(names, key=str.lower)}), 200
+
+
+# --------------------------------------------------------------------------- #
+# IDENTITY PROFILES (studio stage (a)) — a NAMED, DURABLE library item:
+#   {name, reference_images (1..4), created_at, notes?}
+# DOCTRINE (STUDIO-ROADMAP.md "IDENTITY PROFILES"): a profile is the durable form
+# of "the reference set IS the identity" — a character's curated reference DNA
+# saved ONCE and associated anywhere (single clips, movies, stills) instead of
+# being re-supplied per request. This is the LIBRARY-ITEM surface; stage (b)
+# (turnaround generation from a profile + the re-edit loop that promotes an
+# approved rendering to the canonical reference) layers on top of this store next.
+#
+# These routes only translate HTTP <-> video_intel.identity_profiles (the store
+# owns the single-writer/atomic-write invariant, reused from api_keys). Reference
+# images are validated HERE with the studio movie/i2v route's EXACT jail + ingest
+# + image-classify pass, then stored as given (durable uploads/store paths).
+# Errors-as-data throughout — a bad path is a clean 4xx, never a deferred failure.
+# --------------------------------------------------------------------------- #
+def _validate_profile_reference_images(raws):
+    """Jail-resolve + image-classify a list of reference-image paths EXACTLY as the
+    studio routes do (``_jail_resolve`` -> ``media_store.ingest(kind_hint="image")``
+    -> ``kind == "image"``). Returns ``(resolved_abs_paths, None)`` on success or
+    ``(None, (error_payload, status))`` so the caller returns the clean 4xx. 1..4
+    images required — the same envelope the movie route enforces."""
+    if not isinstance(raws, list) or not raws:
+        return None, ({"error": "reference_images must be a non-empty list of paths"}, 400)
+    if len(raws) > identity_profiles.MAX_REFERENCE_IMAGES:
+        return None, ({
+            "error": f"at most {identity_profiles.MAX_REFERENCE_IMAGES} reference_images are accepted"
+        }, 400)
+    resolved: list = []
+    for raw in raws:
+        if not isinstance(raw, str) or not raw.strip():
+            return None, ({"error": "each reference_image must be a non-empty path"}, 400)
+        rp = _jail_resolve(raw)
+        if rp is None:
+            return None, ({"error": "reference_image outside storage jail"}, 400)
+        if not os.path.isfile(rp):
+            return None, ({"error": "reference_image not found"}, 404)
+        try:
+            iref = media_store.ingest(rp, kind_hint="image")
+        except Exception as exc:  # unreadable / not a real image = bad input
+            return None, ({"error": f"reference_image is not a readable media file: {exc}"}, 400)
+        if iref.kind != "image":
+            return None, ({
+                "error": f"reference_image is not an image (classified as {iref.kind})"
+            }, 400)
+        resolved.append(iref.uri)
+    return resolved, None
+
+
+def _reference_images_from_body(body):
+    """Resolve an optional ``identity_profile`` slug to its canonical reference set,
+    for the studio i2v / movie enqueue bodies.
+
+    UNIFIED IDENTITY (operator 2026-07-12): an identity profile IS the identity. A
+    studio enqueue may carry ``identity_profile: "<slug>"`` instead of a raw
+    ``reference_images`` list. The saved profile's reference set is CANONICAL: when
+    BOTH are present the profile WINS — a named, curated identity outranks ad-hoc
+    paths (and a later edit to the profile re-resolves through the same slug). Raw
+    ``reference_images`` stays accepted for the unsaved / backward-compat case.
+
+    PROMOTED CANONICAL preference (stage (b)): once the operator promotes reconstruction
+    views to the profile's ``canonical`` ref set (POST .../canonical), that APPROVED DNA
+    outranks the raw uploaded ``reference_images`` — the profile resolves to ``canonical``
+    when it is non-empty, falling back to ``reference_images`` otherwise. Same single
+    code path either way.
+
+    Returns ``(reference_images_or_None, None)`` on success, or
+    ``(None, (error_payload, status))`` when a given slug names no profile — a stale
+    slug is a clean 4xx, never a silent empty identity. The returned list still flows
+    through the SAME jail + ingest + image-classify validation the routes already run
+    (the profile's stored paths are re-checked, one code path)."""
+    slug = body.get("identity_profile")
+    if slug is None:
+        return body.get("reference_images"), None
+    if not isinstance(slug, str) or not slug.strip():
+        return None, ({"error": "identity_profile must be a slug string"}, 400)
+    profile = identity_profiles.get_profile(slug.strip())
+    if profile is None:
+        return None, ({"error": f"identity_profile {slug!r} not found"}, 404)
+    canonical = profile.get("canonical") or []
+    chosen = canonical if canonical else list(profile.get("reference_images") or [])
+    return list(chosen), None
+
+
+@video_bp.route("/video/identity-profiles", methods=["GET"])
+def video_identity_profiles_list():
+    # Active (non-archived) profiles, newest first. The store's projection already
+    # folds the slug into each row, so a list row is self-describing.
+    return jsonify({"profiles": identity_profiles.list_profiles()}), 200
+
+
+@video_bp.route("/video/identity-profiles", methods=["POST"])
+def video_identity_profiles_create():
+    # {name, reference_images[1..4], notes?} -> create. Slug derives from name; a
+    # collision with an existing ACTIVE profile is a 409 (never a silent overwrite).
+    body = request.get_json(silent=True) or {}
+    name = body.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return jsonify({"error": "name is required"}), 400
+    resolved, err = _validate_profile_reference_images(body.get("reference_images"))
+    if err is not None:
+        payload, status = err
+        return jsonify(payload), status
+    notes = body.get("notes")
+    if notes is not None and not isinstance(notes, str):
+        return jsonify({"error": "notes must be a string"}), 400
+    try:
+        profile = identity_profiles.create_profile(name, resolved, notes=notes or "")
+    except identity_profiles.ProfileError as exc:  # dup slug / bad shape = errors-as-data
+        status = 409 if exc.code == "duplicate" else 400
+        return jsonify({"error": str(exc), "code": exc.code}), status
+    return jsonify({"profile": profile}), 201
+
+
+@video_bp.route("/video/identity-profiles/<slug>", methods=["GET"])
+def video_identity_profile_get(slug):
+    profile = identity_profiles.get_profile(slug)
+    if profile is None:
+        return jsonify({"error": "identity profile not found"}), 404
+    return jsonify({"profile": profile}), 200
+
+
+@video_bp.route("/video/identity-profiles/<slug>", methods=["DELETE"])
+def video_identity_profile_delete(slug):
+    # ARCHIVE semantics (never-delete doctrine): the store moves the entry under a
+    # `_deleted` key with a timestamp rather than erasing it. Idempotent — deleting
+    # an unknown/already-archived slug is a clean 404 no-op.
+    archived = identity_profiles.delete_profile(slug)
+    if archived is None:
+        return jsonify({"error": "identity profile not found", "archived": False}), 404
+    return jsonify({"ok": True, "archived": True, "slug": slug}), 200
+
+
+# --------------------------------------------------------------------------- #
+# PATCH /video/identity-profiles/<slug> — edit an existing profile's DISPLAY
+# fields + reference set. {name?, notes?, reference_images?}, all optional (a
+# true partial update — an omitted key is left untouched, matching
+# identity_profiles.update_profile's **kwargs contract below). Any given
+# `reference_images` runs the SAME jail + ingest + image-classify validation as
+# POST create (`_validate_profile_reference_images`), so a PATCH can never leave
+# a profile pointing at an unreadable/non-image/jail-escaping path.
+#
+# RENAMING KEEPS THE SLUG STABLE — `name` only ever changes the stored display
+# string, never the `<slug>` this route (and every identity_profile:<slug>
+# reference in a saved template/spec/enqueue body) keys on. Re-slugging on
+# rename would silently break every one of those references; see
+# identity_profiles.update_profile's docstring for the full rationale.
+#
+# An identity keeps >=1 reference image always: a given `reference_images` must
+# be non-empty (the store rejects an empty list exactly like create does) — omit
+# the key entirely to leave the current set untouched. Existence is checked
+# BEFORE any (potentially expensive) reference validation runs, so an unknown
+# slug 404s fast without jail-resolving/ingesting images that will never be
+# stored; the store's own None-return is still honored afterward as a defensive
+# recheck against a concurrent archive racing this same request.
+# --------------------------------------------------------------------------- #
+@video_bp.route("/video/identity-profiles/<slug>", methods=["PATCH"])
+def video_identity_profile_update(slug):
+    if identity_profiles.get_profile(slug) is None:
+        return jsonify({"error": "identity profile not found"}), 404
+
+    body = request.get_json(silent=True) or {}
+    kwargs: dict = {}
+
+    if "name" in body:
+        name = body.get("name")
+        if not isinstance(name, str) or not name.strip():
+            return jsonify({"error": "name is required"}), 400
+        kwargs["name"] = name
+
+    if "notes" in body:
+        notes = body.get("notes")
+        if notes is not None and not isinstance(notes, str):
+            return jsonify({"error": "notes must be a string"}), 400
+        kwargs["notes"] = notes or ""
+
+    if "reference_images" in body:
+        resolved, err = _validate_profile_reference_images(body.get("reference_images"))
+        if err is not None:
+            payload, status = err
+            return jsonify(payload), status
+        kwargs["reference_images"] = resolved
+
+    try:
+        profile = identity_profiles.update_profile(slug, **kwargs)
+    except identity_profiles.ProfileError as exc:  # errors-as-data, never a 500
+        return jsonify({"error": str(exc), "code": exc.code}), 400
+    if profile is None:  # lost a race with a concurrent archive
+        return jsonify({"error": "identity profile not found"}), 404
+    return jsonify({"profile": profile}), 200
+
+
+# --------------------------------------------------------------------------- #
+# POST /video/identity-profiles/<slug>/reconstruction — STAGE (b): generate an
+# identity-locked TURNAROUND of the character (one still per view) from its reference
+# images + description, stored in the identity's dir for approval.
+#
+# Body (all optional): {prompt?: str, views?: [str], seed?: int, mode?: "sheet"|"turntable"}
+#   prompt  extra description woven into every view prompt; default = the profile's notes.
+#   views   the view names to render; default ["front","three_quarter","profile","back"].
+#           A SINGLE-view request (["front"]) is valid — the cheap one-render check.
+#           IGNORED in turntable mode (the orbit clip's frames define the set).
+#   seed    base render seed (default 0; all views share it — the view differs by prompt).
+#   mode    "sheet" (default — N independent view-stills) or "turntable" (ONE 360° orbit
+#           clip, every frame kept as an angular degree-view the UI scrubs to rotate).
+#
+# Enqueues ONE orchestrator job (identity_reconstruction) and returns {job_id, recon_id};
+# its runner renders each view behind the swap seam, then attaches the produced stills to
+# the profile. Poll GET /video/jobs/<job_id>; on done, re-read the profile (GET .../<slug>)
+# for the new ``reconstructions`` entry keyed by recon_id.
+# --------------------------------------------------------------------------- #
+@video_bp.route("/video/identity-profiles/<slug>/reconstruction", methods=["POST"])
+def video_identity_profile_reconstruction(slug):
+    profile = identity_profiles.get_profile(slug)
+    if profile is None:
+        return jsonify({"error": "identity profile not found"}), 404
+    body = request.get_json(silent=True) or {}
+
+    # Resolve the profile's reference set through the SAME resolver the studio enqueue
+    # uses (canonical-preferred) + the SAME jail + ingest + image-classify validation
+    # (single code path). A promoted canonical set outranks the raw uploads here too.
+    refs_in, perr = _reference_images_from_body({"identity_profile": slug})
+    if perr is not None:
+        payload, status = perr
+        return jsonify(payload), status
+    resolved_refs, verr = _validate_profile_reference_images(refs_in)
+    if verr is not None:
+        payload, status = verr
+        return jsonify(payload), status
+
+    # prompt: default to the profile's notes (the description the profile carries).
+    prompt = body.get("prompt")
+    if prompt is None:
+        prompt = profile.get("notes") or ""
+    elif not isinstance(prompt, str):
+        return jsonify({"error": "prompt must be a string"}), 400
+
+    # views: default to the canonical turnaround set; a non-empty list of non-empty
+    # strings (a single view is valid — verify one render cheaply first).
+    views = body.get("views")
+    if views is None:
+        views = list(_DEFAULT_RECON_VIEWS)
+    if not isinstance(views, list) or not views:
+        return jsonify({"error": "views must be a non-empty list of view names"}), 400
+    for v in views:
+        if not isinstance(v, str) or not v.strip():
+            return jsonify({"error": "each view must be a non-empty string"}), 400
+
+    seed = body.get("seed", 0)
+    if not isinstance(seed, int) or isinstance(seed, bool):
+        return jsonify({"error": "seed must be an int"}), 400
+
+    # mode: default "sheet" (the existing N-independent-view-stills path). "turntable"
+    # renders ONE 360° orbit clip and keeps every frame as a scrubbable degree-view
+    # (``views`` from the body are ignored in turntable mode — the orbit defines the set).
+    mode = body.get("mode", "sheet")
+    if mode not in ("sheet", "turntable"):
+        return jsonify({"error": 'mode must be "sheet" or "turntable"'}), 400
+
+    recon_id = "recon_" + secrets.token_hex(8)
+    try:
+        spec = make_identity_reconstruction(
+            slug=slug,
+            recon_id=recon_id,
+            reference_images=tuple(resolved_refs),
+            views=tuple(views),
+            base_prompt=prompt,
+            seed=seed,
+            mode=mode,
+            # geometry (<=480p id_lock ceiling) + autofit VRAM are the schema defaults.
+        )
+    except (ValueError, TypeError) as exc:  # bad fields = 400
+        return jsonify({"error": str(exc)}), 400
+    job_id = media_bus.enqueue("identity_reconstruction", spec)
+    return jsonify({"job_id": job_id, "recon_id": recon_id}), 200
+
+
+# --------------------------------------------------------------------------- #
+# POST /video/identity-profiles/<slug>/canonical — STAGE (b) approve: promote chosen
+# reconstruction views into the profile's ``canonical`` reference set (the approved
+# character DNA the resolver then PREFERS over the raw uploads). Body:
+# {recon_id: str, views: [int]} — the view indices of that reconstruction to promote
+# (at most 4; canonical feeds the id_lock reference channel). Returns {profile} with
+# ``canonical`` populated. An unknown recon_id / out-of-range index is a clean 400.
+# --------------------------------------------------------------------------- #
+@video_bp.route("/video/identity-profiles/<slug>/canonical", methods=["POST"])
+def video_identity_profile_canonical(slug):
+    if identity_profiles.get_profile(slug) is None:
+        return jsonify({"error": "identity profile not found"}), 404
+    body = request.get_json(silent=True) or {}
+    recon_id = body.get("recon_id")
+    if not isinstance(recon_id, str) or not recon_id.strip():
+        return jsonify({"error": "recon_id is required"}), 400
+    views = body.get("views")
+    if not isinstance(views, list) or not views:
+        return jsonify({"error": "views must be a non-empty list of view indices"}), 400
+    for v in views:
+        if not isinstance(v, int) or isinstance(v, bool):
+            return jsonify({"error": "each view must be an integer index"}), 400
+    try:
+        profile = identity_profiles.promote_reconstruction_views(slug, recon_id, views)
+    except identity_profiles.ProfileError as exc:  # bad index / unknown recon = 400
+        return jsonify({"error": str(exc), "code": exc.code}), 400
+    if profile is None:  # lost a race with a concurrent archive
+        return jsonify({"error": "identity profile not found"}), 404
+    return jsonify({"profile": profile}), 200

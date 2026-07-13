@@ -1,5 +1,56 @@
 from .imports import *
+import re
+from difflib import SequenceMatcher
 # base_runner.py
+
+# --------------------------------------------------------------------------- #
+# loop / stagnation guard for the unbounded continue-loop                     #
+# --------------------------------------------------------------------------- #
+# The unbounded paths append a {"role":"user","content":"continue"} nudge after
+# every finish_reason=="length" chunk and go again. With no guard a model that
+# has started looping regenerates the same block up to max_chunks times. This is
+# a CONSERVATIVE safety net: only stop when consecutive continue-chunks are
+# (near-)identical for several passes in a row, so genuinely long, evolving
+# output — where each pass produces distinct text — never trips it.
+_LOOP_GUARD_WINDOW = 4000   # trailing chars compared per chunk (bounds cost)
+
+
+def _loop_guard_params():
+    """(max_repeat, similarity) for the anti-repetition guard, env-tunable via
+    HUGPY_LOOP_GUARD_MAX_REPEAT / HUGPY_LOOP_GUARD_SIMILARITY. Defaults are
+    deliberately conservative: a chunk must be a near-duplicate of the previous
+    one for 2 consecutive continue-passes (i.e. 3 near-identical chunks in a row)
+    before we finalize, and 'near-duplicate' means a >=0.95 similarity ratio."""
+    try:
+        max_repeat = int(os.environ.get("HUGPY_LOOP_GUARD_MAX_REPEAT", "2"))
+    except (TypeError, ValueError):
+        max_repeat = 2
+    try:
+        similarity = float(os.environ.get("HUGPY_LOOP_GUARD_SIMILARITY", "0.95"))
+    except (TypeError, ValueError):
+        similarity = 0.95
+    return max(1, max_repeat), similarity
+
+
+def _normalize_for_guard(text: str) -> str:
+    """Collapse whitespace + lowercase so trivial spacing/case differences
+    between two loop-chunks don't hide an otherwise-identical repeat."""
+    return re.sub(r"\s+", " ", (text or "")).strip().lower()
+
+
+def _chunks_are_similar(prev_norm: str, cur_norm: str, threshold: float) -> bool:
+    """True when two normalized continue-chunks are (near-)identical. Empty
+    inputs are never 'similar' — the first continue-pass has no predecessor, so
+    the guard cannot trip on it. Compares trailing windows to bound cost on very
+    large chunks; two looping chunks share their tail, distinct chunks don't."""
+    if not prev_norm or not cur_norm:
+        return False
+    if prev_norm == cur_norm:
+        return True
+    a, b = prev_norm[-_LOOP_GUARD_WINDOW:], cur_norm[-_LOOP_GUARD_WINDOW:]
+    return SequenceMatcher(None, a, b).ratio() >= threshold
+
+
 class LlamaCppBaseRunner(ABC):
     """Shared scaffolding — event loop, unbounded loop, logging.
     Subclasses implement only the raw I/O."""
@@ -166,6 +217,10 @@ class LlamaCppBaseRunner(ABC):
         convo    = self._attach_image(messages_to_dicts(req.messages), req)
         output_chunks = 0
         last_finish = "stop"
+        # Anti-repetition guard state (see _loop_guard_params / _chunks_are_similar).
+        guard_max_repeat, guard_sim = _loop_guard_params()
+        prev_norm = ""
+        repeat_run = 0
 
         try:
             for _ in range(max_chunks):
@@ -193,6 +248,24 @@ class LlamaCppBaseRunner(ABC):
 
                 last_finish = chunk_finish or "stop"
                 if last_finish != "length" or not piece_text:
+                    break
+
+                # Loop-guard: if this length-chunk is a near-duplicate of the
+                # previous one for guard_max_repeat consecutive passes, the model
+                # is looping rather than making progress — finalize what we have.
+                cur_norm = _normalize_for_guard(piece_text)
+                repeat_run = (repeat_run + 1
+                              if _chunks_are_similar(prev_norm, cur_norm, guard_sim)
+                              else 0)
+                prev_norm = cur_norm
+                if repeat_run >= guard_max_repeat:
+                    logger.warning(
+                        "loop-guard tripped: model=%s reason=repetition "
+                        "consecutive_near_dups=%s sim>=%.2f chunks=%s — finalizing early",
+                        self.model_key, repeat_run, guard_sim, output_chunks)
+                    # Report a clean stop (not 'length') so any client that
+                    # auto-continues on truncation doesn't re-drive the loop.
+                    last_finish = "stop"
                     break
 
                 convo.append({"role": "assistant", "content": piece_text})
@@ -237,6 +310,10 @@ class LlamaCppBaseRunner(ABC):
         top_p_val = resolve_top_p(top_p)
         accumulated = ""
         convo = list(messages)
+        # Anti-repetition guard state (mirrors stream_chat_unbounded).
+        guard_max_repeat, guard_sim = _loop_guard_params()
+        prev_norm = ""
+        repeat_run = 0
 
         for chunk_idx in range(max_chunks):
             text, finish = self._blocking_complete(
@@ -248,6 +325,22 @@ class LlamaCppBaseRunner(ABC):
                        chunk_idx, self.model_key, finish)
             if finish != "length" or not text:
                 break
+
+            # Loop-guard: stop when consecutive length-chunks are near-duplicates
+            # (the model is looping, not progressing). Conservative — see
+            # _loop_guard_params / _chunks_are_similar.
+            cur_norm = _normalize_for_guard(text)
+            repeat_run = (repeat_run + 1
+                          if _chunks_are_similar(prev_norm, cur_norm, guard_sim)
+                          else 0)
+            prev_norm = cur_norm
+            if repeat_run >= guard_max_repeat:
+                logger.warning(
+                    "loop-guard tripped: model=%s reason=repetition "
+                    "consecutive_near_dups=%s sim>=%.2f chunk=%s — finalizing early",
+                    self.model_key, repeat_run, guard_sim, chunk_idx)
+                break
+
             convo = convo + [{"role": "assistant", "content": text},
                              {"role": "user", "content": "continue"}]
 

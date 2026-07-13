@@ -97,8 +97,14 @@ class LlamaCppRunner(LlamaCppBaseRunner):
         return True
 
     async def _iter_stream(self, messages, max_tokens, temp, top_p):
+        # Mild anti-repetition on the streaming path (llama.cpp sampling
+        # extension accepted by llama-server's OpenAI-compatible endpoint;
+        # harmless if a given build ignores it). Complements the loop-guard in
+        # base_runner.stream_chat_unbounded — this discourages the repetition,
+        # the guard stops it if it starts anyway.
         payload = {"messages": messages, "max_tokens": max_tokens,
-                   "temperature": temp, "top_p": top_p, "stream": True}
+                   "temperature": temp, "top_p": top_p, "stream": True,
+                   "repeat_penalty": 1.1}
         for attempt in (1, 2):
             try:
                 async with httpx.AsyncClient(timeout=None) as client:

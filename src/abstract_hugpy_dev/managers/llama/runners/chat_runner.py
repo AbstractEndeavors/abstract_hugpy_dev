@@ -131,8 +131,30 @@ class LlamaCppChatRunner:
         (TokenEvent stream + one terminal DoneEvent/ErrorEvent), so the
         adapter is a straight passthrough.
         """
+        # Per-request loop bounds (bug B): the unbounded continue-loop used to
+        # drop the caller's caps entirely. Mirror the DeepCoder path in
+        # generate_runner._run/stream unbounded, which threads max_chunks and uses
+        # `req.max_new_tokens or 1024` as the per-pass chunk budget. ChatRequest
+        # here differs from that mental model in one way that matters: its
+        # max_new_tokens is NEVER None — it defaults to DEFAULT_MAX_TOKENS — so a
+        # literal `req.max_new_tokens or 1024` would silently change the historical
+        # default per-pass budget from 1024 to 32768. To honor the "preserve the
+        # unbounded default; only make the caps honorable when a caller SETS them"
+        # rule, treat the schema default as "unset" (keep the runner's own 1024)
+        # and honor any explicit, non-default value. req.max_chunks is genuinely
+        # Optional[None] -> pass through; None lets base_runner apply its
+        # HUGPY_MAX_CHUNKS ceiling (256), so the default is unchanged.
+        if req.max_new_tokens and req.max_new_tokens != DEFAULT_MAX_TOKENS:
+            chunk_tokens = req.max_new_tokens
+        else:
+            chunk_tokens = 1024
         streamer = (
-            self.runner.stream_chat_unbounded(req, cancel_event=cancel_event)
+            self.runner.stream_chat_unbounded(
+                req,
+                cancel_event=cancel_event,
+                chunk_tokens=chunk_tokens,
+                max_chunks=req.max_chunks,
+            )
             if req.unbounded
             else self.runner.stream_chat(req, cancel_event=cancel_event)
         )

@@ -73,7 +73,13 @@ class StudioI2VSpec:
     width: int
     height: int
     fps: int
-    vram_budget_gb: float
+    # AUTOFIT budget. A number PINS the routing tier (manual override). ``None`` means
+    # AUTOFIT: a BLANK budget is NOT a guaranteed-fail low guess — at render time the
+    # shared render path (``runners.studio_i2v.render_clip``) sizes it to the serving
+    # worker's MEASURED free VRAM (operator doctrine: "if a model needs 14GB and it's
+    # blank, just do 14, otherwise a fail is 100% likely"). None is threaded verbatim
+    # through the router probes / produce_clip only AFTER render_clip resolves it.
+    vram_budget_gb: Optional[float]
     seed: int
     out_root: str            # output location (a dir under the media-store root)
     start_image: Optional[str] = None   # abs path to a still (i2v conditioning)
@@ -156,9 +162,15 @@ def make_studio_i2v(
     for name, val in (("width", width), ("height", height), ("fps", fps)):
         if not isinstance(val, int) or isinstance(val, bool) or val <= 0:
             raise ValueError(f"{name} must be a positive int; got {val!r}")
-    if not isinstance(vram_budget_gb, (int, float)) or isinstance(vram_budget_gb, bool) \
-            or vram_budget_gb <= 0:
-        raise ValueError(f"vram_budget_gb must be a positive number; got {vram_budget_gb!r}")
+    # AUTOFIT: None is a LEGAL value (blank budget -> fit to the serving worker's free
+    # VRAM at render time). A NUMBER is the manual override and must be positive; a bad
+    # non-None value is still a clean caller error (400 at the route).
+    if vram_budget_gb is not None:
+        if not isinstance(vram_budget_gb, (int, float)) or isinstance(vram_budget_gb, bool) \
+                or vram_budget_gb <= 0:
+            raise ValueError(
+                f"vram_budget_gb must be a positive number or None (autofit); "
+                f"got {vram_budget_gb!r}")
     if not isinstance(seed, int) or isinstance(seed, bool):
         raise ValueError(f"seed must be an int; got {seed!r}")
     if start_image is not None and not (isinstance(start_image, str) and start_image.strip()):
@@ -254,7 +266,8 @@ def make_studio_i2v(
         width=width,
         height=height,
         fps=fps,
-        vram_budget_gb=float(vram_budget_gb),
+        # AUTOFIT: keep None verbatim (resolved at render time); coerce a number to float.
+        vram_budget_gb=(float(vram_budget_gb) if vram_budget_gb is not None else None),
         seed=seed,
         out_root=os.path.abspath(resolved_out),
         start_image=start_image,

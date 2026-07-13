@@ -110,6 +110,14 @@ UPLOADS_HOME = CHAT_UPLOAD_DIR =  _env_root_or_default("UPLOADS_HOME", os.path.j
 
 PROJECTS_HOME = PROJECTS_DIR =  _env_root_or_default("PROJECTS_HOME", os.path.join(DEFAULT_ROOT,"projects"))
 
+# Identity profiles are PERSISTENT library items that OWN their reference images.
+# IDENTITIES_HOME is a first-class storage root and a SIBLING of UPLOADS_HOME (both
+# under DEFAULT_ROOT) — never a child of UPLOADS_HOME — so the session-scoped
+# upload reaper (upload_routes._wipe_session, jailed to UPLOADS_HOME) structurally
+# cannot reach an identity's copied reference images. Env-overridable exactly like
+# its siblings so tests can repoint it before import.
+IDENTITIES_HOME = IDENTITIES_DIR =  _env_root_or_default("IDENTITIES_HOME", os.path.join(DEFAULT_ROOT,"identities"))
+
 PROJECTS_PLACEMENT_PATH = get_env_value("PROJECTS_PLACEMENT_PATH") or os.path.join(PROJECTS_HOME,"placement.json")
 
 DATASETS_HOME = DATASETS_DIR =  _env_root_or_default("DATASETS_HOME", os.path.join(DEFAULT_ROOT,"datasets"))
@@ -132,6 +140,7 @@ PATHS = [
     MODELS_HOME,
     UPLOADS_HOME,
     PROJECTS_HOME,
+    IDENTITIES_HOME,
     DATASETS_HOME,
     HF_HUB_CACHE,
     HF_CACHE,

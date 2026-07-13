@@ -300,7 +300,22 @@ def enrich(directory: str, hub_id: str,
     return ModelMetadata(**merged), sources
 
 
+def _reap_orphaned_staging_quiet() -> None:
+    """Sweep MODELS_HOME for dead-pid `.tmp-<pid>` download staging orphans
+    (see imports/apis/download_models.py) before/while walking the tree — the
+    discovery walk already visits every dir, so this is the natural hook and
+    needs no new daemon. Never raises into discovery over a reaper hiccup."""
+    try:
+        from .download_models import reap_orphaned_staging
+        removed = reap_orphaned_staging()
+        if removed:
+            logger.info("discovery: reaped %d orphaned download staging dir(s)", len(removed))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("discovery: staging reaper skipped (%s)", exc)
+
+
 def discover_model(save_json: bool = True, verbose: bool = True, use_hub: bool = True):
+    _reap_orphaned_staging_quiet()
     discovered = {}
     chain = build_resolver_chain(use_hub=use_hub)
 
@@ -350,6 +365,7 @@ def discover_models(save_json: bool = True, verbose: bool = True, use_hub: bool 
     this, two distinct models with the same basename collapse onto one key and
     one silently overwrites the other — taking its dir/filename/size with it
     (the "confused local map": only one shows, with the wrong gguf size)."""
+    _reap_orphaned_staging_quiet()
     chain = build_resolver_chain(use_hub=use_hub)
 
     rows = []

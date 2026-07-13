@@ -29,6 +29,10 @@ from .studio_i2v import run_studio_i2v
 # INLINE through the produce_clip spine. Import-safe like studio_i2v (studio/numpy
 # imports stay lazy inside the runner), so this never breaks app boot.
 from .studio_movie import run_generate_studio_movie
+# Identity reconstruction (studio stage (b)) — the orchestrator that renders an
+# identity-locked turnaround set from a profile + description. Import-safe like the
+# studio runners (studio/media_store imports stay lazy inside the runner).
+from .identity_reconstruction import run_identity_reconstruction
 
 DISPATCH = {
     ("ffmpeg", "crop"): run_crop,
@@ -39,4 +43,5 @@ DISPATCH = {
     ("diffusers", "generate_movie"): run_generate_movie,
     ("studio", "i2v"): run_studio_i2v,
     ("studio", "movie"): run_generate_studio_movie,
+    ("identity", "reconstruction"): run_identity_reconstruction,
 }

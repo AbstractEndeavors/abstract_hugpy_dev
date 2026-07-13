@@ -217,6 +217,18 @@ def get_hugpy_flask(name=None,allowed_origins=None,debug=False):
         import logging as _logging
         _logging.getLogger(__name__).error("operator gate install failed: %s", _exc)
 
+    # Human-friendly /endpoints: content-negotiate the abstract_flask endpoint
+    # inspector so a browser hitting dev.hugpy.ai/endpoints gets a rendered,
+    # searchable page while curl / programmatic clients still get the exact JSON
+    # abstract_flask produced. Overrides the view in place (no new rule). Never
+    # break boot.
+    try:
+        from .app.endpoints_view import install_endpoints_view
+        install_endpoints_view(app)
+    except Exception as _exc:
+        import logging as _logging
+        _logging.getLogger(__name__).error("endpoints view install failed: %s", _exc)
+
     # F1/F5 wiring: control.cancel messages on the bus reach the shared job
     # store (which fires the cancel handle each live stream attached), and job
     # lifecycle transitions publish back onto the bus for any subscriber

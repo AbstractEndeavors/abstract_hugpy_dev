@@ -106,6 +106,19 @@ def _dir_bytes(path: str) -> int:
     return total
 
 
+def _progress_bytes(dest: str) -> int:
+    """Bytes on disk for a download IN PROGRESS: the final `dest` (once
+    promoted) PLUS any still-live `.tmp-<pid>` staging sibling(s) — atomic
+    provisioning (imports/apis/download_models.py) lands new work in staging
+    and only renames it onto `dest` on completion, so `_dir_bytes(dest)` alone
+    always read 0 (0%) for the entire in-flight window (operator-felt
+    regression, fixed 2026-07-12: a staging dir was seen growing 3.7GB->4.4GB
+    in 3s while the console showed 0%). Safe to sum both — see
+    download_models.staged_bytes' docstring for why this never double-counts."""
+    from .....imports.apis.download_models import staged_bytes
+    return _dir_bytes(dest) + staged_bytes(dest)
+
+
 def _is_cancelled(job_id: str) -> bool:
     cur = job_store.get(job_id)
     return bool(cur and cur.status == "cancelled")
@@ -118,7 +131,7 @@ def _watch(proc, job_id: str, dest: str, total_bytes: int | None) -> bool:
     (no new bytes for STALL_SECONDS) — in which case the process group is
     killed so it can be resumed — or False if the process exited on its own.
     """
-    last_bytes = _dir_bytes(dest)
+    last_bytes = _progress_bytes(dest)
     last_change = time.time()
     prev_bytes, prev_t = last_bytes, last_change
 
@@ -127,7 +140,7 @@ def _watch(proc, job_id: str, dest: str, total_bytes: int | None) -> bool:
         if _is_cancelled(job_id):
             return False
         now = time.time()
-        got = _dir_bytes(dest)
+        got = _progress_bytes(dest)
         bps = max(got - prev_bytes, 0) / max(now - prev_t, 1e-6)
         prev_bytes, prev_t = got, now
         if got > last_bytes:
@@ -190,7 +203,7 @@ def start_cancellable_download(job: Job, model: dict, total_bytes: int | None = 
             if not stalled and proc.exitcode == 0:
                 job_store.update(
                     job.id, status="completed", progress=1.0, stalled=False,
-                    downloaded_bytes=_dir_bytes(dest), error=None,
+                    downloaded_bytes=_progress_bytes(dest), error=None,
                     bytes_per_second=None, message=f"Installed at {dest}",
                 )
                 try:

@@ -86,13 +86,28 @@ directly onto the parent's branch frame — no frame double-plays. (A "still" ch
 ``{branch_frame, trim_frames, mode, context_frames}`` (``mode`` labels each splice
 "still" vs "vace_extend" so the UI can show it honestly) + a DRIFT note.
 
+PER-SEGMENT WORKER OFFLOAD. Each segment renders through the SHARED ``render_clip``
+primitive (the same one the single-clip bus job uses), so a REAL-model segment is
+DELEGATED to the studio GPU worker (``HUGPY_STUDIO_WORKER``) — kicked off, polled,
+its progress nested into this movie's per-segment progress, its cancel relayed from
+the MOVIE's ``is_cancelling``, then INGESTED from the SHARED content-addressed path —
+exactly like a single clip, while a SYNTHETIC segment keeps rendering IN-PROCESS
+(cheap, correct, no model load). This is what makes a REAL id-movie possible from a
+GPU-less central: the segments execute on the worker's GPU. Each delegated segment
+uses a DISTINCT worker render id (``<job>.s<NN>.<run-nonce>``) since a movie posts
+many renders under its one bus job (the worker keys by that id; a per-run nonce also
+avoids replaying a stale worker-side terminal across a bus retry). RESUME is
+unchanged: content-addressed reuse still lives inside ``produce_clip`` — for a
+delegated segment it runs ON the worker over the SHARED store, so a re-run's completed
+segments come back ``resumed=True`` fast without re-rendering. The per-segment
+branch-frame / context-frame stills are written under this movie's ``out_root`` on the
+SHARED volume, so the worker reads them directly (no upload).
+
 DRIFT / v0 simplifications (also in ``studio_movie_schema``'s header + the report):
   * one movie-level tier (``vram_budget_gb``) applied to every segment;
-  * geometry (w/h/fps) uniform across segments (they concat into one row);
-  * per-segment renders run IN-PROCESS through ``run_produce_clip`` (no
-    HUGPY_STUDIO_WORKER delegation, unlike the single-clip ``run_studio_i2v``) —
-    per-segment GPU-worker offload is planned growth. On this GPU-less box the
-    synthetic tier renders every segment fine.
+  * geometry (w/h/fps) uniform across segments (they concat into one row).
+    On a GPU-less box with NO worker configured the synthetic tier renders every
+    segment fine; a REAL segment there surfaces the graceful per-segment Err.
 
 Pure discipline (map §6): EXPECTED failures are returned as
 ``JobResult(ok=False, JobError(...))`` — DATA, never a raise. The studio-spine
@@ -109,6 +124,7 @@ import os
 import shutil
 import subprocess
 import time
+import uuid
 from dataclasses import asdict, replace
 
 from abstract_hugpy_dev._platform.binaries import resolve_bin
@@ -120,12 +136,20 @@ from ..result_schema import JobError, JobResult
 from ..studio.job import make_studio_i2v
 from ..studio_movie_schema import StudioMovieSpec
 # The studio-spine boundary. studio_i2v's module top is dependency-light (its
-# studio/numpy imports are lazy INSIDE its functions), so importing these here —
-# and thus at app boot via runners/__init__ — can never break boot. run_produce_clip
-# builds env+seeds from a StudioI2VSpec and calls produce_clip (content-addressed
-# resume inside); _stage_error_to_job_error is the ONE StageError -> JobError adapter
-# (reused so a movie segment's Err classifies identically to a single-clip job).
-from .studio_i2v import _stage_error_to_job_error, run_produce_clip
+# studio/numpy imports are lazy INSIDE its functions), so importing these here — and
+# thus at app boot via runners/__init__ — can never break boot.
+#   * render_clip is the SHARED render primitive: the delegate-or-inline decision ladder
+#     + the delegation loop (kickoff, progress forward, cancel relay, timeout, shared-path
+#     ingest, error translation) the single-clip bus job uses, so a REAL movie segment
+#     delegates to the GPU worker (HUGPY_STUDIO_WORKER) exactly like a single clip while a
+#     SYNTHETIC segment renders inline. It returns a normalized ClipOutcome (Artifact
+#     fields on Ok, an already-translated bus JobError on Err).
+#   * run_produce_clip stays imported (and is passed to render_clip as its inline
+#     ``produce``) because it is THIS module's patchable render seam — the movie tests
+#     fake ``studio_movie.run_produce_clip`` to drive controlled clips through the inline
+#     path with no GPU. It builds env+seeds from a StudioI2VSpec and calls produce_clip
+#     (content-addressed resume inside).
+from .studio_i2v import render_clip, run_produce_clip
 
 logger = logging.getLogger(__name__)
 
@@ -160,6 +184,19 @@ _DRIFT_NOTE = ("still-mode splices condition each segment on ONE frame of its pa
 # graceful Err. NOTE: vace-1.3b tops out at 480p, so a movie wider/taller than 832x480
 # surfaces an honest VRAM_EXCEEDED (a bigger VACE model needs a bigger movie budget).
 _VACE_MIN_BUDGET_GB = 6.0
+
+
+def _seg_budget(movie_budget, floor: float):
+    """Per-segment vram budget for a VACE-path segment (id_lock / vace_extend).
+
+    * An EXPLICIT movie budget is FLOORED to the VACE minimum so a real VACE model can
+      actually bind (today's behavior, byte-identical) — never a silent downgrade.
+    * A BLANK (None) movie budget stays None: AUTOFIT flows through to ``render_clip``,
+      which sizes it to the serving worker's MEASURED free VRAM. The floor is moot there —
+      a real box's free VRAM already clears 6GB, and a too-small box honestly Errs rather
+      than pretending the floor is available (the exact guaranteed-fail the operator hates).
+    """
+    return None if movie_budget is None else max(movie_budget, floor)
 
 
 # --------------------------------------------------------------------------- #
@@ -462,6 +499,14 @@ def run_generate_studio_movie(spec: StudioMovieSpec, job_id: str) -> JobResult:
     started_at = time.time()
     from ..media_bus import is_cancelling, set_progress
 
+    # Per-RUN nonce for the worker-side render ids of DELEGATED segments: a movie posts
+    # many renders under its one bus job, so each segment needs a distinct worker key,
+    # and a fresh nonce per invocation stops a bus RETRY of the movie from replaying a
+    # prior attempt's stale worker-side terminal (resume still comes from produce_clip's
+    # content-addressing on the SHARED store, NOT from the render id). Irrelevant to the
+    # in-process path (synthetic segments never reach the worker).
+    run_nonce = uuid.uuid4().hex[:8]
+
     seg_total = len(spec.goals)
     projectmeta = slugify(spec.project) if spec.project else job_id
     movie_root = os.path.join(
@@ -470,9 +515,23 @@ def run_generate_studio_movie(spec: StudioMovieSpec, job_id: str) -> JobResult:
     work_dir = os.path.join(movie_root, "_assembly")
     os.makedirs(movie_root, exist_ok=True)
     os.makedirs(work_dir, exist_ok=True)
+    # GROUP-WRITABLE out_root (2026-07-12 hotfix, first delegated id-movie):
+    # central (uid 1000) creates these dirs, but DELEGATED segments are written
+    # by the WORKER's uid (ae runs as 988) through the shared llmstorage group.
+    # Default umask 022 yields 0755 dirs -> the worker EPERMs writing its clip
+    # ("[Errno 13] Permission denied ... segment_00"). The canonical studio
+    # tree is 2775/setgid by design; make what we create match it, so cross-box
+    # writes work regardless of the service's umask.
+    for _d in (movie_root, work_dir):
+        try:
+            os.chmod(_d, 0o2775)
+        except OSError:
+            pass  # non-shared roots (tests, tmp) may not permit; harmless
 
-    logger.info("studio movie %s: %d segment(s), %dx%d @ %dfps, tier vram<=%.2fGB",
-                job_id, seg_total, spec.width, spec.height, spec.fps, spec.vram_budget_gb)
+    _tier = ("autofit" if spec.vram_budget_gb is None
+             else f"<={spec.vram_budget_gb:.2f}GB")
+    logger.info("studio movie %s: %d segment(s), %dx%d @ %dfps, tier vram %s",
+                job_id, seg_total, spec.width, spec.height, spec.fps, _tier)
 
     seg_records: "list[dict]" = []   # movie.json / JobResult.movie segment nodes
     seg_refs: "list" = []            # per-segment clip MediaRefs, in order
@@ -537,6 +596,13 @@ def run_generate_studio_movie(spec: StudioMovieSpec, job_id: str) -> JobResult:
                 retryable=True)))
 
         seg_out_root = os.path.join(movie_root, f"segment_{seg_i:02d}")
+        # Delegated segments are WRITTEN INTO this dir by the worker's uid —
+        # same group-writability requirement as movie_root above (2775).
+        os.makedirs(seg_out_root, exist_ok=True)
+        try:
+            os.chmod(seg_out_root, 0o2775)
+        except OSError:
+            pass
 
         # ---- decide this segment's conditioning + capability + joint mode ----
         # IDENTITY MOVIE (movie-level reference_images set): EVERY segment renders capability
@@ -560,8 +626,10 @@ def run_generate_studio_movie(spec: StudioMovieSpec, job_id: str) -> JobResult:
         seg_joint_mode = "still"
         seg_context_frames = 0          # how many parent frames carried the motion (K)
         seg_context_drop = 0            # frames DROPPED from THIS segment's head at assembly
-        # An id-movie segment (id_lock) routes through VACE -> raise to the shared VACE floor.
-        seg_budget = (max(spec.vram_budget_gb, _VACE_MIN_BUDGET_GB)
+        # An id-movie segment (id_lock) routes through VACE -> raise to the shared VACE floor
+        # when the budget is EXPLICIT; a BLANK (None) movie budget flows through as autofit
+        # (render_clip sizes it to the worker's free VRAM — the floor is moot there).
+        seg_budget = (_seg_budget(spec.vram_budget_gb, _VACE_MIN_BUDGET_GB)
                       if is_id_movie else spec.vram_budget_gb)
         if seg_i == 0:
             # Root: id_lock in an id-movie (the references define the render); else i2v from
@@ -616,7 +684,9 @@ def run_generate_studio_movie(spec: StudioMovieSpec, job_id: str) -> JobResult:
                 vace_context_frames = tuple(paths)
                 seg_context_frames = len(paths)     # actual K extracted = min(k, branch+1)
                 seg_context_drop = len(paths)        # the child reconstructs these -> drop at assembly
-                seg_budget = max(spec.vram_budget_gb, _VACE_MIN_BUDGET_GB)
+                # EXPLICIT budget -> floored to the VACE minimum; BLANK (None) -> autofit
+                # flows through (render_clip sizes it to the worker's free VRAM).
+                seg_budget = _seg_budget(spec.vram_budget_gb, _VACE_MIN_BUDGET_GB)
                 capability = "v2v"
             else:
                 # STILL (default, backward-compatible): condition on ONE branch frame. In an
@@ -668,15 +738,36 @@ def run_generate_studio_movie(spec: StudioMovieSpec, job_id: str) -> JobResult:
         _emit("generating", {"segment_id": goal.segment_id, "index": seg_i,
                              "prompt": goal.prompt, "capability": capability})
 
-        result = run_produce_clip(seg_spec, should_cancel)
-        if result.is_err():
-            # An expected per-segment failure (unroutable, mid-render CANCELLED, IO, or a
-            # vace_extend segment's graceful NO_GPU/DEPS_MISSING/WEIGHTS_MISSING on a
-            # GPU-less box) fails the whole movie — DATA, never a raise, NEVER a silent
-            # fallback to still-mode. The JobError is ENRICHED with WHICH segment + joint
-            # mode failed, and the failed node is recorded in movie.json (status="failed").
+        # RENDER via the SHARED render_clip: a REAL-model segment DELEGATES to the studio
+        # GPU worker (HUGPY_STUDIO_WORKER) — progress nested into THIS movie's per-segment
+        # blob, cancel relayed from the MOVIE's is_cancelling, ingested from the SHARED
+        # content-addressed path — while a synthetic segment renders IN-PROCESS. The inline
+        # execution point is passed as ``produce=run_produce_clip`` (this module's global,
+        # which the movie tests patch to a fake render seam). ``render_id`` is a DISTINCT
+        # per-segment worker key (the worker keys renders by it; a movie posts many).
+        seg_render_id = f"{job_id}.s{seg_i:02d}.{run_nonce}"
+
+        def _seg_progress_sink(worker_blob, _sid=goal.segment_id, _idx=seg_i,
+                               _prompt=goal.prompt, _cap=capability):
+            # Nest the DELEGATED segment's worker progress (queue position / render
+            # progress) under the movie's ``current.worker`` so the console shows the
+            # in-flight segment without flattening the movie-level nested blob.
+            _emit("generating", {"segment_id": _sid, "index": _idx, "prompt": _prompt,
+                                 "capability": _cap, "delegated": True, "worker": worker_blob})
+
+        outcome = render_clip(
+            seg_spec, render_id=seg_render_id, should_cancel=should_cancel,
+            progress_sink=_seg_progress_sink, produce=run_produce_clip)
+        if not outcome.ok:
+            # An expected per-segment failure (unroutable, mid-render CANCELLED, IO, a
+            # vace_extend/id_lock segment's graceful NO_GPU/DEPS_MISSING/WEIGHTS_MISSING on
+            # a GPU-less box, or a delegation error — worker_lost/delegation_timeout/
+            # worker_busy — from the worker seam) fails the whole movie: DATA, never a
+            # raise, NEVER a silent fallback to still-mode. ``outcome.error`` is already a
+            # bus JobError (translated in-process OR on the worker), ENRICHED here with
+            # WHICH segment + joint mode failed; the failed node is recorded (status="failed").
             segments_meta[seg_i].update(status="failed")
-            je = _stage_error_to_job_error(result.error)
+            je = outcome.error
             seg_records.append({
                 "index": seg_i,
                 "segment_id": goal.segment_id,
@@ -686,7 +777,12 @@ def run_generate_studio_movie(spec: StudioMovieSpec, job_id: str) -> JobResult:
                 "joint_mode": seg_joint_mode,
                 "context_frames": seg_context_frames,
                 "resolved_branch": resolved_branch,
-                "vram_budget_gb": seg_budget,
+                # RESOLVED effective budget + how it was chosen (honesty in the artifact):
+                # the autofit-resolved number when the movie budget was blank, else the
+                # explicit/floored seg_budget. render_clip stamps these on failure too.
+                "vram_budget_gb": (outcome.effective_budget_gb
+                                   if outcome.effective_budget_gb is not None else seg_budget),
+                "budget_source": outcome.budget_source,
                 "status": "failed",
                 "error": {"code": je.code, "message": je.message},
             })
@@ -696,9 +792,10 @@ def run_generate_studio_movie(spec: StudioMovieSpec, job_id: str) -> JobResult:
                          f"capability={capability}): {je.message}"),
                 retryable=je.retryable)))
 
-        art = result.unwrap()
-        # Catalog the WHOLE clip (never trimmed) as a video MediaRef on outputs.
-        ref = ingest(art.path, kind_hint="video")
+        # Ok: the clip exists on the SHARED store (rendered in-process OR by the worker).
+        # Catalog the WHOLE clip (never trimmed) as a video MediaRef on outputs — the
+        # ingest is identical for a local or a worker-written clip (same shared path).
+        ref = ingest(outcome.path, kind_hint="video")
         seg_refs.append(ref)
 
         seg_records.append({
@@ -718,25 +815,31 @@ def run_generate_studio_movie(spec: StudioMovieSpec, job_id: str) -> JobResult:
             "joint_mode": seg_joint_mode,
             "context_frames": seg_context_frames,
             "context_drop": seg_context_drop,
-            "vram_budget_gb": seg_budget,
-            "clip_path": art.path,
+            # RESOLVED effective per-segment budget + its source ("explicit" |
+            # "autofit:<worker>" | "autofit:fallback"): the number the router actually used
+            # (autofit-sized to the worker's free VRAM when the movie budget was blank, else
+            # the explicit/floored seg_budget). Honesty in movie.json.
+            "vram_budget_gb": (outcome.effective_budget_gb
+                               if outcome.effective_budget_gb is not None else seg_budget),
+            "budget_source": outcome.budget_source,
+            "clip_path": outcome.path,
             "clip_uri": ref.uri,
-            "frames": art.frames,
-            "width": art.width,
-            "height": art.height,
-            "duration_s": art.duration_s,
-            "content_hash": art.content_hash,
-            "resumed": art.resumed,
-            "status": "resumed" if art.resumed else "done",
+            "frames": outcome.frames,
+            "width": outcome.width,
+            "height": outcome.height,
+            "duration_s": outcome.duration_s,
+            "content_hash": outcome.content_hash,
+            "resumed": outcome.resumed,
+            "status": "resumed" if outcome.resumed else "done",
         })
-        segments_meta[seg_i].update(status=("resumed" if art.resumed else "done"),
-                                    resumed=art.resumed)
+        segments_meta[seg_i].update(status=("resumed" if outcome.resumed else "done"),
+                                    resumed=outcome.resumed)
 
-        prev_clip_path = art.path
-        prev_frames = art.frames
-        logger.info("studio movie %s: segment %d (%s) %s — %d frames @ %s",
+        prev_clip_path = outcome.path
+        prev_frames = outcome.frames
+        logger.info("studio movie %s: segment %d (%s) %s — %s frames @ %s",
                     job_id, seg_i, goal.segment_id,
-                    "RESUMED" if art.resumed else "rendered", art.frames, art.path)
+                    "RESUMED" if outcome.resumed else "rendered", outcome.frames, outcome.path)
 
         _emit("generating", None)
         # ITERATIVE save after every segment (watchable partial + fresh manifest).

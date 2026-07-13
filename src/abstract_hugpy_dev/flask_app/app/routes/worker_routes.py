@@ -709,11 +709,53 @@ def _disk_preflight_reason(worker: dict, model_key: str) -> str | None:
     return None
 
 
+@worker_bp.route("/llm/central-provisioning", methods=["GET"])
+def central_provisioning():
+    """Per-model central-disk readiness — the SAME authoritative check the worker
+    load/assign guard uses (``_central_missing_reason``), exposed so the picker can
+    show each model's provisioning state BEFORE an allocation is attempted, and
+    offer a download for the ones central doesn't hold complete.
+
+    Why not the manifest ``status`` field: it is NOT trustworthy for this — a dir
+    holding only an ``mmproj-*.gguf`` (no main quant) is still marked 'installed',
+    and archived rows can read 'partial'. This endpoint reflects what the loader
+    actually enforces, so the UI and the guard never disagree.
+
+    Returns ``{ model_key: {state, reason} }`` where state is one of
+    ``ready`` (allocatable) / ``incomplete`` (dir present, files missing → offer
+    download) / ``absent`` (no dir → offer download) / ``error`` (couldn't
+    resolve). Optional ``?keys=k1,k2`` scans only those manifest keys (the picker
+    passes what it's showing); default = every manifest model. Read-only."""
+    manifest = get_models_dict(dict_return=True)
+    keys_param = (request.args.get("keys") or "").strip()
+    if keys_param:
+        keys = [k for k in (s.strip() for s in keys_param.split(",")) if k in manifest]
+    else:
+        keys = list(manifest.keys())
+    out = {}
+    for k in keys:
+        reason = _central_missing_reason(k)
+        if reason is None:
+            state = "ready"
+        elif reason == "no model directory":
+            state = "absent"
+        elif reason == "directory present but files incomplete":
+            state = "incomplete"
+        else:
+            state = "error"
+        out[k] = {"state": state, "reason": reason}
+    return jsonify(out)
+
+
 @worker_bp.route("/llm/workers/<worker_id>/assign", methods=["POST"])
 def workers_assign(worker_id):
     body = AssignRequest(**(request.get_json(silent=True) or {}))
     if body.model_key not in get_models_dict(dict_return=True):
-        abort(404, description="Unknown model key.")
+        # JSON (not abort's HTML) so the UI surfaces a clean reason instead of a
+        # raw 404 page. A key that isn't in the manifest is usually a name-vs-key
+        # slip (e.g. "Wan2.1-VACE-1.3B" the display name vs the "Wan-AI~..." key).
+        return jsonify({"error": f"unknown model key '{body.model_key}' — it is "
+                        "not in central's manifest"}), 404
     # Item 4 guard: a model can't be designated unless central itself holds the
     # files — otherwise the worker silently pulls ~50GB from HF at internet
     # speed (the 2026-07-03 sdxl-turbo saga). Clear 409 with the fix.
@@ -1218,7 +1260,10 @@ def workers_load(worker_id):
     force = bool(raw.get("force"))
     redownload = bool(raw.get("redownload"))
     if body.model_key not in get_models_dict(dict_return=True):
-        abort(404, description="Unknown model key.")
+        # JSON (not abort's HTML) so allocateMany's refusal note is a clean line,
+        # never a raw <!doctype> 404 page dumped into the UI.
+        return jsonify({"error": f"unknown model key '{body.model_key}' — it is "
+                        "not in central's manifest"}), 404
     # Item 4 guard — same invariant as /assign: central must hold the files.
     missing = _central_missing_reason(body.model_key)
     if missing:

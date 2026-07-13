@@ -2,6 +2,8 @@
 from .imports import *
 import threading
 import shutil as _shutil
+import time as _time
+import re as _re
 _REPORT_LOCK = threading.Lock()
 
 
@@ -44,6 +46,166 @@ def _discard_staged(staged: str) -> None:
     """Remove a failed/partial staging dir. Temp cleanup — EXEMPT from the
     never-delete rule (in-flight scratch, never catalog data)."""
     _shutil.rmtree(staged, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Orphan staging reaper (operator-locked 2026-07-12): a central restart
+# SIGKILLs whatever download subprocesses were mid-pull, leaving their
+# `.tmp-<pid>` staging dirs behind with no owner ever coming back to promote
+# or discard them — dead weight on the shared store (several GB observed).
+# A pid is DEFINITELY dead only on ProcessLookupError (os.kill(pid, 0));
+# anything else (alive, EPERM, or an unexpected errno) is treated as alive so
+# the reaper never removes a staging dir it isn't certain is orphaned. Temp
+# staging is EXEMPT from the never-delete rule (module docstring above) — this
+# is our own in-flight scratch, never catalog data.
+# ---------------------------------------------------------------------------
+_ORPHAN_GRACE_SECONDS = int(os.environ.get("HUGPY_STAGING_ORPHAN_GRACE_SECONDS", "600"))
+_STAGING_SUFFIX_RE = _re.compile(r"\.tmp-(\d+)$")
+
+
+def _staging_pid_from_name(name: str) -> "int | None":
+    """The pid suffix of a `<dest>.tmp-<pid>` staging dir's basename, else None
+    (not a staging dir at all)."""
+    m = _STAGING_SUFFIX_RE.search(name)
+    return int(m.group(1)) if m else None
+
+
+def _pid_alive(pid: int) -> bool:
+    """Conservative liveness check: only a definite ProcessLookupError (ESRCH)
+    says dead. EPERM means it exists under another user; any other unexpected
+    OSError is treated as alive too — an ambiguous read must never lead to
+    deleting a live download's scratch."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _staging_siblings(dest: str) -> "list[tuple[str, int | None, float]]":
+    """Every `<dest>.tmp-*` staging dir currently on disk, as
+    ``(path, pid_or_None, mtime)``."""
+    parent = os.path.dirname(dest) or "."
+    prefix = f"{os.path.basename(dest)}.tmp-"
+    try:
+        entries = os.listdir(parent)
+    except OSError:
+        return []
+    out = []
+    for name in entries:
+        if not name.startswith(prefix):
+            continue
+        path = os.path.join(parent, name)
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        out.append((path, _staging_pid_from_name(name), mtime))
+    return out
+
+
+def staged_bytes(dest: str) -> int:
+    """Bytes currently on disk under every live ``<dest>.tmp-*`` staging
+    sibling of `dest` — dead or alive, this just answers "what's out there".
+
+    PROGRESS HONESTY (operator-locked 2026-07-12): atomic provisioning lands
+    an in-flight download in a per-pid staging sibling and only renames it
+    onto `dest` on completion (see `_staging_dir`/`_promote_staged` above).
+    The download-progress reader (flask_app/.../downloads/cancelable_downloads.py)
+    used to measure bytes at `dest` ONLY, so every in-flight pull showed 0%
+    until the finishing rename. It now sums `_dir_bytes(dest) + staged_bytes(dest)`
+    — cheap to reason about because `_promote_staged` is a rename (whole-dir
+    in the common case, per-file os.replace in the resume/merge case), so a
+    byte only ever lives under ONE of {dest, a staging sibling} at any given
+    instant; summing both here can never double-count.
+    """
+    total = 0
+    for staged, _pid, _mtime in _staging_siblings(dest):
+        for root, _dirs, files in os.walk(staged):
+            for f in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, f))
+                except OSError:
+                    pass
+    return total
+
+
+def reap_orphaned_staging(root: str = None, grace_seconds: int = None) -> "list[str]":
+    """Store-wide sweep: remove every ``<dest>.tmp-<pid>`` staging dir whose
+    pid is DEFINITELY dead (see `_pid_alive`) AND whose mtime clears
+    `grace_seconds` (default 10 min, env HUGPY_STAGING_ORPHAN_GRACE_SECONDS —
+    the grace protects a pid that JUST died from being reaped mid-race with
+    something still settling). A live pid's staging dir is another process's
+    in-flight scratch and is never touched.
+
+    Hooked into the discovery walk (imports/apis/get_module.py discover_model*)
+    — it already visits the whole tree, so this needs no new daemon.
+    """
+    root = root or MODELS_HOME
+    grace_seconds = _ORPHAN_GRACE_SECONDS if grace_seconds is None else grace_seconds
+    now = _time.time()
+    removed = []
+    for dirpath, dirnames, _filenames in os.walk(root):
+        staging = [d for d in dirnames if _staging_pid_from_name(d) is not None]
+        for name in staging:
+            dirnames.remove(name)          # scratch, not a model — never descend
+            path = os.path.join(dirpath, name)
+            pid = _staging_pid_from_name(name)
+            if pid is not None and _pid_alive(pid):
+                continue
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            if (now - mtime) < grace_seconds:
+                continue
+            _shutil.rmtree(path, ignore_errors=True)   # temp cleanup: EXEMPT from never-delete
+            removed.append(path)
+    return removed
+
+
+def _adopt_or_reap_staging(dest: str, staged: str, grace_seconds: int = None) -> str:
+    """Called right before a fresh download starts staging into ``staged``
+    (this pid's own ``_staging_dir(dest)``). Looks at ``<dest>.tmp-*``
+    siblings left by earlier pids first:
+
+      * a LIVE pid's staging dir is another in-flight download of the same
+        model — left alone entirely (no adopt, no reap);
+      * the NEWEST dead-pid staging dir is ADOPTED: renamed onto ``staged`` so
+        snapshot_download resumes from whatever bytes already landed instead
+        of re-fetching from zero. A fresh run always gets a brand new
+        ``.tmp-<pid>`` name (that's the point of embedding the pid), so reuse
+        requires this rename — HF resume does not work across two different
+        ``local_dir`` paths, only within the same one;
+      * any OTHER dead-pid orphans (an older crashed attempt — e.g. a second
+        central restart mid-pull) are reaped once they clear `grace_seconds`,
+        same rule as `reap_orphaned_staging`'s store-wide sweep.
+
+    Returns the path to actually stage into: ``staged`` unchanged, or the
+    adopted dir now renamed to live at ``staged``.
+    """
+    grace_seconds = _ORPHAN_GRACE_SECONDS if grace_seconds is None else grace_seconds
+    dead = [(p, pid, mtime) for (p, pid, mtime) in _staging_siblings(dest)
+            if not (pid is not None and _pid_alive(pid))]
+    if not dead:
+        return staged
+    dead.sort(key=lambda t: t[2], reverse=True)   # newest mtime first
+    newest_path, _newest_pid, _newest_mtime = dead[0]
+    rest = dead[1:]
+    try:
+        os.rename(newest_path, staged)
+        print(f"  resuming from orphaned staging: {os.path.basename(newest_path)}")
+    except OSError as exc:
+        print(f"  [warn] could not adopt orphaned staging {newest_path!r} ({exc}); starting fresh")
+        rest = dead   # adoption failed — newest is just another orphan to age out
+    now = _time.time()
+    for path, _pid, mtime in rest:
+        if (now - mtime) >= grace_seconds:
+            _shutil.rmtree(path, ignore_errors=True)   # temp cleanup: EXEMPT from never-delete
+    return staged
+
 
 def record_downloaded_model(model: dict, dest: str = None, root: str = DEFAULT_ROOT,
                             report_path: str = None) -> dict:
@@ -183,7 +345,10 @@ def download_one(model: dict[str, Any],root: str=None,model_key=None, dry_run: b
         return
 
     # ATOMIC: download into a per-pid staging sibling, promote on success only.
+    # Before creating a fresh one, adopt the newest dead-pid orphan for this
+    # SAME dest (resume its bytes instead of re-fetching) and reap any others.
     staged = _staging_dir(destination)
+    staged = _adopt_or_reap_staging(destination, staged)
     os.makedirs(staged, exist_ok=True)
     try:
         # GGUF / single-file
@@ -320,6 +485,9 @@ def ensure_model(key: str, root: str = DEFAULT_ROOT) -> str:
     # sit at a resolvable model dir.
     path = flat_destination(routing, root)
     staged = _staging_dir(path)
+    # Adopt a dead-pid orphan's bytes for this SAME dest before starting
+    # fresh (resume instead of re-fetch); reap any other stale orphans.
+    staged = _adopt_or_reap_staging(path, staged)
     os.makedirs(staged, exist_ok=True)
 
     repo_id, subfolder = split_hub_id(repo_id)  # handle owner/repo/subfolder
