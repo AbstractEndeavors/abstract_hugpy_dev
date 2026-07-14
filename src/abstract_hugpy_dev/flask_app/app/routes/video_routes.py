@@ -1894,3 +1894,185 @@ def video_identity_profile_canonical(slug):
     if profile is None:  # lost a race with a concurrent archive
         return jsonify({"error": "identity profile not found"}), 404
     return jsonify({"profile": profile}), 200
+
+# --------------------------------------------------------------------------- #
+# 5d) POST /video/identity-profiles/<slug>/reconstruction — STAGE (b) update:
+#     Support "mode": "angle-ring" in the base reconstruction handler.
+# --------------------------------------------------------------------------- #
+@video_bp.route("/video/identity-profiles/<slug>/reconstruction", methods=["POST"])
+def video_identity_profile_reconstruction(slug):
+    profile = identity_profiles.get_profile(slug)
+    if profile is None:
+        return jsonify({"error": "identity profile not found"}), 404
+    body = request.get_json(silent=True) or {}
+
+    refs_in, perr = _reference_images_from_body({"identity_profile": slug})
+    if perr is not None:
+        payload, status = perr
+        return jsonify(payload), status
+    resolved_refs, verr = _validate_profile_reference_images(refs_in)
+    if verr is not None:
+        payload, status = verr
+        return jsonify(payload), status
+
+    prompt = body.get("prompt")
+    if prompt is None:
+        prompt = profile.get("notes") or ""
+    elif not isinstance(prompt, str):
+        return jsonify({"error": "prompt must be a string"}), 400
+
+    # mode: "sheet" | "turntable" | "angle-ring"
+    mode = body.get("mode", "sheet")
+    if mode not in ("sheet", "turntable", "angle-ring"):
+        return jsonify({"error": 'mode must be "sheet", "turntable", or "angle-ring"'}), 400
+
+    # Extract angle-ring parameters when active
+    angle_step_deg = body.get("angle_step_deg", 10)
+    elevations_deg = body.get("elevations_deg", [0])
+
+    if mode == "angle-ring":
+        # 36 views at 10 deg step is default
+        if not isinstance(angle_step_deg, int) or angle_step_deg <= 0:
+            return jsonify({"error": "angle_step_deg must be a positive integer"}), 400
+        if not isinstance(elevations_deg, list) or not elevations_deg:
+            return jsonify({"error": "elevations_deg must be a non-empty list of integers"}), 400
+        views = [f"angle_{deg}" for deg in range(0, 360, angle_step_deg)]
+    else:
+        views = body.get("views")
+        if views is None:
+            views = list(_DEFAULT_RECON_VIEWS)
+        if not isinstance(views, list) or not views:
+            return jsonify({"error": "views must be a non-empty list"}), 400
+
+    seed = body.get("seed", 0)
+    if not isinstance(seed, int) or isinstance(seed, bool):
+        return jsonify({"error": "seed must be an int"}), 400
+
+    recon_id = "recon_" + secrets.token_hex(8)
+    try:
+        spec = make_identity_reconstruction(
+            slug=slug,
+            recon_id=recon_id,
+            reference_images=tuple(resolved_refs),
+            views=tuple(views),
+            base_prompt=prompt,
+            seed=seed,
+            mode=mode,
+            angle_step_deg=angle_step_deg,
+            elevations_deg=elevations_deg,
+        )
+    except (ValueError, TypeError) as exc:
+        return jsonify({"error": str(exc)}), 400
+        
+    job_id = media_bus.enqueue("identity_reconstruction", spec)
+    return jsonify({"job_id": job_id, "recon_id": recon_id}), 200
+
+
+# --------------------------------------------------------------------------- #
+# 5e) PATCH /video/identity-profiles/<slug>/reconstruction/<recon_id>/views/<view_id>
+#     Approve or reject a specific angle tile. Updates the status locally in the
+#     identity profile record.
+# --------------------------------------------------------------------------- #
+@video_bp.route("/video/identity-profiles/<slug>/reconstruction/<recon_id>/views/<view_id>", methods=["PATCH"])
+def video_identity_profile_view_status(slug, recon_id, view_id):
+    if identity_profiles.get_profile(slug) is None:
+        return jsonify({"error": "identity profile not found"}), 404
+        
+    body = request.get_json(silent=True) or {}
+    status = body.get("status")
+    if status not in ("approved", "rejected"):
+        return jsonify({"error": "status must be 'approved' or 'rejected'"}), 400
+
+    try:
+        profile = identity_profiles.update_reconstruction_view_status(
+            slug=slug,
+            recon_id=recon_id,
+            view_id=view_id,
+            status=status
+        )
+    except identity_profiles.ProfileError as exc:
+        return jsonify({"error": str(exc), "code": exc.code}), 400
+        
+    return jsonify({"profile": profile}), 200
+
+
+# --------------------------------------------------------------------------- #
+# 5f) POST /video/identity-profiles/<slug>/reconstruction/<recon_id>/views/<view_id>/regenerate
+#     Regenerate a single angle conditioned on nearby approved angle neighbors.
+# --------------------------------------------------------------------------- #
+@video_bp.route("/video/identity-profiles/<slug>/reconstruction/<recon_id>/views/<view_id>/regenerate", methods=["POST"])
+def video_identity_profile_view_regenerate(slug, recon_id, view_id):
+    profile = identity_profiles.get_profile(slug)
+    if profile is None:
+        return jsonify({"error": "identity profile not found"}), 404
+        
+    body = request.get_json(silent=True) or {}
+    prompt = body.get("prompt") or (profile.get("notes") or "")
+    seed = body.get("seed", secrets.randbelow(1000000))
+    use_neighbors = bool(body.get("use_nearest_approved_neighbors", True))
+
+    try:
+        # Fetch the active reconstruction configuration to preserve overall context
+        spec = identity_profiles.make_single_view_regeneration_spec(
+            slug=slug,
+            recon_id=recon_id,
+            view_id=view_id,
+            prompt=prompt,
+            seed=seed,
+            use_neighbors=use_neighbors
+        )
+    except identity_profiles.ProfileError as exc:
+        return jsonify({"error": str(exc), "code": exc.code}), 400
+
+    job_id = media_bus.enqueue("identity_view_regenerate", spec)
+    return jsonify({"job_id": job_id, "recon_id": recon_id}), 200
+
+
+# --------------------------------------------------------------------------- #
+# 5g) POST /video/identity-profiles/<slug>/reconstruction/<recon_id>/mesh
+#     Trigger a ComfyUI mesh pipeline job (Hunyuan3D) utilizing selected, approved
+#     anchor views.
+# --------------------------------------------------------------------------- #
+@video_bp.route("/video/identity-profiles/<slug>/reconstruction/<recon_id>/mesh", methods=["POST"])
+def video_identity_profile_build_mesh(slug, recon_id):
+    profile = identity_profiles.get_profile(slug)
+    if profile is None:
+        return jsonify({"error": "identity profile not found"}), 404
+        
+    body = request.get_json(silent=True) or {}
+    views = body.get("views")  # Selected anchor viewIds (0°, 45°, 90°, etc.)
+    if not isinstance(views, list) or not views:
+        return jsonify({"error": "views must be a non-empty list of approved view IDs"}), 400
+
+    try:
+        # Bundle the asset locations of the selected approved frames
+        spec = identity_profiles.make_mesh_reconstruction_spec(
+            slug=slug,
+            recon_id=recon_id,
+            view_ids=views,
+            backend="comfyui",
+            workflow="hunyuan3d-2mv",
+            output_format="glb"
+        )
+    except identity_profiles.ProfileError as exc:
+        return jsonify({"error": str(exc), "code": exc.code}), 400
+
+    job_id = media_bus.enqueue("identity_mesh_build", spec)
+    return jsonify({"job_id": job_id, "recon_id": recon_id}), 200
+
+
+# --------------------------------------------------------------------------- #
+# 5h) GET /video/identity-profiles/<slug>/reconstruction/<recon_id>/mesh
+#     Retrieve the generation status, active GLB path, and preview assets.
+# --------------------------------------------------------------------------- #
+@video_bp.route("/video/identity-profiles/<slug>/reconstruction/<recon_id>/mesh", methods=["GET"])
+def video_identity_profile_mesh_status(slug, recon_id):
+    profile = identity_profiles.get_profile(slug)
+    if profile is None:
+        return jsonify({"error": "identity profile not found"}), 404
+        
+    mesh_state = identity_profiles.get_mesh_state(slug, recon_id)
+    if mesh_state is None:
+        return jsonify({"status": "none"}), 200
+        
+    return jsonify(mesh_state), 200
