@@ -17,7 +17,7 @@ from .movie_schema import MovieSpec
 from .scene_schema import GenerateSceneSpec
 from .studio.job import StudioI2VSpec
 from .studio_movie_schema import StudioMovieSpec
-from .identity_reconstruction_schema import IdentityReconstructionSpec
+from .identity_reconstruction_schema import IdentityReconstructionSpec, IdentityMeshSpec
 
 
 @dataclass(frozen=True)
@@ -57,4 +57,12 @@ JOB_REGISTRY = {
     "identity_reconstruction": JobSpec(
         "identity_reconstruction", IdentityReconstructionSpec,
         ("identity", "reconstruction"), "gpu", 14400),
+    # Identity 3D MESH build (+ optional turntable) = a RELAY job: central has no GPU,
+    # so its runner (runners/identity_render_relay.py) forwards the spec over HTTP to the
+    # IDENTITY_RENDER_URL service and polls it. runner_key ("identity","mesh_build");
+    # "gpu" queue (it consumes a remote GPU); long timeout — a mesh + Blender orbit is
+    # minutes-to-longer, mirroring the movie/reconstruction budgets.
+    "identity_mesh_build": JobSpec(
+        "identity_mesh_build", IdentityMeshSpec,
+        ("identity", "mesh_build"), "gpu", 14400),
 }

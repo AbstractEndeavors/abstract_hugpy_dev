@@ -69,6 +69,8 @@ from abstract_hugpy_dev.video_intel.studio_movie_schema import (
 from abstract_hugpy_dev.video_intel.identity_reconstruction_schema import (
     DEFAULT_VIEWS as _DEFAULT_RECON_VIEWS,
     make_identity_reconstruction,
+    make_identity_mesh,
+    MESH_VIEW_NAMES as _MESH_VIEW_NAMES,
 )
 from abstract_hugpy_dev.video_intel.chains import (
     resolve_video_parts,
@@ -1669,6 +1671,13 @@ def _reference_images_from_body(body):
         return None, ({"error": f"identity_profile {slug!r} not found"}, 404)
     canonical = profile.get("canonical") or []
     chosen = canonical if canonical else list(profile.get("reference_images") or [])
+    # A saved profile keeps positional slots for sources that never materialized
+    # (recorded in missing_references) or that have since gone stale on disk. Drop
+    # any reference that no longer exists so ONE bad path can't 404 the whole
+    # identity downstream — the profile IS the identity, complete or not
+    # (operator 2026-07-12). If this empties the set, the caller's non-empty
+    # validation returns a clean 400 rather than a per-path "not found".
+    chosen = [r for r in chosen if isinstance(r, str) and os.path.isfile(r)]
     return list(chosen), None
 
 
@@ -1769,7 +1778,10 @@ def video_identity_profile_update(slug):
         if err is not None:
             payload, status = err
             return jsonify(payload), status
-        kwargs["reference_images"] = resolved
+        # Wire key stays ``reference_images`` (UI + tests read it); the store's
+        # param is ``source_images`` (internal rename). Map here, or update_profile
+        # raises "unexpected keyword argument 'reference_images'" (the PATCH 500).
+        kwargs["source_images"] = resolved
 
     try:
         profile = identity_profiles.update_profile(slug, **kwargs)
@@ -1799,8 +1811,13 @@ def video_identity_profile_update(slug):
 # the profile. Poll GET /video/jobs/<job_id>; on done, re-read the profile (GET .../<slug>)
 # for the new ``reconstructions`` entry keyed by recon_id.
 # --------------------------------------------------------------------------- #
-@video_bp.route("/video/identity-profiles/<slug>/reconstruction", methods=["POST"])
-def video_identity_profile_reconstructions(slug):
+# NOTE (keeper 2026-07-14): the OLD sheet/turntable-only reconstruction handler was
+# CONSOLIDATED into the single angle-ring-aware handler below
+# (video_identity_profile_reconstruction). Its @video_bp.route decorator is removed so
+# exactly ONE rule serves this path — Werkzeug matched the first-registered rule, which
+# shadowed the newer handler and rejected mode="angle-ring". Body retained (never-delete);
+# full prior file at video_routes.py.bak-keeper-20260714.
+def _retired_video_identity_profile_reconstructions(slug):
     profile = identity_profiles.get_profile(slug)
     if profile is None:
         return jsonify({"error": "identity profile not found"}), 404
@@ -1852,7 +1869,9 @@ def video_identity_profile_reconstructions(slug):
         spec = make_identity_reconstruction(
             slug=slug,
             recon_id=recon_id,
-            reference_images=tuple(resolved_refs),
+            # builder param is source_images (internal rename); passing
+            # reference_images= raises "unexpected keyword argument".
+            source_images=tuple(resolved_refs),
             views=tuple(views),
             base_prompt=prompt,
             seed=seed,
@@ -1910,6 +1929,13 @@ def video_identity_profile_reconstruction(slug):
     if perr is not None:
         payload, status = perr
         return jsonify(payload), status
+    # id_lock reference channel accepts at most 4 (_MAX_CANONICAL_IMAGES). A profile may
+    # hold up to 12 SOURCE images; take the first 4 of the resolver's canonical-preferred,
+    # existence-filtered set (canonical wins via _reference_images_from_body) so a 12-ref
+    # identity doesn't 400 with "at most 4 ... accepted".
+    refs_in = list(refs_in)[:4]
+    if not refs_in:
+        return jsonify({"error": "Profile has no valid reference images"}), 400
     resolved_refs, verr = _validate_profile_reference_images(refs_in)
     if verr is not None:
         payload, status = verr
@@ -1953,7 +1979,9 @@ def video_identity_profile_reconstruction(slug):
         spec = make_identity_reconstruction(
             slug=slug,
             recon_id=recon_id,
-            reference_images=tuple(resolved_refs),
+            # builder param is source_images (internal rename); passing
+            # reference_images= raises "unexpected keyword argument".
+            source_images=tuple(resolved_refs),
             views=tuple(views),
             base_prompt=prompt,
             seed=seed,
@@ -2029,6 +2057,75 @@ def video_identity_profile_view_regenerate(slug, recon_id, view_id):
 
 
 # --------------------------------------------------------------------------- #
+# Shared: build the cardinal-view -> path map for a mesh build, JAILED to the
+# profile's OWN reference/canonical images. Central has no GPU — the relay runner
+# reads exactly these paths — so the "default front = canonical[0]-on-disk else the
+# first existing reference" rule + the path jail live in ONE place, shared by the
+# per-reconstruction mesh route (5g) and the one-click /generate template.
+#   Returns (view_map, candidates, None) on success, or (None, None, (payload, status))
+#   when an explicit view path is not one of the profile's own images (a clean 400) —
+#   the caller then returns ``jsonify(payload), status``.
+#   ``candidates`` is the ordered list of ALL existing-on-disk source reference images
+#   — populated ONLY when the caller did NOT explicitly assign ``views.front`` (an
+#   explicit front assignment disables fleet-VLM auto-selection: candidates == []).
+#   The relay runner (bus job context, never the request handler — a vision call is
+#   ~5-10s/image and there can be up to 12) uses this to ask the fleet vision amenity
+#   which candidate shows the character's FULL BODY and swap it in as front (keeper
+#   2026-07-14: luigi ref_00 was a cropped waist-up portrait -> cut-off-legs mesh).
+# --------------------------------------------------------------------------- #
+def _resolve_profile_mesh_views(profile, body_views):
+    canonical = [p for p in (profile.get("canonical") or []) if isinstance(p, str)]
+    references = [p for p in (profile.get("reference_images") or []) if isinstance(p, str)]
+    allowed = set(canonical) | set(references)  # the jail: only the profile's own images
+
+    def _first_existing(paths):
+        for p in paths:
+            if os.path.isfile(p):
+                return p
+        return None
+
+    # Default FRONT = the first existing SOURCE reference image — NEVER canonical.
+    # canonical is GENERATION DNA and (via auto-promote) usually holds renders of the
+    # PREVIOUS mesh's turntable; feeding it back into mesh reconstruction creates a
+    # feedback loop that faithfully re-meshes the prior mesh, artifacts and all (bit
+    # live 2026-07-14: luigi's 2nd generate re-meshed his 1st mesh's background slab
+    # because front defaulted to canonical[0] — rembg 'applied' but the subject WAS the
+    # old render). Reconstruction eats ORIGINAL photos; canonical is only reachable via
+    # an EXPLICIT body views assignment below.
+    existing_references = [p for p in references if os.path.isfile(p)]
+    front = existing_references[0] if existing_references else None
+    view_map: dict = {}
+    if front is not None:
+        view_map["front"] = front
+    # Candidates for fleet-VLM auto-selection: every OTHER existing source reference,
+    # in order (the current default front stays first-tried / the fallback). Cleared
+    # below the moment an explicit front is assigned.
+    candidates: list = list(existing_references)
+
+    # Optional explicit assignment: {views: {front|right|back|left: <path>}}. Each path
+    # must be one of the profile's own images (the jail) — an arbitrary path is a clean
+    # 400, never accepted.
+    if isinstance(body_views, dict):
+        for vname, vpath in body_views.items():
+            if vname not in _MESH_VIEW_NAMES:
+                return None, None, ({"error": f"unknown view {vname!r}; expected one of "
+                                        f"{list(_MESH_VIEW_NAMES)}"}, 400)
+            if not isinstance(vpath, str) or vpath not in allowed:
+                return None, None, ({"error": f"view {vname!r} must reference one of this "
+                                        "profile's own reference/canonical images"}, 400)
+            view_map[vname] = vpath
+            if vname == "front":
+                # An EXPLICIT front assignment is an operator override — auto-selection
+                # never second-guesses it.
+                candidates = []
+
+    if "front" not in view_map:
+        return None, None, ({"error": "profile has no usable reference image for the mesh "
+                                "front view"}, 400)
+    return view_map, candidates, None
+
+
+# --------------------------------------------------------------------------- #
 # 5g) POST /video/identity-profiles/<slug>/reconstruction/<recon_id>/mesh
 #     Trigger a ComfyUI mesh pipeline job (Hunyuan3D) utilizing selected, approved
 #     anchor views.
@@ -2038,24 +2135,60 @@ def video_identity_profile_build_mesh(slug, recon_id):
     profile = identity_profiles.get_profile(slug)
     if profile is None:
         return jsonify({"error": "identity profile not found"}), 404
-        
+
     body = request.get_json(silent=True) or {}
-    views = body.get("views")  # Selected anchor viewIds (0°, 45°, 90°, etc.)
-    if not isinstance(views, list) or not views:
-        return jsonify({"error": "views must be a non-empty list of approved view IDs"}), 400
+
+    # The mesh (+ optional turntable) is built from the identity's OWN reference/canonical
+    # images — NEVER arbitrary paths (the shared jail below). (The old contract's
+    # `views: [viewIds]` list is IGNORED, not rejected — the default front mapping applies
+    # — so an older client never hard-400s here.)
+    view_map, view_candidates, verr = _resolve_profile_mesh_views(profile, body.get("views"))
+    if verr is not None:
+        payload, status = verr
+        return jsonify(payload), status
+
+    # Optional knobs — malformed optional params fall back to their defaults (a bad tuning
+    # value should not hard-fail the build; make_identity_mesh re-validates regardless).
+    def _pos_int(d, name, default):
+        v = d.get(name, default)
+        return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else default
+
+    seed = body.get("seed", 12345)
+    if not isinstance(seed, int) or isinstance(seed, bool) or seed < 0:
+        seed = 12345
+    tt = body.get("turntable") if isinstance(body.get("turntable"), dict) else {}
+    elev = tt.get("elevation_deg", 8.0)
+    if not isinstance(elev, (int, float)) or isinstance(elev, bool):
+        elev = 8.0
 
     try:
-        # Bundle the asset locations of the selected approved frames
-        spec = identity_profiles.make_mesh_reconstruction_spec(
+        spec = make_identity_mesh(
             slug=slug,
             recon_id=recon_id,
-            view_ids=views,
-            backend="comfyui",
-            workflow="hunyuan3d-2mv",
-            output_format="glb"
+            view_sources=tuple(view_map.items()),
+            seed=seed,
+            num_inference_steps=_pos_int(body, "num_inference_steps", 30),
+            octree_resolution=_pos_int(body, "octree_resolution", 380),
+            texture=bool(body.get("texture", False)),
+            chain_turntable=bool(body.get("chain_turntable", True)),
+            frame_count=_pos_int(tt, "frame_count", 72),
+            fps=_pos_int(tt, "fps", 24),
+            width=_pos_int(tt, "width", 768),
+            height=_pos_int(tt, "height", 768),
+            elevation_deg=elev,
+            transparent=bool(tt.get("transparent", False)),
+            view_candidates=view_candidates,
         )
-    except identity_profiles.ProfileError as exc:
-        return jsonify({"error": str(exc), "code": exc.code}), 400
+    except (ValueError, TypeError) as exc:  # bad fields = 400
+        return jsonify({"error": str(exc)}), 400
+
+    # Seed the mesh state to "queued" so the GET mesh-status route + UI reflect the
+    # in-flight build immediately (best-effort — a clean no-op if this recon_id has no
+    # attached reconstruction yet; the relay attaches + records the terminal state).
+    try:
+        identity_profiles.set_mesh_state(slug, recon_id, {"status": "queued", "error": None})
+    except identity_profiles.ProfileError:
+        pass
 
     job_id = media_bus.enqueue("identity_mesh_build", spec)
     return jsonify({"job_id": job_id, "recon_id": recon_id}), 200
@@ -2074,5 +2207,95 @@ def video_identity_profile_mesh_status(slug, recon_id):
     mesh_state = identity_profiles.get_mesh_state(slug, recon_id)
     if mesh_state is None:
         return jsonify({"status": "none"}), 200
-        
+
     return jsonify(mesh_state), 200
+
+
+# --------------------------------------------------------------------------- #
+# 5i) POST /video/identity-profiles/<slug>/generate
+#     ONE-CLICK FULL IDENTITY GENERATION — the template that turns a saved identity
+#     PROFILE into a complete 3D identity in a single action: a Hunyuan3D mesh, a
+#     true-360° Blender turntable, and (by default) auto-promoted CANONICAL reference
+#     angles. Usable on ANY profile that carries 1..12 reference images — NO prior
+#     reconstruction / character-sheet / angle-ring approval is required (it mints a
+#     fresh recon_id and drives the whole chain off the profile's own refs).
+#
+#     Body — all optional; the DEFAULTS are the happy path (a bare {} is the intended
+#     call):
+#       views?      {front|right|back|left: <path>} — each an EXPLICIT override; every
+#                   path must be one of THIS profile's own reference/canonical images
+#                   (the shared jail — an arbitrary path is a clean 400). Omitted views
+#                   fall back to the default front (canonical[0]-on-disk else the first
+#                   existing reference image), exactly like the 5g mesh route.
+#       texture?    bool (default TRUE) — bake a texture onto the mesh (the template's happy path).
+#       turntable?  {frame_count?, fps?, width?, height?, elevation_deg?, transparent?}
+#                   — orbit render knobs (defaults 72 / 24 / 768 / 768 / 8.0 / False).
+#       auto_promote? bool (default True) — promote the 4 cardinal turntable frames to
+#                   canonical AFTER the render, but ONLY when canonical is still empty
+#                   (a curated canonical set is never clobbered; the relay re-reads it).
+#     Always chains the turntable (the "full identity" always renders mesh -> 360°).
+#     Returns {job_id, recon_id} 200; 404 for an unknown profile.
+# --------------------------------------------------------------------------- #
+@video_bp.route("/video/identity-profiles/<slug>/generate", methods=["POST"])
+def video_identity_profile_generate(slug):
+    profile = identity_profiles.get_profile(slug)
+    if profile is None:
+        return jsonify({"error": "identity profile not found"}), 404
+
+    body = request.get_json(silent=True) or {}
+
+    # Cardinal view map, JAILED to the profile's own images (shared with the 5g route).
+    view_map, view_candidates, verr = _resolve_profile_mesh_views(profile, body.get("views"))
+    if verr is not None:
+        payload, status = verr
+        return jsonify(payload), status
+
+    # A fresh, self-describing reconstruction id — the whole chain (mesh + turntable +
+    # canonical) hangs off it; no prior reconstruction is needed.
+    recon_id = "identity_" + secrets.token_hex(8)
+
+    # Optional knobs — a malformed optional value falls back to its default (a bad tuning
+    # value should not hard-fail the build; make_identity_mesh re-validates regardless).
+    def _pos_int(d, name, default):
+        v = d.get(name, default)
+        return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else default
+
+    tt = body.get("turntable") if isinstance(body.get("turntable"), dict) else {}
+    elev = tt.get("elevation_deg", 8.0)
+    if not isinstance(elev, (int, float)) or isinstance(elev, bool):
+        elev = 8.0
+
+    try:
+        spec = make_identity_mesh(
+            slug=slug,
+            recon_id=recon_id,
+            view_sources=tuple(view_map.items()),
+            # TEXTURE DEFAULTS TRUE on the one-click template (operator 2026-07-14 night:
+            # only the explicitly-textured run "is textured correctly of the 3" — the UI
+            # sends a bare body, so the default IS the promise; the paint path is proven
+            # and costs ~1-2 extra minutes). ``"texture": false`` opts a run out; the
+            # per-reconstruction 5g mesh route keeps texture opt-in for surgical builds.
+            texture=bool(body.get("texture", True)),
+            chain_turntable=True,   # the full-identity template always renders the 360°
+            auto_promote=bool(body.get("auto_promote", True)),
+            frame_count=_pos_int(tt, "frame_count", 72),
+            fps=_pos_int(tt, "fps", 24),
+            width=_pos_int(tt, "width", 768),
+            height=_pos_int(tt, "height", 768),
+            elevation_deg=elev,
+            transparent=bool(tt.get("transparent", False)),
+            view_candidates=view_candidates,
+        )
+    except (ValueError, TypeError) as exc:  # bad fields = 400
+        return jsonify({"error": str(exc)}), 400
+
+    # Seed mesh state to "queued" so GET .../reconstruction/<recon_id>/mesh + the UI
+    # reflect the in-flight build immediately (set_mesh_state creates the record for this
+    # brand-new recon_id — the mesh-first flow — then the relay records the terminal state).
+    try:
+        identity_profiles.set_mesh_state(slug, recon_id, {"status": "queued", "error": None})
+    except identity_profiles.ProfileError:
+        pass
+
+    job_id = media_bus.enqueue("identity_mesh_build", spec)
+    return jsonify({"job_id": job_id, "recon_id": recon_id}), 200

@@ -237,6 +237,12 @@ class LlamaCppPythonRunner(LlamaCppBaseRunner):
         stream = await asyncio.to_thread(run)
         for raw in stream:
             try:
+                # llama-cpp-python stream chunks normally carry no usage; if a
+                # build ever adds one (final chunk), keep it for the DoneEvent.
+                # Otherwise base_runner._usage_for falls back to this runner's
+                # exact tokenizer (_count_tokens).
+                if isinstance(raw, dict) and raw.get("usage"):
+                    self._stream_usage = raw["usage"]
                 choice = raw["choices"][0]
                 text = (choice.get("delta") or {}).get("content") or ""
                 fr   = choice.get("finish_reason")

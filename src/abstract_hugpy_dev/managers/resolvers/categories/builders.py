@@ -49,8 +49,11 @@ def _build_chat_request(kwargs: Dict[str, Any], model_key: str) -> ChatRequest:
             f"got keys: {sorted(kwargs)}"
         )
 
+    # max_chunks: the caller's continuation budget (ChatRequest already defines
+    # it). It was silently dropped here, so a /v1 client could never bound the
+    # unbounded continue-loop — part of the 2026-07-14 /v1 stall fix.
     for k in ("max_new_tokens", "temperature", "top_p", "do_sample", "request_id",
-              "unbounded", "pool", "images"):
+              "unbounded", "max_chunks", "pool", "images"):
         if k in kwargs:
             out[k] = kwargs[k]
     out.setdefault("request_id", make_request_id())

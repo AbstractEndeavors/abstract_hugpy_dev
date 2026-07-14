@@ -12,6 +12,12 @@ class DoneEvent(BaseModel):
     input_tokens: int
     output_chunks: int
     finish_reason: FINISH_REASONS
+    # Token accounting for the finished stream, when the producer knows it:
+    # {"prompt_tokens": int, "completion_tokens": int, "total_tokens": int}
+    # (engine-reported or tokenizer-counted). Optional + additive — every
+    # existing constructor call is unchanged and consumers must treat None as
+    # "unavailable". /v1 threads this into the OpenAI `usage` object.
+    usage: Optional[dict] = None
 
 class ErrorEvent(BaseModel):
     model_config = ConfigDict(extra="forbid")

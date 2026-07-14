@@ -198,7 +198,7 @@ def run_identity_reconstruction(spec, job_id: str) -> JobResult:
     from .. import identity_profiles, media_store
     from ..media_bus import is_cancelling
 
-    refs = list(spec.reference_images)
+    refs = list(spec.source_images)
 
     # Relay THIS reconstruction job's cancel down to the GPU render. render_clip's default
     # cancel probe watches the CHILD render_id (e.g. "<job>:<recon>:turntable"), which the

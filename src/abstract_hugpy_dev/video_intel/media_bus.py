@@ -37,7 +37,10 @@ from .movie_schema import GoalInterval, make_movie
 from .scene_schema import make_generate_scene
 from .studio.job import studio_i2v_from_dict
 from .studio_movie_schema import studio_movie_from_dict
-from .identity_reconstruction_schema import identity_reconstruction_from_dict
+from .identity_reconstruction_schema import (
+    identity_reconstruction_from_dict,
+    identity_mesh_from_dict,
+)
 from .result_schema import JobResult
 from .runners import DISPATCH
 
@@ -206,6 +209,10 @@ SPEC_DESERIALIZERS: Dict[str, Callable[[dict], object]] = {
     # Identity reconstruction (studio stage (b)) — rehydrates through its own
     # validate-at-construction factory (identity_reconstruction_from_dict).
     "identity_reconstruction": identity_reconstruction_from_dict,
+    # Identity 3D mesh build (+ turntable) RELAY — rehydrates through its own
+    # validate-at-construction factory (identity_mesh_from_dict). The runner relays it
+    # to the remote GPU render service (central has no GPU).
+    "identity_mesh_build": identity_mesh_from_dict,
 }
 
 

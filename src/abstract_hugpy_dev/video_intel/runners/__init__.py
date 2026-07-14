@@ -33,6 +33,10 @@ from .studio_movie import run_generate_studio_movie
 # identity-locked turnaround set from a profile + description. Import-safe like the
 # studio runners (studio/media_store imports stay lazy inside the runner).
 from .identity_reconstruction import run_identity_reconstruction
+# Identity 3D MESH build (+ turntable) — a RELAY to a remote GPU render service (central
+# has no GPU). Import-safe like the other identity runners: requests + the store imports
+# stay lazy INSIDE the runner, so this top-level import can never break app boot.
+from .identity_render_relay import run_identity_mesh_build
 
 DISPATCH = {
     ("ffmpeg", "crop"): run_crop,
@@ -44,4 +48,5 @@ DISPATCH = {
     ("studio", "i2v"): run_studio_i2v,
     ("studio", "movie"): run_generate_studio_movie,
     ("identity", "reconstruction"): run_identity_reconstruction,
+    ("identity", "mesh_build"): run_identity_mesh_build,
 }

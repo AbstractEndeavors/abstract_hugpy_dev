@@ -27,6 +27,15 @@ from flask import Response, jsonify, request, stream_with_context
 from ..functions import *  # get_bp, api-key store, chat_iter_sync, get_models_dict, update_model_status, …
 # Default media-chat model_key (single global value); explicit import — not in the functions star-export.
 from ....imports.config.models.models_config import media_default_state
+# Pure request/response plumbing lives in v1_helpers (stdlib-only, no Flask)
+# so it unit-tests offline; see that module's docstring.
+from .v1_helpers import (
+    _build_tools_preamble,
+    _completion_kwargs,
+    _inject_tools_preamble,
+    _parse_tool_calls,
+    _usage_block,
+)
 
 v1_bp, logger = get_bp("v1_bp", __name__)
 
@@ -92,36 +101,8 @@ def v1_models():
 
 # ──────────────────────────────────────────────────────────────────────────
 # /v1/chat/completions
+# (payload -> prompt_kwargs translation is _completion_kwargs in v1_helpers)
 # ──────────────────────────────────────────────────────────────────────────
-def _completion_kwargs(payload: dict) -> dict:
-    messages = payload.get("messages")
-    if not messages:
-        raise ValueError("'messages' is required")
-    # OpenAI clients must send *something* as model; "default" (and empty)
-    # mean "no preference" — leave model_key unset so resolve() falls through
-    # to the reconciled chat default instead of 404ing on a literal "default".
-    model = payload.get("model")
-    if isinstance(model, str) and model.strip().lower() in ("", "default"):
-        model = None
-    kwargs = {
-        "messages": [
-            {"role": m.get("role", "user"), "content": m.get("content", "")}
-            for m in messages
-        ],
-        "model_key": model,
-        "request_id": f"v1-{uuid.uuid4().hex}",
-    }
-    max_tokens = payload.get("max_tokens") or payload.get("max_completion_tokens")
-    if max_tokens:
-        # Explicit client cap → bounded; omitted → engine runs unbounded with
-        # auto-continuation, same as the console.
-        kwargs["max_new_tokens"] = int(max_tokens)
-    if payload.get("temperature") is not None:
-        kwargs["temperature"] = float(payload["temperature"])
-        kwargs["do_sample"] = float(payload["temperature"]) > 0
-    return kwargs
-
-
 async def _v1_events(prompt_kwargs: dict):
     """Raw StreamEvents from the chat engine (late import dodges circulars).
 
@@ -157,10 +138,30 @@ def _finish_reason(reason: str | None) -> str:
 @v1_auth
 def v1_chat_completions():
     payload = request.get_json(silent=True) or {}
+
+    # Central-side tools shim (see v1_helpers): the frozen engine schema can't
+    # carry `tools`, so tool-calling is prompt-injected here and parsed back
+    # out of the reply — every GGUF model gains it with no engine change.
+    # tool_choice "none" (or no usable tool entries) leaves tools_preamble
+    # None and the request behaves exactly as today.
+    tools_preamble = _build_tools_preamble(payload.get("tools"),
+                                           payload.get("tool_choice"))
+    if tools_preamble and payload.get("messages"):
+        payload = dict(payload)
+        payload["messages"] = _inject_tools_preamble(payload["messages"],
+                                                     tools_preamble)
+
     try:
         prompt_kwargs = _completion_kwargs(payload)
     except (ValueError, TypeError) as exc:
         return _openai_error(str(exc), 400)
+
+    # A tool call is one short, bounded turn — never auto-continue it. A
+    # continuation pass is exactly what rambled the captured 2026-07-14
+    # incident and would splice "Continue…" text into the JSON block. An
+    # explicit client max_chunks still wins.
+    if tools_preamble and "max_chunks" not in prompt_kwargs:
+        prompt_kwargs["max_chunks"] = 1
 
     model = payload.get("model") or "default"
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -178,20 +179,68 @@ def v1_chat_completions():
                 }, ensure_ascii=False) + "\n\n"
             ).encode("utf-8")
 
+        # OpenAI semantics: usage rides in ONE extra final chunk (choices: []),
+        # and only when the client opted in via stream_options.include_usage.
+        include_usage = bool((payload.get("stream_options") or {}).get("include_usage"))
+
+        def usage_chunk(usage) -> bytes:
+            return (
+                "data: " + json.dumps({
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [],
+                    "usage": _usage_block(usage),
+                }, ensure_ascii=False) + "\n\n"
+            ).encode("utf-8")
+
         async def sse():
+            usage = None
             yield chunk({"role": "assistant", "content": ""})
+            # Streaming with tools buffers the whole reply and parses at done —
+            # the simplest CORRECT behavior: a <tool_call> block is only
+            # recognizable once complete, and OpenAI SDKs accept the final
+            # burst. A fully-incremental tool-call stream (deltas per argument
+            # fragment) is a later refinement. Non-tool requests stream
+            # token-by-token exactly as before.
+            buffered: list = []
             try:
                 async for ev in _v1_events(prompt_kwargs):
                     t = getattr(ev, "type", None)
                     if t == "token":
-                        yield chunk({"content": ev.text})
+                        if tools_preamble:
+                            buffered.append(ev.text)
+                        else:
+                            yield chunk({"content": ev.text})
                     elif t == "done":
-                        yield chunk({}, finish=_finish_reason(ev.finish_reason))
+                        usage = getattr(ev, "usage", None)
+                        finish = _finish_reason(ev.finish_reason)
+                        if tools_preamble:
+                            clean_text, tool_calls = _parse_tool_calls("".join(buffered))
+                            buffered = []
+                            if tool_calls:
+                                yield chunk({"tool_calls": [
+                                    {**tc, "index": i}
+                                    for i, tc in enumerate(tool_calls)
+                                ]})
+                                finish = "tool_calls"
+                            elif clean_text:
+                                # No call — the buffered reply is plain content.
+                                yield chunk({"content": clean_text})
+                        yield chunk({}, finish=finish)
                     elif t == "error":
+                        if buffered:
+                            yield chunk({"content": "".join(buffered)})
+                            buffered = []
                         yield chunk({"content": f"\n[error: {ev.message}]"}, finish="stop")
             except Exception as exc:
                 logger.exception("v1 stream failed")
+                if buffered:
+                    yield chunk({"content": "".join(buffered)})
                 yield chunk({"content": f"\n[error: {exc}]"}, finish="stop")
+            if include_usage:
+                yield usage_chunk(usage)
             yield b"data: [DONE]\n\n"
 
         return Response(
@@ -210,6 +259,7 @@ def v1_chat_completions():
     text_parts: list[str] = []
     finish = "stop"
     error_message = None
+    usage = None
     try:
         for ev in chat_iter_sync(_v1_events(prompt_kwargs)):
             t = getattr(ev, "type", None)
@@ -217,6 +267,7 @@ def v1_chat_completions():
                 text_parts.append(ev.text)
             elif t == "done":
                 finish = _finish_reason(ev.finish_reason)
+                usage = getattr(ev, "usage", None)
             elif t == "error":
                 error_message = ev.message
     except KeyError as exc:
@@ -236,6 +287,18 @@ def v1_chat_completions():
         status = 404 if "Unknown model" in error_message else 500
         return _openai_error(error_message, status, "api_error")
 
+    content = "".join(text_parts)
+    message = {"role": "assistant", "content": content}
+    if tools_preamble:
+        # Errors-as-data: _parse_tool_calls returns (original text, None) on
+        # no/malformed calls, so the worst case is a plain content answer —
+        # a shim parse failure can never 500 the route.
+        clean_text, tool_calls = _parse_tool_calls(content)
+        if tool_calls:
+            message = {"role": "assistant", "content": clean_text or None,
+                       "tool_calls": tool_calls}
+            finish = "tool_calls"
+
     return jsonify({
         "id": completion_id,
         "object": "chat.completion",
@@ -243,10 +306,12 @@ def v1_chat_completions():
         "model": model,
         "choices": [{
             "index": 0,
-            "message": {"role": "assistant", "content": "".join(text_parts)},
+            "message": message,
             "finish_reason": finish,
         }],
-        "usage": {"prompt_tokens": None, "completion_tokens": None, "total_tokens": None},
+        # Real token accounting threaded up from the runner via the done
+        # event; all-None only when genuinely unavailable (never a crash).
+        "usage": _usage_block(usage),
     })
 
 

@@ -111,7 +111,10 @@ _SENSITIVE = [
     # free-ram = non-destructive host-RAM reclaim (gc + malloc_trim + CUDA
     # empty_cache on the worker); it runs a privileged executor op on the box,
     # so it sits in the same operator-only tier as the other worker ops.
-    ({"POST"},                   re.compile(r"^/llm/workers/[^/]+/(restart|update|pip|config|reap|reap-approve|pin-all|unpin-all|free-ram)$")),
+    # evict = targeted per-model RAM+VRAM reclaim (slot child kill / in-process
+    # ref-drop / comfy /free) — a privileged destructive executor op on the box,
+    # same operator-only tier as unload/free-ram.
+    ({"POST"},                   re.compile(r"^/llm/workers/[^/]+/(restart|update|pip|config|reap|reap-approve|pin-all|unpin-all|free-ram|evict)$")),
     # Civitai checkpoint download — writes multi-GB files into central's
     # /checkpoints store (which self-registers models) — operator-only.
     ({"POST"},                   re.compile(r"^/civitai/download$")),

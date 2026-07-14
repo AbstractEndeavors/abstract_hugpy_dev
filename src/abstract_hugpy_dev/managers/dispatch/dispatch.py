@@ -349,7 +349,10 @@ async def stream_runner(runner, req, cancel_event=None):
                          text=getattr(result, "text", "") or str(result))
         yield DoneEvent(request_id=req.request_id, input_tokens=0,
                         output_chunks=1,
-                        finish_reason=getattr(result, "finish_reason", None) or "stop")
+                        finish_reason=getattr(result, "finish_reason", None) or "stop",
+                        # ChatResult already defines usage; surface it when the
+                        # runner filled it in (None otherwise — additive).
+                        usage=getattr(result, "usage", None))
     else:
         yield ErrorEvent(request_id=req.request_id,
                          message=getattr(result, "error", None) or "run failed")
@@ -450,8 +453,40 @@ async def execute_chat_stream(*args, cancel_event=None, **kwargs):
     if isinstance(_mnt, int) and _mnt > _PER_PASS_MAX_TOKENS:
         base["max_new_tokens"] = _PER_PASS_MAX_TOKENS
 
+    # Caller-supplied continuation budget (ChatRequest.max_chunks). This loop
+    # is where "Continue exactly where you left off" passes are minted, so an
+    # explicit max_chunks MUST bound the TOTAL number of passes here — the
+    # runner-level unbounded loop honoring req.max_chunks isn't enough, because
+    # a bounded (max_new_tokens) pass that ends finish=length re-enters THIS
+    # loop. max_chunks=1 therefore means: one pass, no auto-continuation (the
+    # OpenAI /v1 max_tokens contract). Absent/invalid -> today's ceiling.
+    _mc = base.get("max_chunks")
+    try:
+        _mc = int(_mc) if _mc is not None else None
+    except (TypeError, ValueError):
+        _mc = None
+    total_passes = _MAX_CONTINUATIONS + 1
+    if _mc and _mc > 0:
+        total_passes = min(total_passes, _mc)
+
     full_text = ""
-    for attempt in range(_MAX_CONTINUATIONS + 1):
+    # Aggregate token accounting across continuation passes: each inner pass's
+    # done event may carry a usage dict (engine-reported or tokenizer-counted
+    # by the runner); the request's real cost is their key-wise sum. Stays None
+    # when no pass reported — consumers (/v1 usage object) must degrade.
+    usage_totals: Optional[dict] = None
+
+    def _merge_usage(part):
+        nonlocal usage_totals
+        if not isinstance(part, dict) or not part:
+            return
+        totals = dict(usage_totals or {})
+        for k, v in part.items():
+            if isinstance(v, int):
+                totals[k] = (totals.get(k) or 0) + v
+        usage_totals = totals or None
+
+    for attempt in range(total_passes):
         if cancel_event is not None and cancel_event.is_set():
             yield DoneEvent(request_id=rid, input_tokens=0, output_chunks=1,
                             finish_reason="cancelled")
@@ -492,6 +527,7 @@ async def execute_chat_stream(*args, cancel_event=None, **kwargs):
                     yield TokenEvent(request_id=rid, text=text)
             elif etype == "done":
                 finish = getattr(event, "finish_reason", None) or "stop"
+                _merge_usage(getattr(event, "usage", None))
             elif etype == "error":
                 # A pass that dies after text already streamed shouldn't turn a
                 # partially-delivered answer into "[Error: ...]" in the chat.
@@ -512,7 +548,8 @@ async def execute_chat_stream(*args, cancel_event=None, **kwargs):
                                       message="engine stream ended early — "
                                               "answer truncated")
                     yield DoneEvent(request_id=rid, input_tokens=0,
-                                    output_chunks=1, finish_reason="stop")
+                                    output_chunks=1, finish_reason="stop",
+                                    usage=usage_totals)
                 else:
                     yield ErrorEvent(request_id=rid,
                                      message=getattr(event, "message", None) or "run failed")
@@ -536,12 +573,12 @@ async def execute_chat_stream(*args, cancel_event=None, **kwargs):
 
         if finish not in _CONTINUE_ON:
             yield DoneEvent(request_id=rid, input_tokens=0, output_chunks=1,
-                            finish_reason=finish)
+                            finish_reason=finish, usage=usage_totals)
             return
         if not seg_text.strip():
             # Hit the cap but produced nothing usable — stop to avoid a loop.
             yield DoneEvent(request_id=rid, input_tokens=0, output_chunks=1,
-                            finish_reason="stop")
+                            finish_reason="stop", usage=usage_totals)
             return
 
         # Continue: append the partial assistant turn and re-prompt to keep going.
@@ -553,7 +590,7 @@ async def execute_chat_stream(*args, cancel_event=None, **kwargs):
 
     # Exhausted the continuation budget.
     yield DoneEvent(request_id=rid, input_tokens=0, output_chunks=1,
-                    finish_reason="max_tokens")
+                    finish_reason="max_tokens", usage=usage_totals)
 
 
 # ---------------------------------------------------------------------------

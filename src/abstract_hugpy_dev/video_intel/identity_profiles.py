@@ -1,6 +1,6 @@
 """Identity-profile store — the DURABLE form of "the reference set IS the identity".
 
-An identity profile is a NAMED library item: ``{name, reference_images (1..4),
+An identity profile is a NAMED library item: ``{name, source_images (1..4),
 created_at, notes?}``. The operator's vision (STUDIO-ROADMAP.md, "IDENTITY
 PROFILES") is that a character's DNA — its curated reference set — is created
 ONCE and associated anywhere (single clips, movies, stills) instead of being
@@ -34,7 +34,7 @@ under UPLOADS_HOME/.sessions/): an identity's pixels live ONLY under
 
 On create the validated source paths (which the route has already jail-resolved +
 image-classified) are COPIED into the identity's dir; the entry's
-``reference_images`` then point at the identity-owned copies (still under
+``source_images`` then point at the identity-owned copies (still under
 DEFAULT_ROOT, so the media_store jail still accepts them). The registry lives with
 the other durable registries and survives restarts; the copies survive the reaper.
 
@@ -85,6 +85,37 @@ _LOCK = threading.Lock()
 
 MAX_SOURCE_IMAGES = 12
 MAX_CANONICAL_IMAGES = 4  # Canonical anchors stay capped at 4
+
+# --------------------------------------------------------------------------- #
+# VERSIONS slice (operator-directed 2026-07-14; IDENTITY-VERSIONS-SLICE.md).
+#
+# An identity holds ONE base (the clay mesh minted on the first clay generate,
+# name "base") + N append-only VERSIONS — named render-sets minted by the mesh
+# RELAY on each successful generate. Never-delete lives here too: a version is
+# ARCHIVED (flagged, dropped from the wire list), its pixels never erased.
+#
+# ``gen_settings`` are the per-identity generation defaults the left-column
+# Settings tab persists and the Generate click prefills. ALWAYS present on the
+# wire (defaulted) so the UI can rely on the shape. Additive keys only — nothing
+# below removes or renames an existing profile field.
+# --------------------------------------------------------------------------- #
+VERSION_KINDS = ("clay", "textured", "styled")
+
+# The canonical happy-path generation settings (defaults-are-promises: a bare
+# Generate click == these). Merged over any stored partial in ``_public`` so the
+# wire shape is complete even for a profile that has never had settings PATCHed.
+_DEFAULT_GEN_SETTINGS: dict[str, Any] = {
+    "texture": True,
+    "pose": "none",          # "none" | "t-pose"
+    "frame_count": 72,
+    "fps": 24,
+    "width": 768,
+    "height": 768,
+    "auto_promote": True,
+    "front_ref": None,       # abs path (one of the profile's own refs) | null
+    "remove_background": True,
+}
+_POSE_CHOICES = ("none", "t-pose")
 
 class ProfileError(ValueError):
     """Bad-input on the store contract (empty name, no/too-many refs, dup slug).
@@ -140,7 +171,7 @@ def _atomic_copy(src: str, dest: str) -> None:
 
 def _materialize_refs(dir_path: str, sources: list[str]) -> tuple[list[str], list[str]]:
     """COPY each source in order into ``dir_path/ref_NN.<ext>`` and return
-    ``(reference_images, missing_references)``.
+    ``(source_images, missing_references)``.
 
     Order is preserved and the ref number is the list POSITION, so a rendered set
     stays aligned even when a middle source is absent. A missing/unreadable source
@@ -176,7 +207,7 @@ def _write_profile_json(slug: str, entry: dict[str, Any]) -> None:
         "name": entry.get("name", ""),
         "created_at": entry.get("created_at"),
         "notes": entry.get("notes", ""),
-        "reference_images": list(entry.get("reference_images") or []),
+        "source_images": list(entry.get("source_images") or []),
         "missing_references": list(entry.get("missing_references") or []),
         # stage (b) additive keys: the generated turnaround renderings awaiting
         # approval, and any views the operator has promoted to the canonical set.
@@ -209,6 +240,54 @@ def _supersede_existing_refs(dir_path: str) -> None:
     os.makedirs(dest_dir, exist_ok=True)
     for n in existing:
         shutil.move(os.path.join(dir_path, n), os.path.join(dest_dir, n))
+
+
+def _materialize_refs_staged(dir_path: str, sources: list[str]) -> tuple[list[str], list[str]]:
+    """Two-stage COPY-commit variant of ``_materialize_refs`` for UPDATES, where an
+    incoming path may BE one of the identity's OWN current ``ref_NN`` files (the UI reads
+    the owned copies back and re-submits them when editing the set). The old update flow
+    superseded the current refs FIRST and then copied from ``sources`` — so a
+    self-referential source had already been MOVED under ``_superseded/`` and was recorded
+    as MISSING, desyncing the registry (it named ``ref_01..ref_11`` while disk held
+    ``ref_00..ref_10``, and every path failed ``os.path.isfile`` downstream).
+
+    Here every readable source is COPIED to a ``_stage_NN`` name (extension preserved)
+    BEFORE anything is superseded — so a self-reference is captured while it still exists;
+    only THEN is the current set relocated (never-delete, via ``_supersede_existing_refs``)
+    and the staged files committed to their final position-numbered ``ref_NN`` names. A
+    missing/unreadable source behaves exactly as in ``_materialize_refs`` (its ORIGINAL
+    path is retained in the returned set and recorded in ``missing``)."""
+    os.makedirs(dir_path, exist_ok=True)
+    # STAGE 1 — copy each readable source to a staging name (distinct from ref_*), so
+    # NOTHING is superseded until every source is safely captured off its origin.
+    staged: dict[int, tuple[str, str]] = {}   # position -> (stage_path, ext)
+    originals: dict[int, str] = {}            # position -> original path (missing source)
+    missing: list[str] = []
+    for i, src in enumerate(sources):
+        ext = _ext_for(src)
+        if os.path.isfile(src):
+            stage = os.path.join(dir_path, f"_stage_{i:02d}{ext}")
+            try:
+                _atomic_copy(src, stage)
+                staged[i] = (stage, ext)
+                continue
+            except OSError:
+                pass
+        originals[i] = src
+        missing.append(src)
+    # STAGE 2 — relocate the current ref_* set now that every new source is staged.
+    _supersede_existing_refs(dir_path)
+    # STAGE 3 — commit staged files to their final ref_NN names (position preserved).
+    refs: list[str] = []
+    for i in range(len(sources)):
+        if i in staged:
+            stage, ext = staged[i]
+            dest = os.path.join(dir_path, f"ref_{i:02d}{ext}")
+            os.replace(stage, dest)
+            refs.append(dest)
+        else:
+            refs.append(originals[i])
+    return refs, missing
 
 
 # --------------------------------------------------------------------------- #
@@ -315,7 +394,7 @@ def _migrate_legacy() -> Optional[dict[str, Any]]:
     ``PROJECTS_HOME/identity_profiles.json`` exists (the caller guards on
     new-registry-absence, so this fires at most once). For each ACTIVE profile it
     creates ``<slug>/`` and COPIES (never moves) each referenced image into
-    ``ref_NN.<ext>``, rewriting reference_images to the copies and recording any
+    ``ref_NN.<ext>``, rewriting source_images to the copies and recording any
     missing sources in ``missing_references`` — a missing source neither crashes
     nor drops the identity (an all-missing entry is kept with an empty-copied set,
     its original paths retained, and the full missing list). ``_deleted`` entries
@@ -342,9 +421,9 @@ def _migrate_legacy() -> Optional[dict[str, Any]]:
         if not isinstance(entry, dict):
             continue
         new_entry = dict(entry)
-        sources = [r for r in (entry.get("reference_images") or []) if isinstance(r, str)]
+        sources = [r for r in (entry.get("source_images") or []) if isinstance(r, str)]
         refs, missing = _materialize_refs(_identity_dir(slug), sources)
-        new_entry["reference_images"] = refs
+        new_entry["source_images"] = refs
         if missing:
             new_entry["missing_references"] = missing
         else:
@@ -409,7 +488,12 @@ def _public(slug: str, entry: dict[str, Any]) -> dict[str, Any]:
     out = {
         "slug": slug,
         "name": entry.get("name", ""),
-        "reference_images": list(entry.get("reference_images") or []),
+        # WIRE key is ``reference_images`` (what the UI schema + video_routes'
+        # identity resolver + tests read), sourced from the internal
+        # ``source_images`` storage field. Keep these two names in sync: emitting
+        # ``source_images`` on the wire silently blanks the UI's reference set and
+        # makes the movie/i2v identity resolver see an empty identity.
+        "reference_images": list(entry.get("source_images") or []),
         "created_at": entry.get("created_at"),
         "notes": entry.get("notes", ""),
     }
@@ -430,7 +514,45 @@ def _public(slug: str, entry: dict[str, Any]) -> dict[str, Any]:
     canonical_missing = entry.get("canonical_missing")
     if canonical_missing:
         out["canonical_missing"] = list(canonical_missing)
+    # VERSIONS slice additive keys — ALWAYS present (defaulted) so the UI can rely
+    # on the shape. ``versions`` omits archived entries (never-delete: they stay in
+    # storage, just off the wire); ``active_version`` is the id_lock DNA pointer;
+    # ``gen_settings`` is the full happy-path defaults merged over any stored partial.
+    out["versions"] = [
+        _public_version(v) for v in (entry.get("versions") or [])
+        if isinstance(v, dict) and not v.get("archived")
+    ]
+    out["active_version"] = entry.get("active_version")
+    out["gen_settings"] = _merged_gen_settings(entry.get("gen_settings"))
     return out
+
+
+def _public_version(v: dict[str, Any]) -> dict[str, Any]:
+    """The FIXED wire shape for one version — exactly the seven contract keys (a
+    sibling UI is built to these). The internal-only ``base``/``archived`` flags stay
+    OFF the wire; the base version is identifiable by ``name == "base"`` + ``kind ==
+    "clay"``, and archived versions are omitted from the list entirely."""
+    return {
+        "version_id": v.get("version_id"),
+        "name": v.get("name", ""),
+        "kind": v.get("kind", "clay"),
+        "recon_id": v.get("recon_id"),
+        "created_at": v.get("created_at"),
+        "canonical": list(v.get("canonical") or []),
+        "notes": v.get("notes", ""),
+    }
+
+
+def _merged_gen_settings(stored: Any) -> dict[str, Any]:
+    """The full happy-path defaults with any stored partial layered on top — only
+    KNOWN keys survive (a stale/unknown stored key is dropped from the wire), so the
+    shape is always exactly the contract's nine keys."""
+    gs = dict(_DEFAULT_GEN_SETTINGS)
+    if isinstance(stored, dict):
+        for k in _DEFAULT_GEN_SETTINGS:
+            if k in stored:
+                gs[k] = stored[k]
+    return gs
 
 
 def list_profiles() -> list[dict[str, Any]]:
@@ -456,7 +578,7 @@ def get_profile(slug: str) -> Optional[dict[str, Any]]:
 
 def create_profile(
     name: str,
-    reference_images: list[str],
+    source_images: list[str],
     notes: str = "",
 ) -> dict[str, Any]:
     """Create a profile from a display name + a set of ALREADY-VALIDATED reference
@@ -473,16 +595,16 @@ def create_profile(
     display = (name or "").strip()
     if not display:
         raise ProfileError("name is required", code="invalid_profile")
-    if not isinstance(reference_images, list) or not reference_images:
+    if not isinstance(source_images, list) or not source_images:
         raise ProfileError("at least one reference_image is required", code="invalid_profile")
-    # Change MAX_REFERENCE_IMAGES to MAX_SOURCE_IMAGES here:
-    if len(reference_images) > MAX_SOURCE_IMAGES:
+    # Change MAX_source_images to MAX_SOURCE_IMAGES here:
+    if len(source_images) > MAX_SOURCE_IMAGES:
         raise ProfileError(
-            f"at most {MAX_SOURCE_IMAGES} reference_images are accepted",
+            f"at most {MAX_SOURCE_IMAGES} source_images are accepted",
             code="invalid_profile",
         )
     refs: list[str] = []
-    for raw in reference_images:
+    for raw in source_images:
         if not isinstance(raw, str) or not raw.strip():
             raise ProfileError("each reference_image must be a non-empty path", code="invalid_profile")
         refs.append(raw)
@@ -492,7 +614,7 @@ def create_profile(
 
     entry: dict[str, Any] = {
         "name": display,
-        "reference_images": refs,  # replaced by the identity-owned copies below
+        "source_images": refs,  # replaced by the identity-owned copies below
         "created_at": time.time(),
         "notes": (notes or "").strip(),
     }
@@ -504,7 +626,7 @@ def create_profile(
         # points at the identity-owned copies (under IDENTITIES_HOME, still within
         # DEFAULT_ROOT -> media_store jail OK) and so survives the upload reaper.
         owned, missing = _materialize_refs(_identity_dir(slug), refs)
-        entry["reference_images"] = owned
+        entry["source_images"] = owned
         if missing:
             entry["missing_references"] = missing
         _write_profile_json(slug, entry)
@@ -518,10 +640,10 @@ def update_profile(
     *,
     name: Optional[str] = None,
     notes: Optional[str] = None,
-    reference_images: Optional[list[str]] = None,
+    source_images: Optional[list[str]] = None,
 ) -> Optional[dict[str, Any]]:
     """Edit an EXISTING active profile IN PLACE. A true partial update: each of
-    ``name``/``notes``/``reference_images`` left at its default (``None``) is a
+    ``name``/``notes``/``source_images`` left at its default (``None``) is a
     no-op for that field — the route only forwards the keys actually present in
     the PATCH body, so this never needs a sentinel to distinguish "omitted" from
     "cleared".
@@ -535,7 +657,7 @@ def update_profile(
     display name to "Mira Prime"). So ``name`` is DISPLAY-ONLY here: the dict key
     in ``data["profiles"]`` never changes, only the stored ``name`` string does.
 
-    ``reference_images``, when given, must be a non-empty 1..MAX_REFERENCE_IMAGES
+    ``source_images``, when given, must be a non-empty 1..MAX_source_images
     list (the route has already jail-resolved + image-classified it exactly like
     POST create) — an identity is never left pointing at zero references. Pass it
     as ``None`` (the default) to leave the current reference set untouched. When a
@@ -558,17 +680,17 @@ def update_profile(
             raise ProfileError("name is required", code="invalid_profile")
 
     new_refs: Optional[list[str]] = None
-    if reference_images is not None:
-        if not isinstance(reference_images, list) or not reference_images:
+    if source_images is not None:
+        if not isinstance(source_images, list) or not source_images:
             raise ProfileError("at least one reference_image is required", code="invalid_profile")
-        # Change MAX_REFERENCE_IMAGES to MAX_SOURCE_IMAGES here:
-        if len(reference_images) > MAX_SOURCE_IMAGES:
+        # Change MAX_source_images to MAX_SOURCE_IMAGES here:
+        if len(source_images) > MAX_SOURCE_IMAGES:
             raise ProfileError(
-                f"at most {MAX_SOURCE_IMAGES} reference_images are accepted",
+                f"at most {MAX_SOURCE_IMAGES} source_images are accepted",
                 code="invalid_profile",
             )
         new_refs = []
-        for raw in reference_images:
+        for raw in source_images:
             if not isinstance(raw, str) or not raw.strip():
                 raise ProfileError("each reference_image must be a non-empty path", code="invalid_profile")
             new_refs.append(raw)
@@ -584,11 +706,14 @@ def update_profile(
         if notes is not None:
             entry["notes"] = notes.strip()
         if new_refs is not None:
-            # MOVE the current ref files aside (never erase), then COPY the new set
-            # in renumbered from ref_00. The entry points at the fresh copies.
-            _supersede_existing_refs(_identity_dir(slug))
-            owned, missing = _materialize_refs(_identity_dir(slug), new_refs)
-            entry["reference_images"] = owned
+            # Two-stage COPY-commit: stage the new set to _stage_NN BEFORE superseding the
+            # old ref_* files, so re-submitting the identity's OWN owned paths (the UI reads
+            # them back on edit) can't desync — a self-referential source is copied while it
+            # still exists. _materialize_refs_staged supersedes then commits internally.
+            # (Was: supersede-then-copy, which moved the source out from under the copy and
+            # recorded every ref as missing → registry named ref_01..ref_11, disk had ref_00..)
+            owned, missing = _materialize_refs_staged(_identity_dir(slug), new_refs)
+            entry["source_images"] = owned
             if missing:
                 entry["missing_references"] = missing
             else:
@@ -664,6 +789,7 @@ def attach_reconstruction(
     view_paths: list[str],
     *,
     spec: Optional[dict[str, Any]] = None,
+    replace: bool = False,
 ) -> Optional[dict[str, Any]]:
     """Persist a generated turnaround set for *slug* under ``recon_id``.
 
@@ -721,7 +847,20 @@ def attach_reconstruction(
 
         entry = dict(entry)  # edit a copy — nothing is written until _save
         recons = list(entry.get("reconstructions") or [])
-        recons.append(record)
+        # replace=True (used by the mesh RELAY, which re-attaches under an EXISTING
+        # recon_id): overwrite the first record sharing this recon_id IN PLACE so the
+        # promote route — which finds a record by recon_id — sees THIS set, and the
+        # list never grows a second same-id record. Default (append) is unchanged for
+        # the reconstruction runner, which always mints a fresh recon_id.
+        replaced = False
+        if replace:
+            for i, r in enumerate(recons):
+                if isinstance(r, dict) and r.get("recon_id") == recon_id:
+                    recons[i] = record
+                    replaced = True
+                    break
+        if not replaced:
+            recons.append(record)
         entry["reconstructions"] = recons
         _write_profile_json(slug, entry)  # regenerate the mirror
         data["profiles"][slug] = entry
@@ -741,7 +880,7 @@ def promote_reconstruction_views(
     ``_materialize_refs``, so a promoted set is renumbered from ``ref_00`` exactly like
     an uploaded set) and points the entry's ``canonical`` key at those identity-owned
     copies. Any existing canonical set is SUPERSEDED first (never-delete). At most
-    ``MAX_REFERENCE_IMAGES`` may be promoted (canonical feeds the id_lock reference
+    ``MAX_source_images`` may be promoted (canonical feeds the id_lock reference
     channel, capped at 4). ``profile.json`` is regenerated.
 
     Errors-as-data on the store contract (``ProfileError`` -> the route's 4xx): a bad
@@ -761,9 +900,9 @@ def promote_reconstruction_views(
             raise ProfileError("each view index must be a non-negative int",
                                code="invalid_profile")
         idxs.append(raw)
-    if len(idxs) > MAX_REFERENCE_IMAGES:
+    if len(idxs) > MAX_CANONICAL_IMAGES:
         raise ProfileError(
-            f"at most {MAX_REFERENCE_IMAGES} views may be promoted to canonical",
+            f"at most {MAX_CANONICAL_IMAGES} views may be promoted to canonical",
             code="invalid_profile")
 
     canon_dir = _canonical_dir(slug)
@@ -903,10 +1042,323 @@ def get_mesh_state(slug: str, recon_id: str) -> dict:
     profile = get_profile(slug)
     if not profile:
         return None
-        
+
     recons = profile.get("reconstructions", [])
     target_recon = next((r for r in recons if r.get("recon_id") == recon_id), None)
     if not target_recon:
         return None
-        
+
     return target_recon.get("mesh")
+
+
+def set_mesh_state(slug: str, recon_id: str, patch: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Merge *patch* into reconstruction ``recon_id``'s ``mesh`` state block (created if
+    absent) and persist. This is the DURABLE WRITE side of the mesh-build lifecycle that
+    ``get_mesh_state`` reads: the route seeds ``{"status": "queued"}`` on enqueue, and the
+    relay runner records ``{"status": "running"}`` → ``{"status": "done", "glb_path": …,
+    "video_path": …, "mesh_json_path": …}`` (or ``{"status": "error", "error": …}``).
+
+    Uses the store's REAL single-writer + atomic idiom (``_LOCK`` / ``_load`` / ``_save`` /
+    ``_write_profile_json``) — NOT the unwired ``_save_profile`` stub the older
+    ``make_mesh_reconstruction_spec`` references. Returns the updated ``mesh`` dict, or
+    ``None`` if the slug/recon_id names no active reconstruction (a best-effort caller — a
+    bus runner — tolerates that; the profile may have been archived or the reconstruction
+    not yet attached)."""
+    if not slug or not isinstance(slug, str):
+        return None
+    if not recon_id or not isinstance(recon_id, str):
+        return None
+    if not isinstance(patch, dict):
+        raise ProfileError("mesh state patch must be a dict", code="invalid_profile")
+    with _LOCK:
+        data = _load()
+        entry = data["profiles"].get(slug)
+        if entry is None:
+            return None
+        recons = list(entry.get("reconstructions") or [])
+        target_idx = next(
+            (i for i, r in enumerate(recons)
+             if isinstance(r, dict) and r.get("recon_id") == recon_id),
+            None,
+        )
+        if target_idx is None:
+            # MESH-FIRST flow (v0 photos→mesh): there IS no prior reconstruction to hang
+            # the mesh state on — the old silent ``return None`` made a successful build
+            # invisible to GET .../mesh even though the GLB persisted (keeper 2026-07-14,
+            # first live build). Create a minimal record in attach_reconstruction's shape
+            # (views empty until a turntable attach replaces it) instead of no-opping.
+            recons.append({
+                "recon_id": recon_id,
+                "created_at": time.time(),
+                "views": [],
+                "mode": "mesh",
+            })
+            target_idx = len(recons) - 1
+        record = dict(recons[target_idx])
+        mesh = dict(record.get("mesh") or {})
+        mesh.update(patch)
+        record["mesh"] = mesh
+        recons[target_idx] = record
+        entry = dict(entry)  # edit a copy — nothing is written until _save
+        entry["reconstructions"] = recons
+        _write_profile_json(slug, entry)  # regenerate the mirror
+        data["profiles"][slug] = entry
+        _save(data)
+    return mesh
+
+
+# --------------------------------------------------------------------------- #
+# VERSIONS slice — append-only version list + active pointer + gen_settings.
+#
+# The mesh RELAY (runners/identity_render_relay.py) owns the mint moment: on a
+# successful build it calls ``mint_version`` with the auto-promoted cardinals as the
+# version's canonical, and the new version becomes ACTIVE (latest-wins). The routes
+# own activate / rename / archive + the Settings tab (``set_gen_settings``). Every
+# mutation is single-writer under ``_LOCK`` with the store's atomic-write idiom, and
+# never-delete holds — an archived version is flagged, never dropped from storage.
+# --------------------------------------------------------------------------- #
+def _auto_version_name(versions: list, kind: str) -> tuple[str, bool]:
+    """The auto-name for a freshly minted version + whether it is the BASE.
+
+    The FIRST ``clay`` version ever minted for a profile is the base (name ``"base"``,
+    the geometric ground truth). Every other version is ``"<kind>-NN"`` where NN counts
+    ALL prior versions of that kind (archived included, so a name is never reused).
+    Returns ``(name, is_base)``."""
+    has_base = any(isinstance(v, dict) and v.get("base") for v in versions)
+    if kind == "clay" and not has_base:
+        return "base", True
+    nn = 1 + sum(1 for v in versions if isinstance(v, dict) and v.get("kind") == kind)
+    return f"{kind}-{nn:02d}", False
+
+
+def mint_version(
+    slug: str,
+    recon_id: str,
+    kind: str,
+    canonical: list[str],
+    name: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """Mint (or, on a re-run of the SAME ``recon_id``, update in place) a VERSION and
+    make it ACTIVE (latest-wins).
+
+    ``kind`` is one of ``VERSION_KINDS`` (``clay``/``textured``/``styled``). ``canonical``
+    is the version's own promoted cardinal set (the id_lock DNA a caller gets when this
+    version is active). When ``name`` is ``None`` an auto-name is derived
+    (``_auto_version_name``) — the first clay is pinned as the ``base``. Dedupe by
+    ``recon_id``: a version already carrying this recon_id (e.g. a bus retry) is updated
+    in place rather than duplicated, preserving its ``version_id``/``name``/base flag.
+
+    Append-only + never-delete: an existing version is never removed here. Returns the
+    minted/updated version's PUBLIC shape, or ``None`` if the slug names no active
+    profile (a best-effort caller — the relay — tolerates that)."""
+    if not slug or not isinstance(slug, str):
+        return None
+    if not recon_id or not isinstance(recon_id, str) or not recon_id.strip():
+        raise ProfileError("recon_id is required", code="invalid_profile")
+    if kind not in VERSION_KINDS:
+        raise ProfileError(f"kind must be one of {list(VERSION_KINDS)}", code="invalid_profile")
+    canon = [p for p in (canonical or []) if isinstance(p, str)]
+    with _LOCK:
+        data = _load()
+        entry = data["profiles"].get(slug)
+        if entry is None:
+            return None
+        entry = dict(entry)  # edit a copy — nothing is written until _save
+        versions = list(entry.get("versions") or [])
+        existing_idx = next(
+            (i for i, v in enumerate(versions)
+             if isinstance(v, dict) and v.get("recon_id") == recon_id and not v.get("archived")),
+            None,
+        )
+        if existing_idx is not None:
+            version = dict(versions[existing_idx])
+            version["kind"] = kind
+            version["canonical"] = canon
+            if name is not None:
+                version["name"] = name
+            versions[existing_idx] = version
+        else:
+            auto_name, is_base = _auto_version_name(versions, kind)
+            version = {
+                "version_id": "ver_" + secrets.token_hex(8),
+                "name": name if name is not None else auto_name,
+                "kind": kind,
+                "recon_id": recon_id,
+                "created_at": time.time(),
+                "canonical": canon,
+                "notes": "",
+            }
+            if is_base and name is None:
+                version["base"] = True  # the geometric ground truth — never archivable
+            versions.append(version)
+        entry["versions"] = versions
+        entry["active_version"] = version["version_id"]  # latest-wins
+        _write_profile_json(slug, entry)
+        data["profiles"][slug] = entry
+        _save(data)
+    return _public_version(version)
+
+
+def set_active_version(slug: str, version_id: str) -> Optional[dict[str, Any]]:
+    """Point the identity's ACTIVE version at ``version_id`` (the id_lock DNA source).
+    Returns the updated PUBLIC profile, or ``None`` if the slug names no active profile
+    OR ``version_id`` names no active (non-archived) version of it — the route turns
+    either into a 404."""
+    if not slug or not isinstance(slug, str) or not version_id or not isinstance(version_id, str):
+        return None
+    with _LOCK:
+        data = _load()
+        entry = data["profiles"].get(slug)
+        if entry is None:
+            return None
+        versions = list(entry.get("versions") or [])
+        match = next(
+            (v for v in versions
+             if isinstance(v, dict) and v.get("version_id") == version_id and not v.get("archived")),
+            None,
+        )
+        if match is None:
+            return None
+        entry = dict(entry)
+        entry["active_version"] = version_id
+        _write_profile_json(slug, entry)
+        data["profiles"][slug] = entry
+        _save(data)
+    return _public(slug, entry)
+
+
+def update_version(
+    slug: str,
+    version_id: str,
+    *,
+    name: Optional[str] = None,
+    notes: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """Partial edit of a version's DISPLAY fields (``name`` / ``notes``) in place — an
+    argument left at ``None`` is a no-op for that field (the route only forwards keys
+    actually present). Returns the updated PUBLIC profile, or ``None`` if the slug/version
+    is unknown or archived (route 404). A blank ``name`` is a ProfileError -> the route's
+    400."""
+    if not slug or not isinstance(slug, str) or not version_id or not isinstance(version_id, str):
+        return None
+    new_name: Optional[str] = None
+    if name is not None:
+        new_name = name.strip()
+        if not new_name:
+            raise ProfileError("name is required", code="invalid_profile")
+    new_notes: Optional[str] = None
+    if notes is not None:
+        if not isinstance(notes, str):
+            raise ProfileError("notes must be a string", code="invalid_profile")
+        new_notes = notes.strip()
+    with _LOCK:
+        data = _load()
+        entry = data["profiles"].get(slug)
+        if entry is None:
+            return None
+        versions = list(entry.get("versions") or [])
+        idx = next(
+            (i for i, v in enumerate(versions)
+             if isinstance(v, dict) and v.get("version_id") == version_id and not v.get("archived")),
+            None,
+        )
+        if idx is None:
+            return None
+        version = dict(versions[idx])
+        if new_name is not None:
+            version["name"] = new_name
+        if new_notes is not None:
+            version["notes"] = new_notes
+        versions[idx] = version
+        entry = dict(entry)
+        entry["versions"] = versions
+        _write_profile_json(slug, entry)
+        data["profiles"][slug] = entry
+        _save(data)
+    return _public(slug, entry)
+
+
+def archive_version(slug: str, version_id: str) -> Optional[dict[str, Any]]:
+    """ARCHIVE a version (never-delete: flag it ``archived``, keep its bytes, drop it
+    from the wire list). REFUSED for the clay BASE (the geometric ground truth) and for
+    the currently ACTIVE version — either is a ProfileError -> the route's 400 with a
+    clear message. Returns the updated PUBLIC profile, or ``None`` if the slug/version is
+    unknown / already archived (route 404)."""
+    if not slug or not isinstance(slug, str) or not version_id or not isinstance(version_id, str):
+        return None
+    with _LOCK:
+        data = _load()
+        entry = data["profiles"].get(slug)
+        if entry is None:
+            return None
+        versions = list(entry.get("versions") or [])
+        idx = next(
+            (i for i, v in enumerate(versions)
+             if isinstance(v, dict) and v.get("version_id") == version_id and not v.get("archived")),
+            None,
+        )
+        if idx is None:
+            return None
+        if versions[idx].get("base"):
+            raise ProfileError(
+                "the clay base version cannot be archived (it is the identity's geometric "
+                "ground truth)", code="invalid_profile")
+        if entry.get("active_version") == version_id:
+            raise ProfileError(
+                "the active version cannot be archived — activate another version first",
+                code="invalid_profile")
+        version = dict(versions[idx])
+        version["archived"] = True
+        version["archived_at"] = time.time()
+        versions[idx] = version
+        entry = dict(entry)
+        entry["versions"] = versions
+        _write_profile_json(slug, entry)
+        data["profiles"][slug] = entry
+        _save(data)
+    return _public(slug, entry)
+
+
+def set_gen_settings(slug: str, partial: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Merge a PARTIAL gen_settings update into the identity's stored settings. Only the
+    contract's known keys are accepted (an unknown key is a ProfileError -> the route's
+    400); every value is type-checked, ``pose`` is enum-checked, and ``front_ref`` (when
+    non-null) is JAILED to the profile's OWN reference images. Returns the updated PUBLIC
+    profile (its ``gen_settings`` reflecting the merge), or ``None`` if the slug names no
+    active profile (route 404)."""
+    if not isinstance(partial, dict):
+        raise ProfileError("gen_settings must be an object", code="invalid_profile")
+    with _LOCK:
+        data = _load()
+        entry = data["profiles"].get(slug)
+        if entry is None:
+            return None
+        own = {p for p in (entry.get("source_images") or []) if isinstance(p, str)}
+        cleaned: dict[str, Any] = {}
+        for k, v in partial.items():
+            if k not in _DEFAULT_GEN_SETTINGS:
+                raise ProfileError(f"unknown gen_settings key {k!r}", code="invalid_profile")
+            if k in ("texture", "auto_promote", "remove_background"):
+                if not isinstance(v, bool):
+                    raise ProfileError(f"{k} must be a bool", code="invalid_profile")
+            elif k == "pose":
+                if v not in _POSE_CHOICES:
+                    raise ProfileError(
+                        f"pose must be one of {list(_POSE_CHOICES)}", code="invalid_profile")
+            elif k in ("frame_count", "fps", "width", "height"):
+                if not isinstance(v, int) or isinstance(v, bool) or v <= 0:
+                    raise ProfileError(f"{k} must be a positive int", code="invalid_profile")
+            elif k == "front_ref":
+                if v is not None and (not isinstance(v, str) or v not in own):
+                    raise ProfileError(
+                        "front_ref must be one of the profile's own reference images",
+                        code="invalid_profile")
+            cleaned[k] = v
+        entry = dict(entry)
+        gs = dict(entry.get("gen_settings") or {})
+        gs.update(cleaned)
+        entry["gen_settings"] = gs
+        _write_profile_json(slug, entry)
+        data["profiles"][slug] = entry
+        _save(data)
+    return _public(slug, entry)

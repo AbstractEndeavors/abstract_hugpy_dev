@@ -24,7 +24,7 @@ Locks (each check runs independently so one failure never masks the rest):
       empty list, missing name — each a clean 4xx, never a 500.
   [8] PATCH /<slug> partial edit: rename is DISPLAY-ONLY (the slug NEVER
       re-derives from the new name — every identity_profile:<slug> reference
-      stays valid); an omitted field is left untouched; reference_images
+##      stays valid); an omitted field is left untouched; reference_images
       REPLACES the set (not merges); an empty reference_images list is a clean
       400 (an identity keeps >=1 ref, unchanged by the rejected PATCH); an
       unknown slug is a clean 404.

@@ -31,8 +31,8 @@ from typing import Optional, Tuple
 
 # The subject reference images cap — an id_lock render consumes at most this many
 # (diffusers 0.39 prepends each as a VACE reference latent). Mirrors
-# ``studio.job._MAX_REFERENCE_IMAGES`` / ``identity_profiles.MAX_REFERENCE_IMAGES``.
-_MAX_REFERENCE_IMAGES = 4
+# ``studio.job._MAX_CANONICAL_IMAGES`` / ``identity_profiles.MAX_CANONICAL_IMAGES``.
+_MAX_CANONICAL_IMAGES = 4
 
 # The default set of turnaround views (order preserved end-to-end). A single-view
 # request (e.g. ``["front"]``) is valid — the cheap way to verify one render first.
@@ -47,7 +47,7 @@ _DEFAULT_WIDTH, _DEFAULT_HEIGHT, _DEFAULT_FPS = 480, 480, 16
 #   "turntable" — NEW: ONE id_lock ORBIT clip whose EVERY frame is kept, each frame a
 #                 degree-view; the record's ordered ``views`` hold the frames in angular
 #                 order. The runner branches on this.
-RECON_MODES: Tuple[str, ...] = ("sheet", "turntable")
+RECON_MODES: Tuple[str, ...] = ("sheet", "turntable", "angle-ring")
 _DEFAULT_MODE = "sheet"
 
 # Turntable frame cap: a studio id_lock clip is spine-derived (~2s, model-capped), so at
@@ -64,7 +64,7 @@ class IdentityReconstructionSpec:
                          store key ``attach_reconstruction`` writes back to).
         recon_id         the minted id of THIS turnaround set (the route mints it and
                          returns it alongside the job_id so the UI can correlate).
-        reference_images the ORDERED, jailed abs paths of the subject reference
+        source_images the ORDERED, jailed abs paths of the subject reference
                          image(s) the id_lock render conditions on (1..4). CANONICAL —
                          they define the identity. The route resolves + validates them
                          (canonical set preferred over the raw uploads) before enqueue.
@@ -85,7 +85,7 @@ class IdentityReconstructionSpec:
     """
     slug: str
     recon_id: str
-    reference_images: Tuple[str, ...]
+    source_images: Tuple[str, ...]
     views: Tuple[str, ...] = DEFAULT_VIEWS
     base_prompt: str = ""
     seed: int = 0
@@ -112,7 +112,7 @@ def make_identity_reconstruction(
     *,
     slug: str,
     recon_id: str,
-    reference_images: Tuple[str, ...],
+    source_images: Tuple[str, ...],
     views: Optional[Tuple[str, ...]] = None,
     base_prompt: str = "",
     seed: int = 0,
@@ -122,6 +122,8 @@ def make_identity_reconstruction(
     vram_budget_gb: Optional[float] = None,
     mode: str = _DEFAULT_MODE,
     turntable_max_frames: int = _DEFAULT_TURNTABLE_MAX_FRAMES,
+    angle_step_deg: Optional[int] = None,
+    elevations_deg: Optional[Sequence[int]] = None,
 ) -> IdentityReconstructionSpec:
     """Validate every field and build the frozen ``IdentityReconstructionSpec``.
     Raises ``ValueError``/``TypeError`` LOCALLY on any structural violation (house
@@ -135,20 +137,20 @@ def make_identity_reconstruction(
         raise ValueError(f"recon_id must be a non-empty string; got {recon_id!r}")
 
     # reference images: coerce list/tuple -> tuple; each a non-empty string; 1..4.
-    if isinstance(reference_images, (list, tuple)):
-        reference_images = tuple(reference_images)
+    if isinstance(source_images, (list, tuple)):
+        source_images = tuple(source_images)
     else:
         raise ValueError(
-            f"reference_images must be a list/tuple of paths; got {reference_images!r}")
-    if not reference_images:
+            f"source_images must be a list/tuple of paths; got {source_images!r}")
+    if not source_images:
         raise ValueError("at least one reference_image is required")
-    for i, r in enumerate(reference_images):
+    for i, r in enumerate(source_images):
         if not (isinstance(r, str) and r.strip()):
-            raise ValueError(f"reference_images[{i}] must be a non-empty string; got {r!r}")
-    if len(reference_images) > _MAX_REFERENCE_IMAGES:
+            raise ValueError(f"source_images[{i}] must be a non-empty string; got {r!r}")
+    if len(source_images) > _MAX_CANONICAL_IMAGES:
         raise ValueError(
-            f"at most {_MAX_REFERENCE_IMAGES} reference_images are accepted; "
-            f"got {len(reference_images)}")
+            f"at most {_MAX_CANONICAL_IMAGES} source_images are accepted; "
+            f"got {len(source_images)}")
 
     # views: None -> the default turnaround set; coerce list/tuple -> tuple; >=1;
     # each a non-empty string.
@@ -196,7 +198,7 @@ def make_identity_reconstruction(
     return IdentityReconstructionSpec(
         slug=slug,
         recon_id=recon_id,
-        reference_images=reference_images,
+        source_images=source_images,
         views=views,
         base_prompt=base_prompt,
         seed=seed,
@@ -206,6 +208,10 @@ def make_identity_reconstruction(
         vram_budget_gb=(float(vram_budget_gb) if vram_budget_gb is not None else None),
         mode=mode,
         turntable_max_frames=turntable_max_frames,
+        # angle-ring geometry (forwarded so the spec's __post_init__ can validate
+        # angle_step_deg>0; None for sheet/turntable). elevations normalized to a tuple.
+        angle_step_deg=angle_step_deg,
+        elevations_deg=(tuple(elevations_deg) if elevations_deg is not None else None),
     )
 
 
@@ -216,7 +222,7 @@ def identity_reconstruction_from_dict(d: dict) -> IdentityReconstructionSpec:
     return make_identity_reconstruction(
         slug=d["slug"],
         recon_id=d["recon_id"],
-        reference_images=d.get("reference_images") or (),
+        source_images=d.get("source_images") or (),
         views=d.get("views"),
         base_prompt=d.get("base_prompt", ""),
         seed=d.get("seed", 0),
@@ -227,6 +233,10 @@ def identity_reconstruction_from_dict(d: dict) -> IdentityReconstructionSpec:
         # Backward-compat: an old serialized spec has no ``mode`` -> "sheet".
         mode=d.get("mode") or _DEFAULT_MODE,
         turntable_max_frames=d.get("turntable_max_frames", _DEFAULT_TURNTABLE_MAX_FRAMES),
+        # Preserve angle-ring geometry across the bus (asdict->from_dict), or an
+        # angle-ring spec would re-validate with angle_step_deg=None and be rejected.
+        angle_step_deg=d.get("angle_step_deg"),
+        elevations_deg=d.get("elevations_deg"),
     )
 
 @dataclass(frozen=True)
@@ -242,12 +252,224 @@ class IdentitySingleViewRegenSpec:
     
 @dataclass(frozen=True)
 class IdentityMeshSpec:
+    """Frozen, JSON-safe currency of an ``identity_mesh_build`` bus job — the durable
+    intent for "build a 3D mesh (+ optional turntable) of an identity from its
+    reference images, on the remote GPU render service".
+
+    Central has NO GPU: the runner (``runners/identity_render_relay.py``) RELAYS this
+    over HTTP to the ``IDENTITY_RENDER_URL`` service. Every field is a primitive /
+    string tuple so ``asdict`` -> ``json`` round-trips cleanly and the bus can rehydrate
+    it through ``identity_mesh_from_dict`` (reconstruct + RE-VALIDATE).
+
+    EXISTING fields (``view_ids``/``backend``/``workflow``/``output_format``) are kept
+    for backward-compat — the old ComfyUI stub runner and ``make_mesh_reconstruction_spec``
+    still construct them. NEW (additive, all defaulted):
+
+        view_sources     ordered ``((view_name, abs_path), ...)`` pairs assigning a
+                         profile reference/canonical image to a cardinal view
+                         (front/right/back/left). ``front`` is required by Hunyuan3D-2mv;
+                         the route jails every path to the profile's own refs.
+        seed/num_inference_steps/octree_resolution/texture  mesh_params for the service.
+        chain_turntable  when True (default) the service renders the mesh AND a real
+                         Blender turntable orbit in one job (kind=``mesh_and_turntable``);
+                         False = mesh only (kind=``mesh_build``).
+        frame_count/fps/width/height/elevation_deg/transparent  turntable_params.
+        auto_promote      when True (default False) the relay, AFTER a successful
+                         turntable attach AND ONLY when the profile's canonical set is
+                         still EMPTY, promotes the 4 cardinal turntable frames into
+                         ``canonical`` (the ONE-CLICK full-identity template sets this;
+                         a curated canonical set is never clobbered). A promotion
+                         failure never fails the job.
+        view_candidates  ordered tuple of abs paths — the profile's OTHER existing
+                         source reference images, populated by the route ONLY when the
+                         caller did NOT explicitly assign a front (an explicit
+                         ``views.front`` disables auto-selection: empty tuple). When
+                         this has >=2 entries, the relay runner asks the fleet vision
+                         amenity which candidate shows the character's FULL BODY and,
+                         if one qualifies, swaps it in as the mesh ``front`` view
+                         BEFORE the render-service POST (see
+                         ``runners/identity_render_relay.py``). Never fails the job —
+                         a vision miss/error just keeps the existing default front.
+    """
     slug: str
     recon_id: str
-    view_ids: tuple[str, ...]
+    view_ids: tuple[str, ...] = ()
     backend: str = "comfyui"
     workflow: str = "hunyuan3d-2mv"
     output_format: str = "glb"
+    # --- additive: remote render-service relay contract ---------------------- #
+    view_sources: tuple[tuple[str, str], ...] = ()
+    seed: int = 12345
+    num_inference_steps: int = 30
+    octree_resolution: int = 380
+    texture: bool = False
+    chain_turntable: bool = True
+    frame_count: int = 72
+    fps: int = 24
+    width: int = 768
+    height: int = 768
+    elevation_deg: float = 8.0
+    transparent: bool = False
+    # additive: one-click full-identity template flag (see docstring above)
+    auto_promote: bool = False
+    # additive: fleet-VLM front auto-selection candidates (see docstring above)
+    view_candidates: tuple[str, ...] = ()
+    # additive (VERSIONS slice): pose-normalization stage. "none" (default) meshes the
+    # input pose as-is; "t-pose" makes the relay render ONE id_lock T-pose still FIRST
+    # and use it as the mesh front (clears crossed-arm occlusion). Honest degrade — a
+    # failed pose render never fails the job, it falls back to the normal front.
+    pose: str = "none"
+
+
+# Cardinal views the remote render service accepts (front is required; the others
+# are optional multi-view conditioning inputs). Mirrors identity_pipeline/mesh.py.
+MESH_VIEW_NAMES: Tuple[str, ...] = ("front", "right", "back", "left")
+
+
+def make_identity_mesh(
+    *,
+    slug: str,
+    recon_id: str,
+    view_sources,
+    seed: int = 12345,
+    num_inference_steps: int = 30,
+    octree_resolution: int = 380,
+    texture: bool = False,
+    chain_turntable: bool = True,
+    frame_count: int = 72,
+    fps: int = 24,
+    width: int = 768,
+    height: int = 768,
+    elevation_deg: float = 8.0,
+    transparent: bool = False,
+    auto_promote: bool = False,
+    view_ids: Tuple[str, ...] = (),
+    backend: str = "comfyui",
+    workflow: str = "hunyuan3d-2mv",
+    output_format: str = "glb",
+    view_candidates=(),
+) -> IdentityMeshSpec:
+    """Validate every field and build the frozen ``IdentityMeshSpec`` (house discipline:
+    a structurally-invalid spec is caller error caught at the boundary, never carried
+    across the bus). Runtime policy failures (the render service being unconfigured, a
+    ref image gone missing) are NOT validated here — they surface as errors-as-data
+    from the relay runner."""
+    if not (isinstance(slug, str) and slug.strip()):
+        raise ValueError(f"slug must be a non-empty string; got {slug!r}")
+    if not (isinstance(recon_id, str) and recon_id.strip()):
+        raise ValueError(f"recon_id must be a non-empty string; got {recon_id!r}")
+
+    # view_sources: coerce list/tuple of (name, path) pairs -> tuple of tuples. Each
+    # name must be a cardinal view; each path a non-empty string. ``front`` is REQUIRED
+    # (Hunyuan3D-2mv keys on it). Later duplicates of a view win (last assignment).
+    if not isinstance(view_sources, (list, tuple)):
+        raise ValueError(
+            f"view_sources must be a list/tuple of (view, path) pairs; got {view_sources!r}")
+    norm_pairs: list[tuple[str, str]] = []
+    seen: dict[str, str] = {}
+    for i, pair in enumerate(view_sources):
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            raise ValueError(
+                f"view_sources[{i}] must be a (view, path) pair; got {pair!r}")
+        name, path = pair[0], pair[1]
+        if not (isinstance(name, str) and name in MESH_VIEW_NAMES):
+            raise ValueError(
+                f"view_sources[{i}] view must be one of {list(MESH_VIEW_NAMES)}; got {name!r}")
+        if not (isinstance(path, str) and path.strip()):
+            raise ValueError(f"view_sources[{i}] path must be a non-empty string; got {path!r}")
+        seen[name] = path
+    # Preserve cardinal order (front first) for a stable, self-describing payload.
+    for name in MESH_VIEW_NAMES:
+        if name in seen:
+            norm_pairs.append((name, seen[name]))
+    if not norm_pairs:
+        raise ValueError("at least one view_sources pair is required")
+    if "front" not in seen:
+        raise ValueError("view_sources must include a 'front' view (Hunyuan3D-2mv requires it)")
+
+    if not isinstance(seed, int) or isinstance(seed, bool) or seed < 0:
+        raise ValueError(f"seed must be a non-negative int; got {seed!r}")
+    for pname, pval in (("num_inference_steps", num_inference_steps),
+                        ("octree_resolution", octree_resolution),
+                        ("frame_count", frame_count), ("fps", fps),
+                        ("width", width), ("height", height)):
+        if not isinstance(pval, int) or isinstance(pval, bool) or pval <= 0:
+            raise ValueError(f"{pname} must be a positive int; got {pval!r}")
+    if not isinstance(elevation_deg, (int, float)) or isinstance(elevation_deg, bool):
+        raise ValueError(f"elevation_deg must be a number; got {elevation_deg!r}")
+    for bname, bval in (("texture", texture), ("chain_turntable", chain_turntable),
+                        ("transparent", transparent), ("auto_promote", auto_promote)):
+        if not isinstance(bval, bool):
+            raise ValueError(f"{bname} must be a bool; got {bval!r}")
+
+    # view_candidates: coerce list/tuple -> tuple of non-empty strings (mirrors
+    # view_sources' list-of-lists -> tuple coercion below/at the deserializer). Any
+    # non-string / empty entry is a caller error caught at the boundary, never carried.
+    if not isinstance(view_candidates, (list, tuple)):
+        raise ValueError(
+            f"view_candidates must be a list/tuple of paths; got {view_candidates!r}")
+    norm_candidates: list[str] = []
+    for i, cpath in enumerate(view_candidates):
+        if not (isinstance(cpath, str) and cpath.strip()):
+            raise ValueError(
+                f"view_candidates[{i}] must be a non-empty string; got {cpath!r}")
+        norm_candidates.append(cpath)
+
+    return IdentityMeshSpec(
+        slug=slug,
+        recon_id=recon_id,
+        view_ids=tuple(view_ids) if isinstance(view_ids, (list, tuple)) else (),
+        backend=backend,
+        workflow=workflow,
+        output_format=output_format,
+        view_sources=tuple(norm_pairs),
+        seed=seed,
+        num_inference_steps=num_inference_steps,
+        octree_resolution=octree_resolution,
+        texture=bool(texture),
+        chain_turntable=bool(chain_turntable),
+        frame_count=frame_count,
+        fps=fps,
+        width=width,
+        height=height,
+        elevation_deg=float(elevation_deg),
+        transparent=bool(transparent),
+        auto_promote=bool(auto_promote),
+        view_candidates=tuple(norm_candidates),
+    )
+
+
+def identity_mesh_from_dict(d: dict) -> IdentityMeshSpec:
+    """Rebuild an ``IdentityMeshSpec`` from its ``asdict`` form THROUGH the validating
+    factory (deserialize-then-revalidate, like every other bus spec). Registered in
+    ``media_bus.SPEC_DESERIALIZERS`` under ``"identity_mesh_build"``. ``asdict`` turns the
+    ``view_sources`` tuple-of-tuples into list-of-lists over JSON, so coerce it back."""
+    raw = d.get("view_sources") or ()
+    pairs = [tuple(p) for p in raw if isinstance(p, (list, tuple)) and len(p) == 2]
+    return make_identity_mesh(
+        slug=d["slug"],
+        recon_id=d["recon_id"],
+        view_sources=pairs,
+        seed=d.get("seed", 12345),
+        num_inference_steps=d.get("num_inference_steps", 30),
+        octree_resolution=d.get("octree_resolution", 380),
+        texture=bool(d.get("texture", False)),
+        chain_turntable=bool(d.get("chain_turntable", True)),
+        frame_count=d.get("frame_count", 72),
+        fps=d.get("fps", 24),
+        width=d.get("width", 768),
+        height=d.get("height", 768),
+        elevation_deg=d.get("elevation_deg", 8.0),
+        transparent=bool(d.get("transparent", False)),
+        auto_promote=bool(d.get("auto_promote", False)),
+        view_ids=tuple(d.get("view_ids") or ()),
+        backend=d.get("backend", "comfyui"),
+        workflow=d.get("workflow", "hunyuan3d-2mv"),
+        output_format=d.get("output_format", "glb"),
+        # asdict->json keeps view_candidates a plain list; coerce back like view_ids.
+        view_candidates=tuple(d.get("view_candidates") or ()),
+    )
+
 
 def make_identity_reconstruction(**kwargs) -> IdentityReconstructionSpec:
     return IdentityReconstructionSpec(**kwargs)

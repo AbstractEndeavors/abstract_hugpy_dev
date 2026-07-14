@@ -329,6 +329,10 @@ class HeartbeatRequest(BaseModel):
     # slots/loaded_models — the console renders the worker card from it when
     # present, and falls back to slots+loaded_models for older agents.
     allocations: list | None = None
+    # Precision model->PID log: {"models":[{model_key,pid,host_mode,vram_bytes,
+    # alive}], "unattributed":[{pid,name,mib}]}. Stored verbatim + spread through
+    # _public_view. Absent on older agents -> field simply absent.
+    pid_registry: dict | None = None
     # Local-STORAGE survey (model-cache footprint on the model-root disk):
     # {cache_used_bytes, disk_free, models:[{model_key, bytes, pinned, loaded,
     # loading, provisioning, assigned, protected, why}]}. Central stores it
@@ -535,6 +539,7 @@ def workers_heartbeat(worker_id):
         loaded_detail=body.loaded_detail,
         slots=body.slots,
         allocations=body.allocations,
+        pid_registry=body.pid_registry,
         storage=body.storage,
         install=body.install,
         serving_limits=body.serving_limits,
@@ -936,6 +941,24 @@ def workers_free_ram(worker_id):
     return _relay_worker_op(worker_id, "/ops/free-ram",
                             request.get_json(silent=True) or {},
                             timeout=30.0, action="free-ram")
+
+
+@worker_bp.route("/llm/workers/<worker_id>/evict", methods=["POST"])
+def workers_evict(worker_id):
+    """Targeted eviction: free ONE model's RAM+VRAM on a worker, letting the
+    worker pick the mechanism by how the model is hosted (comfy /free, slot child
+    SIGTERM->SIGKILL, or in-process ref-drop). Relays to the worker's /ops/evict.
+
+    Body: {"model_key": ..., "force"?: bool}. We send the model_key, NEVER a PID
+    (PIDs are per-box and recycled) — the worker resolves the model_key to its
+    live handle and verifies identity at eviction time. force=true overrides the
+    static/pinned/in-flight gate. The model stays ASSIGNED (registry untouched);
+    this only drops it from residency. Unknown/not-resident is an idempotent
+    no-op. Returns the worker JSON verbatim (host_mode, evicted, vram/ram freed).
+    """
+    return _relay_worker_op(worker_id, "/ops/evict",
+                            request.get_json(silent=True) or {},
+                            timeout=45.0, action="evict")
 
 
 @worker_bp.route("/llm/workers/<worker_id>/config", methods=["POST"])

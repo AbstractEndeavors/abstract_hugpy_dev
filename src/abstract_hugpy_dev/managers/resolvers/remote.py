@@ -594,6 +594,9 @@ def _event_from_worker_line(d: dict, request_id: str):
                 input_tokens=d.get("input_tokens", 0),
                 output_chunks=d.get("output_chunks", 1),
                 finish_reason=finish,
+                # Token accounting from a worker on a build that reports it;
+                # absent (old workers) -> None, same as before.
+                usage=d.get("usage") if isinstance(d.get("usage"), dict) else None,
             )
         except Exception:
             return StatusEvent(**{**d, "request_id": request_id})

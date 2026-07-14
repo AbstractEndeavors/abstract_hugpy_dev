@@ -1479,7 +1479,13 @@ def _event_to_dict(ev) -> dict:
     if t == "token":
         return {"type": "token", "text": getattr(ev, "text", "")}
     if t == "done":
-        return {"type": "done", "finish_reason": getattr(ev, "finish_reason", "stop")}
+        out = {"type": "done", "finish_reason": getattr(ev, "finish_reason", "stop")}
+        # Token accounting (DoneEvent.usage, additive): forward when the engine
+        # reported it so central's /v1 usage object is real for relayed chats.
+        usage = getattr(ev, "usage", None)
+        if isinstance(usage, dict) and usage:
+            out["usage"] = usage
+        return out
     if t == "error":
         return {"type": "error", "message": getattr(ev, "message", "run failed")}
     try:
@@ -2393,6 +2399,28 @@ def build_app(state: "WorkerState") -> Flask:
             "loaded_models": loaded_model_keys(),
         })
 
+    @app.route("/ops/evict", methods=["POST"])
+    def ops_evict():
+        # Targeted eviction: free ONE model's RAM+VRAM, picking the mechanism by
+        # how that model is hosted (comfy /free, slot child kill, or in-process
+        # ref-drop). Central sends {"model_key": ..., "force"?: bool} — NEVER a
+        # PID (per-box, recycled): the worker resolves the model_key to its live
+        # handle here and verifies identity before acting. Fail-safe: an unknown
+        # or not-resident model_key is an idempotent no-op at HTTP 200, never a
+        # 500. force=true overrides the static/pinned/in-flight gate. Contrast
+        # /models/unload (coarse: one key or ALL, in-process/slot-proxy cache
+        # only) — this is the surgical, host-mode-aware verb.
+        body = request.get_json(silent=True) or {}
+        model_key = body.get("model_key")
+        force = bool(body.get("force"))
+        try:
+            return jsonify({"ok": True, **_evict_model(state, model_key, force)})
+        except Exception as exc:  # noqa: BLE001 — evict must never 500 the control plane
+            return jsonify({"ok": False, "model_key": model_key,
+                            "host_mode": "unknown", "evicted": False,
+                            "vram_freed": None, "ram_freed": None,
+                            "reason": f"{type(exc).__name__}: {exc}"})
+
     @app.route("/models/redownload", methods=["POST"])
     def redownload():
         # Force a CLEAN re-pull from central: evict from VRAM, DELETE the model's
@@ -2943,16 +2971,42 @@ def _resolve_model_profile(model_key: str) -> "dict | None":
 def _incoming_need_bytes(model_key: str) -> "int | None":
     """Best-effort bytes the incoming model's weights will want (× a small
     headroom factor), resolved from its on-disk size the same way the loader does
-    (route_destination + weight-file sum, cached by dispatch). None when the size
-    is unknown — the fit-guard then fails OPEN (never blocks an unmeasurable
-    load)."""
+    (route_destination). None when the size is unknown — the fit-guard then fails
+    OPEN (never blocks an unmeasurable load).
+
+    GGUF landmine (fixed 2026-07-14, mirrors central model_meta): a GGUF repo
+    commonly holds several quantizations but only ONE serves, so summing every
+    ``.gguf`` in the dir badly overstates the VRAM need — a 24-quant 8B repo read
+    as ~94GB (×1.15 ≈ 108GB) and blocked loads on a 7.4GB card even though the
+    single served quant is ~5GB. For gguf/llama_cpp we size by the SINGLE
+    effective serving quant (+ its mmproj), resolved by the SAME helper central
+    uses (``gguf_variants_detail`` → ``effective_bytes``, which honors the
+    operator ``gguf_file`` override / ``cfg.filename`` / deterministic auto-rank —
+    exactly what the runner loads). We deliberately do NOT fall back to the
+    inflated dir-sum for GGUF: an unresolvable effective quant returns None
+    (fail-open) rather than re-introducing the very over-count this fixes.
+    Non-GGUF frameworks (safetensors/bin) are a single weight set, so the
+    dispatch weight-sum stays accurate and is used exactly as before."""
     try:
         from ..imports import route_destination
         from ..imports.config.main import get_model_config
         from ..managers.dispatch.dispatch import _dir_size_detail
         cfg = get_model_config(model_key, dict_return=True)
         path = route_destination(cfg)
-        detail = _dir_size_detail(path) if path else {}
+        if not path:
+            return None
+        framework = str((cfg or {}).get("framework") or "").lower()
+        if framework in ("gguf", "llama_cpp"):
+            # Effective-quant-aware sizing. On any resolution miss, return None
+            # (fail open) — never the dir sum, which is the bug this fixes.
+            try:
+                from ..managers.serve.overrides import gguf_variants_detail
+                gguf = gguf_variants_detail(model_key, path, cfg) or {}
+            except Exception:  # noqa: BLE001 — best-effort; unresolved -> fail open
+                gguf = {}
+            eff = gguf.get("effective_bytes")
+            return int(eff * 1.15) if eff else None
+        detail = _dir_size_detail(path)
         weight = detail.get("weight_bytes") or detail.get("model_bytes")
         return int(weight * 1.15) if weight else None
     except Exception:  # noqa: BLE001 — best-effort; unknown size -> fail open
@@ -3004,6 +3058,259 @@ def _worker_evictable(model_key: str) -> bool:
     except Exception:  # noqa: BLE001 — can't tell slot-backing -> allow (in-process default)
         pass
     return True
+
+
+# ── targeted eviction (evict <model_key>) ───────────────────────────────────
+# Central signals `evict <model_key>` (never a raw PID — PIDs are per-box and get
+# recycled). The worker resolves the model_key to its LIVE hosting handle AT
+# eviction time, verifies identity, and frees it with the mechanism that matches
+# HOW the model is hosted. This is the surgical bookend to /models/unload (which
+# is coarse: one model_key or all) — same "stays ASSIGNED, just not resident"
+# semantics, but it picks slot-kill vs in-process-drop vs comfy-free per model.
+
+def _evict_gate(model_key: str) -> "tuple[bool, str]":
+    """Eviction permission for the destructive evict verb: (allowed, reason).
+
+    Same primitives as _worker_evictable (static/pinned/in-flight) but WITHOUT
+    the slot-backed exclusion — evicting a slot child is the whole point of this
+    verb, so slot-backing must NOT block it. ``force`` (checked by the caller)
+    overrides every clause here. A model mid-generation is protected unless
+    forced: we never rip weights out from under a running request."""
+    if _residency(model_key) == "static":
+        return False, "static (locked residency) — pass force to override"
+    if _pinned(model_key):
+        return False, "pinned (permanent attribution) — pass force to override"
+    try:
+        if gen_gate.in_flight(model_key) > 0:
+            return False, "in-flight generation — pass force to override"
+    except Exception:  # noqa: BLE001 — can't tell -> treat as busy (don't rip a maybe-busy model)
+        return False, "cannot determine in-flight state — pass force to override"
+    return True, ""
+
+
+def _resolve_slot_handle(model_key: str) -> "dict | None":
+    """Resolve model_key -> the slot HANDLE currently serving it, or None.
+
+    Returns {"control_url", "child_pid", "endpoint"} from a LIVE slot-pool
+    status read (never a cached/central-supplied value). ``child_pid`` is the
+    llama-server/llama_cpp.server child that actually holds the VRAM. Returns
+    None when no slot is serving this model_key right now."""
+    try:
+        from ..managers.serve.slots import SlotPool
+        for s in SlotPool().statuses():
+            if s.get("model_key") == model_key and s.get("child_pid"):
+                return {"control_url": s.get("_control"),
+                        "child_pid": s.get("child_pid"),
+                        "endpoint": s.get("endpoint")}
+    except Exception:  # noqa: BLE001 — no slots / pool error -> not slot-hosted here
+        return None
+    return None
+
+
+def _is_inprocess_resident(model_key: str) -> bool:
+    """True if this worker holds the model's WEIGHTS in its OWN python process —
+    a GGUF llama handle, a dispatch-cached torch runner, a diffusers pipeline, or
+    a torch model nvidia-smi attributes to our PID. A slot-backed HTTP proxy
+    (base_url, no ``llm``) is NOT a resident (its weights live in the child), so
+    the slot branch must be resolved BEFORE this is consulted."""
+    # GGUF heavy singletons with a real in-process llm handle.
+    try:
+        from ..managers.llama.runners.get import _LLAMA_INSTANCES, _LLAMA_LOCK
+        with _LLAMA_LOCK:
+            for k, r in list(_LLAMA_INSTANCES.items()):
+                if k == model_key and getattr(r, "llm", None) is not None:
+                    return True
+    except Exception:  # noqa: BLE001
+        pass
+    # dispatch-cached in-process runners (torch/vision/etc.), excluding slot proxies.
+    try:
+        from ..managers.dispatch import dispatch as _d
+        from ..managers.llama.runners.get import slot_backed_model_keys
+        slot_keys = slot_backed_model_keys() or set()
+        with _d._INSTANCES_LOCK:
+            keys = [k[0] if isinstance(k, tuple) and k else k
+                    for k in list(_d._INSTANCES)]
+        if model_key in keys and model_key not in slot_keys:
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    # diffusers imagegen pipelines (class-level singleton, not on a runner attr).
+    try:
+        from ..managers.imagegen import imagegen_runner as _ig
+        for clsname in ("ImageGenRunner", "Img2ImgRunner"):
+            cache = getattr(getattr(_ig, clsname, None), "_PIPELINES", None)
+            if isinstance(cache, dict) and model_key in cache:
+                return True
+    except Exception:  # noqa: BLE001
+        pass
+    # last resort: torch attributes real VRAM to this model under our PID.
+    try:
+        if model_key in _inprocess_gpu_bytes():
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
+def _drop_inprocess_model(model_key: str) -> bool:
+    """Drop the in-process refs for ``model_key`` and free its weights WITHOUT
+    killing the worker PID (siblings share it). dispatch.evict cascades through
+    the dispatch adapter cache AND the GGUF heavy singleton; the diffusers
+    pipeline lives in a class-level cache that cascade misses, so drop it too.
+    _trim_host_ram() then hands the freed arena + torch CUDA cache back."""
+    dropped = False
+    try:
+        from ..managers.dispatch import evict as _evict
+        dropped = bool(_evict(model_key)) or dropped
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from ..managers.imagegen import imagegen_runner as _ig
+        for clsname in ("ImageGenRunner", "Img2ImgRunner"):
+            cache = getattr(getattr(_ig, clsname, None), "_PIPELINES", None)
+            if isinstance(cache, dict) and cache.pop(model_key, None) is not None:
+                dropped = True
+    except Exception:  # noqa: BLE001
+        pass
+    _trim_host_ram()
+    return dropped
+
+
+def _comfy_free_models(state: "WorkerState") -> "tuple[bool, str]":
+    """Ask the ADOPTED external ComfyUI to release its resident models via its OWN
+    HTTP API — never a PID kill (the worker doesn't own comfy's process). ComfyUI
+    exposes ``POST /free`` with ``{"unload_models": true, "free_memory": true}``;
+    it unloads comfy's currently-loaded checkpoint(s) and hands VRAM back while
+    the server stays up for the next job. Returns (freed_ok, note). Degrades
+    gracefully (freed_ok=False + reason) when comfy is unreachable / lacks /free."""
+    url = _comfy_base_url(state)
+    try:
+        import httpx
+        r = httpx.post(url + "/free",
+                       json={"unload_models": True, "free_memory": True},
+                       timeout=30.0)
+        if r.status_code == 200:
+            return True, "comfy /free accepted (unload_models + free_memory)"
+        return False, f"comfy /free returned HTTP {r.status_code}"
+    except Exception as exc:  # noqa: BLE001 — comfy down / no /free: degrade, never 500
+        return False, f"comfy unreachable at {url}: {type(exc).__name__}: {exc}"
+
+
+def _comfy_base_url(state: "WorkerState") -> str:
+    """The adopted ComfyUI base URL: the operator/comfy_url setting projects onto
+    COMFY_URL (see _apply_settings_env); default 127.0.0.1:8188 matches
+    managers/comfy/comfy_runner._comfy_url()."""
+    return (os.environ.get("COMFY_URL") or "http://127.0.0.1:8188").rstrip("/")
+
+
+def _evict_model(state: "WorkerState", model_key: str,
+                 force: bool = False) -> dict:
+    """Resolve ``model_key`` to its LIVE hosting handle and free it with the
+    mechanism that matches how it is hosted. Fail-safe: unknown/not-resident is
+    an idempotent no-op, never an error. Returns the /ops/evict contract dict.
+
+    Resolution order (comfy first, because a comfy checkpoint is served by an
+    EXTERNAL process and never appears in our slot/in-process caches; slot before
+    in-process, because a slot-backed model also leaves a thin HTTP proxy in the
+    in-process cache that holds no weights):
+      1. comfy  — framework == 'comfy'      -> comfy's own /free API
+      2. slot   — a live slot serves it     -> verify identity, then slot /unload
+                                               (owner does SIGTERM->wait->SIGKILL)
+      3. in-process — weights in our PID     -> drop refs + torch empty_cache + trim
+      4. not resident                        -> idempotent no-op
+    """
+    if not isinstance(model_key, str) or not model_key.strip():
+        return {"model_key": model_key, "host_mode": "unknown", "evicted": False,
+                "vram_freed": None, "ram_freed": None,
+                "reason": "missing model_key"}
+    model_key = model_key.strip()
+
+    vram_before = _free_vram_bytes()
+    ram_before = _free_ram_bytes()
+
+    def _result(host_mode, evicted, reason, **extra):
+        vram_after = _free_vram_bytes()
+        ram_after = _free_ram_bytes()
+        vram_freed = (vram_after - vram_before) if (
+            vram_before is not None and vram_after is not None) else None
+        ram_freed = (ram_after - ram_before) if (
+            ram_before is not None and ram_after is not None) else None
+        out = {"model_key": model_key, "host_mode": host_mode,
+               "evicted": bool(evicted), "reason": reason,
+               "vram_freed": vram_freed, "ram_freed": ram_freed,
+               "vram_free_before": vram_before, "vram_free_after": vram_after,
+               "ram_free_before": ram_before, "ram_free_after": ram_after,
+               "forced": bool(force), "loaded_models": loaded_model_keys()}
+        out.update(extra)
+        return out
+
+    # 1. ComfyUI-hosted (external adopted service) — framework says comfy. The
+    #    worker never owns comfy's PID; it asks comfy to free via HTTP. The gate
+    #    still applies best-effort (a comfy gen in flight is protected unless
+    #    forced), but comfy's /free is coarse (releases comfy's resident set).
+    if _model_framework(model_key) == "comfy":
+        allowed, why = (True, "") if force else _evict_gate(model_key)
+        if not allowed:
+            return _result("comfy", False, f"eviction gated: {why}")
+        freed_ok, note = _comfy_free_models(state)
+        return _result("comfy", freed_ok, note)
+
+    # 2. Subprocess-hosted (slot child / worker-spawned llama-server). Resolve the
+    #    model_key -> its CURRENT slot handle from a LIVE status read.
+    handle = _resolve_slot_handle(model_key)
+    if handle is not None:
+        allowed, why = (True, "") if force else _evict_gate(model_key)
+        if not allowed:
+            return _result("slot", False, f"eviction gated: {why}",
+                           child_pid=handle.get("child_pid"))
+        # RECYCLED-PID GUARD: re-read the slot status right before acting and
+        # confirm it STILL maps this model_key to the SAME child_pid we resolved.
+        # A slot that has since swapped to another model (or respawned its child
+        # under a new pid) must NOT be evicted — that would kill the wrong model.
+        pid = handle.get("child_pid")
+        control = handle.get("control_url")
+        recheck = _resolve_slot_handle(model_key)
+        if recheck is None or recheck.get("child_pid") != pid \
+                or recheck.get("control_url") != control:
+            return _result("slot", False,
+                           "slot handle changed before evict (recycled/swapped) "
+                           "— not evicted", child_pid=pid)
+        # Free via the slot's OWN /unload: the slot supervisor owns the child, so
+        # it performs the SIGTERM -> short wait -> SIGKILL itself (Slot._kill:
+        # terminate, wait 15s, kill) and clears its own model_key claim atomically
+        # — cleaner and safer than the agent os.kill-ing another supervisor's
+        # child on a possibly-recycled pid. CUDA context drops on child exit; a
+        # host-RAM trim follows to hand the freed arena back.
+        err = None
+        try:
+            from ..managers.serve.slots import SlotPool
+            SlotPool().unload(control)
+        except Exception as exc:  # noqa: BLE001
+            err = f"{type(exc).__name__}: {exc}"
+        _trim_host_ram()
+        if err is not None:
+            return _result("slot", False, f"slot unload failed: {err}",
+                           child_pid=pid)
+        return _result("slot", True,
+                       f"slot child pid={pid} terminated (SIGTERM->SIGKILL) via "
+                       "its supervisor", child_pid=pid)
+
+    # 3. In-process torch/GGUF model sharing THIS worker's python PID. Never kill
+    #    the PID (that kills the worker + every sibling model) — drop the refs.
+    if _is_inprocess_resident(model_key):
+        allowed, why = (True, "") if force else _evict_gate(model_key)
+        if not allowed:
+            return _result("in_process", False, f"eviction gated: {why}")
+        dropped = _drop_inprocess_model(model_key)
+        return _result("in_process", dropped,
+                       "in-process refs dropped + CUDA cache/host arena trimmed"
+                       if dropped else "in-process handle already gone")
+
+    # 4. Nothing here holds it. This ALSO covers the foreign/rogue case: a model
+    #    that resolves only to a process the agent did not spawn (and isn't comfy)
+    #    is OUT OF SCOPE for this slice — we never os.kill an arbitrary PID, so
+    #    such a model simply reads as not-resident here. Idempotent no-op, HTTP 200.
+    return _result("none", False, "not resident on this worker")
 
 
 def _prune_stale_residency(state: "WorkerState") -> None:
@@ -3725,6 +4032,28 @@ def _heartbeat_loop(client: CentralClient, state: WorkerState, args) -> None:
         try:
             # Compute slot statuses ONCE — the unified allocations view reuses it.
             _slots = _slot_statuses()
+            # Precision model->PID registry (2026-07-14): populate from data the
+            # agent already has THIS beat — slot child_pid (subprocess-hosted),
+            # in-process torch keys (share the worker PID), comfy — then reconcile
+            # against nvidia-smi ground truth so central gets an honest per-model
+            # PID+VRAM log plus any unattributed (foreign/rogue) squatters.
+            # Best-effort and fully isolated: a registry error must NEVER skip the
+            # beat (a missed heartbeat drops the worker off the fleet), so it
+            # degrades to no log exactly like a no-GPU box.
+            try:
+                from . import pid_registry as _pidreg
+                _pidreg.sweep_dead()
+                for _s in (_slots or []):
+                    if _s.get("model_key") and _s.get("child_pid"):
+                        _pidreg.record_launch(_s["model_key"], _s["child_pid"], "subprocess")
+                _inproc = _inprocess_gpu_bytes()
+                for _mk in _inproc:
+                    _pidreg.record_launch(_mk, os.getpid(), "in_process")
+                _pidreg.reconcile(_gpu_process_vram(), _inproc, _comfy_process_vram())
+                _pid_log = _pidreg.snapshot_for_heartbeat()
+            except Exception as _pe:  # noqa: BLE001 — telemetry must never break the beat
+                logger.debug("pid_registry snapshot failed: %s", _pe)
+                _pid_log = None
             worker = client.heartbeat(
                 state.worker_id,
                 {
@@ -3752,6 +4081,10 @@ def _heartbeat_loop(client: CentralClient, state: WorkerState, args) -> None:
                     "loaded_detail": _loaded_detail(),
                     "slots": _slots,
                     "allocations": _allocations(_slots),
+                    # Precision model->PID log (2026-07-14): {"models":[{model_key,
+                    # pid,host_mode,vram_bytes,alive}], "unattributed":[{pid,name,
+                    # mib}]}. None on older/no-GPU boxes -> central just omits it.
+                    "pid_registry": _pid_log,
                     "storage": _worker_storage(state),
                     "install": _install_shape(),
                     # Concurrency hardening (2026-07-11): advertise this box's

@@ -915,6 +915,7 @@ class WorkerStore:
         loaded_detail: Optional[Dict[str, Any]] = None,
         slots: Optional[List[Dict[str, Any]]] = None,
         allocations: Optional[List[Dict[str, Any]]] = None,
+        pid_registry: Optional[Dict[str, Any]] = None,
         storage: Optional[Dict[str, Any]] = None,
         install: Optional[Dict[str, Any]] = None,
         serving_limits: Optional[Dict[str, Any]] = None,
@@ -985,6 +986,11 @@ class WorkerStore:
                 # Unified engine-agnostic allocation view (slot-seated + in-RAM
                 # residents). Stored verbatim; _public_view spreads it through.
                 worker["allocations"] = allocations
+            if pid_registry is not None:
+                # Precision model->PID log (2026-07-14): per-model pid/host_mode/
+                # vram + unattributed foreign squatters. Stored verbatim;
+                # _public_view spreads it so the console renders it per worker.
+                worker["pid_registry"] = pid_registry
             if storage is not None:
                 # Worker-reported local-storage survey (per-model on-disk bytes +
                 # protection flags + cache_used_bytes). Stored verbatim; the

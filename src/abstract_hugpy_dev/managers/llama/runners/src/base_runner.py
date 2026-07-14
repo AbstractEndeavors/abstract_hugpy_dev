@@ -38,6 +38,23 @@ def _normalize_for_guard(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "")).strip().lower()
 
 
+def _merge_usage(total: "dict | None", part: "dict | None") -> "dict | None":
+    """Sum two usage dicts key-wise (prompt/completion/total tokens).
+
+    The unbounded continue-loop runs several engine passes per request; each
+    pass may report its own usage, and the request's real cost is the sum.
+    Non-int values are ignored, either side may be None — never raises."""
+    if not part:
+        return total
+    if not total:
+        total = {}
+    out = dict(total)
+    for k, v in part.items():
+        if isinstance(v, int):
+            out[k] = (out.get(k) or 0) + v
+    return out or None
+
+
 def _chunks_are_similar(prev_norm: str, cur_norm: str, threshold: float) -> bool:
     """True when two normalized continue-chunks are (near-)identical. Empty
     inputs are never 'similar' — the first continue-pass has no predecessor, so
@@ -158,6 +175,45 @@ class LlamaCppBaseRunner(ABC):
             messages.append({"role": "user", "content": list(parts)})
         return messages
 
+    # --- usage accounting ---------------------------------------------------
+    # Subclasses stash the engine-reported usage dict of the CURRENT pass here
+    # from _iter_stream (llama-server's final SSE chunk carries one on recent
+    # builds; in-process llama_cpp streams don't). The stream drivers below
+    # pop it per pass via _take_stream_usage.
+    _stream_usage: "Optional[dict]" = None
+
+    def _take_stream_usage(self) -> "Optional[dict]":
+        usage, self._stream_usage = self._stream_usage, None
+        return usage
+
+    def _usage_for(self, engine_usage, messages, completion_text) -> "Optional[dict]":
+        """Best-effort token accounting for a DoneEvent — never load-bearing.
+
+        Prefers what the engine itself reported (exact). Otherwise, runners
+        that expose the model's own tokenizer (_count_tokens on the in-process
+        runner — the common /v1 serving path, whose streamed chunks carry no
+        usage) count the prompt and completion directly; the +8/message mirrors
+        _fit_chat's per-message template overhead, so prompt_tokens is a close
+        (not byte-exact) figure. None when neither source exists (e.g. an HTTP
+        runner against an old llama-server) — callers must degrade, not crash.
+        """
+        if isinstance(engine_usage, dict) and engine_usage:
+            return engine_usage
+        counter = getattr(self, "_count_tokens", None)
+        if counter is None:
+            return None
+        try:
+            prompt = sum(
+                counter(m.get("content") if isinstance(m.get("content"), str)
+                        else str(m.get("content") or "")) + 8
+                for m in messages if isinstance(m, dict)
+            )
+            completion = counter(completion_text or "")
+            return {"prompt_tokens": prompt, "completion_tokens": completion,
+                    "total_tokens": prompt + completion}
+        except Exception:
+            return None
+
     # --- shared streaming --------------------------------------------------
 
     async def stream_chat(
@@ -171,6 +227,8 @@ class LlamaCppBaseRunner(ABC):
         messages  = self._attach_image(messages_to_dicts(req.messages), req)
         output_chunks = 0
         last_finish: Optional[str] = None
+        full_text = ""          # for tokenizer-based usage accounting
+        self._stream_usage = None
 
         try:
             async for text, fr in self._iter_stream(messages, max_tokens, temp, top_p):
@@ -181,6 +239,7 @@ class LlamaCppBaseRunner(ABC):
                     return
                 if text:
                     output_chunks += 1
+                    full_text += text
                     yield TokenEvent(request_id=req.request_id, text=text)
                 if fr is not None:
                     last_finish = fr
@@ -188,7 +247,9 @@ class LlamaCppBaseRunner(ABC):
             mapped = map_finish_reason(last_finish)
             self._log_done(req, mapped, output_chunks, max_tokens)
             yield DoneEvent(request_id=req.request_id, input_tokens=0,
-                           output_chunks=output_chunks, finish_reason=mapped)
+                           output_chunks=output_chunks, finish_reason=mapped,
+                           usage=self._usage_for(self._take_stream_usage(),
+                                                 messages, full_text))
         except Exception as exc:
             logger.exception("stream_chat failed: model=%s req=%s", self.model_key, req.request_id)
             yield ErrorEvent(request_id=req.request_id, message=f"{type(exc).__name__}: {exc}")
@@ -215,8 +276,12 @@ class LlamaCppBaseRunner(ABC):
         temp     = resolve_temperature(req.temperature, req.do_sample)
         top_p    = resolve_top_p(req.top_p)
         convo    = self._attach_image(messages_to_dicts(req.messages), req)
+        initial_convo = list(convo)   # usage: count the CALLER's prompt, not the continue-nudges
         output_chunks = 0
         last_finish = "stop"
+        full_text = ""                # all generated text, for tokenizer usage
+        usage_sum: Optional[dict] = None
+        self._stream_usage = None
         # Anti-repetition guard state (see _loop_guard_params / _chunks_are_similar).
         guard_max_repeat, guard_sim = _loop_guard_params()
         prev_norm = ""
@@ -246,6 +311,11 @@ class LlamaCppBaseRunner(ABC):
                     if fr is not None:
                         chunk_finish = fr
 
+                full_text += piece_text
+                # Each engine pass may report its own usage; the request costs
+                # their sum (the tokenizer fallback in _usage_for covers engines
+                # that report none).
+                usage_sum = _merge_usage(usage_sum, self._take_stream_usage())
                 last_finish = chunk_finish or "stop"
                 if last_finish != "length" or not piece_text:
                     break
@@ -274,7 +344,8 @@ class LlamaCppBaseRunner(ABC):
             mapped = map_finish_reason(last_finish)
             self._log_done(req, mapped, output_chunks, chunk_tokens)
             yield DoneEvent(request_id=req.request_id, input_tokens=0,
-                           output_chunks=output_chunks, finish_reason=mapped)
+                           output_chunks=output_chunks, finish_reason=mapped,
+                           usage=self._usage_for(usage_sum, initial_convo, full_text))
         except Exception as exc:
             logger.exception("stream_chat_unbounded failed: model=%s req=%s", self.model_key, req.request_id)
             yield ErrorEvent(request_id=req.request_id, message=f"{type(exc).__name__}: {exc}")

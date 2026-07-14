@@ -118,6 +118,12 @@ class LlamaCppRunner(LlamaCppBaseRunner):
                             line = line.removeprefix("data: ")
                             try:
                                 data = json.loads(line)
+                                # Recent llama-server sends a final chunk with
+                                # real token counts; stash it for the DoneEvent
+                                # (base_runner._take_stream_usage). Absent on
+                                # older builds -> usage stays None downstream.
+                                if data.get("usage"):
+                                    self._stream_usage = data["usage"]
                                 choice = data["choices"][0]
                                 delta = choice.get("delta") or {}
                                 fr    = choice.get("finish_reason")
