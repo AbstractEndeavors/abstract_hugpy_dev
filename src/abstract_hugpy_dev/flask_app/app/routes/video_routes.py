@@ -1612,9 +1612,9 @@ def _validate_profile_reference_images(raws):
     images required — the same envelope the movie route enforces."""
     if not isinstance(raws, list) or not raws:
         return None, ({"error": "reference_images must be a non-empty list of paths"}, 400)
-    if len(raws) > identity_profiles.MAX_REFERENCE_IMAGES:
+    if len(raws) > identity_profiles.MAX_SOURCE_IMAGES:
         return None, ({
-            "error": f"at most {identity_profiles.MAX_REFERENCE_IMAGES} reference_images are accepted"
+            "error": f"at most {identity_profiles.MAX_SOURCE_IMAGES} reference_images are accepted"
         }, 400)
     resolved: list = []
     for raw in raws:
@@ -1800,7 +1800,7 @@ def video_identity_profile_update(slug):
 # for the new ``reconstructions`` entry keyed by recon_id.
 # --------------------------------------------------------------------------- #
 @video_bp.route("/video/identity-profiles/<slug>/reconstruction", methods=["POST"])
-def video_identity_profile_reconstruction(slug):
+def video_identity_profile_reconstructions(slug):
     profile = identity_profiles.get_profile(slug)
     if profile is None:
         return jsonify({"error": "identity profile not found"}), 404

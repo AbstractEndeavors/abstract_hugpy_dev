@@ -28,6 +28,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
+
 # The subject reference images cap — an id_lock render consumes at most this many
 # (diffusers 0.39 prepends each as a VACE reference latent). Mirrors
 # ``studio.job._MAX_REFERENCE_IMAGES`` / ``identity_profiles.MAX_REFERENCE_IMAGES``.
@@ -94,7 +95,18 @@ class IdentityReconstructionSpec:
     vram_budget_gb: Optional[float] = None
     mode: str = _DEFAULT_MODE
     turntable_max_frames: int = _DEFAULT_TURNTABLE_MAX_FRAMES
-
+    # Angle-ring specific properties
+    angle_step_deg: Optional[int] = None
+    elevations_deg: Optional[tuple[int, ...]] = None
+    
+    def __post_init__(self):
+        if not self.slug or not self.recon_id:
+            raise ValueError("slug and recon_id are required")
+        if self.mode not in ("sheet", "turntable", "angle-ring"):
+            raise ValueError(f"Invalid mode: {self.mode}")
+        if self.mode == "angle-ring":
+            if not self.angle_step_deg or self.angle_step_deg <= 0:
+                raise ValueError("angle_step_deg must be > 0 for angle-ring")
 
 def make_identity_reconstruction(
     *,
@@ -216,3 +228,26 @@ def identity_reconstruction_from_dict(d: dict) -> IdentityReconstructionSpec:
         mode=d.get("mode") or _DEFAULT_MODE,
         turntable_max_frames=d.get("turntable_max_frames", _DEFAULT_TURNTABLE_MAX_FRAMES),
     )
+
+@dataclass(frozen=True)
+class IdentitySingleViewRegenSpec:
+    slug: str
+    recon_id: str
+    view_id: str
+    prompt: str
+    seed: int
+    use_neighbors: bool
+    # Will be populated by the router with the actual neighbor image URIs
+    neighbor_images: tuple[str, ...] = ()
+    
+@dataclass(frozen=True)
+class IdentityMeshSpec:
+    slug: str
+    recon_id: str
+    view_ids: tuple[str, ...]
+    backend: str = "comfyui"
+    workflow: str = "hunyuan3d-2mv"
+    output_format: str = "glb"
+
+def make_identity_reconstruction(**kwargs) -> IdentityReconstructionSpec:
+    return IdentityReconstructionSpec(**kwargs)

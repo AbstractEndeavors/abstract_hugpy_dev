@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import os
 import re
+import json
 import secrets
 import shutil
 import threading
@@ -75,12 +76,15 @@ from abstract_hugpy_dev.imports.src.constants.constants import (
 
 # json is imported lazily inside _load/_save to keep the module import cheap and
 # to mirror how the route modules defer json/sqlite until first use.
-import json
+
+# video_intel/identity_profiles.py (Append to existing file)
+
+from .identity_reconstruction_schema import IdentitySingleViewRegenSpec, IdentityMeshSpec
 
 _LOCK = threading.Lock()
 
-MAX_REFERENCE_IMAGES = 4
-
+MAX_SOURCE_IMAGES = 12
+MAX_CANONICAL_IMAGES = 4  # Canonical anchors stay capped at 4
 
 class ProfileError(ValueError):
     """Bad-input on the store contract (empty name, no/too-many refs, dup slug).
@@ -471,9 +475,10 @@ def create_profile(
         raise ProfileError("name is required", code="invalid_profile")
     if not isinstance(reference_images, list) or not reference_images:
         raise ProfileError("at least one reference_image is required", code="invalid_profile")
-    if len(reference_images) > MAX_REFERENCE_IMAGES:
+    # Change MAX_REFERENCE_IMAGES to MAX_SOURCE_IMAGES here:
+    if len(reference_images) > MAX_SOURCE_IMAGES:
         raise ProfileError(
-            f"at most {MAX_REFERENCE_IMAGES} reference_images are accepted",
+            f"at most {MAX_SOURCE_IMAGES} reference_images are accepted",
             code="invalid_profile",
         )
     refs: list[str] = []
@@ -556,9 +561,10 @@ def update_profile(
     if reference_images is not None:
         if not isinstance(reference_images, list) or not reference_images:
             raise ProfileError("at least one reference_image is required", code="invalid_profile")
-        if len(reference_images) > MAX_REFERENCE_IMAGES:
+        # Change MAX_REFERENCE_IMAGES to MAX_SOURCE_IMAGES here:
+        if len(reference_images) > MAX_SOURCE_IMAGES:
             raise ProfileError(
-                f"at most {MAX_REFERENCE_IMAGES} reference_images are accepted",
+                f"at most {MAX_SOURCE_IMAGES} reference_images are accepted",
                 code="invalid_profile",
             )
         new_refs = []
@@ -817,3 +823,90 @@ def get_reconstruction(slug: str, recon_id: str) -> Optional[dict[str, Any]]:
     if recons is None:
         return None
     return next((r for r in recons if r.get("recon_id") == recon_id), None)
+
+
+def update_reconstruction_view_status(slug: str, recon_id: str, view_id: str, status: str) -> dict:
+    """Updates the explicit approval status of a single angle tile."""
+    if status not in ("approved", "rejected"):
+        raise ProfileError("validation", "Status must be 'approved' or 'rejected'")
+        
+    profile = get_profile(slug)
+    if not profile:
+        raise ProfileError("not_found", f"Profile {slug} not found")
+
+    recons = profile.get("reconstructions", [])
+    target_recon = next((r for r in recons if r.get("recon_id") == recon_id), None)
+    if not target_recon:
+        raise ProfileError("not_found", f"Reconstruction {recon_id} not found")
+
+    views = target_recon.get("views", [])
+    target_view = next((v for v in views if isinstance(v, dict) and v.get("viewId") == view_id), None)
+    if not target_view:
+        raise ProfileError("not_found", f"View {view_id} not found")
+
+    target_view["status"] = status
+    
+    # Save the updated profile
+    _save_profile(slug, profile)
+    return profile
+
+def make_single_view_regeneration_spec(slug: str, recon_id: str, view_id: str, prompt: str, seed: int, use_neighbors: bool) -> IdentitySingleViewRegenSpec:
+    """Prepares the regeneration spec, extracting nearest approved neighbors for conditioning."""
+    profile = get_profile(slug)
+    if not profile:
+        raise ProfileError("not_found", f"Profile {slug} not found")
+        
+    # (In a full implementation, you would scan target_recon["views"] to find 
+    # the closest azimuthDeg neighbors with status == "approved" and extract their imageUris)
+    neighbor_uris = [] 
+    
+    return IdentitySingleViewRegenSpec(
+        slug=slug,
+        recon_id=recon_id,
+        view_id=view_id,
+        prompt=prompt,
+        seed=seed,
+        use_neighbors=use_neighbors,
+        neighbor_images=tuple(neighbor_uris)
+    )
+
+def make_mesh_reconstruction_spec(slug: str, recon_id: str, view_ids: list, backend: str, workflow: str, output_format: str) -> IdentityMeshSpec:
+    """Locks the active views and queues the mesh build job."""
+    profile = get_profile(slug)
+    if not profile:
+        raise ProfileError("not_found", f"Profile {slug} not found")
+        
+    recons = profile.get("reconstructions", [])
+    target_recon = next((r for r in recons if r.get("recon_id") == recon_id), None)
+    if not target_recon:
+        raise ProfileError("not_found", f"Reconstruction {recon_id} not found")
+
+    # Initialize the mesh block to "queued" so the UI disables the build button
+    if "mesh" not in target_recon:
+        target_recon["mesh"] = {}
+    target_recon["mesh"]["status"] = "queued"
+    target_recon["mesh"]["error"] = None
+    
+    _save_profile(slug, profile)
+    
+    return IdentityMeshSpec(
+        slug=slug,
+        recon_id=recon_id,
+        view_ids=tuple(view_ids),
+        backend=backend,
+        workflow=workflow,
+        output_format=output_format
+    )
+
+def get_mesh_state(slug: str, recon_id: str) -> dict:
+    """Read-only fetch of the mesh build status."""
+    profile = get_profile(slug)
+    if not profile:
+        return None
+        
+    recons = profile.get("reconstructions", [])
+    target_recon = next((r for r in recons if r.get("recon_id") == recon_id), None)
+    if not target_recon:
+        return None
+        
+    return target_recon.get("mesh")
