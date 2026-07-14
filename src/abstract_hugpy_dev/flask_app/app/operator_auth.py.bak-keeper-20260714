@@ -115,14 +115,6 @@ _SENSITIVE = [
     # ref-drop / comfy /free) — a privileged destructive executor op on the box,
     # same operator-only tier as unload/free-ram.
     ({"POST"},                   re.compile(r"^/llm/workers/[^/]+/(restart|update|pip|config|reap|reap-approve|pin-all|unpin-all|free-ram|evict)$")),
-    # P3.1 agent-node fleet: the operator-facing routes only. GET /agent/nodes
-    # (the fleet roster) and POST /agent/<id>/dispatch (queue a task on a node)
-    # are operator intent — gated here too, belt-and-suspenders with the
-    # blueprint's own operator_authenticated() check. The node-facing M2M routes
-    # (POST /agent/register, POST /agent/<id>/heartbeat, GET /agent/<id>/tasks)
-    # are deliberately NOT here — their credential is the node's enroll token.
-    ({"GET"},                    re.compile(r"^/agent/nodes$")),
-    ({"POST"},                   re.compile(r"^/agent/[^/]+/dispatch$")),
     # Civitai checkpoint download — writes multi-GB files into central's
     # /checkpoints store (which self-registers models) — operator-only.
     ({"POST"},                   re.compile(r"^/civitai/download$")),

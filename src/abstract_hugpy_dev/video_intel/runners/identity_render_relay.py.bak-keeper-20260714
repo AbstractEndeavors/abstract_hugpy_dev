@@ -32,12 +32,7 @@ stays cheap and can never break app boot. No pathlib anywhere; os.path only.
 Remote service contract (FIXED — the service is built to exactly this):
   * ``GET  /health``                     -> 200 {ok, service, capabilities}
   * ``POST /jobs``                       -> 202 {job_id}
-  * ``GET  /jobs/<id>``                  -> {job_id, status, error?, files?,
-                                           stage?, progress?, log_tail?, updated?}
-       stage (str), progress (0..1 float), log_tail (last <=40 lines, newest-last),
-       updated (float epoch) are ADDITIVE live-progress fields — they MAY be absent
-       (an older service); the relay mirrors whatever it sees into GET /llm/jobs and
-       degrades gracefully when they are missing.
+  * ``GET  /jobs/<id>``                  -> {job_id, status, error?, files?}
   * ``GET  /jobs/<id>/files/<path>``     -> raw bytes
   * ``DELETE /jobs/<id>``                -> best-effort cleanup
 Auth: header ``X-Identity-Render-Token: <IDENTITY_RENDER_TOKEN>`` (missing/wrong -> 401).
@@ -200,7 +195,7 @@ def run_identity_mesh_build(spec, job_id: str) -> JobResult:
     kind). Every expected failure is a clean error-as-data."""
     # Lazy imports keep this module boot-cheap (runners/__init__ imports it at boot).
     from .. import identity_profiles
-    from ..media_bus import is_cancelling, set_progress
+    from ..media_bus import is_cancelling
     from ..media_schema import make_media_ref
 
     slug = spec.slug
@@ -363,27 +358,6 @@ def run_identity_mesh_build(spec, job_id: str) -> JobResult:
                               timeout=_HTTP_TIMEOUT_S)
             if pr.status_code == 200:
                 pbody = pr.json()
-                # ---- live progress relay (additive; older services omit these) ----
-                # Mirror ae's per-stage progress + rolling log tail into the media bus
-                # (and thence, via job_bridge.on_progress, into GET /llm/jobs) so a long —
-                # or WEDGED — render surfaces its stage + live log instead of reading
-                # progress 0 / message "". Best-effort + wrapped: any field MAY be absent
-                # (an older render service) -> a partial blob; a DB hiccup here NEVER fails
-                # the render (the poll/done/error logic below is untouched). set_progress
-                # writing 'updated' is also what keeps the honest stall clock ticking —
-                # a stuck remote reporting the SAME stage/progress does not advance it.
-                if isinstance(pbody, dict) and any(
-                        k in pbody for k in ("stage", "progress", "log_tail")):
-                    try:
-                        blob = {"source": "identity_render",
-                                "remote_updated": pbody.get("updated")}
-                        for k in ("stage", "progress", "log_tail"):
-                            if k in pbody:
-                                blob[k] = pbody.get(k)
-                        set_progress(job_id, blob)
-                    except Exception:  # noqa: BLE001 — progress mirror is best-effort only
-                        logger.debug("identity mesh: progress stamp failed for %s",
-                                     job_id, exc_info=True)
                 status = pbody.get("status")
                 if status == "done":
                     files = pbody.get("files") or []
@@ -477,7 +451,6 @@ def run_identity_mesh_build(spec, job_id: str) -> JobResult:
     # A promotion failure NEVER fails the job (the mesh + turntable already succeeded) — it
     # is recorded in mesh state as ``auto_promote_error`` and the job still returns ok.
     auto_promote_extra: dict = {}
-    promoted_canonical: list = []  # the canonical this run seeded (empty if none) -> the minted version's DNA
     if getattr(spec, "auto_promote", False) and attached_rec is not None:
         try:
             rec_views = list(attached_rec.get("views") or [])
@@ -492,39 +465,12 @@ def run_identity_mesh_build(spec, job_id: str) -> JobResult:
                     i = min(i, nv - 1)  # clamp (defensive; all < nv for nv>=4)
                     if i not in cardinal:
                         cardinal.append(i)  # dedupe, preserve angular order
-                promoted = identity_profiles.promote_reconstruction_views(slug, recon_id, cardinal)
+                identity_profiles.promote_reconstruction_views(slug, recon_id, cardinal)
                 auto_promote_extra["auto_promoted"] = True
-                if isinstance(promoted, dict):
-                    promoted_canonical = [
-                        p for p in (promoted.get("canonical") or []) if isinstance(p, str)]
         except Exception as exc:  # noqa: BLE001 — a promote failure never fails the job
             logger.warning("identity mesh: auto-promote failed for %s/%s",
                            slug, recon_id, exc_info=True)
             auto_promote_extra["auto_promote_error"] = str(exc)
-
-    # ---- VERSION MINT (IDENTITY-VERSIONS-SLICE.md slice 3) ----
-    # A successful build lands as a NEW append-only VERSION and becomes ACTIVE (latest-wins
-    # applies WITHIN a version's canonical; versions themselves never overwrite one another).
-    # ``kind`` is "textured" when this run baked a texture, else "clay" — and the FIRST clay
-    # version minted for an identity is pinned as the geometric BASE (identity_profiles.
-    # _auto_version_name owns that rule). The version's ``canonical`` is the set auto-promote
-    # just seeded (empty for a surgical run that did not auto-promote — the version still
-    # records the recon + kind, and the resolver falls back to the profile canonical /
-    # reference set). mint_version dedupes by recon_id, so a bus RETRY of this same build
-    # updates the version in place rather than duplicating it. A mint failure NEVER fails the
-    # job (the mesh + turntable already succeeded) — it is recorded as ``version_error``.
-    version_extra: dict = {}
-    try:
-        kind = "textured" if bool(getattr(spec, "texture", False)) else "clay"
-        minted = identity_profiles.mint_version(slug, recon_id, kind, promoted_canonical)
-        if isinstance(minted, dict):
-            version_extra["version_id"] = minted.get("version_id")
-            version_extra["version_name"] = minted.get("name")
-            version_extra["version_kind"] = minted.get("kind")
-    except Exception as exc:  # noqa: BLE001 — a version mint failure never fails the job
-        logger.warning("identity mesh: version mint failed for %s/%s",
-                       slug, recon_id, exc_info=True)
-        version_extra["version_error"] = str(exc)
 
     # ---- record terminal mesh state (the GET mesh-status route reads this) ----
     # front_selection is re-included here (not just in the "running" patch above)
@@ -543,7 +489,6 @@ def run_identity_mesh_build(spec, job_id: str) -> JobResult:
         "job_id": job_id,
         "front_selection": front_selection,
         **auto_promote_extra,
-        **version_extra,
     })
 
     _delete_remote()  # best-effort remote cleanup after a successful download

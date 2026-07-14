@@ -47,31 +47,6 @@ _POLL_S = 1.0
 _TIMEOUT_S = float(os.environ.get("COMFY_TIMEOUT_S", "600"))
 
 
-# ── call-time attribution (2026-07-14) ──────────────────────────────────────
-# ComfyUI is an EXTERNAL GPU process the worker drives; in nvidia-smi it is
-# anonymous (not a slot child, holds no torch weights we can split), so its VRAM
-# fell into pid_registry.unattributed even though THIS call knows the checkpoint.
-# Record the (model_key, job_id) at dispatch so the worker heartbeat's reconcile
-# can stamp the comfy PID with the model it was called for. Both helpers are
-# STRICTLY best-effort: any failure (pid_registry absent on a non-worker import,
-# a telemetry bug) is swallowed so it can NEVER perturb a generation. The import
-# is lazy so importing this runner never drags in the worker agent stack.
-def _reg_comfy_call(model_key, job_id) -> None:
-    try:
-        from ...worker_agent import pid_registry
-        pid_registry.record_foreign_call("comfy", model_key, job_id=job_id)
-    except Exception:  # noqa: BLE001 — attribution telemetry never breaks generation
-        pass
-
-
-def _end_comfy_call(job_id) -> None:
-    try:
-        from ...worker_agent import pid_registry
-        pid_registry.end_foreign_call("comfy", job_id=job_id)
-    except Exception:  # noqa: BLE001 — attribution telemetry never breaks generation
-        pass
-
-
 def _comfy_url() -> str:
     return (os.environ.get("COMFY_URL") or "http://127.0.0.1:8188").rstrip("/")
 
@@ -405,11 +380,6 @@ class ComfyRunner:
 
     # -- public API (mirrors Img2ImgRunner) ----------------------------------
     async def run(self, req: ImageGenRequest) -> ImageGenResult:
-        # Call-time attribution: record which model this comfy dispatch is FOR (job
-        # id = the hugpy request id) for the whole generation window, cleared in the
-        # finally. Best-effort — a telemetry failure never touches the result path.
-        _job_id = getattr(req, "request_id", None)
-        _reg_comfy_call(self.model_key, _job_id)
         try:
             images = await asyncio.to_thread(self._generate, req)
             return ImageGenResult(
@@ -421,5 +391,3 @@ class ComfyRunner:
             return ImageGenResult(
                 request_id=req.request_id, model_key=req.model_key,
                 ok=False, images=[], error=f"{type(exc).__name__}: {exc}")
-        finally:
-            _end_comfy_call(_job_id)

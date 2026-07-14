@@ -40,26 +40,10 @@ Host modes (``host_mode``):
                       the per-model torch split (nvidia-smi can't split the lump).
   * ``comfy``       — the external, adopted ComfyUI process: VRAM by process name.
   * ``external``    — an adopted foreign process the worker chose to track by PID.
-  * ``cuda_context``— the worker's OWN process(es) (the agent + idle slot children
-                      sharing its venv): infrastructure CUDA context, NOT a called
-                      model. Labelled so it stops reading as an anonymous squatter.
-
-CALL-TIME ATTRIBUTION (2026-07-14). A foreign GPU service the WORKER drives —
-ComfyUI is the live case — is anonymous in nvidia-smi (its process is not a slot
-child and holds no torch weights we can split), so before this it fell into
-``unattributed`` even though the CALL that produced it knew the model. The
-``record_foreign_call``/``end_foreign_call`` table records, at dispatch time, the
-``model_key`` (+ ``job_id``) the worker submitted to that service; ``reconcile``
-then stamps it onto the recognized service PID, moving it out of ``unattributed``
-into an attributed ``comfy`` row. No active call -> the PID is still recognized as
-ComfyUI (labelled idle/unknown-model), never dumped as an anonymous squatter. A
-truly foreign, call-less process (a real rogue) still surfaces as ``unattributed``
-— that is the wanted signal, preserved.
 """
 
 from __future__ import annotations
 
-import os
 import threading
 import time
 from typing import Callable, Dict, List, Optional
@@ -67,22 +51,6 @@ from typing import Callable, Dict, List, Optional
 # Bytes per MiB — defined locally so this module stays dependency-free (importing
 # it must never drag in torch / the runner stack via agent.py).
 _MIB = 1024 * 1024
-
-# How long an unclosed foreign-call record stays trusted for attribution. The
-# best-effort ``end_foreign_call`` at the submit site's completion is the primary
-# clear; this TTL is the SAFETY NET so a call whose end was missed (a crashed
-# generation, a killed worker request) can never pin a stale model onto a comfy
-# PID forever. Default is comfortably above a comfy render's worst case; override
-# via env for slow boxes / tests.
-try:
-    _FOREIGN_CALL_TTL_S = float(os.environ.get("HUGPY_FOREIGN_CALL_TTL_S", "1800") or "1800")
-except (TypeError, ValueError):
-    _FOREIGN_CALL_TTL_S = 1800.0
-
-# nvidia-smi ``process_name`` substrings that mark a recognized foreign service.
-# ComfyUI's process_name is the venv python path (…/ComfyUI/venv/bin/python), so a
-# case-insensitive "comfyui" substring is the same anchor _comfy_process_vram uses.
-_COMFY_NAME_MARKER = "comfyui"
 
 # Field index of ``starttime`` in /proc/<pid>/stat AFTER the "pid (comm)" prefix
 # is split off. The stat line is: `pid (comm) state ppid ... starttime ...`;
@@ -92,7 +60,7 @@ _STAT_STARTTIME_IDX = 19
 
 ProcInfo = Dict[str, object]        # {"starttime": int|None, "cmdline": str, "name": str}
 ProcInfoProbe = Callable[[int], Optional[ProcInfo]]
-HostMode = str                      # "subprocess"|"in_process"|"comfy"|"external"|"cuda_context"
+HostMode = str                      # "subprocess" | "in_process" | "comfy" | "external"
 
 
 def _default_proc_info(pid: int) -> Optional[ProcInfo]:
@@ -145,17 +113,6 @@ class PidRegistry:
         self._lock = threading.RLock()
         self._records: Dict[str, dict] = {}
         self._last_unattributed: List[dict] = []
-        # Recognized-foreign attribution rows from the last reconcile (worker's own
-        # CUDA-context lumps + call-attributed / idle ComfyUI). Rebuilt every beat
-        # from fresh nvidia-smi + the live foreign-call table, so nothing here
-        # persists stale across beats. Surfaced in snapshot_for_heartbeat.models.
-        self._last_foreign_rows: List[dict] = []
-        # Active foreign-call table (service -> [{model_key, job_id, at}, …]). The
-        # worker records a call here at the moment it DISPATCHES a job to a foreign
-        # GPU service (ComfyUI), so reconcile can attribute that service's PID to the
-        # model the call was FOR. A list (not a scalar) tolerates overlapping calls;
-        # attribution picks the most-recent still-live entry.
-        self._foreign_calls: Dict[str, List[dict]] = {}
         self._proc_info: ProcInfoProbe = proc_info or _default_proc_info
 
     # -- probe injection (tests) ------------------------------------------------
@@ -216,57 +173,6 @@ class PidRegistry:
                     dropped.append(mk)
         return dropped
 
-    # -- call-time foreign-service attribution ----------------------------------
-    def record_foreign_call(self, service: str, model_key: Optional[str] = None,
-                            job_id: Optional[str] = None) -> None:
-        """Record that this worker DISPATCHED a job to a foreign GPU ``service``
-        (e.g. ``"comfy"``) FOR ``model_key``. Called at the submit site so the PID
-        that service is running under can be attributed to the called model at the
-        next ``reconcile``. Best-effort by contract: it never raises for a caller
-        (the submit path wraps it anyway), so a telemetry hiccup can't break a
-        generation. Idempotent-ish: overlapping calls stack; ``end_foreign_call``
-        (or the TTL) unwinds them."""
-        if not service:
-            return
-        with self._lock:
-            self._foreign_calls.setdefault(service, []).append(
-                {"model_key": model_key, "job_id": job_id, "at": time.time()})
-
-    def end_foreign_call(self, service: str, job_id: Optional[str] = None,
-                         model_key: Optional[str] = None) -> None:
-        """Clear a foreign-call record on completion. Removes the entry matching
-        ``job_id`` (preferred) or ``model_key``; failing an exact match it drops the
-        oldest entry for the service so a mismatched close still unwinds one call
-        rather than leaking. A no-op for an unknown service. The TTL in reconcile is
-        the backstop if this is never reached."""
-        if not service:
-            return
-        with self._lock:
-            lst = self._foreign_calls.get(service)
-            if not lst:
-                return
-            idx = None
-            for i, c in enumerate(lst):
-                if job_id is not None and c.get("job_id") == job_id:
-                    idx = i
-                    break
-                if (job_id is None and model_key is not None
-                        and c.get("model_key") == model_key):
-                    idx = i
-                    break
-            lst.pop(idx if idx is not None else 0)
-            if not lst:
-                self._foreign_calls.pop(service, None)
-
-    def _active_foreign_call_locked(self, service: str, ttl: float) -> Optional[dict]:
-        """The most-recent still-live foreign call for ``service`` (caller holds the
-        lock). Entries older than ``ttl`` are treated as leaked and ignored (the
-        recycled-PID guard's spirit applied to call records)."""
-        lst = self._foreign_calls.get(service) or []
-        now = time.time()
-        live = [c for c in lst if (now - float(c.get("at") or 0.0)) <= ttl]
-        return live[-1] if live else None
-
     # -- identity ---------------------------------------------------------------
     def _verify_locked(self, model_key: str) -> Optional[int]:
         """``verify`` core; caller holds the lock."""
@@ -308,10 +214,7 @@ class PidRegistry:
     # -- reconcile against nvidia-smi ground truth ------------------------------
     def reconcile(self, gpu_procs: Optional[dict],
                   inprocess_bytes: Optional[dict],
-                  comfy_bytes: Optional[int],
-                  own_pids: Optional[set] = None,
-                  self_venv_marker: Optional[str] = None,
-                  foreign_call_ttl: Optional[float] = None) -> dict:
+                  comfy_bytes: Optional[int]) -> dict:
         """Join the registry against nvidia-smi ground truth. PURE of its inputs
         (no ``/proc``, no nvidia-smi call) so it's directly unit-testable.
 
@@ -320,44 +223,25 @@ class PidRegistry:
           * ``inprocess_bytes`` -> ``{model_key: {"vram_bytes", "device"}}``
                                    (``_inprocess_gpu_bytes``)
           * ``comfy_bytes``     -> ``int`` bytes | ``None`` (``_comfy_process_vram``)
-          * ``own_pids``        -> the worker's OWN pids (``{os.getpid(), …}``) — the
-                                   agent process + any slot supervisor it spawned.
-          * ``self_venv_marker``-> a substring of the worker's own venv path; any
-                                   unexplained GPU proc whose ``process_name``
-                                   contains it is one of the worker's own pids (an
-                                   idle slot child or the agent), tagged
-                                   ``cuda_context`` — infra, not a called model.
-          * ``foreign_call_ttl``-> override the module TTL for the call table.
 
-        Attribution rules (record-driven, unchanged):
+        Attribution rules:
           * ``subprocess``/``external`` -> the record's PID's ``mib`` (bytes);
             an alive child that isn't a GPU compute app attributes 0 (CPU).
           * ``in_process`` -> the per-model torch split; the shared worker-python
             PID lump is marked explained so it isn't flagged as a squatter.
-          * ``comfy`` (record) -> ``comfy_bytes``; comfyui-named GPU procs explained.
+          * ``comfy`` -> ``comfy_bytes``; comfyui-named GPU procs are explained.
 
-        SECOND PASS (recognized-foreign, 2026-07-14): every still-unexplained GPU
-        proc is tested against, in order —
-          1. the worker's OWN pids / venv -> a ``cuda_context`` row (agent CUDA
-             context / idle slot), NOT a squatter;
-          2. ComfyUI (name marker) -> a ``comfy`` row stamped with the active
-             foreign call's ``model_key`` (+ ``job_id``) if one is live, else
-             labelled "ComfyUI (idle/unknown model)" — recognized, never anonymous.
-        Anything that survives BOTH passes is a genuine foreign / rogue squatter and
-        stays in ``unattributed`` — the wanted signal, preserved.
+        Any GPU proc the registry can't explain is surfaced as ``unattributed`` —
+        this is how central learns about FOREIGN / ROGUE VRAM squatters.
 
-        Returns ``{"attributed": {model_key: vram_bytes}, "foreign": [row…],
-        "unattributed": [{pid, name, mib}]}`` and stores ``last_vram_bytes`` per
-        record + the foreign rows + unattributed for the next snapshot.
+        Returns ``{"attributed": {model_key: vram_bytes}, "unattributed":
+        [{pid, name, mib}]}`` and stores ``last_vram_bytes`` per record +
+        ``unattributed`` for the next ``snapshot_for_heartbeat``.
         """
         gpu_procs = gpu_procs or {}
         inprocess_bytes = inprocess_bytes or {}
-        own = set(own_pids or ())
-        marker = (self_venv_marker or "").strip() or None
-        ttl = foreign_call_ttl if foreign_call_ttl is not None else _FOREIGN_CALL_TTL_S
         attributed: Dict[str, int] = {}
         explained: set = set()
-        foreign_rows: List[dict] = []
         with self._lock:
             for rec in self._records.values():
                 mk = rec["model_key"]
@@ -371,7 +255,7 @@ class PidRegistry:
                 elif mode == "comfy":
                     vb = int(comfy_bytes or 0)
                     for p, meta in gpu_procs.items():
-                        if _COMFY_NAME_MARKER in (str(meta.get("name") or "")).lower():
+                        if "comfyui" in (str(meta.get("name") or "")).lower():
                             explained.add(p)
                 else:                           # subprocess / external
                     vb = 0
@@ -382,70 +266,27 @@ class PidRegistry:
                         explained.add(pid)      # alive child, CPU-resident
                 attributed[mk] = vb
                 rec["last_vram_bytes"] = vb
-
-            # -- SECOND PASS: recognized-foreign attribution of the leftovers ------
-            for p, meta in gpu_procs.items():
-                if p in explained:
-                    continue
-                name = str(meta.get("name") or "")
-                mib = int(meta.get("mib") or 0)
-                # (1) the worker's OWN infra CUDA context (agent + idle slot child).
-                if p in own or (marker is not None and marker in name):
-                    foreign_rows.append({
-                        "model_key": None, "pid": p, "host_mode": "cuda_context",
-                        "vram_bytes": mib * _MIB, "alive": True,
-                        "service": "worker", "label": "agent CUDA context",
-                        "name": name})
-                    explained.add(p)
-                    continue
-                # (2) ComfyUI — call-time attribution or recognized-idle.
-                if _COMFY_NAME_MARKER in name.lower():
-                    call = self._active_foreign_call_locked("comfy", ttl)
-                    row = {
-                        "pid": p, "host_mode": "comfy", "vram_bytes": mib * _MIB,
-                        "alive": True, "service": "comfy", "name": name}
-                    if call is not None:
-                        row["model_key"] = call.get("model_key")
-                        row["job_id"] = call.get("job_id")
-                        row["label"] = None
-                    else:
-                        row["model_key"] = None
-                        row["job_id"] = None
-                        row["label"] = "ComfyUI (idle/unknown model)"
-                    foreign_rows.append(row)
-                    explained.add(p)
-                    continue
-
             unattributed = [
                 {"pid": p, "name": meta.get("name"), "mib": meta.get("mib")}
                 for p, meta in gpu_procs.items() if p not in explained
             ]
             self._last_unattributed = unattributed
-            self._last_foreign_rows = foreign_rows
-        return {"attributed": attributed, "foreign": foreign_rows,
-                "unattributed": unattributed}
+        return {"attributed": attributed, "unattributed": unattributed}
 
     # -- heartbeat telemetry ----------------------------------------------------
     def snapshot_for_heartbeat(self) -> dict:
         """The "worker-module-pid log" central displays.
 
-        Returns ``{"models": [{model_key, pid, host_mode, vram_bytes, alive, …}],
+        Returns ``{"models": [{model_key, pid, host_mode, vram_bytes, alive}],
         "unattributed": [{pid, name, mib}]}``. ``alive`` is a LIVE recycled-PID-
-        guarded ``verify`` (not the last-cached flag) for record rows; ``vram_bytes``
-        is the most recent ``reconcile`` attribution. Empty registry -> both lists
-        empty (degrade-safe).
-
-        ``models`` carries TWO row kinds: the recycled-PID-guarded per-record rows
-        (subprocess / in_process) AND the recognized-foreign rows from the last
-        reconcile (``cuda_context`` for the worker's own infra pids, ``comfy`` for a
-        call-attributed or idle ComfyUI). Foreign rows additionally carry
-        ``service``/``label`` (and ``job_id`` when a call attributed them) and may
-        have ``model_key`` None (a cuda_context lump / an idle ComfyUI has no served
-        model) — a consumer keys those on ``pid``, not ``model_key``.
+        guarded ``verify`` (not the last-cached flag); ``vram_bytes`` is the most
+        recent ``reconcile`` attribution. Empty registry -> both lists empty
+        (degrade-safe).
 
         NB: the contract sketch said "-> list"; a dict carrying BOTH the per-model
         log and the unattributed squatters is strictly better for the single
-        heartbeat field (central needs both), so this returns one dict.
+        heartbeat field (central needs both), so this returns one dict. The
+        per-model log is under ``["models"]``.
         """
         with self._lock:
             models = []
@@ -459,10 +300,6 @@ class PidRegistry:
                     "vram_bytes": rec.get("last_vram_bytes"),
                     "alive": alive,
                 })
-            # Recognized-foreign rows (already alive-by-construction: they were in
-            # this beat's nvidia-smi output). Append as extra model rows so they read
-            # as attributed, not anonymous.
-            models.extend(dict(r) for r in self._last_foreign_rows)
             return {"models": models, "unattributed": list(self._last_unattributed)}
 
 
@@ -500,22 +337,8 @@ def verify(model_key: str) -> Optional[int]:
 
 
 def reconcile(gpu_procs: Optional[dict], inprocess_bytes: Optional[dict],
-              comfy_bytes: Optional[int], own_pids: Optional[set] = None,
-              self_venv_marker: Optional[str] = None,
-              foreign_call_ttl: Optional[float] = None) -> dict:
-    return _REGISTRY.reconcile(gpu_procs, inprocess_bytes, comfy_bytes,
-                               own_pids=own_pids, self_venv_marker=self_venv_marker,
-                               foreign_call_ttl=foreign_call_ttl)
-
-
-def record_foreign_call(service: str, model_key: Optional[str] = None,
-                        job_id: Optional[str] = None) -> None:
-    return _REGISTRY.record_foreign_call(service, model_key, job_id)
-
-
-def end_foreign_call(service: str, job_id: Optional[str] = None,
-                     model_key: Optional[str] = None) -> None:
-    return _REGISTRY.end_foreign_call(service, job_id=job_id, model_key=model_key)
+              comfy_bytes: Optional[int]) -> dict:
+    return _REGISTRY.reconcile(gpu_procs, inprocess_bytes, comfy_bytes)
 
 
 def snapshot_for_heartbeat() -> dict:

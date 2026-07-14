@@ -202,7 +202,7 @@ def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None,
         _model_file_for, _ctx_for, get_model_config,
         LLAMA_SERVER_BIN, DEFAULT_LLAMA_THREADS,
     )
-    from ..spill import autofit_gpu_layers, vision_projector_bytes
+    from ..spill import autofit_gpu_layers
 
     cfg = None
     if path and os.path.isfile(path):
@@ -254,19 +254,12 @@ def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None,
             free_cap = int(float(gpu_mem_gib) * 2**30)
         except (TypeError, ValueError):
             free_cap = None
-    # Vision GGUF: the mmproj/CLIP projector loads onto the GPU beside the
-    # offloaded layers, so reserve its VRAM BEFORE fitting layers — otherwise on
-    # an 8 GB card autofit plans "all layers" against the model file alone and the
-    # child then OOMs when the ~1.3 GB projector lands on top. 0 for text models
-    # (byte-identical to before).
-    _mmproj_reserve = vision_projector_bytes(path)
     if free_cap is not None:
         from ..spill import free_vram_bytes as _fvb
         fv = _fvb()
-        auto = autofit_gpu_layers(path, free_vram=min(fv, free_cap) if fv else free_cap,
-                                  extra_reserve_bytes=_mmproj_reserve)
+        auto = autofit_gpu_layers(path, free_vram=min(fv, free_cap) if fv else free_cap)
     else:
-        auto = autofit_gpu_layers(path, extra_reserve_bytes=_mmproj_reserve)
+        auto = autofit_gpu_layers(path)
     ngl = n_gpu_layers if n_gpu_layers is not None else auto
     ctx = int(ctx) if ctx else (_ctx_for(cfg, model_key) if cfg is not None else 4096)
     threads = int(threads) if threads else DEFAULT_LLAMA_THREADS

@@ -8,7 +8,6 @@ from .app.routes.worker_routes import worker_bp
 from .app.routes.phone_brick_routes import phone_brick_bp
 from .app.routes.discord_routes import discord_bp
 from .app.routes.video_routes import video_bp
-from .app.routes.agent_routes import agent_bp
 
 # Video Intelligence worker daemon is started ONCE per process at app init
 # (guarded below). Module-level so re-entrant app creation can't spawn a second.
@@ -148,15 +147,6 @@ def get_hugpy_flask(name=None,allowed_origins=None,debug=False):
     # untouched.
     try:
         app.register_blueprint(video_bp, url_prefix="/api", name="video_bp_api")
-    except (ValueError, AssertionError):
-        pass
-
-    # Same /api dual-mount for the P3.1 agent-node fleet: remote agent nodes
-    # register, heartbeat and pull tasks by reaching gunicorn directly over the
-    # VPN, exactly like GPU workers and phone bricks. The bare /agent/... mount
-    # (auto-discovered via routes/__init__) serves the nginx-proxied path.
-    try:
-        app.register_blueprint(agent_bp, url_prefix="/api", name="agent_bp_api")
     except (ValueError, AssertionError):
         pass
 

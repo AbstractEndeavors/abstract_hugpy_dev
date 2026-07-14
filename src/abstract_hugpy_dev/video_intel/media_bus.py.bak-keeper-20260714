@@ -610,11 +610,6 @@ def set_progress(job_id: str, progress: dict) -> None:
         )
     finally:
         conn.close()
-    # One-directional bridge (A/P0-2): mirror this live progress blob into the
-    # comms.JobStore so GET /llm/jobs carries the running job's stage + log tail +
-    # honest stall clock (not green-but-empty). Best-effort by construction (the
-    # dispatcher swallows) — a bridge hiccup never fails the generation.
-    _bridge("on_progress", job_id, progress)
 
 
 def work_once(worker_token: Optional[str] = None) -> Optional[str]:

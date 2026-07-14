@@ -4049,19 +4049,7 @@ def _heartbeat_loop(client: CentralClient, state: WorkerState, args) -> None:
                 _inproc = _inprocess_gpu_bytes()
                 for _mk in _inproc:
                     _pidreg.record_launch(_mk, os.getpid(), "in_process")
-                # OWN-PID attribution (2026-07-14): tell reconcile which GPU pids are
-                # the worker's own infrastructure so a residual agent / idle-slot CUDA
-                # context lump reads as "cuda_context", not an anonymous squatter.
-                # os.getpid() is the agent; the venv marker (this python's venv root)
-                # catches slot children sharing the venv that aren't a recorded model.
-                _own_pids = {os.getpid()}
-                _venv_marker = None
-                try:
-                    _venv_marker = os.path.dirname(os.path.dirname(sys.executable)) or None
-                except Exception:  # noqa: BLE001 — marker is best-effort telemetry
-                    _venv_marker = None
-                _pidreg.reconcile(_gpu_process_vram(), _inproc, _comfy_process_vram(),
-                                  own_pids=_own_pids, self_venv_marker=_venv_marker)
+                _pidreg.reconcile(_gpu_process_vram(), _inproc, _comfy_process_vram())
                 _pid_log = _pidreg.snapshot_for_heartbeat()
             except Exception as _pe:  # noqa: BLE001 — telemetry must never break the beat
                 logger.debug("pid_registry snapshot failed: %s", _pe)

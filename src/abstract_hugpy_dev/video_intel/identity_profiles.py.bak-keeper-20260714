@@ -434,83 +434,11 @@ def _migrate_legacy() -> Optional[dict[str, Any]]:
     return new_data
 
 
-def _backfill_versions(data: dict[str, Any]) -> bool:
-    """One-time, idempotent, in-place VERSIONS backfill for identities that predate the
-    versions slice (IDENTITY-VERSIONS-SLICE.md, build order 1).
-
-    For each ACTIVE profile that carries NO ``versions`` key yet, seed the append-only
-    version list from what the profile already holds — the design's migration verbatim:
-    "existing identities get their newest recon as base/clay + current canonical as
-    version-01":
-
-      * base (clay): minted from the NEWEST reconstruction — its ``recon_id`` anchors the
-        geometric ground truth. Flagged ``base: True`` (never archivable, like a first
-        clay minted live). Created ONLY when the profile has >=1 reconstruction.
-      * version-01: the profile's CURRENT promoted ``canonical`` set becomes a named
-        render-set (kind ``"textured"`` — the promoted cardinals are rendered DNA).
-        Created ONLY when ``canonical`` is non-empty, and made ACTIVE so the version-aware
-        resolver returns EXACTLY today's DNA (no behavioral regression on first load).
-      * ``active_version`` points at version-01 when present, else the base, else None.
-
-    A never-generated profile (no reconstruction AND no canonical) is still marked
-    migrated — it gets ``versions: []`` + ``active_version: None`` so this never re-runs
-    for it. Idempotency is guarded by ``"versions" not in entry``: once an entry carries
-    the key (even an empty list) it is NEVER re-seeded. ``_deleted`` archives are left
-    untouched. Mutates ``data`` in place and returns True iff any entry changed (the
-    caller then persists via the single _save below)."""
-    changed = False
-    for entry in (data.get("profiles") or {}).values():
-        if not isinstance(entry, dict) or "versions" in entry:
-            continue
-        recons = [r for r in (entry.get("reconstructions") or []) if isinstance(r, dict)]
-        canonical = [p for p in (entry.get("canonical") or []) if isinstance(p, str)]
-        # reconstructions append newest-LAST (attach_reconstruction appends), so the last
-        # element is the newest recon — the one whose mesh IS the identity's current clay.
-        newest_recon = recons[-1] if recons else None
-        versions: list[dict[str, Any]] = []
-        base_id: Optional[str] = None
-        v01_id: Optional[str] = None
-        if newest_recon is not None:
-            base_id = "ver_" + secrets.token_hex(8)
-            versions.append({
-                "version_id": base_id,
-                "name": "base",
-                "kind": "clay",
-                "recon_id": newest_recon.get("recon_id"),
-                "created_at": (newest_recon.get("created_at")
-                               or entry.get("created_at") or time.time()),
-                "canonical": [],  # clay = geometry; textured DNA rides on version-01
-                "notes": "",
-                "base": True,  # the geometric ground truth — never archivable
-            })
-        if canonical:
-            v01_id = "ver_" + secrets.token_hex(8)
-            versions.append({
-                "version_id": v01_id,
-                "name": "version-01",
-                "kind": "textured",
-                "recon_id": (newest_recon.get("recon_id")
-                             if newest_recon is not None else None),
-                "created_at": entry.get("created_at") or time.time(),
-                "canonical": list(canonical),
-                "notes": "",
-            })
-        entry["versions"] = versions
-        # ACTIVE preserves today's resolver output: version-01 (== current canonical) when
-        # present, else the clay base, else nothing (a never-generated profile).
-        entry["active_version"] = v01_id or base_id
-        changed = True
-    if changed:
-        _save(data)
-    return changed
-
-
 def _load() -> dict[str, Any]:
     path = _store_path()
     if not os.path.exists(path):
         migrated = _migrate_legacy()
         if migrated is not None:
-            _backfill_versions(migrated)  # seed versions on the freshly-migrated registry
             return migrated
         return _empty()
     try:
@@ -524,7 +452,6 @@ def _load() -> dict[str, Any]:
         return _empty()
     data.setdefault("profiles", {})
     data.setdefault("_deleted", {})
-    _backfill_versions(data)  # seed versions[] for any identity that predates the slice
     return data
 
 

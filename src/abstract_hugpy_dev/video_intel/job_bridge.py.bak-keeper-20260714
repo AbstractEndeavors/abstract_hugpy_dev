@@ -158,67 +158,6 @@ def on_running(job_id: str, name: str, worker: str | None = None) -> None:
                        job_id, name, exc_info=True)
 
 
-def _summary(stage: str, progress) -> str:
-    """A short human message for the comms Job — ``"<stage> <pct>%"`` — from a
-    progress blob's stage + 0..1 float. Degrades: stage-only when there is no
-    usable number, percent-only when there is no stage, "" when neither."""
-    pct = None
-    try:
-        if progress is not None:
-            p = float(progress)
-            if p == p:  # not NaN
-                pct = max(0, min(100, int(round(p * 100))))
-    except (TypeError, ValueError):
-        pct = None
-    if stage and pct is not None:
-        return f"{stage} {pct}%"
-    if stage:
-        return stage
-    if pct is not None:
-        return f"{pct}%"
-    return ""
-
-
-def on_progress(job_id: str, progress: dict) -> None:
-    """running -> running, carrying live per-stage progress into the comms Job so
-    GET /llm/jobs shows a render's stage + rolling log tail + an honest stall
-    clock (not green-but-empty). Fed by media_bus.set_progress (every runner that
-    reports progress) via the ``_bridge`` dispatcher — so this is BEST-EFFORT and
-    swallows everything, exactly like the other bridge points.
-
-    The blob is a runner's own free-form dict; we defensively pull only the keys
-    the /llm/jobs contract carries (stage/progress/log_tail) and update just those.
-    A store.update on an unknown/terminal id is a safe no-op (returns None), so a
-    progress push that races a terminal write can never resurrect or corrupt a
-    finished job. log_tail capping lives in the JobStore (LOG_TAIL_CAP)."""
-    try:
-        if not isinstance(progress, dict):
-            return
-        changes: dict = {}
-        if "stage" in progress:
-            changes["stage"] = str(progress.get("stage") or "")
-        prog = progress.get("progress")
-        if prog is not None:
-            try:
-                changes["progress"] = float(prog)
-            except (TypeError, ValueError):
-                pass
-        lt = progress.get("log_tail")
-        if isinstance(lt, (list, tuple)):
-            changes["log_tail"] = [str(x) for x in lt]
-        # Nothing recognizable in the blob -> nothing to mirror (a runner may
-        # write a private progress shape we don't surface). No-op, no message.
-        if not changes:
-            return
-        msg = _summary(changes.get("stage", ""), changes.get("progress"))
-        if msg:
-            changes["message"] = msg
-        _store().update(job_id, **changes)
-    except Exception:
-        logger.warning("job_bridge.on_progress failed for %s", job_id,
-                       exc_info=True)
-
-
 def on_terminal(job_id: str, name: str, status: str, result=None,
                 worker: str | None = None) -> None:
     """done|failed|cancelled -> terminal, in the process that ran the job. Marks

@@ -378,18 +378,6 @@ def workers_list():
         w["required_pkg_version"] = required
         w["version_ok"] = (required is None
                            or w.get("pkg_version") == required)
-    # Call-time attribution (2026-07-14): stamp each worker's pid_registry
-    # unattributed entries that are a RELAY-dispatched foreign GPU service
-    # (identity-render) with the identity slug + job_id of the active
-    # identity_mesh_build job central dispatched — so hy3dgen's ~5GB reads as the
-    # identity it was called for, not an anonymous squatter. Best-effort: never
-    # breaks the worker list (see pid_attribution.enrich_workers_pid_registry).
-    try:
-        from ..functions.imports.utils.pid_attribution import (
-            enrich_workers_pid_registry)
-        enrich_workers_pid_registry(rows)
-    except Exception:  # noqa: BLE001 — attribution enrichment never 5xxes /llm/workers
-        logger.debug("pid_registry relay attribution hook failed", exc_info=True)
     return jsonify(rows)
 
 

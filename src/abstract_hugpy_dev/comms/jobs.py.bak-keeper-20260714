@@ -88,50 +88,6 @@ def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-# HONEST stalled (media/relay live-progress): a job in an active/running state
-# that has made no FORWARD progress for this long reads as stuck, not green.
-# "Forward progress" is tracked by Job.progressed_at (bumped on a token, a
-# progress advance, a stage change, a status transition) — NOT updated_at, which
-# also bumps on a log-tail-only write. Computed at serialize/snapshot time so a
-# wedged render turns stalled without any writer having to notice (a stored bool
-# would go stale). Only "processing"/"streaming" can be stalled — a pending job
-# waiting its turn in the queue is starved, not wedged.
-_STALL_ACTIVE = frozenset(("processing", "streaming"))
-# The last-N log lines a bridged job carries on /llm/jobs (newest-last). Caps the
-# wire size (and the mirror row's JSON) so a chatty render can't bloat the view.
-LOG_TAIL_CAP = 40
-
-
-def _stall_seconds() -> float:
-    """The forward-progress silence (seconds) after which an active job reads as
-    stalled. Env-overridable (HUGPY_JOB_STALL_SECONDS); default 90s. Read at
-    compute time so an operator can retune it without a restart, and a bad value
-    degrades to the default rather than raising into a serialize/snapshot path."""
-    raw = (os.environ.get("HUGPY_JOB_STALL_SECONDS") or "").strip()
-    if not raw:
-        return 90.0
-    try:
-        v = float(raw)
-        return v if v > 0 else 90.0
-    except ValueError:
-        return 90.0
-
-
-def _compute_stalled(status: Any, progressed_at: Any, now: float) -> bool:
-    """True when *status* is active/running AND *progressed_at* (epoch seconds) is
-    older than the stall threshold. Fail-open: a missing/garbage progressed_at is
-    treated as "just now" (never a false stall), and this never raises — it runs
-    on every /llm/jobs row."""
-    try:
-        if normalize_status(status) not in _STALL_ACTIVE:
-            return False
-        if progressed_at is None:
-            return False
-        return (now - float(progressed_at)) > _stall_seconds()
-    except (TypeError, ValueError):
-        return False
-
-
 @dataclass
 class JobError:
     """Error-as-data. A failed job carries one of these, never a bare string
@@ -198,16 +154,6 @@ class Job:
     max_attempts: int = 0
     stalled: bool = False
     bytes_per_second: Optional[float] = None
-    # Live per-stage progress carried from a bridged execution plane (media_bus
-    # runners via job_bridge.on_progress) — a wedged render surfaces its stage +
-    # rolling log tail in /llm/jobs instead of reading green-but-empty. Both
-    # default empty (backward-compatible; chat/download rows carry "" and []).
-    stage: str = ""
-    log_tail: list = field(default_factory=list)
-    # Last time this job made FORWARD progress (epoch seconds) — the honest
-    # stalled clock (see _compute_stalled). Distinct from updated_at, which also
-    # bumps on a log-tail-only write; this bumps only on real advancement.
-    progressed_at: float = field(default_factory=time.time)
     created_at: str = field(default_factory=_utcnow_iso)
     updated_at: str = field(default_factory=_utcnow_iso)
     # Runtime-only, never serialized: download subprocess, resolved model dict
@@ -250,19 +196,8 @@ class Job:
             "downloaded_bytes": self.downloaded_bytes,
             "attempt": self.attempt,
             "max_attempts": self.max_attempts,
-            # HONEST stalled: an explicit stall (a download writer sets self.stalled)
-            # OR a computed forward-progress silence for an active job. Computed
-            # HERE so it is always fresh — a stored-only bool goes stale the moment
-            # the render wedges. progressed_at rides along so a sibling process
-            # reading this from the mirror can recompute it just as freshly.
-            "stalled": bool(self.stalled)
-            or _compute_stalled(self.status, self.progressed_at, now),
+            "stalled": self.stalled,
             "bytes_per_second": self.bytes_per_second,
-            "stage": self.stage or "",
-            # Cap defensively at serialize time too (a writer that stored more never
-            # bloats the wire / the mirror row).
-            "log_tail": list(self.log_tail or [])[-LOG_TAIL_CAP:],
-            "progressed_at": self.progressed_at,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -368,33 +303,10 @@ class JobStore:
                         resurrected = True
             if "error" in changes:
                 changes["error"] = JobError.coerce(changes["error"])
-            # Forward-progress detection (the honest stalled clock): a status
-            # transition, a numeric progress advance, or a stage change is real
-            # movement and resets progressed_at. A log_tail-only write is NOT —
-            # a wedged render can still spew retry lines, so logs update but the
-            # stall clock keeps ticking. Bumping updated_at stays UNCHANGED (it
-            # marks any field write); progressed_at is the movement-only mirror.
-            advanced = ("status" in changes
-                        and normalize_status(changes["status"]) != prior)
-            try:
-                if "progress" in changes \
-                        and float(changes["progress"]) > float(job.progress):
-                    advanced = True
-            except (TypeError, ValueError):
-                pass
-            if "stage" in changes and changes.get("stage") != job.stage:
-                advanced = True
-            # Cap the rolling log tail on write so neither the wire nor the mirror
-            # row's JSON can be bloated by a chatty producer.
-            if "log_tail" in changes:
-                lt = changes["log_tail"]
-                changes["log_tail"] = list(lt or [])[-LOG_TAIL_CAP:]
             for k, v in changes.items():
                 if hasattr(job, k):
                     setattr(job, k, v)
             job.updated_at = _utcnow_iso()
-            if advanced:
-                job.progressed_at = time.time()
         if normalize_status(job.status) != prior:
             self._emit(job, prior)
         if resurrected and self.mirror is not None:
@@ -426,11 +338,6 @@ class JobStore:
                 job.status = "streaming"
                 emit = True
             job.tokens += n
-            # A token is forward progress — reset the honest stall clock so a
-            # long, healthy stream never reads as stalled (on_output deliberately
-            # does NOT touch updated_at, so progressed_at is the only movement
-            # marker for the token hot path).
-            job.progressed_at = time.time()
             if self.mirror is not None and \
                     time.time() - job._last_sync >= 1.0:
                 sync = True
@@ -541,7 +448,6 @@ class JobStore:
             local_ids = set(self._jobs)
         out = [j.to_dict() for j in jobs]
         if self.mirror is not None:
-            now = time.time()
             try:
                 for d in self.mirror.live_rows():
                     # Skip our own rows — the in-memory record is the truth
@@ -550,13 +456,6 @@ class JobStore:
                         continue
                     if kinds is not None and d.get("kind") not in kinds:
                         continue
-                    # A sibling's row carries the `stalled` value computed WHEN it
-                    # was last upserted — stale by now. Recompute it FRESH from the
-                    # progressed_at epoch that rides in the row (OR the sibling's
-                    # own explicit stall) so a wedged cross-process render reads as
-                    # stalled here too, without the owner having to re-upsert.
-                    d["stalled"] = bool(d.get("stalled")) or _compute_stalled(
-                        d.get("status"), d.get("progressed_at"), now)
                     out.append(d)
             except Exception:
                 pass

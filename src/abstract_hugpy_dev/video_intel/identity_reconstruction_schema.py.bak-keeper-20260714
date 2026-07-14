@@ -325,12 +325,6 @@ class IdentityMeshSpec:
 # are optional multi-view conditioning inputs). Mirrors identity_pipeline/mesh.py.
 MESH_VIEW_NAMES: Tuple[str, ...] = ("front", "right", "back", "left")
 
-# Pose-normalization choices (IDENTITY-VERSIONS-SLICE.md slice 3). "none" meshes the
-# input pose as-is (today's behavior); "t-pose" asks the relay to render an id_lock
-# T-pose still FIRST and mesh THAT (clears crossed-arm occlusion). Mirrors the store's
-# identity_profiles._POSE_CHOICES so the wire vocabulary is one word everywhere.
-POSE_CHOICES: Tuple[str, ...] = ("none", "t-pose")
-
 
 def make_identity_mesh(
     *,
@@ -354,7 +348,6 @@ def make_identity_mesh(
     workflow: str = "hunyuan3d-2mv",
     output_format: str = "glb",
     view_candidates=(),
-    pose: str = "none",
 ) -> IdentityMeshSpec:
     """Validate every field and build the frozen ``IdentityMeshSpec`` (house discipline:
     a structurally-invalid spec is caller error caught at the boundary, never carried
@@ -422,11 +415,6 @@ def make_identity_mesh(
                 f"view_candidates[{i}] must be a non-empty string; got {cpath!r}")
         norm_candidates.append(cpath)
 
-    # pose: validated at the boundary like every other field (a structurally-invalid
-    # spec is caller error caught here, never carried across the bus).
-    if not (isinstance(pose, str) and pose in POSE_CHOICES):
-        raise ValueError(f"pose must be one of {list(POSE_CHOICES)}; got {pose!r}")
-
     return IdentityMeshSpec(
         slug=slug,
         recon_id=recon_id,
@@ -448,7 +436,6 @@ def make_identity_mesh(
         transparent=bool(transparent),
         auto_promote=bool(auto_promote),
         view_candidates=tuple(norm_candidates),
-        pose=pose,
     )
 
 
@@ -481,9 +468,6 @@ def identity_mesh_from_dict(d: dict) -> IdentityMeshSpec:
         output_format=d.get("output_format", "glb"),
         # asdict->json keeps view_candidates a plain list; coerce back like view_ids.
         view_candidates=tuple(d.get("view_candidates") or ()),
-        # additive (VERSIONS slice): round-trip pose; an OLD spec (pre-pose) has no key
-        # -> defaults to "none" (today's behavior), so deserialization stays backward-compat.
-        pose=d.get("pose", "none"),
     )
 
 

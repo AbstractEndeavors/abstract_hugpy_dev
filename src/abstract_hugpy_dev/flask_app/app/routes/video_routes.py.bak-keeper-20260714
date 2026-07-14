@@ -1656,15 +1656,6 @@ def _reference_images_from_body(body):
     when it is non-empty, falling back to ``reference_images`` otherwise. Same single
     code path either way.
 
-    VERSION-AWARE DNA (VERSIONS slice): an identity now holds N named versions, each with
-    its own promoted ``canonical``. The resolved DNA is the ACTIVE version's canonical by
-    default; an optional ``identity_version`` (a version_id OR its name, e.g.
-    "textured-01") names a specific version. Resolution precedence is:
-    active/named version's canonical -> profile-level ``canonical`` -> ``reference_images``
-    — so an un-versioned profile, an un-versioned caller, or an empty-canonical version all
-    degrade to exactly the behavior above. A stale/unknown/archived ``identity_version`` is
-    a clean 404.
-
     Returns ``(reference_images_or_None, None)`` on success, or
     ``(None, (error_payload, status))`` when a given slug names no profile — a stale
     slug is a clean 4xx, never a silent empty identity. The returned list still flows
@@ -1678,43 +1669,7 @@ def _reference_images_from_body(body):
     profile = identity_profiles.get_profile(slug.strip())
     if profile is None:
         return None, ({"error": f"identity_profile {slug!r} not found"}, 404)
-
-    # VERSION-AWARE DNA (IDENTITY-VERSIONS-SLICE.md slice 2): the id_lock reference set is
-    # the ACTIVE version's canonical by default; an explicit ``identity_version`` names a
-    # specific one — matched by its version_id OR its name (e.g. "textured-01"). A stale /
-    # unknown / archived version is a clean 404, never a silent wrong-identity (the public
-    # ``versions`` list already omits archived versions, so those are unreachable here).
-    # Precedence for the resolved DNA:
-    #     chosen version's canonical -> profile-level canonical -> reference_images
-    # so a pre-versions profile, an un-versioned caller, or a version with an empty
-    # canonical all degrade to EXACTLY today's behavior (no regression on first load).
-    versions = [v for v in (profile.get("versions") or []) if isinstance(v, dict)]
-    req_version = body.get("identity_version")
-    chosen_version = None
-    if req_version is not None:
-        if not isinstance(req_version, str) or not req_version.strip():
-            return None, ({"error": "identity_version must be a version id or name string"}, 400)
-        needle = req_version.strip()
-        chosen_version = next(
-            (v for v in versions
-             if v.get("version_id") == needle or v.get("name") == needle),
-            None,
-        )
-        if chosen_version is None:
-            return None, ({"error": f"identity_version {req_version!r} not found for "
-                                    f"identity_profile {slug!r}"}, 404)
-    else:
-        active_id = profile.get("active_version")
-        if active_id:
-            chosen_version = next(
-                (v for v in versions if v.get("version_id") == active_id), None)
-
-    version_canonical = (
-        [p for p in (chosen_version.get("canonical") or []) if isinstance(p, str)]
-        if chosen_version else []
-    )
-    profile_canonical = [p for p in (profile.get("canonical") or []) if isinstance(p, str)]
-    canonical = version_canonical or profile_canonical
+    canonical = profile.get("canonical") or []
     chosen = canonical if canonical else list(profile.get("reference_images") or [])
     # A saved profile keeps positional slots for sources that never materialized
     # (recorded in missing_references) or that have since gone stale on disk. Drop
@@ -2281,23 +2236,6 @@ def video_identity_profile_mesh_status(slug, recon_id):
 #     Always chains the turntable (the "full identity" always renders mesh -> 360°).
 #     Returns {job_id, recon_id} 200; 404 for an unknown profile.
 # --------------------------------------------------------------------------- #
-_POSE_CHOICES = ("none", "t-pose")
-
-
-def _pose_stage_capable(slug: str) -> bool:
-    """Whether the T-pose pose-normalization RENDER STAGE is available on this deployment.
-
-    Slice 5 (IDENTITY-VERSIONS-SLICE.md) builds that stage — an id_lock T-pose still
-    rendered on the VACE path (needs ~6GB free on the 3090, lands with evict-to-make-room)
-    then rembg'd and used as the mesh front. Until it ships this is False, so a
-    ``pose: "t-pose"`` request degrades honestly (the /generate route falls back to the
-    normal front AND returns a structured not-capable notice — never a silent
-    crossed-arm mesh). Kept a FUNCTION (not a constant) so slice 5 wires the real
-    render-service capability probe here in ONE place, and so a test can exercise the
-    capable branch by monkeypatching it."""
-    return False
-
-
 @video_bp.route("/video/identity-profiles/<slug>/generate", methods=["POST"])
 def video_identity_profile_generate(slug):
     profile = identity_profiles.get_profile(slug)
@@ -2311,36 +2249,6 @@ def video_identity_profile_generate(slug):
     if verr is not None:
         payload, status = verr
         return jsonify(payload), status
-
-    # POSE NORMALIZATION (IDENTITY-VERSIONS-SLICE.md slice 3): optional pose, validated
-    # none|t-pose. The t-pose RENDER STAGE (render an id_lock T-pose still and mesh THAT to
-    # clear crossed-arm occlusion) is slice 5 — gated here behind a capability check.
-    #   * pose="none" (or absent) -> today's behavior EXACTLY (no extra response fields).
-    #   * pose="t-pose" + capable  -> the spec carries pose so the relay renders the T-pose
-    #                                 front; response notes it applied.
-    #   * pose="t-pose" + NOT capable (today) -> the build STILL proceeds off the normal
-    #     front (honest fallback), and the response carries a structured not-capable notice
-    #     so the caller knows the normalization was not applied. A malformed pose is a 400.
-    pose_req = body.get("pose", "none")
-    if pose_req is None:
-        pose_req = "none"
-    if not isinstance(pose_req, str) or pose_req not in _POSE_CHOICES:
-        return jsonify({"error": f"pose must be one of {list(_POSE_CHOICES)}"}), 400
-    effective_pose = "none"
-    pose_notice = None
-    if pose_req == "t-pose":
-        if _pose_stage_capable(slug):
-            effective_pose = "t-pose"
-            pose_notice = {"requested": "t-pose", "applied": True, "capable": True}
-        else:
-            pose_notice = {
-                "requested": "t-pose",
-                "applied": False,
-                "capable": False,
-                "code": "pose_stage_unavailable",
-                "message": ("the T-pose normalization render stage is not yet available "
-                            "on this deployment; generated from the source pose instead"),
-            }
 
     # A fresh, self-describing reconstruction id — the whole chain (mesh + turntable +
     # canonical) hangs off it; no prior reconstruction is needed.
@@ -2377,7 +2285,6 @@ def video_identity_profile_generate(slug):
             elevation_deg=elev,
             transparent=bool(tt.get("transparent", False)),
             view_candidates=view_candidates,
-            pose=effective_pose,
         )
     except (ValueError, TypeError) as exc:  # bad fields = 400
         return jsonify({"error": str(exc)}), 400
@@ -2391,118 +2298,4 @@ def video_identity_profile_generate(slug):
         pass
 
     job_id = media_bus.enqueue("identity_mesh_build", spec)
-    resp = {"job_id": job_id, "recon_id": recon_id}
-    # Only surface a ``pose`` block when t-pose was explicitly requested — a bare click
-    # (pose="none") keeps the exact {job_id, recon_id} shape it has today.
-    if pose_notice is not None:
-        resp["pose"] = pose_notice
-    return jsonify(resp), 200
-
-
-# --------------------------------------------------------------------------- #
-# 5j) PATCH /video/identity-profiles/<slug>/settings — VERSIONS slice: persist the
-#     per-identity generation defaults the left-column Settings tab edits and a
-#     bare /generate click honors. Body IS the partial gen_settings object itself
-#     (NOT nested under a "gen_settings" key — matches identityProfileSettingsUrl's
-#     client, which PATCHes `fields` directly). A true partial merge — an omitted
-#     key is left untouched (identity_profiles.set_gen_settings's contract); the
-#     store rejects an unknown key, a wrong-typed value, an out-of-enum pose, or a
-#     front_ref outside the profile's own reference images, all as a clean 400
-#     (ProfileError, never a 500). Unknown slug -> 404, same message/shape as the
-#     other identity-profile routes.
-# --------------------------------------------------------------------------- #
-@video_bp.route("/video/identity-profiles/<slug>/settings", methods=["PATCH"])
-def video_identity_profile_settings(slug):
-    if identity_profiles.get_profile(slug) is None:
-        return jsonify({"error": "identity profile not found"}), 404
-
-    body = request.get_json(silent=True) or {}
-    try:
-        profile = identity_profiles.set_gen_settings(slug, body)
-    except identity_profiles.ProfileError as exc:  # unknown key / bad type = clean 400
-        return jsonify({"error": str(exc), "code": exc.code}), 400
-    if profile is None:  # lost a race with a concurrent archive
-        return jsonify({"error": "identity profile not found"}), 404
-    return jsonify({"profile": profile}), 200
-
-
-# --------------------------------------------------------------------------- #
-# 5k) POST /video/identity-profiles/<slug>/versions/<version_id>/activate —
-#     VERSIONS slice: point the identity's ACTIVE version at <version_id> (the
-#     id_lock DNA source future generations resolve to by default, via
-#     _reference_images_from_body). No body. 404 when the slug is unknown OR
-#     version_id names no active (non-archived) version of it —
-#     set_active_version returns None for either case; the slug is checked first
-#     so an unknown slug gets the same message every other identity-profile route
-#     gives it, and an unknown/archived version_id is called out by name.
-# --------------------------------------------------------------------------- #
-@video_bp.route("/video/identity-profiles/<slug>/versions/<version_id>/activate", methods=["POST"])
-def video_identity_profile_activate_version(slug, version_id):
-    if identity_profiles.get_profile(slug) is None:
-        return jsonify({"error": "identity profile not found"}), 404
-
-    profile = identity_profiles.set_active_version(slug, version_id)
-    if profile is None:
-        return jsonify({"error": f"version {version_id!r} not found"}), 404
-    return jsonify({"profile": profile}), 200
-
-
-# --------------------------------------------------------------------------- #
-# 5l) PATCH /video/identity-profiles/<slug>/versions/<version_id> — VERSIONS
-#     slice: rename/annotate one version. Body {name?, notes?}, both optional (a
-#     true partial update — an omitted key is left untouched, mirrors the
-#     PATCH /<slug> profile-edit route's **kwargs idiom above). A blank name is a
-#     clean 400 (checked here exactly like the profile-edit route, before ever
-#     calling the store — update_version also guards it, belt-and-suspenders).
-#     404 when the slug or version_id is unknown/archived.
-# --------------------------------------------------------------------------- #
-@video_bp.route("/video/identity-profiles/<slug>/versions/<version_id>", methods=["PATCH"])
-def video_identity_profile_update_version(slug, version_id):
-    if identity_profiles.get_profile(slug) is None:
-        return jsonify({"error": "identity profile not found"}), 404
-
-    body = request.get_json(silent=True) or {}
-    kwargs: dict = {}
-
-    if "name" in body:
-        name = body.get("name")
-        if not isinstance(name, str) or not name.strip():
-            return jsonify({"error": "name is required"}), 400
-        kwargs["name"] = name
-
-    if "notes" in body:
-        notes = body.get("notes")
-        if notes is not None and not isinstance(notes, str):
-            return jsonify({"error": "notes must be a string"}), 400
-        kwargs["notes"] = notes or ""
-
-    try:
-        profile = identity_profiles.update_version(slug, version_id, **kwargs)
-    except identity_profiles.ProfileError as exc:  # errors-as-data, never a 500
-        return jsonify({"error": str(exc), "code": exc.code}), 400
-    if profile is None:
-        return jsonify({"error": f"version {version_id!r} not found"}), 404
-    return jsonify({"profile": profile}), 200
-
-
-# --------------------------------------------------------------------------- #
-# 5m) DELETE /video/identity-profiles/<slug>/versions/<version_id> — VERSIONS
-#     slice: ARCHIVE a version (never-delete: flagged, bytes kept, dropped from
-#     the wire list). The store REFUSES the clay base (the geometric ground
-#     truth) and the currently ACTIVE version — either surfaces here as the
-#     store's own ProfileError message/code turned into a clean 400 (the check
-#     lives in identity_profiles.archive_version; this route does not duplicate
-#     it). 404 when the slug or version_id is unknown/already archived.
-# --------------------------------------------------------------------------- #
-@video_bp.route("/video/identity-profiles/<slug>/versions/<version_id>", methods=["DELETE"])
-def video_identity_profile_archive_version(slug, version_id):
-    if identity_profiles.get_profile(slug) is None:
-        return jsonify({"error": "identity profile not found"}), 404
-
-    try:
-        profile = identity_profiles.archive_version(slug, version_id)
-    except identity_profiles.ProfileError as exc:  # base/active refusal = clean 400
-        return jsonify({"error": str(exc), "code": exc.code}), 400
-    if profile is None:
-        return jsonify({"error": f"version {version_id!r} not found"}), 404
-    return jsonify({"profile": profile}), 200
+    return jsonify({"job_id": job_id, "recon_id": recon_id}), 200

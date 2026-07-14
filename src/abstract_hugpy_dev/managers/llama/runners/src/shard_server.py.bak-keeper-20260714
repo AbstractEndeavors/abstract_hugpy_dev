@@ -194,50 +194,7 @@ def ensure_shard_server(
 # lifecycle as the shard lead). Returns None for non-vision models (no projector)
 # or any failure, so callers fall back to the in-process load unchanged.
 # ---------------------------------------------------------------------------
-# HUGPY_VISION_NGL controls how many language-model layers the native vision
-# llama-server offloads. Historically hardcoded "999" (ALL layers) — correct for
-# a big card, but a guaranteed OOM on an 8 GB laptop GPU (a 7B VL quant is
-# ~5-9 GB + a ~1.3 GB projector), so the server never became healthy and the
-# vision model silently fell through to the in-process path that cannot load the
-# projector at all. Default is now "auto": an HONEST partial-offload split from
-# the free VRAM, reserving the projector's own VRAM (see spill.autofit +
-# vision_projector_bytes). An explicit value still wins:
-#   auto / (unset)   -> autofit a partial split (projector-aware)
-#   max / all / 999  -> every layer on the GPU (the old behaviour)
-#   <int>            -> exactly that many layers
-_VISION_NGL_ENV = "HUGPY_VISION_NGL"
-
-
-def _vision_ngl_arg(model_path: str, mmproj_path: "str | None") -> str:
-    """Resolve the ``-ngl`` value for the native vision llama-server.
-
-    Returns a string suitable for llama.cpp's ``-ngl`` ("999" == all). Falls back
-    to "999" (today's behaviour) on any resolution error, so this can never make
-    a load that used to work stop working."""
-    raw = (os.environ.get(_VISION_NGL_ENV) or "").strip().lower()
-    if raw in ("max", "all", "999", "-1"):
-        return "999"
-    if raw and raw != "auto":
-        try:
-            return str(int(raw))
-        except ValueError:
-            pass                                # bad value -> autofit below
-    try:
-        from .....managers.spill import autofit_gpu_layers, vision_projector_bytes
-        reserve = 0
-        if mmproj_path:
-            try:
-                reserve = int(os.path.getsize(mmproj_path))
-            except OSError:
-                reserve = vision_projector_bytes(model_path)
-        else:
-            reserve = vision_projector_bytes(model_path)
-        ngl = autofit_gpu_layers(model_path, extra_reserve_bytes=reserve)
-        return "999" if ngl == -1 else str(max(0, int(ngl)))
-    except Exception as exc:                    # noqa: BLE001 — never break a load
-        logger.warning("vision ngl autofit failed for %s (%s); offloading all",
-                       model_path, exc)
-        return "999"
+_VISION_NGL = os.environ.get("HUGPY_VISION_NGL", "999")   # offload all layers (GPU if present)
 
 
 def ensure_vision_server(model_key: str) -> Optional[str]:
@@ -269,19 +226,15 @@ def ensure_vision_server(model_key: str) -> Optional[str]:
 
         port = _free_port(_PORT_BASE + 200)
         base_url = f"http://127.0.0.1:{port}"
-        ngl = _vision_ngl_arg(os.fspath(model_path), os.fspath(mmproj))
         cmd = [
             binary,
             "-m", os.fspath(model_path),
             "--mmproj", os.fspath(mmproj),
             "--host", "127.0.0.1",
             "--port", str(port),
-            "-ngl", ngl,                    # honest partial split (projector-aware autofit)
+            "-ngl", str(_VISION_NGL),       # all layers onto the GPU if one is present
             "-c", str(DEFAULT_N_CTX),
         ]
-        logger.info("vision server: %s -ngl=%s (projector %s)",
-                    os.path.basename(os.fspath(model_path)), ngl,
-                    os.path.basename(os.fspath(mmproj)))
         logger.info("vision server: %s", " ".join(cmd))
         try:
             from ....._platform.procutil import popen_detached
