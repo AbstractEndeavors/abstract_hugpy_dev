@@ -1200,6 +1200,7 @@ class WorkerStore:
         tier_skipped = 0
         task_skipped = 0
         id_lock_skipped = 0
+        engine_skipped = 0
         out = []
         for w in self.all():
             # Only admitted workers serve. Pending (awaiting operator approval) and
@@ -1210,6 +1211,15 @@ class WorkerStore:
             # it would accept the dispatch and fail, wasting a hop before the
             # local fallback. (Workers not reporting engine status are kept.)
             if _engine_unusable(w):
+                # Say-why parity with the tier/task/id_lock gates below: count a
+                # worker only when it is otherwise ASSIGNED to this model, so an
+                # empty result's log names the real cause (a DESIGNATED worker
+                # whose engine can't serve — the "assigned+pinned but 500s"
+                # mystery) instead of every engine-broken box on the fleet.
+                _serveable = list(w.get("models", [])) + list(w.get("loaded_models", []))
+                if (model_key in _serveable
+                        or wanted & {a for m in _serveable for a in _match_keys(m)}):
+                    engine_skipped += 1
                 continue
             # Dedicated-pool reservation: a request for pool P uses ONLY pool-P
             # workers; a general request (no pool) uses ONLY un-pooled workers.
@@ -1260,6 +1270,19 @@ class WorkerStore:
                 id_lock_skipped += 1
                 continue
             out.append(w)
+        if not out and engine_skipped:
+            # The model HAS designated servers — every one was excluded because it
+            # AFFIRMATIVELY reports its inference engine is unusable (llama-cpp not
+            # loadable AND no native llama-server binary; engine.installed=False).
+            # Name the cause so the operator repairs the box (`hugpy install-engine`
+            # / reinstall llama-cpp-python) instead of seeing only the downstream
+            # "no worker available / local serving disabled" 500 with no reason.
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "model %s: %d assigned worker(s) skipped — inference engine "
+                "unusable (llama-cpp not loadable AND no native llama-server "
+                "binary). Repair the engine on those boxes or assign the model to "
+                "a healthy worker.", model_key, engine_skipped)
         if not out and tier_skipped:
             # The model HAS servers — they were excluded on env tier alone. Say
             # so, or the operator sees only the downstream "no worker / local
@@ -1508,6 +1531,71 @@ def candidates_for_model(model_key: str, pool: Optional[str] = None,
     return worker_store.candidates_for_model(model_key, pool=pool, task=task)
 
 
+def explain_no_worker(model_key: str, pool: Optional[str] = None,
+                      task: Optional[str] = None) -> str:
+    """Human reason no worker took a request for ``model_key`` — the ``detail`` the
+    refused-local error (HUGPY_NO_LOCAL_SERVING) surfaces so a DESIGNATED-but-idle
+    model's failure is actionable instead of an opaque "no worker available".
+
+    Walks the workers ASSIGNED to (or holding) the model and names why each was
+    excluded from selection by a HARD static gate (admission, engine usability,
+    dedicated-pool reservation, env tier, task capability) — the same gates
+    ``workers_for_model`` applies. Returns "" when the model has no assigned worker
+    at all (the caller's generic message already covers "assign it somewhere"),
+    when every assigned worker actually passed the static gates (so the miss was
+    transient — a stale beat or momentary cap, not a designation problem), or on
+    ANY error: this is advisory and must never raise into a request.
+    """
+    try:
+        wanted = _match_keys(model_key)
+        want_pool = (pool or "").strip()
+        need_tier = env_tier_for_model(model_key)
+        reasons: List[str] = []
+        for w in worker_store.all():
+            serveable = list(w.get("models", [])) + list(w.get("loaded_models", []))
+            if not (model_key in serveable
+                    or wanted & {a for m in serveable for a in _match_keys(m)}):
+                continue                          # not designated for this model
+            name = w.get("name") or w.get("id") or "worker"
+            if w.get("admission") != "approved":
+                reasons.append(f"{name}: not approved (admission={w.get('admission')!r})")
+                continue
+            if _engine_unusable(w):
+                eng = w.get("engine") or {}
+                sr = w.get("slot_incapable_reason")
+                err = str(eng.get("error") or "").strip()
+                if w.get("slot_capable") is False and sr:
+                    why = str(sr)
+                elif err:
+                    why = f"llama-cpp not loadable: {err}"
+                else:
+                    why = "inference engine reports installed=False"
+                reasons.append(f"{name}: engine unusable ({why[:400]})")
+                continue
+            if (w.get("pool") or "").strip() != want_pool:
+                reasons.append(f"{name}: reserved for pool {w.get('pool')!r} "
+                               f"(request pool {want_pool!r})")
+                continue
+            if _worker_env_tier(w) != need_tier:
+                reasons.append(f"{name}: env tier {_worker_env_tier(w)!r} != "
+                               f"required {need_tier!r}")
+                continue
+            if not _task_capable(w, task):
+                reasons.append(f"{name}: cannot run task {task!r} "
+                               f"(missing optional dependency)")
+                continue
+            # Passed every HARD static gate — its miss was runtime/transient, not a
+            # designation problem; don't manufacture a reason for it.
+        if not reasons:
+            return ""
+        return (f"{model_key} is assigned but no worker could serve it — "
+                + "; ".join(reasons[:4])
+                + ". Repair the worker (e.g. `hugpy install-engine` / reinstall "
+                  "llama-cpp-python) or assign the model to a healthy worker.")
+    except Exception:  # noqa: BLE001 — advisory only; never raise into a request
+        return ""
+
+
 def fleet_snapshot() -> list:
     """The deterministic allocator's view of the fleet, from the live registry.
 
@@ -1628,6 +1716,18 @@ try:
         import logging as _logging
         _logging.getLogger(__name__).info(
             "candidates provider not registered (older core): %s", _exc2)
+    # No-worker diagnostic (2026-07-15): when selection yields no worker and this
+    # box refuses local serving, the refused-local error names the DESIGNATED-but-
+    # excluded worker(s) + reason (broken engine / no llama-server binary), turning
+    # the opaque "assigned+pinned but 500s" mystery into an actionable message.
+    # Optional in older cores — guarded; unset ⇒ the message is byte-identical.
+    try:
+        from ......managers.resolvers.remote import set_no_worker_diagnostic
+        set_no_worker_diagnostic(explain_no_worker)
+    except Exception as _exc3:  # older core without the seam — message unchanged
+        import logging as _logging
+        _logging.getLogger(__name__).info(
+            "no-worker diagnostic not registered (older core): %s", _exc3)
 except Exception as _exc:  # never let registration break importing the pool
     import logging as _logging
     _logging.getLogger(__name__).warning("worker provider registration failed: %s", _exc)

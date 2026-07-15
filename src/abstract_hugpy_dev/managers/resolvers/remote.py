@@ -99,6 +99,47 @@ def get_worker_provider() -> Optional[Callable]:
     return _worker_provider
 
 
+# ---------------------------------------------------------------------------
+# No-worker diagnostic (web -> core, optional).
+#
+# When selection yields no worker AND this box refuses local serving
+# (HUGPY_NO_LOCAL_SERVING), the refused-local error is otherwise opaque ("no
+# registered worker is available"). That is exactly the mystery a DESIGNATED-but-
+# idle model presents: it is assigned + pinned + on disk, yet the request 500s
+# with no hint that its assigned worker was SKIPPED (e.g. a broken llama-cpp / no
+# native llama-server binary). This seam, given (model_key, pool, task), returns a
+# human-readable reason so the error names the real cause. Unset on the standalone
+# worker / bare central ⇒ detail="" ⇒ the message is byte-identical to before.
+_no_worker_diag: Optional[Callable[..., str]] = None
+
+
+def set_no_worker_diagnostic(diag_fn: Optional[Callable]) -> None:
+    """Register the assigned-but-excluded explainer (web -> core), optional."""
+    global _no_worker_diag
+    _no_worker_diag = diag_fn
+    logger.info("no-worker diagnostic registered: %s",
+                getattr(diag_fn, "__name__", diag_fn))
+
+
+def _no_worker_detail(model_key: str, pool: Optional[str] = None,
+                      task: Optional[str] = None) -> str:
+    """Best-effort human reason no worker took a request — the refused-local
+    error's ``detail``. "" when the seam is unset or on ANY failure, so it can
+    never turn a clean policy refusal into a 500 (advisory only)."""
+    if _no_worker_diag is None:
+        return ""
+    try:
+        # Degrade arg-count like the other seams, for a provider on older code.
+        for _args in ((model_key, pool, task), (model_key, pool), (model_key,)):
+            try:
+                return (_no_worker_diag(*_args) or "").strip()
+            except TypeError:
+                continue
+    except Exception as exc:  # noqa: BLE001 — diagnostics must never break a request
+        logger.warning("no-worker diagnostic failed for %s: %s", model_key, exc)
+    return ""
+
+
 def _pick_worker(model_key: str, pool: Optional[str] = None,
                  task: Optional[str] = None,
                  require_comfy_id_lock: bool = False) -> Optional[dict]:
@@ -932,7 +973,9 @@ def make_delegating_runner(framework: str, task: str):
             # never set the flag. See managers.serve.policy.
             from ..serve.policy import no_local_serving, local_serving_error
             if no_local_serving():
-                raise RuntimeError(local_serving_error(self.model_key))
+                raise RuntimeError(local_serving_error(
+                    self.model_key,
+                    detail=_no_worker_detail(self.model_key, pool, task)))
             result = self._local_runner().run(req=req)
             if inspect.isawaitable(result):
                 result = await result
@@ -1047,7 +1090,9 @@ def make_delegating_runner(framework: str, task: str):
             from ..serve.policy import no_local_serving, local_serving_error
             if no_local_serving():
                 yield ErrorEvent(request_id=req.request_id,
-                                 message=local_serving_error(self.model_key))
+                                 message=local_serving_error(
+                                     self.model_key,
+                                     detail=_no_worker_detail(self.model_key, pool, task)))
                 return
             # Local fallback — reuse dispatch's shared stream-or-wrap primitive
             # (imported lazily to avoid a resolvers<->dispatch import cycle).

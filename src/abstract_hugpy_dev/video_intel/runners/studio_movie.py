@@ -618,7 +618,13 @@ def run_generate_studio_movie(spec: StudioMovieSpec, job_id: str) -> JobResult:
         #   * "still": i2v conditioned on ONE branch frame (start_image). No motion carry.
         #   * "vace_extend": v2v (VACE) conditioned on the parent's TRAILING context frames.
         #   * "cut": a HARD scene cut — no frame carry; a FRESH render, parent plays in FULL.
-        id_refs = tuple(spec.reference_images or ())
+        # PER-GOAL id_lock DNA (IDENTITY-3D-CONTINUITY-PLAN.md S2-movie): prefer THIS
+        # segment's own references (a specific turntable VIEW of the identity the route
+        # resolved from the goal's ``view``) over the movie-level set, so a ``cut`` into a
+        # new scene can hold the SAME person while re-framing the camera per shot. A goal
+        # with no per-goal refs (reference_images None) inherits the movie-level set —
+        # byte-identical to today's every-segment behavior.
+        id_refs = tuple(goal.reference_images or spec.reference_images or ())
         is_id_movie = bool(id_refs)
         resolved_branch = None
         start_image = None

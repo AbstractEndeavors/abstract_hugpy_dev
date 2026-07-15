@@ -319,6 +319,17 @@ class IdentityMeshSpec:
     # and use it as the mesh front (clears crossed-arm occlusion). Honest degrade — a
     # failed pose render never fails the job, it falls back to the normal front.
     pose: str = "none"
+    # additive (per-identity VISION MODEL, operator-requested): the VL model key the
+    # relay's FRONT-SELECT step (runners/identity_render_relay._select_front_view) asks
+    # "does this show the FULL body?" with, before meshing. None (default) == the
+    # fleet-default VL model (the 3B): the relay sends NO ``model`` field on its
+    # /ml/vision POST, byte-identical to before this field existed (zero regression;
+    # defaults-are-promises). A non-null key routes that vision call at THAT model (e.g. a
+    # 7B) — resolved by the route with precedence request-body > the identity's
+    # gen_settings.vision_model > None. Structural-only here (None or a non-empty string);
+    # the LIVE image-text-to-text registry check lives in the store (set_gen_settings) so
+    # the spec factory stays import-cheap on the bus rehydrate path.
+    vision_model: Optional[str] = None
 
 
 # Cardinal views the remote render service accepts (front is required; the others
@@ -355,6 +366,7 @@ def make_identity_mesh(
     output_format: str = "glb",
     view_candidates=(),
     pose: str = "none",
+    vision_model: Optional[str] = None,
 ) -> IdentityMeshSpec:
     """Validate every field and build the frozen ``IdentityMeshSpec`` (house discipline:
     a structurally-invalid spec is caller error caught at the boundary, never carried
@@ -427,6 +439,15 @@ def make_identity_mesh(
     if not (isinstance(pose, str) and pose in POSE_CHOICES):
         raise ValueError(f"pose must be one of {list(POSE_CHOICES)}; got {pose!r}")
 
+    # vision_model: STRUCTURAL only (None or a non-empty string). ""/whitespace is
+    # normalized to None (== the fleet-default VL model), so a blank setting is exactly
+    # today's behavior. The image-text-to-text REGISTRY-membership check is the store's
+    # (set_gen_settings) + route's job — NOT here, so the bus rehydrate path stays cheap.
+    if vision_model is not None:
+        if not isinstance(vision_model, str):
+            raise ValueError(f"vision_model must be None or a string; got {vision_model!r}")
+        vision_model = vision_model.strip() or None
+
     return IdentityMeshSpec(
         slug=slug,
         recon_id=recon_id,
@@ -449,6 +470,7 @@ def make_identity_mesh(
         auto_promote=bool(auto_promote),
         view_candidates=tuple(norm_candidates),
         pose=pose,
+        vision_model=vision_model,
     )
 
 
@@ -484,6 +506,9 @@ def identity_mesh_from_dict(d: dict) -> IdentityMeshSpec:
         # additive (VERSIONS slice): round-trip pose; an OLD spec (pre-pose) has no key
         # -> defaults to "none" (today's behavior), so deserialization stays backward-compat.
         pose=d.get("pose", "none"),
+        # additive (per-identity VISION MODEL): round-trip vision_model; an OLD spec has no
+        # key -> None (== the fleet-default VL model), so deserialization stays backward-compat.
+        vision_model=d.get("vision_model"),
     )
 
 

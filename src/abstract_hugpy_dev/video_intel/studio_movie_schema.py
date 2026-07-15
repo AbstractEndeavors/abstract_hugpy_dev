@@ -51,7 +51,7 @@ No pathlib anywhere. os.path only (there is none here — pure data).
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional, Tuple
 
 from .media_schema import MediaRef, make_media_ref
@@ -141,6 +141,21 @@ class StudioMovieGoal:
                            frames condition a ``vace_extend`` splice; None ⇒ the
                            movie-level ``context_frames``. Only consulted when
                            ``joint_mode == "vace_extend"``.
+        reference_images   PER-GOAL id_lock DNA override (IDENTITY-3D-CONTINUITY-PLAN.md
+                           S2-movie): the ORDERED tuple of subject reference paths/uris
+                           THIS segment conditions on, when it should differ from the
+                           movie-level set. None ⇒ INHERIT the movie-level
+                           ``reference_images`` (byte-identical to today's every-segment
+                           behavior). The point is CONTINUITY ACROSS A CUT: an identity
+                           movie can hold the SAME person while pointing each shot at a
+                           different turntable VIEW of them (segment 1 front, segment 2
+                           back), so a ``cut`` into a new scene ("beach" -> "volleyball")
+                           keeps the character but re-frames the camera. The route resolves
+                           a goal's ``view`` to the K angle-nearest ring frames and sets
+                           this; the runner just prefers it over the movie-level set. Same
+                           shape/bounds as the movie-level field (tuple of non-empty
+                           path/uri strings, at most ``_MAX_REFERENCE_IMAGES``); jail /
+                           existence / image-classification is the ROUTE's job.
     """
     segment_id: str
     prompt: str
@@ -153,6 +168,7 @@ class StudioMovieGoal:
     cfg: Optional[float] = None
     joint_mode: str = _DEFAULT_JOINT_MODE
     context_frames: Optional[int] = None
+    reference_images: Optional[Tuple[str, ...]] = None
 
 
 @dataclass(frozen=True)
@@ -289,6 +305,10 @@ def make_studio_movie(
         [1, 32] (a splice needs >=1 context frame; the cap keeps room to generate).
       * REFERENCE IMAGES: movie-level ``reference_images`` is None/() or a tuple of
         non-empty path strings, at most ``_MAX_REFERENCE_IMAGES`` (an identity movie).
+        Each node's OPTIONAL ``reference_images`` (the per-goal id_lock override) is
+        validated the SAME way — None (inherit) or a list/tuple of non-empty path/uri
+        strings, at most ``_MAX_REFERENCE_IMAGES`` — and coerced to a tuple (so an
+        asdict->json->from_dict round-trip lands a tuple, mirroring the movie-level field).
 
     Also the reconstruction path used by the bus deserializer — goals are rebuilt
     into ``StudioMovieGoal`` (and ``start_image`` through ``make_media_ref``) before
@@ -358,6 +378,7 @@ def make_studio_movie(
     # ---- per-node validation + linear-chain enforcement (v0) ----
     seen_ids: set = set()
     prev_id: Optional[str] = None
+    norm_goals: list = []   # goals with per-node reference_images coerced to tuple
     for gi, g in enumerate(goals):
         if not isinstance(g, StudioMovieGoal):
             raise ValueError(f"goals[{gi}] must be a StudioMovieGoal; got {type(g).__name__}")
@@ -406,6 +427,31 @@ def make_studio_movie(
                     f"be None (a scene cut extends no context); "
                     f"got context_frames={g.context_frames!r}")
 
+        # PER-GOAL REFERENCE IMAGES (S2-movie id_lock override): None -> inherit the
+        # movie-level set (unchanged behavior). Otherwise SAME shape/bounds as the
+        # movie-level field — a list/tuple of non-empty path/uri strings, at most
+        # _MAX_REFERENCE_IMAGES — coerced to a tuple so a round-trip lands a tuple. A bad
+        # value is caller error caught here (a wrong type, an empty path, too many refs).
+        node_refs = g.reference_images
+        if node_refs is not None:
+            if not isinstance(node_refs, (list, tuple)):
+                raise ValueError(
+                    f"goals[{gi}].reference_images must be a list/tuple of paths or None; "
+                    f"got {node_refs!r}")
+            node_refs = tuple(node_refs)
+            for ri, r in enumerate(node_refs):
+                if not (isinstance(r, str) and r.strip()):
+                    raise ValueError(
+                        f"goals[{gi}].reference_images[{ri}] must be a non-empty string; "
+                        f"got {r!r}")
+            if len(node_refs) > _MAX_REFERENCE_IMAGES:
+                raise ValueError(
+                    f"goals[{gi}]: at most {_MAX_REFERENCE_IMAGES} reference_images are "
+                    f"accepted; got {len(node_refs)}")
+            if node_refs != g.reference_images:   # coerced a list -> tuple: rebuild the node
+                g = replace(g, reference_images=node_refs)
+        norm_goals.append(g)
+
         # LINEAR CHAIN (v0): the root has no parent; every later node's parent is the
         # node right before it. The one rule a real take-tree relaxes.
         if gi == 0:
@@ -426,7 +472,7 @@ def make_studio_movie(
         prev_id = g.segment_id
 
     return StudioMovieSpec(
-        goals=goals,
+        goals=tuple(norm_goals),
         width=width,
         height=height,
         fps=fps,
@@ -461,6 +507,9 @@ def _goal_from_dict(d: dict) -> StudioMovieGoal:
         cfg=d.get("cfg"),
         joint_mode=d.get("joint_mode", _DEFAULT_JOINT_MODE),
         context_frames=d.get("context_frames"),
+        # PER-GOAL id_lock override (S2-movie): None -> inherit the movie-level set.
+        # make_studio_movie coerces a JSON list back to a tuple + re-validates it.
+        reference_images=d.get("reference_images"),
     )
 
 

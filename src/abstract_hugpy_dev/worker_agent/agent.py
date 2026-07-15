@@ -3039,12 +3039,19 @@ def _worker_fit_check(model_key: str) -> bool:
 
 def _worker_evictable(model_key: str) -> bool:
     """Contention yield predicate (dispatch.set_evictable). A model may yield its
-    in-process residency ONLY if it is on-demand, not pinned, has NO in-flight
-    generation (gate permits), and isn't slot-backed (a slot child's weights live
-    in another process — dropping the proxy frees nothing here and breaks the
-    seat). static/pinned NEVER yield; a model mid-generation is skipped (the next
-    LRU is chosen) and becomes evictable only once its gate permits release."""
-    if _residency(model_key) == "static" or _pinned(model_key):
+    in-process residency ONLY if it is not static, has NO in-flight generation
+    (gate permits), and isn't slot-backed (a slot child's weights live in another
+    process — dropping the proxy frees nothing here and breaks the seat).
+
+    Tier semantics (operator, 2026-07-15): 📌 pin = the worker is DESIGNATED that
+    model (durable assignment across restarts), NOT a resource lock — so a pinned
+    model DOES yield to contention (its weights free for a new load; the pin is
+    untouched and it reloads on demand). 🔒 static is the only residency lock
+    ("static means cannot evict") and never yields. A model mid-generation is
+    skipped (the next LRU is chosen) and becomes evictable once its gate permits.
+    (Pre-2026-07-15 pinned also never yielded — that conflated designation with a
+    resource lock, so pin-bloat could deadlock the make-room evictor.)"""
+    if _residency(model_key) == "static":
         return False
     try:
         if gen_gate.in_flight(model_key) > 0:
@@ -3071,15 +3078,22 @@ def _worker_evictable(model_key: str) -> bool:
 def _evict_gate(model_key: str) -> "tuple[bool, str]":
     """Eviction permission for the destructive evict verb: (allowed, reason).
 
-    Same primitives as _worker_evictable (static/pinned/in-flight) but WITHOUT
-    the slot-backed exclusion — evicting a slot child is the whole point of this
-    verb, so slot-backing must NOT block it. ``force`` (checked by the caller)
-    overrides every clause here. A model mid-generation is protected unless
-    forced: we never rip weights out from under a running request."""
+    Tier semantics RE-CLARIFIED by the operator 2026-07-15: 📌 pin means ONLY
+    that this worker is DESIGNATED to serve the model (a durable assignment that
+    survives hard restarts) — it is NOT a resource lock and MUST NOT block
+    eviction. 🔒 static is the ONLY residency lock ("static means cannot evict").
+    So a pinned-but-on-demand model evicts freely: its weights are freed and it
+    reloads on the next call, while the pin (designation) is untouched. This is
+    why a fully-pinned worker is harmless — designation, not a VRAM hoard.
+
+    Only static (and an in-flight generation) protects here. Slot-backing is NOT
+    a blocker — evicting a slot child is the whole point of this verb. ``force``
+    (checked by the caller) overrides every clause. A model mid-generation is
+    protected unless forced: we never rip weights out from under a running
+    request. (Pre-2026-07-15 this also refused pinned models — that conflated
+    designation with a resource lock and jammed eviction under pin-bloat.)"""
     if _residency(model_key) == "static":
         return False, "static (locked residency) — pass force to override"
-    if _pinned(model_key):
-        return False, "pinned (permanent attribution) — pass force to override"
     try:
         if gen_gate.in_flight(model_key) > 0:
             return False, "in-flight generation — pass force to override"

@@ -115,13 +115,21 @@ def _reply_says_yes(text) -> bool:
     return first_word.lower() == "yes"
 
 
-def _select_front_view(candidates, slug: str, requests_mod):
+def _select_front_view(candidates, slug: str, requests_mod, model=None):
     """Ask hugpy's own fleet vision amenity (``POST /ml/vision``), IN ORDER (capped at
     ``_VISION_MAX_CANDIDATES``), which candidate reference image shows the character's
     FULL BODY. Returns ``(chosen_path_or_None, checked_count)`` — the first candidate
     with a clear "yes" wins. EVERY failure (unreadable file, unreachable amenity, a
     non-200, a non-JSON/not-ok reply, an ambiguous answer) is a soft skip logged at
-    info: this never raises, so a flaky vision call can never fail the mesh job."""
+    info: this never raises, so a flaky vision call can never fail the mesh job.
+
+    ``model`` is the per-identity VISION MODEL (``IdentityMeshSpec.vision_model``, resolved
+    by the route from the identity's gen_settings). When set (a non-empty key), it is
+    passed as ``"model"`` in the /ml/vision body so THIS front-select runs on that VL model
+    (e.g. a 7B). When None/empty, NO ``model`` field is sent — byte-identical to before this
+    setting existed, so /ml/vision falls back to ``DEFAULT_VISION_MODEL`` (the 3B). A bad or
+    slow chosen model still cannot fail the job: the soft-skip fallthrough already keeps the
+    route's default front on any miss."""
     base = (os.getenv("HUGPY_CENTRAL_URL", "") or "http://127.0.0.1:7002").strip().rstrip("/")
     url = f"{base}/ml/vision"
     checked = 0
@@ -134,9 +142,13 @@ def _select_front_view(candidates, slug: str, requests_mod):
             logger.info("identity mesh front-select: candidate unreadable (%s)", path)
             continue
         b64 = base64.b64encode(raw).decode("ascii")
+        # Only include ``model`` when the identity named one — an absent field is what
+        # keeps the default-VL (3B) path byte-identical to today (defaults-are-promises).
+        body = {"image_b64": b64, "prompt": _VISION_PROMPT}
+        if model:
+            body["model"] = model
         try:
-            resp = requests_mod.post(url, json={"image_b64": b64, "prompt": _VISION_PROMPT},
-                                     timeout=_VISION_TIMEOUT_S)
+            resp = requests_mod.post(url, json=body, timeout=_VISION_TIMEOUT_S)
         except requests_mod.RequestException as exc:
             logger.info("identity mesh front-select: /ml/vision unreachable for %s (%s)",
                         path, exc)
@@ -250,7 +262,10 @@ def run_identity_mesh_build(spec, job_id: str) -> JobResult:
         front_selection["mode"] = "disabled"
         logger.info("identity mesh front-select: IDENTITY_FRONT_AUTOSELECT disabled for %s", slug)
     else:
-        chosen, checked = _select_front_view(candidates, slug, requests)
+        # spec.vision_model (None when the identity uses the fleet default) selects which
+        # VL model the front-select vision calls run on — see _select_front_view.
+        chosen, checked = _select_front_view(
+            candidates, slug, requests, getattr(spec, "vision_model", None))
         front_selection["mode"] = "vlm"
         front_selection["checked"] = checked
         if chosen is not None:

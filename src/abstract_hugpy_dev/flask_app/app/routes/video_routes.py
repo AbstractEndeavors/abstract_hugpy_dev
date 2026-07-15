@@ -45,7 +45,7 @@ from abstract_hugpy_dev.imports.src.constants.constants import (
     UPLOADS_HOME,
     DEFAULT_ROOT,
 )
-from abstract_hugpy_dev.video_intel import media_store, media_bus, identity_profiles
+from abstract_hugpy_dev.video_intel import media_store, media_bus, identity_profiles, shot_intent
 from abstract_hugpy_dev.video_intel.media_schema import make_media_ref
 from abstract_hugpy_dev.video_intel.crop_schema import (
     SpatialRegion,
@@ -162,6 +162,35 @@ def _autofit_vram_budget(raw):
     if isinstance(raw, str) and not raw.strip():
         return None
     return raw
+
+
+def _ingest_image_references(raws):
+    """Jail-resolve + ``media_store.ingest(kind_hint="image")``-classify a list of raw
+    reference-image paths into media-store URIs — the ONE code path a studio spec's id_lock
+    references (movie-level OR the S2-movie per-goal view refs) must pass through, because
+    the renderer consumes media_store URIs, not raw paths. Errors-as-data: returns
+    ``(uris, None)`` on success, or ``(None, (payload, status))`` on the FIRST bad path (a
+    non-string, a jail escape -> 400, a missing file -> 404, an unreadable/non-image file ->
+    400) so the caller returns the 4xx verbatim. Factored out of the movie-level reference
+    loop so the per-goal bank frames get IDENTICAL jail + classify treatment (no duplication,
+    no drift)."""
+    uris = []
+    for raw in raws:
+        if not isinstance(raw, str) or not raw.strip():
+            return None, ({"error": "each reference_image must be a non-empty path"}, 400)
+        rp = _jail_resolve(raw)
+        if rp is None:
+            return None, ({"error": "reference_image outside storage jail"}, 400)
+        if not os.path.isfile(rp):
+            return None, ({"error": "reference_image not found"}, 404)
+        try:
+            iref = media_store.ingest(rp, kind_hint="image")
+        except Exception as exc:  # unreadable / not a real image = bad input
+            return None, ({"error": f"reference_image is not a readable media file: {exc}"}, 400)
+        if iref.kind != "image":
+            return None, ({"error": f"reference_image is not an image (classified as {iref.kind})"}, 400)
+        uris.append(iref.uri)
+    return uris, None
 
 
 # --------------------------------------------------------------------------- #
@@ -731,23 +760,71 @@ def video_studio_movie():
             return jsonify({"error": "reference_images must be a list of paths"}), 400
         if len(reference_images_in) > 4:
             return jsonify({"error": "at most 4 reference_images are accepted"}), 400
-        for raw in reference_images_in:
-            if not isinstance(raw, str) or not raw.strip():
-                return jsonify({"error": "each reference_image must be a non-empty path"}), 400
-            rp = _jail_resolve(raw)
-            if rp is None:
-                return jsonify({"error": "reference_image outside storage jail"}), 400
-            if not os.path.isfile(rp):
-                return jsonify({"error": "reference_image not found"}), 404
-            try:
-                iref = media_store.ingest(rp, kind_hint="image")
-            except Exception as exc:  # unreadable / not a real image = bad input
-                return jsonify(
-                    {"error": f"reference_image is not a readable media file: {exc}"}), 400
-            if iref.kind != "image":
-                return jsonify(
-                    {"error": f"reference_image is not an image (classified as {iref.kind})"}), 400
-            resolved_refs.append(iref.uri)
+        # jail-resolve + image-classify -> media_store URIs (the ONE ingest path; see
+        # _ingest_image_references). A bad path is a clean 4xx here, not a runner failure.
+        resolved_refs, _ref_err = _ingest_image_references(reference_images_in)
+        if _ref_err is not None:
+            _pl, _st = _ref_err
+            return jsonify(_pl), _st
+
+    # PER-GOAL VIEW (IDENTITY-3D-CONTINUITY-PLAN.md S2-movie + S3): let EACH segment of an
+    # identity movie condition on a DIFFERENT turntable VIEW of the SAME identity, so a
+    # ``cut`` into a new scene ("beach" -> "volleyball") holds the character while turning
+    # the camera per shot. The MOVIE-LEVEL DNA (``resolved_refs``) stays canonical (resolved
+    # above, unchanged) — this only OVERRIDES a goal's own reference set when a view resolves
+    # to ring frames; a goal with no view is left untouched (its schema ``reference_images``
+    # stays None -> the runner inherits the movie-level set, byte-identical to today).
+    #
+    # Per goal the view is chosen by precedence:
+    #   1. explicit ``view`` on the goal (semantic name or {azimuth_deg})  -> "explicit" ;
+    #   2. else DERIVED from the goal's prompt text (S3 keyword pass)       -> "derived"  ;
+    #   3. else no view                                                     -> "none" (inherit).
+    # DEGRADE-TO-INHERIT (defaults-are-promises): only an INVALID *explicit* view is a clean
+    # 400 (naming the segment). A valid view on an identity with NO turntable ring, or on a
+    # NON-identity movie (no slug / no movie-level refs), simply inherits — never an error.
+    # The per-goal bank paths go through the SAME _ingest_image_references media_store path
+    # the movie-level refs use (the renderer consumes URIs, not raw paths).
+    slug = body.get("identity_profile")
+    is_identity_movie = bool(resolved_refs) and isinstance(slug, str) and bool(slug.strip())
+    if is_identity_movie:
+        profile = identity_profiles.get_profile(slug.strip())  # re-fetch; validated above
+        # bank_views resolves the version itself (id-or-name, else active), so mirror the
+        # movie-level precedence by handing it the body's identity_version straight through
+        # (already validated by _reference_images_from_body). Compute the ring ONCE.
+        bank = identity_profiles.bank_views(
+            profile, version_id=body.get("identity_version")) if profile else []
+        for gi, (g_in, goal) in enumerate(zip(goals_in, goals)):
+            view_hint = g_in.get("view")
+            view_source = "none"
+            azimuth_deg = None
+            if view_hint is not None:
+                azimuth_deg, view_err = identity_profiles.azimuth_for_view(view_hint)
+                if view_err is not None:
+                    return jsonify(
+                        {"error": f"goal {goal.segment_id!r}: {view_err}"}), 400
+                view_source = "explicit"
+            else:
+                derived = shot_intent.derive_view_from_prompt(goal.prompt)
+                if derived is not None:
+                    azimuth_deg, _ = identity_profiles.azimuth_for_view(derived)
+                    view_source = "derived"
+            if azimuth_deg is None:
+                logger.info("movie per-goal view: segment=%s view_source=none", goal.segment_id)
+                continue
+            if not bank:
+                # identity has no turntable ring -> inherit the movie-level DNA (never an error)
+                logger.info("movie per-goal view: segment=%s view_source=%s no-ring -> inherit",
+                            goal.segment_id, view_source)
+                continue
+            picked = identity_profiles.nearest_bank_views(
+                bank, azimuth_deg, identity_profiles.MAX_CANONICAL_IMAGES)
+            goal_uris, _g_err = _ingest_image_references([b["path"] for b in picked])
+            if _g_err is not None:
+                _pl, _st = _g_err
+                return jsonify(_pl), _st
+            goals[gi] = dataclasses.replace(goal, reference_images=tuple(goal_uris))
+            logger.info("movie per-goal view: segment=%s view_source=%s azimuth=%.1f n_refs=%d",
+                        goal.segment_id, view_source, azimuth_deg, len(goal_uris))
 
     try:
         spec = make_studio_movie(
@@ -1715,7 +1792,36 @@ def _reference_images_from_body(body):
     )
     profile_canonical = [p for p in (profile.get("canonical") or []) if isinstance(p, str)]
     canonical = version_canonical or profile_canonical
-    chosen = canonical if canonical else list(profile.get("reference_images") or [])
+    canonical_default = canonical if canonical else list(profile.get("reference_images") or [])
+
+    # VIEW-AWARE DNA (IDENTITY-3D-CONTINUITY-PLAN.md S2): an optional ``identity_view`` hint
+    # — a semantic name ("back", "left-profile", …) OR an ``{azimuth_deg, elevation_deg?}``
+    # object — selects the K angle-nearest frames from the identity's turntable RING instead
+    # of the flat cardinals, so a "from behind" shot conditions on back-view frames. The bank
+    # is a pure computed read over the chosen version's turntable reconstruction (the ring the
+    # identity already rendered — no new state). Precedence + graceful degrade:
+    #   * NO hint                       -> canonical_default (byte-identical to before) ;
+    #   * hint + a turntable bank exists -> the K angle-nearest bank frames (angle-spread) ;
+    #   * hint but NO bank (versionless / clay-only / legacy profile) -> canonical_default.
+    # So a hintless call is zero-regression and a hinted call on an identity without a ring
+    # still yields the working canonical set (defaults-are-promises). K matches the canonical
+    # cap (``MAX_CANONICAL_IMAGES``, i.e. up to 4). An invalid hint is a clean 400.
+    view_hint = body.get("identity_view")
+    view_source = "canonical-default"
+    chosen = canonical_default
+    if view_hint is not None:
+        azimuth_deg, view_err = identity_profiles.azimuth_for_view(view_hint)
+        if view_err is not None:
+            return None, ({"error": view_err}, 400)
+        chosen_version_id = chosen_version.get("version_id") if chosen_version else None
+        bank = identity_profiles.bank_views(profile, version_id=chosen_version_id)
+        if bank:
+            picked = identity_profiles.nearest_bank_views(
+                bank, azimuth_deg, identity_profiles.MAX_CANONICAL_IMAGES)
+            chosen = [b["path"] for b in picked]
+            view_source = "explicit-view"
+        # else: no turntable ring for this version -> fall through on canonical_default.
+
     # A saved profile keeps positional slots for sources that never materialized
     # (recorded in missing_references) or that have since gone stale on disk. Drop
     # any reference that no longer exists so ONE bad path can't 404 the whole
@@ -1723,6 +1829,11 @@ def _reference_images_from_body(body):
     # (operator 2026-07-12). If this empties the set, the caller's non-empty
     # validation returns a clean 400 rather than a per-path "not found".
     chosen = [r for r in chosen if isinstance(r, str) and os.path.isfile(r)]
+    # Record which DNA path served the resolve so a live enqueue is auditable (the return
+    # SHAPE is unchanged; this is observability only). ``view_source`` is the S2 honesty
+    # flag: explicit-view == the turntable ring served it; canonical-default == today's set.
+    logger.info("identity DNA resolved: slug=%s view_source=%s n_refs=%d",
+                slug.strip(), view_source, len(chosen))
     return list(chosen), None
 
 
@@ -1761,6 +1872,15 @@ def video_identity_profile_get(slug):
     profile = identity_profiles.get_profile(slug)
     if profile is None:
         return jsonify({"error": "identity profile not found"}), 404
+    # ANGLE BANK summary (IDENTITY-3D-CONTINUITY-PLAN.md S1): surface, per version, WHAT
+    # angles the identity actually carries (count + degrees_per_frame + azimuth range) so
+    # the operator/UI can see the ring a view hint can select from. Purely ADDITIVE — a
+    # new ``views`` key on each version object, computed read-only from the turntable
+    # reconstruction; no existing key is removed or renamed. Scoped to this single-profile
+    # GET (not the list) so the cheap list endpoint stays untaxed.
+    for v in profile.get("versions") or []:
+        if isinstance(v, dict):
+            v["views"] = identity_profiles.views_summary(profile, version_id=v.get("version_id"))
     return jsonify({"profile": profile}), 200
 
 
@@ -2206,6 +2326,16 @@ def video_identity_profile_build_mesh(slug, recon_id):
     if not isinstance(elev, (int, float)) or isinstance(elev, bool):
         elev = 8.0
 
+    # PER-IDENTITY VISION MODEL — same precedence as the one-click /generate route
+    # (request-body ``vision_model`` > the identity's persisted gen_settings.vision_model
+    # > None == fleet default). A surgical per-reconstruction mesh build runs the SAME
+    # front-select step, so it honors the identity's chosen VL model too. Blank/None here
+    # keeps today's behavior exactly (no ``model`` sent -> the 3B).
+    _gen_settings = profile.get("gen_settings") or {}
+    vision_model = body.get("vision_model")
+    if vision_model in (None, ""):
+        vision_model = _gen_settings.get("vision_model")
+
     try:
         spec = make_identity_mesh(
             slug=slug,
@@ -2223,6 +2353,7 @@ def video_identity_profile_build_mesh(slug, recon_id):
             elevation_deg=elev,
             transparent=bool(tt.get("transparent", False)),
             view_candidates=view_candidates,
+            vision_model=vision_model,
         )
     except (ValueError, TypeError) as exc:  # bad fields = 400
         return jsonify({"error": str(exc)}), 400
@@ -2357,6 +2488,20 @@ def video_identity_profile_generate(slug):
     if not isinstance(elev, (int, float)) or isinstance(elev, bool):
         elev = 8.0
 
+    # PER-IDENTITY VISION MODEL (operator-requested): the VL model the mesh relay's
+    # FRONT-SELECT step uses to pick the full-body reference before meshing. Precedence:
+    # an EXPLICIT request-body ``vision_model`` wins; else the identity's PERSISTED
+    # ``gen_settings.vision_model`` (what the Settings tab saves); else None (== the
+    # fleet-default VL model — the relay sends no ``model`` field, byte-identical to before
+    # this setting existed). ``profile`` is already the PUBLIC shape here, so its
+    # ``gen_settings`` is the full defaulted block; ``make_identity_mesh`` normalizes
+    # ""/whitespace to None. This is why a BARE one-click still honors the identity's saved
+    # choice even when the UI omits the field from the body.
+    _gen_settings = profile.get("gen_settings") or {}
+    vision_model = body.get("vision_model")
+    if vision_model in (None, ""):
+        vision_model = _gen_settings.get("vision_model")
+
     try:
         spec = make_identity_mesh(
             slug=slug,
@@ -2378,6 +2523,7 @@ def video_identity_profile_generate(slug):
             transparent=bool(tt.get("transparent", False)),
             view_candidates=view_candidates,
             pose=effective_pose,
+            vision_model=vision_model,
         )
     except (ValueError, TypeError) as exc:  # bad fields = 400
         return jsonify({"error": str(exc)}), 400

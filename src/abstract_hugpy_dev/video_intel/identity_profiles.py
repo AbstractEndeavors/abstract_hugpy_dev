@@ -114,6 +114,14 @@ _DEFAULT_GEN_SETTINGS: dict[str, Any] = {
     "auto_promote": True,
     "front_ref": None,       # abs path (one of the profile's own refs) | null
     "remove_background": True,
+    # The VL model the identity 3D-imaging pipeline's FRONT-SELECT step uses to pick
+    # the full-body reference before meshing (relay: _select_front_view -> POST
+    # /ml/vision). None (default) == the fleet-default VL model (the 3B) — the relay
+    # sends NO model field, byte-identical to before this setting existed (zero
+    # regression; defaults-are-promises). A non-null value is a model key the fleet
+    # advertises as image-text-to-text capable (e.g. a 7B), validated LIVE in
+    # set_gen_settings so it can never point at a non-existent / non-VL model.
+    "vision_model": None,    # image-text-to-text model key | null (== fleet default)
 }
 _POSE_CHOICES = ("none", "t-pose")
 
@@ -619,7 +627,7 @@ def _public_version(v: dict[str, Any]) -> dict[str, Any]:
 def _merged_gen_settings(stored: Any) -> dict[str, Any]:
     """The full happy-path defaults with any stored partial layered on top — only
     KNOWN keys survive (a stale/unknown stored key is dropped from the wire), so the
-    shape is always exactly the contract's nine keys."""
+    shape is always exactly the contract's ten keys."""
     gs = dict(_DEFAULT_GEN_SETTINGS)
     if isinstance(stored, dict):
         for k in _DEFAULT_GEN_SETTINGS:
@@ -1392,13 +1400,42 @@ def archive_version(slug: str, version_id: str) -> Optional[dict[str, Any]]:
     return _public(slug, entry)
 
 
+def _valid_vision_model_keys() -> set[str]:
+    """The set of model keys the FLEET currently advertises as ``image-text-to-text``
+    capable — the ONLY keys a per-identity ``gen_settings.vision_model`` may name.
+
+    Resolved from the LIVE vision registry (never a hardcode) so the setting can never
+    point at a model that has been renamed away or that isn't a VL model. The vision
+    registry is the UNION of ``image-text-to-text`` AND ``text-to-image`` models, so we
+    filter to the image-text-to-text capability specifically: the front-select step is an
+    image->text ask, and a pure text-to-image generator key would route to the wrong
+    engine.
+
+    Imported LAZILY (inside this call), NEVER at module import time: this store module is
+    imported at app boot, and pulling the vision registry up to boot would make a cheap
+    store import expensive. A registry-import failure is a fail-CLOSED empty set — a
+    non-null vision_model then fails validation with a clear message rather than being
+    silently accepted unvalidatable (the None/"" "fleet default" path never reaches here,
+    so clearing/keeping the default still works on a stripped install)."""
+    try:
+        from abstract_hugpy_dev.managers.vision.vision_coder import VISION_MODELS_REGISTRY
+    except Exception:  # noqa: BLE001 — no registry available -> nothing validates as a VL key
+        return set()
+    return {
+        k for k, cfg in VISION_MODELS_REGISTRY.items()
+        if "image-text-to-text" in (getattr(cfg, "tasks", None) or ())
+    }
+
+
 def set_gen_settings(slug: str, partial: dict[str, Any]) -> Optional[dict[str, Any]]:
     """Merge a PARTIAL gen_settings update into the identity's stored settings. Only the
     contract's known keys are accepted (an unknown key is a ProfileError -> the route's
-    400); every value is type-checked, ``pose`` is enum-checked, and ``front_ref`` (when
-    non-null) is JAILED to the profile's OWN reference images. Returns the updated PUBLIC
-    profile (its ``gen_settings`` reflecting the merge), or ``None`` if the slug names no
-    active profile (route 404)."""
+    400); every value is type-checked, ``pose`` is enum-checked, ``front_ref`` (when
+    non-null) is JAILED to the profile's OWN reference images, and ``vision_model`` (when
+    non-null) is validated against the LIVE image-text-to-text registry so it can never
+    name a non-existent / non-VL model. Returns the updated PUBLIC profile (its
+    ``gen_settings`` reflecting the merge), or ``None`` if the slug names no active
+    profile (route 404)."""
     if not isinstance(partial, dict):
         raise ProfileError("gen_settings must be an object", code="invalid_profile")
     with _LOCK:
@@ -1426,6 +1463,21 @@ def set_gen_settings(slug: str, partial: dict[str, Any]) -> Optional[dict[str, A
                     raise ProfileError(
                         "front_ref must be one of the profile's own reference images",
                         code="invalid_profile")
+            elif k == "vision_model":
+                # None/"" == "use the fleet-default VL model" (the 3B): a zero-regression
+                # CLEAR, always accepted and stored as None. A non-empty value must be a
+                # model key the fleet advertises as image-text-to-text capable (checked
+                # against the LIVE registry, lazily). Anything else is a ProfileError ->
+                # the route's 400, so the setting can never point at a non-VL / unknown
+                # model. Validated LAST so the lazy registry import only happens when a
+                # real key is actually being set.
+                if v in (None, ""):
+                    v = None
+                elif not isinstance(v, str) or v not in _valid_vision_model_keys():
+                    raise ProfileError(
+                        "vision_model must be null/empty (use the fleet-default VL model) "
+                        "or a model key the fleet advertises as image-text-to-text capable",
+                        code="invalid_profile")
             cleaned[k] = v
         entry = dict(entry)
         gs = dict(entry.get("gen_settings") or {})
@@ -1435,3 +1487,249 @@ def set_gen_settings(slug: str, partial: dict[str, Any]) -> Optional[dict[str, A
         data["profiles"][slug] = entry
         _save(data)
     return _public(slug, entry)
+
+
+# --------------------------------------------------------------------------- #
+# ANGLE BANK (IDENTITY-3D-CONTINUITY-PLAN.md S1+S2) — the turntable ring as a
+# QUERYABLE, read-only asset over EXISTING state. No new persisted manifest, no
+# migration, no writes: the bank is a COMPUTED read over what the mesh relay already
+# rendered and ``attach_reconstruction`` already stored.
+#
+# Where the bank lives: each version carries a ``recon_id``; the entry's
+# ``reconstructions`` list holds a record for that id with ``mode == "turntable"``,
+# an ordered ``views`` list (``view_00.png`` … ``view_71.png`` copied under
+# ``<slug>/reconstruction/<recon_id>/views/``), plus ``frame_count`` and
+# ``degrees_per_frame`` (luigi: 72 frames @ 5.0°/frame). So an angle bank is simply
+# that record read back with an azimuth attached to each frame by INDEX.
+#
+# AZIMUTH / ROTATION CONVENTION — the single source of truth (documented ONCE here):
+#   * ``azimuth_deg`` is CANONICAL. Semantic names (front/back/…-profile/…) are only a
+#     convenience map over degrees (``SEMANTIC_VIEWS``); when the two ever disagree,
+#     degrees win. This keeps the labels re-pinnable without touching stored bytes.
+#   * Frame 0 == azimuth 0° == FRONT (turntable convention: the orbit starts head-on).
+#   * Azimuth rises with the frame index in the render's orbit direction:
+#         azimuth_deg(N) = (N * degrees_per_frame) % 360
+#     so the ring reads 0° → … → 355° over 72 frames and WRAPS (frame 71 == 355°, one
+#     step short of a full turn back to front). ``degrees_per_frame`` comes off the
+#     record; on an older record that predates that field it is derived as
+#     ``360.0 / len(views)`` (a full turn spread evenly over the frames rendered).
+#   * The orbit turns the subject so increasing azimuth first brings the subject's
+#     RIGHT side toward camera — hence 90° == right-profile, 180° == back, 270° ==
+#     left-profile. This left/right assignment is a DOCUMENTED convention, not yet
+#     eyeballed against the Blender orbit's real handedness; because azimuth degrees are
+#     canonical, if the real orbit turns the other way only ``SEMANTIC_VIEWS`` flips —
+#     no stored data, no azimuth math, and no bank index changes.
+#   * ``elevation_deg`` is recorded as 0.0 for every ring frame: the turntable is
+#     single-elevation. Real elevations (overhead / low-angle) are a later slice (S5,
+#     on-demand novel views from the mesh); they are deliberately NOT synthesized here.
+#
+# Angular nearness always WRAPS: 10° and 350° are 20° apart, never 340° (see
+# ``_angular_distance``). Selection spreads OUTWARD by increasing wrap-distance, so a
+# hint never returns k copies of the single nearest frame — it returns the k distinct
+# frames straddling the target.
+# --------------------------------------------------------------------------- #
+
+# name -> azimuth_deg. A convenience map over the canonical degrees (see the section
+# docstring's convention). Names are matched case-insensitively after trimming. Only
+# the azimuthal views the single-elevation ring can actually serve are listed — a pure
+# elevation ask (e.g. "overhead") is intentionally absent and resolves to a clean error
+# rather than a wrong frame, until the mesh-render slice (S5) can serve elevations.
+SEMANTIC_VIEWS: dict[str, float] = {
+    "front": 0.0,
+    "three-quarter-right": 45.0,
+    "right-profile": 90.0,
+    "back-right": 135.0,
+    "back": 180.0,
+    "back-left": 225.0,
+    "left-profile": 270.0,
+    "three-quarter-left": 315.0,
+}
+
+
+def _angular_distance(a: float, b: float) -> float:
+    """Wrap-aware angular distance in degrees, always in ``[0, 180]``. Python's ``%``
+    returns the sign of the divisor, so ``(a - b) % 360`` is already non-negative; the
+    ``min(d, 360 - d)`` is what makes 10° and 350° read as 20° apart (the short way
+    round the circle), never 340° — the whole reason a hint at 350° selects frames near
+    0° rather than marching the long way back through 180°."""
+    d = abs((a - b) % 360.0)
+    return min(d, 360.0 - d)
+
+
+def _resolve_version(profile: dict[str, Any], version_id: Optional[str]) -> Optional[dict[str, Any]]:
+    """Pick the version whose bank a caller means — MIRRORING the studio resolver's
+    precedence (``video_routes._reference_images_from_body``): ``version_id`` names a
+    specific version by its id OR its name (e.g. "textured-01"); ``None`` falls back to
+    the profile's ACTIVE version. Returns the version dict from the PUBLIC profile shape,
+    or ``None`` when nothing matches (a versionless profile, or an unknown id/name) — the
+    caller then reports an empty bank and degrades, never crashes."""
+    versions = [v for v in (profile.get("versions") or []) if isinstance(v, dict)]
+    if version_id is None:
+        active_id = profile.get("active_version")
+        if not active_id:
+            return None
+        return next((v for v in versions if v.get("version_id") == active_id), None)
+    return next(
+        (v for v in versions
+         if v.get("version_id") == version_id or v.get("name") == version_id),
+        None,
+    )
+
+
+def _turntable_recon(profile: dict[str, Any], version: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """The turntable reconstruction record backing *version*'s bank, or ``None``. Maps
+    ``version.recon_id`` onto the entry's ``reconstructions`` list and requires
+    ``mode == "turntable"`` — a clay/mesh-only or sheet recon carries no orbit ring and
+    yields no bank (the caller falls back to the flat canonical set)."""
+    if not isinstance(version, dict):
+        return None
+    recon_id = version.get("recon_id")
+    if not recon_id:
+        return None
+    return next(
+        (r for r in (profile.get("reconstructions") or [])
+         if isinstance(r, dict) and r.get("recon_id") == recon_id and r.get("mode") == "turntable"),
+        None,
+    )
+
+
+def bank_views(profile: dict[str, Any], *, version_id: Optional[str] = None) -> list[dict[str, Any]]:
+    """The angle bank for a version's turntable ring — a pure, read-only COMPUTED view
+    over existing store state (no ``_LOCK``, no writes, no new persisted manifest).
+
+    *profile* is the PUBLIC shape (``get_profile``/``_public``). The chosen version is the
+    ACTIVE one when ``version_id`` is ``None``, else the version named by id-or-name
+    (``_resolve_version`` mirrors the studio resolver's precedence). Returns, in ANGULAR
+    (frame) order::
+
+        [{"index", "azimuth_deg", "elevation_deg", "path", "source": "turntable"}, …]
+
+    with ``azimuth_deg = (index * degrees_per_frame) % 360`` per the section's convention
+    (``degrees_per_frame`` off the record, or ``360/len(views)`` on an older record that
+    lacks it), and ``elevation_deg`` fixed at 0.0 (single-elevation ring).
+
+    Returns ``[]`` when the chosen version has no turntable reconstruction — a versionless
+    profile, an unknown version, a clay/sheet-only recon — so the caller can fall back to
+    today's flat canonical set. Frames whose file is missing on disk are FILTERED OUT
+    (``os.path.isfile``), but the azimuth of every surviving frame is computed from its
+    ORIGINAL ring index, so a gap never rotates the remaining angles."""
+    version = _resolve_version(profile, version_id)
+    recon = _turntable_recon(profile, version)
+    if recon is None:
+        return []
+    # A turntable record's ``views`` is an ordered list of PNG paths (the orbit frames
+    # copied in by ``_materialize_views``); non-strings are defensively skipped.
+    views = [v for v in (recon.get("views") or []) if isinstance(v, str)]
+    if not views:
+        return []
+    dpf = recon.get("degrees_per_frame")
+    try:
+        dpf = float(dpf)
+        if dpf <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        dpf = 360.0 / len(views)  # older record: spread a full turn over the frames it has
+    bank: list[dict[str, Any]] = []
+    for index, path in enumerate(views):
+        if not os.path.isfile(path):
+            continue  # a dropped frame must not shift the angles of the survivors
+        bank.append({
+            "index": index,
+            "azimuth_deg": round((index * dpf) % 360.0, 4),
+            "elevation_deg": 0.0,
+            "path": path,
+            "source": "turntable",
+        })
+    return bank
+
+
+def nearest_bank_views(bank: list[dict[str, Any]], azimuth_deg: float, k: int) -> list[dict[str, Any]]:
+    """The ``k`` bank frames nearest *azimuth_deg*, wrap-aware and angle-SPREAD.
+
+    Sorts the bank by wrap-aware angular distance to the target (``_angular_distance``,
+    so 350° is near 0°) and takes the closest ``k`` DISTINCT frames — because every ring
+    frame is a distinct angle, the result naturally straddles the target (350° → 350°,
+    345°, 355°, 0° …) rather than returning ``k`` copies of the single nearest. The tie
+    break is azimuth then path, purely for determinism. Paths are de-duplicated
+    defensively. Returns ``min(k, len(bank))`` entries; ``[]`` for an empty bank or
+    ``k <= 0``."""
+    if not bank or k <= 0:
+        return []
+    ordered = sorted(
+        bank,
+        key=lambda v: (_angular_distance(azimuth_deg, v["azimuth_deg"]), v["azimuth_deg"], v["path"]),
+    )
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for v in ordered:
+        p = v["path"]
+        if p in seen:
+            continue
+        seen.add(p)
+        out.append(v)
+        if len(out) >= k:
+            break
+    return out
+
+
+def azimuth_for_view(hint: Any) -> tuple[Optional[float], Optional[str]]:
+    """Resolve a view HINT to a canonical azimuth in ``[0, 360)``.
+
+    Accepts either a SEMANTIC string (looked up case-insensitively in ``SEMANTIC_VIEWS``)
+    or a DICT ``{"azimuth_deg": <number>, "elevation_deg"?: <number>}``. Elevation is
+    accepted for forward-compatibility but does NOT affect selection today — the ring is
+    single-elevation, so nearness is azimuth-only (see S5 for real elevations).
+
+    Errors-as-data (never raises): returns ``(azimuth_deg, None)`` on success or
+    ``(None, message)`` on a bad hint — an unknown semantic name, a dict missing a numeric
+    ``azimuth_deg``, or a wrong type. The route turns the message into a clean 400. The
+    returned azimuth is wrapped into ``[0, 360)`` so an out-of-range dict value (e.g.
+    370°) is normalized rather than rejected."""
+    if isinstance(hint, str):
+        name = hint.strip().lower()
+        if name in SEMANTIC_VIEWS:
+            return SEMANTIC_VIEWS[name] % 360.0, None
+        return None, (f"unknown identity_view {hint!r}; expected one of "
+                      f"{sorted(SEMANTIC_VIEWS)} or an object with a numeric azimuth_deg")
+    if isinstance(hint, dict):
+        az = hint.get("azimuth_deg")
+        if isinstance(az, bool) or not isinstance(az, (int, float)):
+            return None, "identity_view object must carry a numeric azimuth_deg"
+        elev = hint.get("elevation_deg")
+        if elev is not None and (isinstance(elev, bool) or not isinstance(elev, (int, float))):
+            return None, "identity_view elevation_deg must be a number when present"
+        return float(az) % 360.0, None
+    return None, "identity_view must be a semantic name string or an {azimuth_deg} object"
+
+
+def views_summary(profile: dict[str, Any], *, version_id: Optional[str] = None) -> dict[str, Any]:
+    """A compact, read-only summary of a version's angle ring — count + degrees_per_frame
+    + azimuth range — for the operator/UI to see WHAT angles an identity carries without
+    shipping every frame path. Computed from the same bank as ``bank_views`` (so ``count``
+    reflects frames that actually exist on disk), with ``degrees_per_frame``/``frame_count``
+    read straight off the record. A version with no turntable ring returns the zeroed shape
+    (``count`` 0, ranges ``None``, ``source`` ``None``) rather than being omitted, so a
+    caller can rely on the key always being present (defaults-are-promises)."""
+    version = _resolve_version(profile, version_id)
+    recon = _turntable_recon(profile, version)
+    if recon is None:
+        return {"count": 0, "frame_count": 0, "degrees_per_frame": None,
+                "azimuth_min": None, "azimuth_max": None, "source": None}
+    views = [v for v in (recon.get("views") or []) if isinstance(v, str)]
+    dpf = recon.get("degrees_per_frame")
+    try:
+        dpf = float(dpf)
+        if dpf <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        dpf = round(360.0 / len(views), 6) if views else None
+    bank = bank_views(profile, version_id=version_id)
+    azimuths = [b["azimuth_deg"] for b in bank]
+    return {
+        "count": len(bank),
+        "frame_count": recon.get("frame_count") or len(views),
+        "degrees_per_frame": dpf,
+        "azimuth_min": min(azimuths) if azimuths else None,
+        "azimuth_max": max(azimuths) if azimuths else None,
+        "source": "turntable",
+    }
