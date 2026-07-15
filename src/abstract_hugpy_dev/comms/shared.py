@@ -43,9 +43,20 @@ CREATE TABLE IF NOT EXISTS jobs (
     status           TEXT NOT NULL,
     kind             TEXT NOT NULL DEFAULT 'chat',
     cancel_requested INTEGER NOT NULL DEFAULT 0,
-    updated          REAL NOT NULL
+    updated          REAL NOT NULL,
+    -- Last REAL forward-progress epoch (Job.progressed_at), distinct from
+    -- `updated` which any write bumps. The orphan-sweep in prune() ages on
+    -- THIS clock so a wedged render (updated by mere views/recomputes) still
+    -- goes reapable, while a truly-progressing stream never does.
+    progressed_at    REAL
 );
 """
+
+# Statuses considered "active" for the wedged-orphan sweep. Mirrors the
+# _STALL_ACTIVE spirit in jobs.py: only a job that claims to be doing work can
+# be "wedged". A pending/queued job is starved (waiting its turn), not wedged,
+# so it is NEVER reaped by the progress-sweep.
+_ORPHAN_ACTIVE = ("processing", "streaming", "running")
 
 MAX_FAILURES = 5
 
@@ -87,11 +98,25 @@ class SqliteMirror:
             try:
                 with self._connect() as conn:
                     conn.execute(_SCHEMA)
+                    self._migrate(conn)
                 self._initialized = True
                 return True
             except Exception as exc:
                 self._note_failure("init", exc)
                 return False
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        """Idempotent, safe on an existing populated DB. Adds the
+        `progressed_at` column to pre-existing `jobs` tables that predate it
+        (a plain CREATE ... IF NOT EXISTS won't alter an already-present
+        table). Guarded by a table_info probe so a second run is a no-op and a
+        DB already carrying the column never raises."""
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
+        if "progressed_at" not in cols:
+            # NULL default: old rows have no known progress clock, so they are
+            # fail-open (never reaped by the progress-sweep) until a fresh
+            # upsert stamps a real progressed_at.
+            conn.execute("ALTER TABLE jobs ADD COLUMN progressed_at REAL")
 
     def _note_failure(self, op: str, exc: Exception) -> None:
         self._failures += 1
@@ -115,20 +140,30 @@ class SqliteMirror:
         if not self._ensure():
             return
         try:
+            # progressed_at is the movement-only clock (jobs.py bumps it on real
+            # forward progress, NOT on log-tail/view/recompute writes). Persist
+            # it as a real column so prune()'s orphan-sweep can age on it. A
+            # missing/garbage value degrades to NULL -> fail-open (never reaped).
+            prog = job_dict.get("progressed_at")
+            try:
+                prog = float(prog) if prog is not None else None
+            except (TypeError, ValueError):
+                prog = None
             with self._connect() as conn:
                 conn.execute(
-                    "INSERT INTO jobs (id, data, status, kind, cancel_requested, updated) "
-                    "VALUES (?, ?, ?, ?, ?, ?) "
+                    "INSERT INTO jobs (id, data, status, kind, cancel_requested, updated, progressed_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(id) DO UPDATE SET "
                     "  data=excluded.data, status=excluded.status, "
                     "  kind=excluded.kind, "
                     "  cancel_requested=MAX(jobs.cancel_requested, excluded.cancel_requested), "
-                    "  updated=excluded.updated",
+                    "  updated=excluded.updated, "
+                    "  progressed_at=excluded.progressed_at",
                     (str(job_dict.get("id")), json.dumps(job_dict),
                      str(job_dict.get("status") or "pending"),
                      str(job_dict.get("kind") or "chat"),
                      1 if job_dict.get("cancel_requested") else 0,
-                     time.time()))
+                     time.time(), prog))
             self._ok()
         except Exception as exc:
             self._note_failure("upsert", exc)
@@ -166,15 +201,32 @@ class SqliteMirror:
         if not self._ensure():
             return
         try:
+            now = time.time()
             with self._connect() as conn:
+                # (1) Terminal rows past the retain window — correctly keyed on
+                # `updated` (any-write clock): once terminal, no more real
+                # progress happens, so time-since-any-write is the right age.
                 conn.execute(
                     "DELETE FROM jobs WHERE "
                     "status IN ('done','cancelled','failed') AND updated < ?",
-                    (time.time() - self.retain_secs,))
-                # Rows whose owner process died mid-stream never go terminal;
-                # sweep anything untouched for much longer than any stream.
-                conn.execute("DELETE FROM jobs WHERE updated < ?",
-                             (time.time() - max(self.retain_secs * 6, 3600.0),))
+                    (now - self.retain_secs,))
+                # (2) Wedged-orphan sweep: a job whose owner died mid-stream
+                # never goes terminal. It MUST age on real forward-progress
+                # silence (`progressed_at`), NOT on `updated` — `updated` is
+                # bumped by mere views/sibling-recomputes/API-restart re-reads,
+                # which kept these rows immortal. Only reap an ACTIVE row whose
+                # progressed_at is genuinely ancient. NULL progressed_at is
+                # fail-open (never reaped here) — we only reap when we
+                # positively know it's old. A healthy long render bumps
+                # progressed_at on every stage, so this window of TOTAL
+                # progress silence = genuinely wedged.
+                orphan_secs = max(self.retain_secs * 6, 3600.0)
+                placeholders = ",".join("?" for _ in _ORPHAN_ACTIVE)
+                conn.execute(
+                    "DELETE FROM jobs WHERE "
+                    f"status IN ({placeholders}) "
+                    "AND progressed_at IS NOT NULL AND progressed_at < ?",
+                    (*_ORPHAN_ACTIVE, now - orphan_secs))
             self._ok()
         except Exception as exc:
             self._note_failure("prune", exc)

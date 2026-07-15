@@ -108,6 +108,142 @@ def _kick_warm(worker, model_keys, source: str) -> list:
     return due
 
 
+# Reconcile's "deduce, don't count the world" prefilter: cooldown for the
+# skip-log below, same cadence as _kick_warm's own cooldown so an un-fittable
+# assigned model gets ONE note per window instead of per-beat spam.
+_fit_skip_last: dict = {}      # (worker_id, model_key) -> monotonic ts of last skip-log
+
+
+def _warmable_subset(worker, cold: list) -> list:
+    """Filter reconcile's ``cold`` (assigned-but-not-loaded) model keys down to
+    the subset actually worth paying a live load-probe for.
+
+    ``_worker_fit`` (below, ~line 1235) already computes fit from numbers
+    central has every heartbeat (effective GGUF bytes vs vram_free/free_ram) —
+    no load required. Reconcile used to skip this and blanket-probe every cold
+    assignment, which on a worker with dozens of assignments meant sequentially
+    loading each one onto a card that physically holds a handful — a load/evict
+    churn to answer a question already answerable from data on hand.
+
+    Rules (see PLAN-reconcile-deduce-fit.md):
+      * ``fit is False`` (can't fit VRAM+RAM combined) -> DROP. Probing it only
+        confirms what we already know. Logged once per cooldown window, not
+        every beat.
+      * ``fit is None`` (can't be sized) -> KEEP unconditionally. This is the
+        genuinely-ambiguous case where a real load is the only honest answer —
+        the live-probe fallback stays in play for it.
+      * otherwise -> co-residency cap: greedy-pack GPU-resident-first,
+        smallest-``need``-first, until the running total would exceed the
+        worker's current ``vram_free``. The rest stays assigned-but-cold; they
+        still lazy-load correctly the moment real demand hits them.
+
+    Pure function of (worker, cold) plus the module-level cooldown dict — no
+    I/O, no network, safe to unit test directly.
+    """
+    wid = (worker or {}).get("id") or ""
+    vram_free = (worker or {}).get("vram_free")
+    unsizable = []
+    fittable = []   # (need, gpu_resident, model_key)
+    now = _time.monotonic()
+    for mk in (cold or []):
+        verdict = _worker_fit(mk, worker)
+        if verdict.get("fit") is False:
+            key = (wid, mk)
+            if now - _fit_skip_last.get(key, 0.0) >= _WARM_COOLDOWN_S:
+                _fit_skip_last[key] = now
+                logger.info(
+                    "reconcile: skipping load-probe for %s on worker %s "
+                    "(assigned but won't fit) — %s",
+                    mk, wid[:8] if wid else wid, verdict.get("reason") or "won't fit")
+            continue
+        if verdict.get("fit") is None:
+            unsizable.append(mk)
+            continue
+        fittable.append((verdict.get("need") or 0, bool(verdict.get("gpu_resident")), mk))
+
+    if vram_free is None:
+        # No VRAM number to cap against (e.g. a worker that hasn't reported a
+        # GPU yet) — the fit-based drop above already did the useful work;
+        # don't invent a cap out of missing data.
+        return unsizable + [mk for _, _, mk in fittable]
+
+    fittable.sort(key=lambda t: (not t[1], t[0]))   # gpu_resident first, then smallest need
+    capped = []
+    used = 0
+    for need, _resident, mk in fittable:
+        if used + need <= vram_free:
+            capped.append(mk)
+            used += need
+        # else: leave assigned-but-cold — the existing lazy-load-on-demand path
+        # already handles first real request correctly.
+    return unsizable + capped
+
+
+# ── curated keep-warm set: immutable defaults + operator's picks ─────────────
+# Reconcile used to treat *every* model in ``worker["models"]`` as something to
+# keep warm. But ``models`` is the box's whole reported/accumulated inventory
+# (ae carries 104), most of it non-GGUF and unsizable — so even with the fit
+# prefilter above, reconcile would still load-probe the ~dozens of unsizable
+# ones each cooldown. The operator's fix (2026-07-15): reconcile should warm a
+# CURATED set, not the inventory —
+#   * IMMUTABLE DEFAULTS — the fleet's default model per task (TASK_DEFAULTS:
+#     chat, VL, ASR, embed, summarize, depth, detect, classify, segment,
+#     text-to-image). Whichever a box has ON DISK is kept warm so the default
+#     task paths never cold-start ("defaults are promises"). Not operator-
+#     removable — that's what "immutable" means.
+#   * CUSTOMIZABLE — the operator's explicit picks on top: pinned models (the
+#     live keep-resident lever) plus, forward-compat, a ``residency: static``
+#     map or an explicit ``config["warm_whitelist"]`` if either is ever set.
+# Everything else on disk lazy-loads on first real request (already works).
+# This is the analog of the pin-declutter: stop warming the accumulated union,
+# warm only what's designated. Pure central-side — no worker release.
+_IMMUTABLE_WARM_DEFAULTS: frozenset | None = None
+
+
+def _immutable_warm_defaults() -> frozenset:
+    """Fleet default model_keys (one per task) — the immutable keep-warm floor.
+
+    Sourced from ``TASK_DEFAULTS`` (the same table dispatch falls back to when a
+    caller names only a task). Guarded so a refactor of the constant's home can
+    never break heartbeat reconcile — a miss degrades to "warm only the
+    operator's pins", never to an exception on the hot path.
+    """
+    global _IMMUTABLE_WARM_DEFAULTS
+    if _IMMUTABLE_WARM_DEFAULTS is None:
+        try:
+            from abstract_hugpy_dev.imports.src.constants.categories import (
+                TASK_DEFAULTS as _TASK_DEFAULTS)
+            _IMMUTABLE_WARM_DEFAULTS = frozenset(
+                str(v) for v in _TASK_DEFAULTS.values() if v)
+        except Exception:  # noqa: BLE001 — never fail reconcile over a default lookup
+            logger.warning("reconcile: could not load TASK_DEFAULTS for the "
+                           "immutable warm floor; warming pins only")
+            _IMMUTABLE_WARM_DEFAULTS = frozenset()
+    return _IMMUTABLE_WARM_DEFAULTS
+
+
+def _reconcile_warm_set(worker) -> list:
+    """The curated set of a worker's on-disk models to keep warm on reconcile.
+
+    = (immutable task-defaults ∪ pinned ∪ ``static`` residency ∪ explicit
+    ``warm_whitelist``) ∩ what the box actually has on disk. NOT the full
+    ``models`` inventory — everything outside this set lazy-loads on demand.
+    The result still passes through ``_warmable_subset`` (fit-cap) before any
+    real load, so this only ever *narrows* what reconcile touches.
+    """
+    present = set(worker.get("models") or [])
+    if not present:
+        return []
+    cfg = worker.get("config") or {}
+    pinned = {k for k, v in (cfg.get("pinned") or {}).items() if v}
+    # ``residency``/``warm_whitelist`` aren't in the config schema today; honor
+    # them if a future worker/central ever sets them (forward-compat, no-op now).
+    static = {k for k, v in (cfg.get("residency") or {}).items() if v == "static"}
+    whitelist = set(cfg.get("warm_whitelist") or [])
+    curated = (_immutable_warm_defaults() | pinned | static | whitelist) & present
+    return sorted(curated)
+
+
 def _bearer_token() -> str | None:
     """Extract a Bearer token from the Authorization header (worker enrollment)."""
     auth = request.headers.get("Authorization", "")
@@ -566,15 +702,22 @@ def workers_heartbeat(worker_id):
     if worker.get("admission") == "blocked":
         # Persistent eviction: 403 stops the agent instead of letting it limp on.
         abort(403, description="Worker is blocked by the operator.")
-    # Designated = ready: re-converge assigned-vs-loaded on every beat. A cold
-    # assigned model (worker rebooted, agent restarted, weights evicted) gets a
-    # background warm — rate-limited by _WARM_COOLDOWN_S so an un-fittable
-    # model doesn't probe-spin.
+    # Designated = ready: re-converge a CURATED keep-warm set on every beat —
+    # NOT the box's whole ``models`` inventory. The curated set is the immutable
+    # task-defaults present on disk plus the operator's pins (_reconcile_warm_set);
+    # everything else on disk lazy-loads on first real request. A cold member of
+    # that set (worker rebooted, agent restarted, weights evicted) gets a
+    # background warm — rate-limited by _WARM_COOLDOWN_S so an un-fittable model
+    # doesn't probe-spin. It then passes _warmable_subset to deduce fit from
+    # numbers already on hand before paying a live load-probe: never probe a
+    # model that can't fit, and never warm more than can co-reside at once.
     try:
-        cold = [mk for mk in (worker.get("models") or [])
-                if mk not in set(worker.get("loaded_models") or [])]
+        loaded = set(worker.get("loaded_models") or [])
+        cold = [mk for mk in _reconcile_warm_set(worker) if mk not in loaded]
         if cold:
-            _kick_warm(worker, cold, "reconcile")
+            warm_now = _warmable_subset(worker, cold)
+            if warm_now:
+                _kick_warm(worker, warm_now, "reconcile")
     except Exception:
         pass  # readiness convergence must never fail a heartbeat
     # Advertise the target version every beat, so a worker converges within one
@@ -1270,6 +1413,136 @@ def _worker_fit(model_key, worker):
             "headroom": VRAM_HEADROOM, "reason": reason}
 
 
+def _worker_already_has(worker: dict, model_key: str) -> bool:
+    """Whether ``worker`` already holds ``model_key`` in any serveable sense —
+    operator-assigned (``models``), heartbeat-resident (``loaded_models``), or a
+    SYSTEM placement grant (``grants``). Mirrors the union ``workers_for_model``
+    uses to decide "can this worker serve it" (workers.py), so the placement
+    preview's "already_has" reads consistently with real routing. Read-only:
+    just a membership check over fields already on the worker record."""
+    if model_key in (worker.get("models") or []):
+        return True
+    if model_key in (worker.get("loaded_models") or []):
+        return True
+    if model_key in (worker.get("grants") or {}):
+        return True
+    return False
+
+
+@worker_bp.route("/llm/models/<path:model_key>/placement", methods=["GET"])
+def model_placement_preview(model_key):
+    """OBSERVE-ONLY placement feasibility preview (Phase 1 item 3).
+
+    Answers "if a FLOATING call for ``model_key`` arrived with no worker
+    assigned, which workers could feasibly hold it, and which would win?" —
+    pure read, proves the fit/feasibility logic before any auto-placement is
+    built. Takes NO action: no assignment, no grant, no queue mutation, no
+    probe. Reuses ``_worker_fit`` and ``_disk_preflight_reason`` VERBATIM —
+    this endpoint does not compute sizing or fit itself, only surfaces it.
+
+    Gated like the other fleet-capacity/file-adjacent reads in this module
+    (``_transfer_authorized``): operator token OR a valid worker enrollment
+    bearer — the least-privileged gate that still fits a read of per-worker
+    VRAM/RAM/disk capacity.
+    """
+    if not _transfer_authorized():
+        abort(401, description="Worker enrollment or operator token required.")
+
+    size_bytes = None
+    try:
+        size_bytes = _model_gguf_bytes(model_key)
+    except Exception:  # noqa: BLE001 — degrade, never 500 the whole preview
+        size_bytes = None
+
+    workers_out = []
+    feasible_online = []   # (worker_dict, verdict, already_has) candidates for winner
+    for worker in (list_workers() or []):
+        wid = worker.get("id")
+        name = worker.get("name") or wid
+        online = (worker.get("status") == "online")
+        already_has = _worker_already_has(worker, model_key)
+
+        fit_errored = False
+        try:
+            verdict = _worker_fit(model_key, worker)
+        except Exception as exc:  # noqa: BLE001 — one bad worker must not sink the preview
+            fit_errored = True
+            verdict = {"fit": None, "gpu_resident": None, "vram_free": worker.get("vram_free"),
+                       "ram_free": worker.get("free_ram"),
+                       "reason": f"size unknown ({type(exc).__name__}: {exc})"}
+
+        try:
+            disk_reason = _disk_preflight_reason(worker, model_key)
+        except Exception as exc:  # noqa: BLE001 — degrade gracefully per worker
+            disk_reason = f"disk check failed ({type(exc).__name__}: {exc})"
+        disk_ok = disk_reason is None
+
+        fit = verdict.get("fit")
+        if fit_errored:
+            # A genuine failure to evaluate this worker — never claim feasible.
+            feasible = None
+        else:
+            feasible = (fit is not False)   # None (unsizable) treated as feasible/defer
+
+        workers_out.append({
+            "id": wid,
+            "name": name,
+            "feasible": feasible,
+            "gpu_resident": verdict.get("gpu_resident"),
+            "vram_free": verdict.get("vram_free"),
+            "ram_free": verdict.get("ram_free"),
+            "reason": verdict.get("reason"),
+            "disk_ok": disk_ok,
+            "disk_reason": disk_reason,
+            "online": online,
+            "already_has": already_has,
+        })
+
+        if online and feasible and disk_ok:
+            feasible_online.append((worker, verdict, already_has))
+
+    feasible_names = [w.get("name") or w.get("id") for w, _v, _a in feasible_online]
+
+    winner = None
+    winner_reason = None
+    if not feasible_online:
+        if not any(w["online"] for w in workers_out):
+            winner_reason = "no online worker"
+        elif size_bytes is not None:
+            winner_reason = f"no online worker can fit {size_bytes / (2**30):.1f} GiB"
+        else:
+            winner_reason = "no online worker passes disk/fit preflight"
+    else:
+        # Policy (observe-only — mirrors what a real scheduler would pick,
+        # commits nothing): 1) already holds it, 2) GPU-resident outright over
+        # spill-only, 3) most vram_free.
+        def _rank(item):
+            _w, v, already = item
+            return (
+                0 if already else 1,
+                0 if v.get("gpu_resident") else 1,
+                -(v.get("vram_free") or 0),
+            )
+        feasible_online.sort(key=_rank)
+        best_w, best_v, best_already = feasible_online[0]
+        winner = best_w.get("name") or best_w.get("id")
+        if best_already:
+            winner_reason = "already holds the model"
+        elif best_v.get("gpu_resident"):
+            winner_reason = "fits VRAM outright with the most free VRAM among candidates"
+        else:
+            winner_reason = "best available fit (spill to RAM) among candidates"
+
+    return jsonify({
+        "model_key": model_key,
+        "size_bytes": size_bytes,
+        "workers": workers_out,
+        "feasible_workers": feasible_names,
+        "winner": winner,
+        "winner_reason": winner_reason,
+    })
+
+
 @worker_bp.route("/llm/workers/<worker_id>/load", methods=["POST"])
 def workers_load(worker_id):
     """Place a model on a GPU worker: VRAM preflight → assign → load into VRAM.
@@ -1572,6 +1845,136 @@ def _stream_file_window(path: str, start: int, end: int):
             yield buf
 
 
+# ── global central transfer cap (the "pin-30 survives" protection) ──────────
+# Each puller (provision.py) opens up to HUGPY_PULL_CONCURRENCY (default 8)
+# concurrent segmented Range-GETs PER WORKER. A big assignment/pin or a
+# reconcile storm across K workers therefore lands up to ~8*K simultaneous
+# byte streams on central's two weight-serving endpoints (/file and
+# /archive) with NO shared bound between them — a handful of pins was enough
+# to saturate central's link/CPU (the live 2026-07-15 incident). This is a
+# GLOBAL bound across both endpoints, independent of per-worker concurrency.
+#
+# The cap is read ONCE at import time into a BoundedSemaphore, same pattern
+# as _warm_lock/_warm_busy above: a fixed module-level guard, not re-read
+# per request.
+def _transfer_cap() -> int:
+    raw = os.environ.get("HUGPY_CENTRAL_TRANSFER_MAX")
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return 3
+    return n if n >= 1 else 3
+
+
+_TRANSFER_CAP = _transfer_cap()          # fixed at module load, see above
+_transfer_sem = _threading.BoundedSemaphore(_TRANSFER_CAP)
+
+# How long a request waits for a free permit before giving up and telling the
+# worker to back off. Workers already retry failed segments
+# (provision.py:_download_segment_with_retry), so a prompt 503 is safe,
+# cheap backpressure — far better than blocking a gunicorn worker thread
+# indefinitely (which just turns the transfer cap into a request-thread
+# exhaustion bug instead of a fix).
+_TRANSFER_WAIT_S = float(os.environ.get("HUGPY_CENTRAL_TRANSFER_WAIT_S", "5"))
+
+
+def _transfer_busy_response() -> Response:
+    """503 + Retry-After for a request that couldn't get a transfer permit."""
+    resp = Response(
+        "Central weight-transfer capacity is saturated; retry shortly.",
+        status=503,
+        mimetype="text/plain",
+    )
+    resp.headers["Retry-After"] = "2"
+    return resp
+
+
+class _TransferPermit:
+    """One acquired slot on ``_transfer_sem``, released EXACTLY ONCE.
+
+    The tricky part of this cap is lifetime: both endpoints below return a
+    streaming Response/generator, so the route FUNCTION returns long before
+    the bytes finish flowing. Acquiring in the handler and releasing with a
+    plain ``with _transfer_sem:`` around the handler body would release the
+    permit the instant the Response object is constructed — i.e. before a
+    single byte reaches the worker — which caps nothing. The permit must
+    therefore be released when the STREAM ends: normal completion, a client
+    disconnect, or a write error — never on handler return.
+
+    This wrapper makes that release idempotent (BoundedSemaphore.release()
+    raises if called more times than acquire(), so every call site — a
+    generator's ``finally`` and a wrapped-iterable ``close()`` (see
+    ``_ReleaseOnCloseIter`` below) — can all call ``.release()``
+    unconditionally without risking a double-release).
+    """
+
+    __slots__ = ("_sem", "_released", "_lock")
+
+    def __init__(self, sem: "_threading.BoundedSemaphore"):
+        self._sem = sem
+        self._released = False
+        self._lock = _threading.Lock()
+
+    def release(self) -> None:
+        with self._lock:
+            if self._released:
+                return
+            self._released = True
+        self._sem.release()
+
+
+def _acquire_transfer_permit() -> "_TransferPermit | None":
+    """Try to reserve one of the global transfer slots.
+
+    Returns a ``_TransferPermit`` to release when the stream ends, or
+    ``None`` if none became free within ``_TRANSFER_WAIT_S`` (caller should
+    respond 503). Blocking with a bounded timeout — never forever — so a
+    saturated central sheds load instead of piling up stuck request threads.
+    """
+    if _transfer_sem.acquire(blocking=True, timeout=_TRANSFER_WAIT_S):
+        return _TransferPermit(_transfer_sem)
+    return None
+
+
+class _ReleaseOnCloseIter:
+    """Wrap a WSGI response iterable so ``.close()`` also releases a transfer
+    permit — for the ``send_file`` / full-file branch of ``model_file``.
+
+    LANDMINE (why this exists instead of ``Response.call_on_close``):
+    ``send_file`` returns a response with ``direct_passthrough=True`` and
+    ``resp.response`` set to a ``werkzeug.wsgi.FileWrapper``. Werkzeug's
+    ``Response.get_app_iter`` special-cases ``direct_passthrough`` by handing
+    the WSGI server ``self.response`` (the FileWrapper) DIRECTLY, bypassing
+    the ``ClosingIterator(iterable, self.close)`` wrapper it uses in every
+    other case. Concretely: the WSGI server (werkzeug's own dev server,
+    gunicorn — both follow the WSGI spec of calling ``.close()`` on whatever
+    iterable the app returned) ends up calling ``FileWrapper.close()``, never
+    ``Response.close()`` — so anything registered via
+    ``resp.call_on_close(...)`` is simply never invoked on this path. (Proven
+    empirically while building this cap — a first attempt using
+    ``call_on_close`` silently leaked every full-file permit.) Wrapping the
+    iterable itself, instead of relying on the Response object's own close
+    hook, sidesteps that entirely: whatever consumes/closes the returned
+    iterable — real WSGI server or Flask's test client — reaches OUR
+    ``close()``, which forwards to the real FileWrapper's close (still closes
+    the underlying fh) and then releases the permit exactly once.
+    """
+
+    def __init__(self, inner, on_close):
+        self._inner = inner
+        self._on_close = on_close
+
+    def __iter__(self):
+        return iter(self._inner)
+
+    def close(self):
+        try:
+            if hasattr(self._inner, "close"):
+                self._inner.close()
+        finally:
+            self._on_close()
+
+
 @worker_bp.route("/llm/models/<path:model_key>/file", methods=["GET"])
 def model_file(model_key):
     if not _transfer_authorized():
@@ -1620,6 +2023,16 @@ def model_file(model_key):
         resp.headers["Accept-Ranges"] = "bytes"
         return resp
 
+    # ── global transfer cap ────────────────────────────────────────────────
+    # Acquire AFTER auth + path-jail + 404/416 (never spend a permit on a
+    # request that was never going to stream bytes), but BEFORE the first
+    # byte is served. See _TransferPermit above for why this can't be a
+    # plain "with" around the handler: both branches below return a
+    # streaming response and the permit must outlive this function's return.
+    permit = _acquire_transfer_permit()
+    if permit is None:
+        return _transfer_busy_response()
+
     if rng is None:
         # Full-file GET. send_file streams via wsgi.file_wrapper (sendfile) and
         # sets Content-Length/Content-Type/Last-Modified. conditional=False so
@@ -1628,12 +2041,28 @@ def model_file(model_key):
         resp = send_file(target, as_attachment=True, download_name=download_name,
                          conditional=False)
         resp.headers["Accept-Ranges"] = "bytes"  # advertise range support
+        # send_file's response is direct_passthrough with a bare FileWrapper
+        # iterable — Response.call_on_close does NOT fire here (see
+        # _ReleaseOnCloseIter's docstring for why). Wrap the iterable itself
+        # so the permit releases exactly once when the WSGI server (or a
+        # dropped connection) closes it — stream finished OR aborted.
+        resp.response = _ReleaseOnCloseIter(resp.response, permit.release)
         return resp
 
     # Satisfiable single range -> 206 with a real seek (O(1) to the offset).
     start, end = rng
     length = end - start + 1
-    resp = Response(_stream_file_window(target, start, end), status=206,
+
+    def _ranged_body():
+        try:
+            yield from _stream_file_window(target, start, end)
+        finally:
+            # Released on normal completion AND on client disconnect/error:
+            # a generator's `finally` still runs when werkzeug closes it via
+            # GeneratorExit (dropped connection) or an exception propagates.
+            permit.release()
+
+    resp = Response(_ranged_body(), status=206,
                     mimetype=ctype, direct_passthrough=True)
     resp.headers["Content-Range"] = f"bytes {start}-{end}/{size}"
     resp.headers["Accept-Ranges"] = "bytes"
@@ -1764,6 +2193,20 @@ def model_archive(model_key):
                 continue
             entries.append((real, os.path.relpath(full, dest)))
 
+    # ── global transfer cap ────────────────────────────────────────────────
+    # Acquire AFTER auth + the (cheap-ish) directory walk above, but BEFORE
+    # generate() starts the pipe/writer-thread that actually streams bytes.
+    # An archive pull is the biggest single amplifier of the 8*K problem (a
+    # whole model dir over one connection), so it shares the same cap as
+    # /file. See _TransferPermit above: release happens in generate()'s
+    # existing try/finally below, which already runs on normal completion,
+    # a dropped client connection (GeneratorExit), or a writer exception —
+    # exactly the "stream lifetime, not handler return" semantics this cap
+    # needs.
+    permit = _acquire_transfer_permit()
+    if permit is None:
+        return _transfer_busy_response()
+
     def generate():
         r_fd, w_fd = os.pipe()
 
@@ -1790,6 +2233,7 @@ def model_archive(model_key):
                     yield chunk
         finally:
             thread.join()
+            permit.release()
 
     return Response(
         generate(),

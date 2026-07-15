@@ -123,6 +123,12 @@ _SENSITIVE = [
     # are deliberately NOT here — their credential is the node's enroll token.
     ({"GET"},                    re.compile(r"^/agent/nodes$")),
     ({"POST"},                   re.compile(r"^/agent/[^/]+/dispatch$")),
+    # P3.1b: the single-task detail read (a run's full row incl. its result) is
+    # the operator's drill-in for the P3.3 console — gated like /agent/nodes.
+    # Scoped to GET and to the /tasks/<seq> shape (with a trailing seq), so the
+    # node-token pull (GET /agent/<id>/tasks — no seg) and the node-token result
+    # POST (POST /agent/<id>/tasks/<seq>/result — extra seg) both stay M2M-open.
+    ({"GET"},                    re.compile(r"^/agent/[^/]+/tasks/[^/]+$")),
     # Civitai checkpoint download — writes multi-GB files into central's
     # /checkpoints store (which self-registers models) — operator-only.
     ({"POST"},                   re.compile(r"^/civitai/download$")),
@@ -199,6 +205,15 @@ def operator_authenticated() -> bool:
     return _validate_session_external()
 
 
+def _agent_gates_open() -> bool:
+    """Mirror of agent_routes._agent_gates_open (operator-directed 2026-07-15:
+    agents feature ungated "for now"): ``HUGPY_AGENT_OPEN`` truthy exempts the
+    /agent/* operator rules in THIS belt-and-suspenders layer too, so the flag
+    opens the feature end-to-end. Every other sensitive path stays gated."""
+    return (os.environ.get("HUGPY_AGENT_OPEN", "") or "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 def _path_is_sensitive() -> bool:
     path = request.path or "/"
     if path == "/api" or path.startswith("/api/"):
@@ -206,6 +221,9 @@ def _path_is_sensitive() -> bool:
     method = request.method
     for methods, rx in _SENSITIVE:
         if method in methods and rx.match(path):
+            # The agent-fleet rules (and ONLY those) honor the open flag.
+            if path.startswith("/agent/") and _agent_gates_open():
+                continue
             return True
     return False
 

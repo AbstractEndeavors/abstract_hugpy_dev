@@ -122,6 +122,15 @@ _DEFAULT_GEN_SETTINGS: dict[str, Any] = {
     # advertises as image-text-to-text capable (e.g. a 7B), validated LIVE in
     # set_gen_settings so it can never point at a non-existent / non-VL model.
     "vision_model": None,    # image-text-to-text model key | null (== fleet default)
+    # CLEANUP-PROMPT slice (operator-requested 2026-07-15): remembered per-identity
+    # render-steer channels so the operator does NOT re-type the cleanup instruction on
+    # every generate (profile-IS-identity doctrine). Both default "" -> a bare Generate
+    # click renders byte-identically to today (defaults-are-promises).
+    #   cleanup_prompt   a positive-worded AVOID instruction (e.g. "no object on her back,
+    #                    clean bare back") woven into the T-pose front render prompt.
+    #   negative_prompt  a TRUE negative forwarded to the studio Wan-VACE render.
+    "cleanup_prompt": "",    # positive-avoid instruction woven into the front render | ""
+    "negative_prompt": "",   # true negative forwarded to the studio render | ""
 }
 _POSE_CHOICES = ("none", "t-pose")
 
@@ -627,7 +636,7 @@ def _public_version(v: dict[str, Any]) -> dict[str, Any]:
 def _merged_gen_settings(stored: Any) -> dict[str, Any]:
     """The full happy-path defaults with any stored partial layered on top — only
     KNOWN keys survive (a stale/unknown stored key is dropped from the wire), so the
-    shape is always exactly the contract's ten keys."""
+    shape is always exactly the contract's keys (all of ``_DEFAULT_GEN_SETTINGS``)."""
     gs = dict(_DEFAULT_GEN_SETTINGS)
     if isinstance(stored, dict):
         for k in _DEFAULT_GEN_SETTINGS:
@@ -857,9 +866,15 @@ def _recon_manifest(record: dict[str, Any]) -> dict[str, Any]:
     carries no ``mode`` -> defaulted to ``"sheet"`` so the shape is always self-describing.
     A turntable record's ``frame_count``/``degrees_per_frame`` (and the ordered ``views``
     holding the orbit frames in angular order) ride through untouched. Never drops or
-    renames a key — the sheet path's shape is unchanged."""
+    renames a key — the sheet path's shape is unchanged.
+
+    The recognized-mode tuple is widened to include ``"angle-ring"`` (a pre-existing latent
+    bug — it was silently downgraded to "sheet" on read) and ``"video_extract"`` (char360
+    video-derived sets, CHAR360-FEATURE-PLAN S3) so those modes ROUND-TRIP on read instead
+    of being flattened to "sheet". Kept in lock-step with attach_reconstruction's write-side
+    gate below."""
     out = dict(record)
-    if out.get("mode") not in ("sheet", "turntable"):
+    if out.get("mode") not in ("sheet", "turntable", "angle-ring", "video_extract"):
         out["mode"] = "sheet"
     return out
 
@@ -915,14 +930,26 @@ def attach_reconstruction(
         meta = spec if isinstance(spec, dict) else {}
         for key in ("job_id", "prompt", "seed", "prompts", "view_names",
                     # turntable additive provenance (sheet records omit these):
-                    "frame_count", "degrees_per_frame", "orbit_prompt"):
+                    "frame_count", "degrees_per_frame", "orbit_prompt",
+                    # char360 video-extract additive provenance (CHAR360-FEATURE-PLAN S3):
+                    # ``char`` = the detected character id; ``face_centroid`` = that
+                    # character's normed face embedding (or None) — S3b's face-descriptor
+                    # match path reads it off the record. Kept additively so no existing
+                    # key is renamed or dropped.
+                    "char", "face_centroid"):
             if key in meta:
                 record[key] = meta[key]
         # MODE always stored so the manifest is self-describing; absent meta => "sheet"
         # (the existing N-independent-view-stills path). For a turntable, ``views`` holds
-        # the orbit clip's frames in ANGULAR order and ``frame_count`` its length.
+        # the orbit clip's frames in ANGULAR order and ``frame_count`` its length. The gate
+        # is widened to keep ``"angle-ring"`` (a pre-existing latent bug — it was wrongly
+        # downgraded to "sheet") and ``"video_extract"`` (char360, CHAR360-FEATURE-PLAN S3)
+        # rather than SILENTLY DOWNGRADING them. Kept in lock-step with _recon_manifest's
+        # read-side normalizer above. (RECON_MODES + the reconstruction route validators are
+        # deliberately NOT touched — this relay job never builds an IdentityReconstructionSpec.)
         mode = meta.get("mode")
-        record["mode"] = mode if mode in ("sheet", "turntable") else "sheet"
+        record["mode"] = (
+            mode if mode in ("sheet", "turntable", "angle-ring", "video_extract") else "sheet")
         # manifest.json: the on-disk denormalized mirror of the record (same atomic write).
         _atomic_write_json(os.path.join(recon_dir, "manifest.json"), record)
 
@@ -1427,6 +1454,20 @@ def _valid_vision_model_keys() -> set[str]:
     }
 
 
+def preferred_identity_vision_model() -> Optional[str]:
+    """The AUTO default VL model for identity 3D-imaging front-select: a 7B when the
+    fleet has one, else None (== the fleet-default VL, the 3B).
+
+    Operator 2026-07-15: "7B should be default if it is available" — the 3B mislabeled
+    a waist-up reference as full-body, so the bigger judge is the better default for
+    exactly this call. Availability = the live image-text-to-text registry carries a
+    Qwen2.5-VL-7B key (installed models only); sorted() makes the pick deterministic
+    when several vendor-prefixed copies exist. The relay retries WITHOUT a model on a
+    failed 7B call, so an unloadable 7B degrades to the 3B, never to no judgment."""
+    sevens = sorted(k for k in _valid_vision_model_keys() if "Qwen2.5-VL-7B" in k)
+    return sevens[0] if sevens else None
+
+
 def set_gen_settings(slug: str, partial: dict[str, Any]) -> Optional[dict[str, Any]]:
     """Merge a PARTIAL gen_settings update into the identity's stored settings. Only the
     contract's known keys are accepted (an unknown key is a ProfileError -> the route's
@@ -1463,6 +1504,15 @@ def set_gen_settings(slug: str, partial: dict[str, Any]) -> Optional[dict[str, A
                     raise ProfileError(
                         "front_ref must be one of the profile's own reference images",
                         code="invalid_profile")
+            elif k in ("cleanup_prompt", "negative_prompt"):
+                # CLEANUP-PROMPT slice: plain string render-steer channels. None/"" ==
+                # "no steer" (byte-identical to today), stored as "". Any non-string is a
+                # ProfileError -> the route's 400. Whitespace is preserved verbatim (the
+                # relay/reconstruction wiring strips as needed) beyond the None->"" coerce.
+                if v is None:
+                    v = ""
+                elif not isinstance(v, str):
+                    raise ProfileError(f"{k} must be a string", code="invalid_profile")
             elif k == "vision_model":
                 # None/"" == "use the fleet-default VL model" (the 3B): a zero-regression
                 # CLEAR, always accepted and stored as None. A non-empty value must be a

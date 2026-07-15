@@ -72,6 +72,45 @@ def _end_comfy_call(job_id) -> None:
         pass
 
 
+# ── ensure-comfy-headroom hook (Fix B, 2026-07-15) ──────────────────────────
+# When hugpy drives a ComfyUI gen, ComfyUI (a SEPARATE process) silently grabs
+# VRAM or waits — it is never a first-class queue entry, so a card already full
+# of managed on-demand models leaves ComfyUI to under-allocate or stall. This
+# hook lets the WORKER agent register a routine that evicts on-demand managed
+# models (LRU, via the same eviction mechanism Fix A uses) until real free VRAM
+# reaches a target, BEFORE every comfy gen commits. The setter/None-default
+# pattern mirrors slots.set_eviction_policy / dispatch.set_fit_check: comfy_runner
+# is package-shared (central imports it too), so it must NOT import worker/GPU
+# internals directly — the worker registers the hook at boot and comfy_runner
+# calls it if present, else no-op. Central's import stays clean (no GPU deps),
+# and a no-GPU / unregistered box is byte-identical to today (the call is a
+# no-op). Strictly best-effort: any failure is swallowed so it can NEVER break a
+# generation (honest-degrade — never block/hang the comfy gen).
+_COMFY_HEADROOM_HOOK = None
+
+
+def set_comfy_headroom_hook(fn) -> None:
+    """Register the worker-side 'ensure comfy headroom' routine:
+    ``fn(model_key, job_id) -> None`` (evicts on-demand managed models until real
+    free VRAM >= target). None (bare central / no-GPU) => the pre-gen headroom
+    step is a no-op, byte-identical to before."""
+    global _COMFY_HEADROOM_HOOK
+    _COMFY_HEADROOM_HOOK = fn
+
+
+def _ensure_comfy_headroom(model_key, job_id) -> None:
+    """Call the registered ensure-comfy-headroom hook (Fix B) if present, else a
+    no-op. Best-effort — never raises into the generation path."""
+    hook = _COMFY_HEADROOM_HOOK
+    if hook is None:
+        return
+    try:
+        hook(model_key, job_id)
+    except Exception:  # noqa: BLE001 — headroom prep never breaks generation
+        logger.warning("ensure-comfy-headroom hook failed (proceeding with the "
+                       "gen anyway)", exc_info=True)
+
+
 def _comfy_url() -> str:
     return (os.environ.get("COMFY_URL") or "http://127.0.0.1:8188").rstrip("/")
 
@@ -320,6 +359,16 @@ class ComfyRunner:
 
     def _generate(self, req: ImageGenRequest) -> "list[GeneratedImage]":
         import httpx
+
+        # Fix B: ensure headroom before the comfy gen commits. Evict on-demand
+        # managed models (LRU) until real free VRAM reaches the target, so
+        # ComfyUI's demand is a first-class queue entry instead of a silent
+        # squatter. Runs UNCONDITIONALLY (a no-op when already above target, when
+        # no hook is registered, or on a no-GPU box) and honest-degrades: if
+        # eviction can't reach the target it proceeds anyway (logged), never
+        # blocking the gen. Single choke point: every comfy gen (t2i/i2i/id_lock)
+        # passes through _generate before the /prompt POST below.
+        _ensure_comfy_headroom(self.model_key, getattr(req, "request_id", None))
 
         seed = req.seed if req.seed is not None else int.from_bytes(os.urandom(4), "big")
         url = _comfy_url()

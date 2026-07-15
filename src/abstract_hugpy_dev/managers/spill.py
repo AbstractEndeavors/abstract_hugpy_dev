@@ -107,6 +107,25 @@ def free_vram_bytes() -> Optional[int]:
     return max(0, raw - vram_reserve_bytes())
 
 
+def total_vram_bytes() -> Optional[int]:
+    """Total INSTALLED VRAM on the primary GPU in bytes, or None if no GPU /
+    can't tell.
+
+    Unlike ``free_vram_bytes`` this is RAW — the operator reserve is NOT
+    subtracted, because total is a fixed physical property of the card (its
+    capacity), while the reserve is a slice held out of the FREE budget. The
+    VRAM-ceiling gate (Fix A) uses it as the denominator for the ~90% ceiling —
+    "keep the physical card at/under N% full" is a statement about the whole
+    card, so it must be the whole card. Same probe family as ``free_vram_bytes``
+    (torch.cuda.mem_get_info total, then nvidia-smi), so ceiling and free reads
+    come from the same ComfyUI-visible device truth. Degrades to None (never 0)
+    so the ceiling gate can tell "unmeasurable" from "no capacity" and fail
+    OPEN."""
+    from .._platform.hardware import total_vram_bytes as _total_vram
+
+    return _total_vram(_env_int("HUGPY_MAIN_GPU") or 0)
+
+
 def free_ram_bytes() -> Optional[int]:
     """Budgetable free RAM: raw minus the operator reserve, optionally hard-
     capped by HUGPY_RAM_MAX_GIB (an allocation CEILING for this box — "hugpy

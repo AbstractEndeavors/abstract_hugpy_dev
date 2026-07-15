@@ -22,22 +22,75 @@ def _staging_dir(dest: str) -> str:
     return f"{dest}.tmp-{os.getpid()}"
 
 
+def _merge_tree(src: str, dst: str) -> None:
+    """Recursively merge directory ``src`` INTO existing directory ``dst`` on
+    the SAME filesystem, at every depth.
+
+    The old single-level merge did ``os.replace(src/child, dst/child)`` for a
+    dir-onto-dir collision — but ``os.replace`` onto an EXISTING NON-EMPTY
+    directory raises ``OSError [Errno 39] Directory not empty`` (ENOTEMPTY).
+    HF Hub leaves a populated ``.cache/huggingface/download/`` inside BOTH the
+    staged copy and any prior-partial dest, so that collision tripped ENOTEMPTY
+    and wedged the finalize forever (Hunyuan3D-2mv/-2mini). This walks instead:
+
+      * both sides are directories  -> recurse (never replace a dir whole);
+      * anything else (src is a file, or dst is absent) -> ``os.replace`` is an
+        atomic same-fs rename that overwrites a file / lands into an absent
+        slot — never touches ENOTEMPTY;
+
+    then removes the now-emptied ``src`` dir. os.replace stays instant because
+    src and dst are the same store filesystem.
+
+    NEVER-DELETE / overwrite judgment: on a leaf collision the STAGED (just
+    downloaded, complete) copy wins via os.replace — that IS the resume/re-pull
+    intent (finish an interrupted pull with the fresh, complete bytes). The
+    only files that realistically collide here are HF-scratch metadata under
+    ``.cache/huggingface`` (regenerable, not catalog data) and, in a re-pull,
+    a model's own weight files being replaced by their freshly-downloaded
+    identical selves. We do NOT archive the pre-existing leaf: it is either
+    regenerable HF scratch or the same weight re-fetched. Real catalog data is
+    never reached by this path — a COMPLETE model short-circuits download long
+    before promote (resolve_model_dir read-through), so ``dest`` here is only
+    ever a PARTIAL prior attempt, not a finished model.
+    """
+    for name in os.listdir(src):
+        s = os.path.join(src, name)
+        d = os.path.join(dst, name)
+        s_is_dir = os.path.isdir(s) and not os.path.islink(s)
+        d_is_dir = os.path.isdir(d) and not os.path.islink(d)
+        if s_is_dir and d_is_dir:
+            _merge_tree(s, d)          # both dirs -> recurse (avoid ENOTEMPTY)
+            os.rmdir(s)                # src subtree drained -> drop the shell
+        else:
+            # File-over-file / into-absent is a plain atomic os.replace. The
+            # only mismatch that os.replace itself can't do is a FILE landing
+            # where a DIR exists (EISDIR) or a DIR landing where a file exists.
+            # HF never produces such a type-flip for the same path, but be
+            # robust: the STAGED (complete) side wins, so drop the stale dest
+            # node first. This only ever removes a PARTIAL prior attempt's
+            # regenerable node (dest here is never a finished model — a
+            # complete copy short-circuits download before promote), so it is
+            # EXEMPT from never-delete, same class as the staging temp itself.
+            if d_is_dir and not s_is_dir:
+                _shutil.rmtree(d, ignore_errors=True)   # stale dir <- staged file
+            elif os.path.exists(d) and s_is_dir and not d_is_dir:
+                os.remove(d)                            # stale file <- staged dir
+            os.replace(s, d)           # now an atomic, unobstructed rename
+
+
 def _promote_staged(staged: str, dest: str) -> str:
     """Atomically move a COMPLETED staging dir onto its final path. Same
-    filesystem -> os.rename (instant). If dest already exists (resume/merge),
-    move staged's entries in (os.replace) and drop the emptied staging dir."""
+    filesystem -> os.rename (instant). If dest already exists (a prior partial
+    attempt), RECURSIVELY merge staged's tree into it (never os.replace a dir
+    whole — that raises ENOTEMPTY on a non-empty pre-existing nested dir such
+    as HF's ``.cache/huggingface/download``) and drop the emptied staging dir.
+
+    Pure function ``(staged, dest) -> dest``."""
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     if not os.path.exists(dest):
-        os.rename(staged, dest)
+        os.rename(staged, dest)          # fast path: clean, whole-dir rename
         return dest
-    for name in os.listdir(staged):
-        src = os.path.join(staged, name)
-        dst = os.path.join(dest, name)
-        if os.path.isdir(src) and os.path.isdir(dst):
-            for sub in os.listdir(src):
-                os.replace(os.path.join(src, sub), os.path.join(dst, sub))
-        else:
-            os.replace(src, dst)
+    _merge_tree(staged, dest)            # resume/merge: recurse, depth-safe
     _shutil.rmtree(staged, ignore_errors=True)   # temp cleanup: EXEMPT from never-delete
     return dest
 
@@ -383,7 +436,19 @@ def download_one(model: dict[str, Any],root: str=None,model_key=None, dry_run: b
             print(f"  downloaded snapshot with pattern: {allow_patterns}"
                   if allow_patterns else "  downloaded full snapshot")
         _stamp(staged, model_key, model)
-        _promote_staged(staged, destination)
+        try:
+            _promote_staged(staged, destination)
+        except OSError as exc:
+            # Finalize failed AFTER a complete download (bytes are all in
+            # `staged`, progress is ~1.0). A bare OSError here reads to the
+            # download-job monitor as a transient worker exit and burns all
+            # MAX_ATTEMPTS retrying the SAME unfixable collision silently
+            # (the 0.999 "does & doesn't gen" wedge). Part A's recursive merge
+            # should prevent this, but if a finalize STILL can't reconcile,
+            # surface an EXPLICIT, human-readable terminal reason instead of a
+            # raw traceback (operator doctrine: failures must be explicit).
+            raise RuntimeError(
+                f"download finalize failed for {destination}: {exc}") from exc
     except BaseException:
         # A partial/aborted pull must never sit at a resolvable path — discard
         # the staging temp (exempt from never-delete) and re-raise.
@@ -538,7 +603,14 @@ def ensure_model(key: str, root: str = DEFAULT_ROOT) -> str:
             include=getattr(cfg, "include", None),
             source="download",
         )
-        _promote_staged(staged, path)
+        try:
+            _promote_staged(staged, path)
+        except OSError as exc:
+            # See download_one: a finalize collision must surface as an
+            # EXPLICIT terminal reason, not a raw OSError that reads as a
+            # transient worker exit and loops MAX_ATTEMPTS silently.
+            raise RuntimeError(
+                f"download finalize failed for {path}: {exc}") from exc
         return path
     except BaseException as e:
         # A partial/aborted pull must never sit at a resolvable path — discard

@@ -188,6 +188,11 @@ def _public_view(worker: Dict[str, Any]) -> Dict[str, Any]:
         "storage": storage_proposal(worker),
         "status": "online" if _is_online(worker) else "offline",
         "admission": worker.get("admission", "approved"),
+        # SYSTEM-authored placement grants (Phase 1 item 2) — separate from the
+        # operator-designated ``models`` list. Never treat a missing key as
+        # absence-of-feature; always surface the (possibly empty) dict so
+        # console/tests can see grants land and clear.
+        "grants": dict(worker.get("grants") or {}),
     }
 
 
@@ -510,6 +515,7 @@ def storage_proposal(worker: Dict[str, Any]) -> Dict[str, Any]:
         except (TypeError, ValueError):
             return 0.0
 
+    grants_now = worker.get("grants") or {}
     models_out: List[Dict[str, Any]] = []
     candidates: List[tuple] = []   # (last_picked, bytes, model_key)
     raw_models = storage.get("models") if reported else None
@@ -522,6 +528,15 @@ def storage_proposal(worker: Dict[str, Any]) -> Dict[str, Any]:
         # Central-final protection = worker's own flag OR any redundant central
         # guard (slot-merged loaded/loading, provisioning, static, pin). A model
         # is a candidate ONLY if unprotected on BOTH sides.
+        #
+        # NOTE (Phase 1 item 2, grant markers): a SYSTEM grant is DELIBERATELY
+        # ABSENT from this chain — the opposite of an operator "assigned"
+        # designation. A model that is ONLY granted (not assigned/pinned/
+        # static/loaded) gets no protection here and remains a normal LRU
+        # eviction candidate; grants are reclaimable by construction, never a
+        # residency guarantee. If a model happens to be BOTH granted and
+        # pinned/assigned/etc., that other designation still protects it as
+        # before — the grant itself just contributes nothing either way.
         why = m.get("why") or ""
         protected = bool(m.get("protected"))
         if not protected:
@@ -543,6 +558,7 @@ def storage_proposal(worker: Dict[str, Any]) -> Dict[str, Any]:
             "last_picked": lp or None,     # None = never served through central
             "protected": protected,
             "why": why,
+            "granted": mk in grants_now,   # SYSTEM marker only — confers no protection
             "pinned": bool(m.get("pinned") or pinned_cfg.get(mk)),
             "loaded": bool(m.get("loaded") or mk in loaded_now),
             "loading": bool(m.get("loading") or mk in loading_now),
@@ -1144,6 +1160,40 @@ class WorkerStore:
             _remember_assignments(worker)   # 4b: an explicit unassign IS forgotten
             return _public_view(worker)
 
+    # -- placement grants (Phase 1 item 2) -----------------------------------
+    # A GRANT is a SYSTEM-authored designation — born from a future
+    # capacity-aware placement decision, NOT an operator assign/pin. Stored
+    # separately from ``worker["models"]`` so it can never masquerade as
+    # operator intent: assign/unassign, storage protection's "assigned" branch,
+    # and the assignment-memory snapshot all stay blind to it. A grant is
+    # freely LRU-evictable (see storage_proposal) and dies with the live
+    # worker row — it is deliberately NOT written to the assign-memory file
+    # (_remember_assignments), so a row-loss restore never resurrects it. This
+    # method only touches ``worker["grants"]``; ``worker["models"]`` is
+    # untouched (orthogonal to assign_model/unassign_model).
+    def grant_model(self, worker_id: str, model_key: str,
+                    job_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        with self._transaction() as workers:
+            worker = workers.get(worker_id)
+            if worker is None:
+                return None
+            grants = worker.setdefault("grants", {})
+            grants[model_key] = {
+                "ts": _now(),
+                "job_id": job_id,
+                "origin": "system",
+            }
+            return _public_view(worker)
+
+    def ungrant_model(self, worker_id: str, model_key: str) -> Optional[Dict[str, Any]]:
+        """Remove one grant. Idempotent — a missing key is a no-op, not an error."""
+        with self._transaction() as workers:
+            worker = workers.get(worker_id)
+            if worker is None:
+                return None
+            worker.get("grants", {}).pop(model_key, None)
+            return _public_view(worker)
+
     def spill_for(self, worker_id: str, model_key: str) -> Dict[str, Any]:
         """Per-assignment spill override for (worker, model), or {} for autofit."""
         worker = self._load().get(worker_id)
@@ -1216,7 +1266,8 @@ class WorkerStore:
                 # empty result's log names the real cause (a DESIGNATED worker
                 # whose engine can't serve — the "assigned+pinned but 500s"
                 # mystery) instead of every engine-broken box on the fleet.
-                _serveable = list(w.get("models", [])) + list(w.get("loaded_models", []))
+                _serveable = (list(w.get("models", [])) + list(w.get("loaded_models", []))
+                              + list(w.get("grants", {}).keys()))
                 if (model_key in _serveable
                         or wanted & {a for m in _serveable for a in _match_keys(m)}):
                     engine_skipped += 1
@@ -1235,7 +1286,14 @@ class WorkerStore:
             # GPU sat there with the weights already up. Loaded-ness is
             # heartbeat-fresh; if it evicts between beats the relay fails
             # pre-token and the caller falls back as always.
-            serveable = list(w.get("models", [])) + list(w.get("loaded_models", []))
+            # Grants (SYSTEM-authored placement, Phase 1 item 2) are serveable
+            # exactly like an operator assignment or a live-loaded model —
+            # once a granted model is actually held by the worker it must
+            # route, or the grant is pointless. Grants confer NO eviction
+            # protection (see storage_proposal) — this is purely "can serve",
+            # not "may not be reclaimed".
+            serveable = (list(w.get("models", [])) + list(w.get("loaded_models", []))
+                         + list(w.get("grants", {}).keys()))
             # Match on the raw key OR any normalized alias (hub_id vs key vs
             # case), so an assignment made via one form still routes a chat that
             # names the model a slightly different way.
@@ -1491,6 +1549,16 @@ def assign_model(worker_id: str, model_key: str,
 def unassign_model(worker_id: str, model_key: str) -> Optional[Dict[str, Any]]:
     worker_store.set_load_report(worker_id, model_key, None)
     return worker_store.unassign_model(worker_id, model_key)
+
+
+def grant_model(worker_id: str, model_key: str,
+                job_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """SYSTEM-authored placement grant (Phase 1 item 2) — see WorkerStore.grant_model."""
+    return worker_store.grant_model(worker_id, model_key, job_id=job_id)
+
+
+def ungrant_model(worker_id: str, model_key: str) -> Optional[Dict[str, Any]]:
+    return worker_store.ungrant_model(worker_id, model_key)
 
 
 def set_load_report(worker_id: str, model_key: str,

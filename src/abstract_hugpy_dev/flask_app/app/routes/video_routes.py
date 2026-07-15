@@ -72,6 +72,9 @@ from abstract_hugpy_dev.video_intel.identity_reconstruction_schema import (
     make_identity_mesh,
     MESH_VIEW_NAMES as _MESH_VIEW_NAMES,
 )
+from abstract_hugpy_dev.video_intel.identity_video_extract_schema import (
+    make_identity_video_extract,
+)
 from abstract_hugpy_dev.video_intel.chains import (
     resolve_video_parts,
     resolve_video_parts_scene,
@@ -2139,6 +2142,20 @@ def video_identity_profile_reconstruction(slug):
     if not isinstance(seed, int) or isinstance(seed, bool):
         return jsonify({"error": "seed must be an int"}), 400
 
+    # CLEANUP-PROMPT slice (C4 — the reachability wire): same body-or-gen_settings
+    # precedence as the /generate route's vision_model/cleanup_prompt resolution — an
+    # EXPLICIT request-body ``negative_prompt`` wins; else the identity's PERSISTED
+    # gen_settings.negative_prompt (the Advanced-panel field); else "" (today's exact
+    # call, defaults-are-promises). NOTE: make_identity_reconstruction is currently the
+    # bare ``**kwargs`` passthrough (identity_reconstruction_schema.py:570), so this
+    # value reaches IdentityReconstructionSpec.negative_prompt directly via the
+    # dataclass constructor, unvalidated by the dead factory at :119 — acceptable here
+    # since the field is a plain string with default "" (out of scope to fix the shadow).
+    _gen_settings = profile.get("gen_settings") or {}
+    negative_prompt = body.get("negative_prompt")
+    if negative_prompt in (None, ""):
+        negative_prompt = _gen_settings.get("negative_prompt", "")
+
     recon_id = "recon_" + secrets.token_hex(8)
     try:
         spec = make_identity_reconstruction(
@@ -2149,6 +2166,7 @@ def video_identity_profile_reconstruction(slug):
             source_images=tuple(resolved_refs),
             views=tuple(views),
             base_prompt=prompt,
+            negative_prompt=negative_prompt,
             seed=seed,
             mode=mode,
             angle_step_deg=angle_step_deg,
@@ -2335,6 +2353,23 @@ def video_identity_profile_build_mesh(slug, recon_id):
     vision_model = body.get("vision_model")
     if vision_model in (None, ""):
         vision_model = _gen_settings.get("vision_model")
+    if vision_model in (None, ""):
+        # AUTO default (operator 2026-07-15): prefer a 7B VL when the fleet has one —
+        # the 3B mislabeled a waist-up ref as full-body. None when no 7B is installed
+        # (== fleet-default 3B); the relay degrades a failing 7B call back to the 3B.
+        vision_model = identity_profiles.preferred_identity_vision_model()
+
+    # CLEANUP / NEGATIVE prompt — SAME body-or-gen_settings precedence as /generate
+    # (C4). This surgical per-reconstruction re-mesh runs the SAME T-pose front render
+    # + studio path, so it must honor the identity's persisted cleanup/negative too —
+    # else a re-mesh silently drops the "no object on her back" instruction. Blank =
+    # today's exact behavior.
+    cleanup_prompt = body.get("cleanup_prompt")
+    if cleanup_prompt in (None, ""):
+        cleanup_prompt = _gen_settings.get("cleanup_prompt", "")
+    negative_prompt = body.get("negative_prompt")
+    if negative_prompt in (None, ""):
+        negative_prompt = _gen_settings.get("negative_prompt", "")
 
     try:
         spec = make_identity_mesh(
@@ -2354,6 +2389,8 @@ def video_identity_profile_build_mesh(slug, recon_id):
             transparent=bool(tt.get("transparent", False)),
             view_candidates=view_candidates,
             vision_model=vision_model,
+            cleanup_prompt=cleanup_prompt,
+            negative_prompt=negative_prompt,
         )
     except (ValueError, TypeError) as exc:  # bad fields = 400
         return jsonify({"error": str(exc)}), 400
@@ -2388,6 +2425,81 @@ def video_identity_profile_mesh_status(slug, recon_id):
 
 
 # --------------------------------------------------------------------------- #
+# 5g-vx) POST /video/identity-profiles/video-extract
+#     char360 VIDEO -> per-character 360° view-sets, written back into identity profiles
+#     (CHAR360-FEATURE-PLAN S3). This is its OWN relay job (identity_video_extract, mirrors
+#     identity_mesh_build) — it relays a source clip to the standalone GPU render service
+#     (which grew the video_extract kind in S2), polls it, downloads the per-character
+#     view-sets, and writes them back. It is NOT the local identity_reconstruction job.
+#
+#     Body:
+#       source          a MediaRef-shaped dict for the source VIDEO clip (the same shape
+#                       the frame_extract route accepts — rehydrated via make_media_ref).
+#                       Its uri must be an absolute path inside the storage jail; the runner
+#                       forwards it to the service as video_path (ae + central share the
+#                       mount, so a large clip is never base64-inflated through the body).
+#       target          "create" (mint a NEW profile per detected character) or an EXISTING
+#                       profile slug (append each character's view-set to it). Required.
+#       char360_params? optional passthrough knobs for the service's Char360Params
+#                       (stride / yolo_model / min_h_frac / cluster_dist / min_faces);
+#                       unknown keys are dropped by the spec factory.
+#     Returns {job_id, target} 200; a bad source/target is a clean 400; an unknown target
+#     slug is a 404 (checked up front, mirroring the mesh route's profile guard).
+# --------------------------------------------------------------------------- #
+@video_bp.route("/video/identity-profiles/video-extract", methods=["POST"])
+def video_identity_profile_video_extract():
+    body = request.get_json(silent=True) or {}
+
+    # source: a MediaRef-shaped dict (mirrors the frame_extract route — the console builds
+    # the ref via POST /video/ingest, then hands us the ref dict). Rehydrate + validate it,
+    # then jail its uri so the runner can never be pointed at an arbitrary file to relay.
+    source_d = body.get("source")
+    if not isinstance(source_d, dict):
+        return jsonify({"error": "missing or invalid 'source' MediaRef (a video)"}), 400
+    try:
+        source = make_media_ref(**source_d)
+    except (ValueError, TypeError) as exc:  # bad ref shape / non-abs uri = 400
+        return jsonify({"error": f"invalid source MediaRef: {exc}"}), 400
+    if source.kind != "video":
+        return jsonify({"error": f"source must be a video; got kind={source.kind!r}"}), 400
+    if _jail_resolve(source.uri) is None:
+        return jsonify({"error": "source video is outside the storage jail"}), 400
+
+    target = body.get("target")
+    if not isinstance(target, str) or not target.strip():
+        return jsonify({"error": "target is required ('create' or an existing profile slug)"}), 400
+    target = target.strip()
+
+    # An ADD target must name a LIVE profile — a clean 404 up front (rather than after a
+    # full extract), mirroring the mesh route's get_profile guard. The correlation id handed
+    # to the service is the slug (add) or a synthesized id (create — the runner synthesizes
+    # one when identity_id is blank, but pass an explicit honest one here too).
+    if target == "create":
+        identity_id = None  # the runner synthesizes videoextract-<job_id>
+    else:
+        if identity_profiles.get_profile(target) is None:
+            return jsonify({"error": f"identity profile {target!r} not found"}), 404
+        identity_id = target
+
+    char360_params = body.get("char360_params")
+    if char360_params is not None and not isinstance(char360_params, dict):
+        return jsonify({"error": "char360_params must be an object"}), 400
+
+    try:
+        spec = make_identity_video_extract(
+            source=source,
+            target=target,
+            char360_params=char360_params,
+            identity_id=identity_id,
+        )
+    except (ValueError, TypeError) as exc:  # bad fields = 400
+        return jsonify({"error": str(exc)}), 400
+
+    job_id = media_bus.enqueue("identity_video_extract", spec)
+    return jsonify({"job_id": job_id, "target": target}), 200
+
+
+# --------------------------------------------------------------------------- #
 # 5i) POST /video/identity-profiles/<slug>/generate
 #     ONE-CLICK FULL IDENTITY GENERATION — the template that turns a saved identity
 #     PROFILE into a complete 3D identity in a single action: a Hunyuan3D mesh, a
@@ -2414,19 +2526,74 @@ def video_identity_profile_mesh_status(slug, recon_id):
 # --------------------------------------------------------------------------- #
 _POSE_CHOICES = ("none", "t-pose")
 
+# T-pose render geometry — the Wan-VACE id_lock ceiling is 480p (a 512² id_lock render
+# fails ``no_capable_model``); a square 480×480 portrait matches the movie/reconstruction
+# id_lock default, so the T-pose still snaps to it. The capability probe builds a spec at
+# THIS geometry so the routing decision it makes matches the render the relay will run.
+# Shared with runners/identity_render_relay._render_pose_front (kept identical there).
+_TPOSE_RENDER_W, _TPOSE_RENDER_H, _TPOSE_RENDER_FPS = 480, 480, 16
+
 
 def _pose_stage_capable(slug: str) -> bool:
-    """Whether the T-pose pose-normalization RENDER STAGE is available on this deployment.
+    """Whether the T-pose pose-normalization RENDER STAGE can actually run on this
+    deployment RIGHT NOW.
 
-    Slice 5 (IDENTITY-VERSIONS-SLICE.md) builds that stage — an id_lock T-pose still
-    rendered on the VACE path (needs ~6GB free on the 3090, lands with evict-to-make-room)
-    then rembg'd and used as the mesh front. Until it ships this is False, so a
-    ``pose: "t-pose"`` request degrades honestly (the /generate route falls back to the
-    normal front AND returns a structured not-capable notice — never a silent
-    crossed-arm mesh). Kept a FUNCTION (not a constant) so slice 5 wires the real
-    render-service capability probe here in ONE place, and so a test can exercise the
-    capable branch by monkeypatching it."""
-    return False
+    Slice 5 (IDENTITY-VERSIONS-SLICE.md) is the render stage: the relay renders ONE
+    id_lock T-pose STILL on the Wan-VACE path (studio worker on ae, ~6GB free on the
+    3090) and meshes THAT instead of the crossed-arm source photo. Whether that render
+    will land on a GPU worker — versus silently falling to central's GPU-less in-process
+    path, where an id_lock render can only fail — is the EXACT same question the studio
+    delegation layer already answers for every VACE render: ``should_delegate(spec)``
+    returns True iff (a) a studio worker is RESOLVABLE (``HUGPY_STUDIO_WORKER`` set, or
+    the registry-based resolver once studio models are first-class rows) AND (b) the
+    request binds a REAL (non-synthetic) VACE model at the worker's autofit budget. That
+    predicate reads the in-process worker registry + the capability router — no network
+    probe — so it is cheap enough to run on the request path (defaults-are-promises: we
+    only advertise "capable" when the render will really delegate to a GPU that owns the
+    model).
+
+    We reuse that decision instead of hand-rolling a ``comfy.id_lock`` capability check:
+    the T-pose still is a Wan-VACE reference-to-video render, NOT a ComfyUI-IPAdapter
+    still, so ``comfy.id_lock`` is the wrong signal — the right signal is "will an
+    id_lock studio render delegate to a worker that serves the VACE model". We build a
+    REPRESENTATIVE id_lock ``studio_i2v`` spec at the reconstruction id_lock ceiling
+    (480×480, the same geometry the relay's T-pose render will use) and ask
+    ``should_delegate`` about it.
+
+    FAIL-CLOSED: any exception — an import failure, a registry read hiccup, a router
+    error — degrades to False so a ``pose: "t-pose"`` request falls back to the normal
+    front (honest not-capable notice) rather than enqueuing a build that would fail its
+    pose render. ``slug`` is accepted for signature stability (a future per-identity gate
+    could consult it) but the capability is deployment-wide today.
+
+    Kept a FUNCTION so the probe lives in ONE place and a test can exercise the capable
+    branch by monkeypatching it (or by pointing HUGPY_STUDIO_WORKER at a real registry
+    row)."""
+    try:
+        # Lazy imports — the studio spine + registry are heavy and must not load at
+        # module import time (this route module imports at app boot). Mirrors the
+        # relay's lazy-import discipline.
+        from ...video_intel.runners.studio_i2v import should_delegate
+        from ...video_intel.studio.job import make_studio_i2v
+
+        # A representative id_lock still spec at the VACE 480p id_lock ceiling — the SAME
+        # geometry the relay's T-pose render uses (see _render_pose_front). A single
+        # placeholder reference image is enough for the routing decision (should_delegate
+        # reads the worker registry + the capability router; it does not open the file).
+        probe = make_studio_i2v(
+            capability="id_lock",
+            width=_TPOSE_RENDER_W,
+            height=_TPOSE_RENDER_H,
+            fps=_TPOSE_RENDER_FPS,
+            vram_budget_gb=None,        # autofit — exactly what the real render uses
+            seed=0,
+            prompt="capability probe",
+            reference_images=("__probe__",),
+        )
+        return bool(should_delegate(probe))
+    except Exception:  # noqa: BLE001 — fail-closed: any probe failure => not capable
+        logger.debug("pose-stage capability probe failed for %s", slug, exc_info=True)
+        return False
 
 
 @video_bp.route("/video/identity-profiles/<slug>/generate", methods=["POST"])
@@ -2501,6 +2668,24 @@ def video_identity_profile_generate(slug):
     vision_model = body.get("vision_model")
     if vision_model in (None, ""):
         vision_model = _gen_settings.get("vision_model")
+    if vision_model in (None, ""):
+        # AUTO default (operator 2026-07-15): prefer a 7B VL when the fleet has one —
+        # the 3B mislabeled a waist-up ref as full-body. None when no 7B is installed
+        # (== fleet-default 3B); the relay degrades a failing 7B call back to the 3B.
+        vision_model = identity_profiles.preferred_identity_vision_model()
+
+    # CLEANUP-PROMPT slice (C4 — the reachability wire): same precedence pattern as
+    # vision_model above — an EXPLICIT request-body value wins; else the identity's
+    # PERSISTED gen_settings value (what the new Advanced-panel field saves); else ""
+    # (== today's exact render, defaults-are-promises). make_identity_mesh coerces
+    # None -> "" regardless, so a bare one-click still honors the profile's saved
+    # cleanup/negative steer even when the UI body omits the fields.
+    cleanup_prompt = body.get("cleanup_prompt")
+    if cleanup_prompt in (None, ""):
+        cleanup_prompt = _gen_settings.get("cleanup_prompt", "")
+    negative_prompt = body.get("negative_prompt")
+    if negative_prompt in (None, ""):
+        negative_prompt = _gen_settings.get("negative_prompt", "")
 
     try:
         spec = make_identity_mesh(
@@ -2524,6 +2709,8 @@ def video_identity_profile_generate(slug):
             view_candidates=view_candidates,
             pose=effective_pose,
             vision_model=vision_model,
+            cleanup_prompt=cleanup_prompt,
+            negative_prompt=negative_prompt,
         )
     except (ValueError, TypeError) as exc:  # bad fields = 400
         return jsonify({"error": str(exc)}), 400

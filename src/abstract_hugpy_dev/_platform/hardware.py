@@ -136,3 +136,34 @@ def free_vram_bytes(main: int = 0) -> Optional[int]:
         except Exception:
             return None
     return None
+
+
+def total_vram_bytes(main: int = 0) -> Optional[int]:
+    """Total (installed) VRAM on GPU ``main`` in bytes, or ``None`` if no GPU /
+    can't tell. Mirrors ``free_vram_bytes`` probe-for-probe (torch.cuda.mem_get_info
+    total, then ``nvidia-smi --query-gpu=memory.total``) so a device-wide ceiling
+    (e.g. "keep the card at/under 90% full") is computed from the SAME truth the
+    free-VRAM read comes from — both are ComfyUI-visible device totals, not managed
+    bookkeeping. Degrades to ``None`` (not 0) so a caller can tell "unmeasurable"
+    from "no headroom" and fail OPEN."""
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            _free, total = torch.cuda.mem_get_info(main)
+            return int(total)
+    except Exception:
+        pass
+    smi = resolve_bin("nvidia-smi")
+    if smi:
+        try:
+            out = subprocess.check_output(
+                [smi, "--query-gpu=memory.total", "--format=csv,noheader,nounits",
+                 "-i", str(main)],
+                stderr=subprocess.DEVNULL, timeout=10,
+            ).decode("utf-8", "replace")
+            mib = int(out.strip().splitlines()[0].strip())
+            return mib * 1024 * 1024
+        except Exception:
+            return None
+    return None

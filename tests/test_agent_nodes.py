@@ -425,3 +425,244 @@ def test_sensitive_excludes_m2m_agent_routes():
     assert not _is_sensitive("POST", "/agent/register")
     assert not _is_sensitive("POST", "/agent/agn_abc/heartbeat")
     assert not _is_sensitive("GET", "/agent/agn_abc/tasks")
+
+
+# ══ P3.1b — task result reporting ══════════════════════════════════════════
+# ── pure store: complete_task + get_task + size cap + legacy migration ──────
+def test_complete_task_transitions_and_stores_result(store):
+    nid = store.register(name="n")["id"]
+    t = store.dispatch(nid, {"kind": "chat"})
+    # a freshly dispatched task carries the new columns, empty
+    assert t["status"] == "queued"
+    assert t["result"] is None and t["finished_at"] is None
+    out = store.complete_task(nid, t["seq"], status="done", result="the answer")
+    assert out["ok"] is True
+    view = out["task"]
+    assert view["status"] == "done"
+    assert view["result"] == "the answer"
+    assert view["finished_at"] is not None
+    # and it is persisted / re-readable
+    assert store.get_task(nid, t["seq"])["result"] == "the answer"
+
+
+def test_complete_task_error_status(store):
+    nid = store.register(name="n")["id"]
+    t = store.dispatch(nid, {"k": 1})
+    out = store.complete_task(nid, t["seq"], status="error", result="boom")
+    assert out["ok"] and out["task"]["status"] == "error"
+
+
+def test_complete_task_unknown_seq_is_not_found(store):
+    nid = store.register(name="n")["id"]
+    out = store.complete_task(nid, 9999, status="done", result="x")
+    assert out == {"ok": False, "reason": "not_found"}
+
+
+def test_complete_task_wrong_node_is_not_found(store):
+    a = store.register(name="a")["id"]
+    b = store.register(name="b")["id"]
+    t = store.dispatch(a, {"k": 1})              # task belongs to a
+    out = store.complete_task(b, t["seq"], status="done", result="x")
+    assert out == {"ok": False, "reason": "not_found"}   # b can't finalize a's
+    assert store.get_task(a, t["seq"])["status"] == "queued"  # untouched
+
+
+def test_complete_task_conflict_does_not_overwrite(store):
+    nid = store.register(name="n")["id"]
+    t = store.dispatch(nid, {"k": 1})
+    store.complete_task(nid, t["seq"], status="done", result="first")
+    out = store.complete_task(nid, t["seq"], status="error", result="second")
+    assert out["ok"] is False and out["reason"] == "conflict"
+    # FIRST report wins — the stored result/status is not clobbered
+    assert out["task"]["result"] == "first"
+    assert store.get_task(nid, t["seq"])["status"] == "done"
+
+
+def test_complete_task_caps_oversized_result(store):
+    from abstract_hugpy_dev.comms.agent_nodes import _MAX_RESULT_BYTES
+    nid = store.register(name="n")["id"]
+    t = store.dispatch(nid, {"k": 1})
+    big = "x" * (_MAX_RESULT_BYTES + 5000)
+    out = store.complete_task(nid, t["seq"], status="done", result=big)
+    stored = out["task"]["result"]
+    assert len(stored.encode("utf-8")) <= _MAX_RESULT_BYTES
+    assert "truncated" in stored                 # marker present
+    assert out["task"]["status"] == "done"       # still finalizes
+
+
+def test_complete_task_non_string_result_round_trips_as_json(store):
+    nid = store.register(name="n")["id"]
+    t = store.dispatch(nid, {"k": 1})
+    out = store.complete_task(nid, t["seq"], status="done",
+                              result={"answer": 42})
+    assert out["task"]["result"] == '{"answer": 42}'
+
+
+def test_get_task_scoped_to_node(store):
+    a = store.register(name="a")["id"]
+    b = store.register(name="b")["id"]
+    t = store.dispatch(a, {"k": 1})
+    assert store.get_task(a, t["seq"])["seq"] == t["seq"]
+    assert store.get_task(b, t["seq"]) is None   # wrong node
+    assert store.get_task(a, 9999) is None       # unknown seq
+
+
+def test_task_view_exposes_status(store):
+    """The listing the operator/node sees carries status (+result/finished_at)."""
+    nid = store.register(name="n")["id"]
+    store.dispatch(nid, {"k": 1})
+    row = store.tasks_since(nid, 0)[0]
+    assert "status" in row and row["status"] == "queued"
+    assert "result" in row and "finished_at" in row
+
+
+def test_migration_backfills_result_columns_on_legacy_db(tmp_path):
+    """A db whose agent_tasks predates P3.1b (no result/finished_at) is migrated
+    online by _ensure — the store then completes tasks against it."""
+    import sqlite3
+    path = str(tmp_path / "legacy.db")
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "CREATE TABLE agent_tasks (seq INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "id TEXT NOT NULL, node_id TEXT NOT NULL, task TEXT NOT NULL, "
+            "status TEXT NOT NULL DEFAULT 'queued', created_at REAL NOT NULL)")
+    s = AgentNodeStore(path=path)
+    nid = s.register(name="n")["id"]             # _ensure runs the migration
+    with sqlite3.connect(path) as conn:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(agent_tasks)")}
+    assert {"result", "finished_at"} <= cols
+    t = s.dispatch(nid, {"k": 1})
+    assert s.complete_task(nid, t["seq"], status="done", result="ok")["ok"]
+
+
+# ── Flask blueprint: the node-token result route ────────────────────────────
+def _dispatch_one(client, store, nid, task=None):
+    return store.dispatch(nid, task or {"kind": "chat", "prompt": "hi"})
+
+
+def test_route_result_requires_valid_token(client, store):
+    node = _enroll(client)
+    t = _dispatch_one(client, store, node["id"])
+    # no token / wrong token → 401 (same node gate as heartbeat/tasks)
+    assert client.post(f"/agent/{node['id']}/tasks/{t['seq']}/result",
+                       json={"status": "done"}).status_code == 401
+    assert client.post(f"/agent/{node['id']}/tasks/{t['seq']}/result",
+                       json={"status": "done"},
+                       headers=_auth("agt_wrong")).status_code == 401
+
+
+def test_route_result_done_finalizes(client, store):
+    node = _enroll(client)
+    t = _dispatch_one(client, store, node["id"])
+    r = client.post(f"/agent/{node['id']}/tasks/{t['seq']}/result",
+                    json={"status": "done", "result": "answered"},
+                    headers=_auth(node["token"]))
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["status"] == "done" and body["result"] == "answered"
+    assert body["finished_at"] is not None
+
+
+def test_route_result_invalid_status_400(client, store):
+    node = _enroll(client)
+    t = _dispatch_one(client, store, node["id"])
+    r = client.post(f"/agent/{node['id']}/tasks/{t['seq']}/result",
+                    json={"status": "weird", "result": "x"},
+                    headers=_auth(node["token"]))
+    assert r.status_code == 400
+
+
+def test_route_result_unknown_task_404(client):
+    node = _enroll(client)
+    r = client.post(f"/agent/{node['id']}/tasks/9999/result",
+                    json={"status": "done"}, headers=_auth(node["token"]))
+    assert r.status_code == 404
+
+
+def test_route_result_wrong_node_task_404(client, store):
+    a = _enroll(client, name="a")
+    b = _enroll(client, name="b")
+    ta = _dispatch_one(client, store, a["id"])
+    # b authenticates fine, but ta is not b's task → 404 (fail-closed scope)
+    r = client.post(f"/agent/{b['id']}/tasks/{ta['seq']}/result",
+                    json={"status": "done"}, headers=_auth(b["token"]))
+    assert r.status_code == 404
+
+
+def test_route_result_idempotent_conflict_409(client, store):
+    node = _enroll(client)
+    t = _dispatch_one(client, store, node["id"])
+    first = client.post(f"/agent/{node['id']}/tasks/{t['seq']}/result",
+                        json={"status": "done", "result": "first"},
+                        headers=_auth(node["token"]))
+    assert first.status_code == 200
+    again = client.post(f"/agent/{node['id']}/tasks/{t['seq']}/result",
+                        json={"status": "error", "result": "second"},
+                        headers=_auth(node["token"]))
+    assert again.status_code == 409
+    body = again.get_json()
+    assert body["already_finalized"] is True
+    assert body["result"] == "first"            # first report wins
+    assert body["status"] == "done"
+
+
+def test_route_result_unknown_node_410(client):
+    r = client.post("/agent/agn_nope/tasks/1/result",
+                    json={"status": "done"}, headers=_auth("agt_whatever"))
+    assert r.status_code == 410
+
+
+def test_route_result_revoked_node_403(client, store):
+    node = _enroll(client)
+    t = _dispatch_one(client, store, node["id"])
+    store.revoke(node["id"])
+    r = client.post(f"/agent/{node['id']}/tasks/{t['seq']}/result",
+                    json={"status": "done"}, headers=_auth(node["token"]))
+    assert r.status_code == 403
+
+
+# ── Flask blueprint: the operator task-detail route ─────────────────────────
+def test_route_task_detail_operator_gated(client, store, monkeypatch):
+    node = _enroll(client)
+    t = _dispatch_one(client, store, node["id"])
+    hdr = _operator_env(monkeypatch)
+    # no operator creds → 401 (before any lookup)
+    assert client.get(
+        f"/agent/{node['id']}/tasks/{t['seq']}").status_code == 401
+    r = client.get(f"/agent/{node['id']}/tasks/{t['seq']}", headers=hdr)
+    assert r.status_code == 200 and r.get_json()["seq"] == t["seq"]
+
+
+def test_route_task_detail_unknown_404(client, monkeypatch):
+    node = _enroll(client)
+    hdr = _operator_env(monkeypatch)
+    assert client.get(f"/agent/{node['id']}/tasks/9999",
+                      headers=hdr).status_code == 404
+
+
+def test_route_task_detail_shows_result_after_completion(client, store,
+                                                         monkeypatch):
+    """P3.3 read path: dispatch → node posts result → operator GET shows it."""
+    node = _enroll(client)
+    t = _dispatch_one(client, store, node["id"])
+    client.post(f"/agent/{node['id']}/tasks/{t['seq']}/result",
+                json={"status": "done", "result": "the final answer"},
+                headers=_auth(node["token"]))
+    hdr = _operator_env(monkeypatch)
+    got = client.get(f"/agent/{node['id']}/tasks/{t['seq']}",
+                     headers=hdr).get_json()
+    assert got["status"] == "done"
+    assert got["result"] == "the final answer"
+
+
+# ── central operator allowlist covers the new operator route only ───────────
+def test_sensitive_covers_operator_task_detail():
+    assert _is_sensitive("GET", "/agent/agn_abc/tasks/7")
+    assert _is_sensitive("GET", "/api/agent/agn_abc/tasks/7")
+
+
+def test_sensitive_excludes_node_result_and_pull_routes():
+    # the node-token result POST and the node-token pull stay M2M-open
+    assert not _is_sensitive("POST", "/agent/agn_abc/tasks/7/result")
+    assert not _is_sensitive("GET", "/agent/agn_abc/tasks")
+    assert not _is_sensitive("POST", "/api/agent/agn_abc/tasks/7/result")

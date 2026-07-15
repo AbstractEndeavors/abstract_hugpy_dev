@@ -18,6 +18,7 @@ from .scene_schema import GenerateSceneSpec
 from .studio.job import StudioI2VSpec
 from .studio_movie_schema import StudioMovieSpec
 from .identity_reconstruction_schema import IdentityReconstructionSpec, IdentityMeshSpec
+from .identity_video_extract_schema import IdentityVideoExtractSpec
 
 
 @dataclass(frozen=True)
@@ -65,4 +66,14 @@ JOB_REGISTRY = {
     "identity_mesh_build": JobSpec(
         "identity_mesh_build", IdentityMeshSpec,
         ("identity", "mesh_build"), "gpu", 14400),
+    # Identity VIDEO-EXTRACT (char360) = a RELAY job (like identity_mesh_build): central has
+    # no GPU + never runs char360, so its runner (runners/identity_video_extract_relay.py)
+    # forwards the source video over HTTP to the IDENTITY_RENDER_URL service, polls it,
+    # downloads the per-character view-sets, and writes them back into identity profiles.
+    # runner_key ("identity","video_extract"); "gpu" queue (it consumes a remote GPU);
+    # long timeout — scene-detect + YOLO track + insightface over a whole clip is
+    # minutes-to-longer, mirroring the mesh/movie/reconstruction budgets.
+    "identity_video_extract": JobSpec(
+        "identity_video_extract", IdentityVideoExtractSpec,
+        ("identity", "video_extract"), "gpu", 14400),
 }

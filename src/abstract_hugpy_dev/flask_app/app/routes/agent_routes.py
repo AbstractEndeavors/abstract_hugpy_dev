@@ -12,8 +12,10 @@ public-vs-internal curation the /endpoints inspector surfaces:
         POST /agent/register              enroll -> {id, token, ...}   (bootstrap; open)
         POST /agent/<id>/heartbeat        {status, current_task, version}   (node token)
         GET  /agent/<id>/tasks?since=     pull queued tasks            (node token)
+        POST /agent/<id>/tasks/<seq>/result  {status, result} -> finalize  (node token; P3.1b)
   * the console UI (operator, human-driven):
         GET  /agent/nodes                 list every node + live status  (operator)
+        GET  /agent/<id>/tasks/<seq>      one task's full row incl result (operator; P3.1b)
         POST /agent/<id>/dispatch         {task} -> queue it for a node  (operator)
 
 Gates, all fail-closed:
@@ -36,6 +38,9 @@ All node state lives in comms.agent_nodes (the shared comms SQLite db — cross
 these endpoints over nginx (/api stripped) or directly over the VPN; the /api
 dual-mount in wsgi_app.py makes both resolve, exactly like the GPU workers.
 """
+import json
+import os
+
 from flask import request, jsonify, abort
 
 from .imports import *  # get_bp + the functions star
@@ -74,9 +79,27 @@ def _require_node_auth(node_id: str) -> dict:
     return node
 
 
+def _agent_gates_open() -> bool:
+    """OPERATOR-DIRECTED open mode (2026-07-15: "can the agents feature be ungated
+    entirely for now?"): ``HUGPY_AGENT_OPEN`` truthy disables BOTH the register
+    API-key gate and the operator gate on nodes/dispatch. Node-TOKEN auth on
+    heartbeat/tasks stays — that's a node's identity, not a human gate; without it
+    any caller could read/claim another node's queue.
+
+    ⚠ These routes are reachable from the PUBLIC INTERNET on this deployment (the
+    host front → :7001 → :7002 ``/api`` chain bypasses VM nginx allow-deny), so
+    open mode means anyone can enroll nodes and dispatch tasks. Deliberately an
+    env flag, defaulting CLOSED: unset the var + restart to restore the gates."""
+    return (os.getenv("HUGPY_AGENT_OPEN", "") or "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 def _require_operator() -> None:
     """Operator gate for the console-facing routes. Fails closed if the gate
-    module is unavailable for any reason (never fail open)."""
+    module is unavailable for any reason (never fail open) — unless the operator
+    has explicitly opened the agents feature (``HUGPY_AGENT_OPEN``)."""
+    if _agent_gates_open():
+        return
     try:
         from ..operator_auth import operator_authenticated
     except Exception:
@@ -114,6 +137,8 @@ def _require_api_key() -> None:
 
     NB register is the fleet BOOTSTRAP endpoint (a node has no credential yet), so
     with the policy on, agent daemons must be handed a console API key to enroll."""
+    if _agent_gates_open():
+        return
     try:
         from ..functions.imports.utils.api_keys import api_key_required, verify_api_key
     except Exception:
@@ -189,12 +214,57 @@ def agent_tasks(node_id):
                     "cursor": cursor, "tasks": tasks})
 
 
+# ── machine-to-machine: a node reports a task's result (P3.1b) ─────────────
+_RESULT_STATUS = {"done", "error"}
+
+
+@agent_bp.route("/agent/<node_id>/tasks/<seq>/result", methods=["POST"])
+def agent_task_result(node_id, seq):
+    """A node reports the OUTCOME of a dispatched task. Node-token authenticated
+    (the SAME gate as heartbeat/tasks — unknown node → 410, revoked → 403,
+    missing/bad token → 401). Body: ``{status: "done"|"error", result: <string>}``.
+
+    Transitions the task row queued → done/error and stores the (size-capped)
+    result + finished_at. Fail-closed on the task itself: a seq that is unknown
+    or belongs to ANOTHER node → 404. Idempotent-safe: re-posting an already
+    finalized task does NOT overwrite it → 409 with the stored view (first report
+    wins; a node re-posting after a crash treats BOTH 200 and 409 as 'recorded')."""
+    _require_node_auth(node_id)
+    body = request.get_json(silent=True) or {}
+    status = (body.get("status") or "").strip().lower()
+    if status not in _RESULT_STATUS:
+        abort(400, description="Result 'status' must be 'done' or 'error'.")
+    result = body.get("result")
+    if result is not None and not isinstance(result, str):
+        result = json.dumps(result)      # structured output round-trips as text
+    outcome = agent_node_store.complete_task(
+        node_id, seq, status=status, result=result)
+    if outcome.get("ok"):
+        return jsonify(outcome["task"]), 200
+    if outcome.get("reason") == "conflict":
+        return jsonify(dict(outcome["task"], already_finalized=True)), 409
+    abort(404, description="Unknown task for this node.")
+
+
 # ── console UI: operator lists nodes + dispatches tasks ────────────────────
 @agent_bp.route("/agent/nodes", methods=["GET"])
 def agent_nodes():
     """Every enrolled node with its live status — operator-only."""
     _require_operator()
     return jsonify(agent_node_store.all())
+
+
+@agent_bp.route("/agent/<node_id>/tasks/<seq>", methods=["GET"])
+def agent_task_detail(node_id, seq):
+    """One task's full row incl. its ``result`` — operator-only (what the P3.3
+    console panel reads to render a run's final report). Gated exactly like
+    ``GET /agent/nodes``. Distinct from the node-token pull ``GET
+    /agent/<id>/tasks`` (no ``<seq>``, returns the whole queue)."""
+    _require_operator()
+    task = agent_node_store.get_task(node_id, seq)
+    if task is None:
+        abort(404, description="Unknown task for this node.")
+    return jsonify(task)
 
 
 @agent_bp.route("/agent/<node_id>/dispatch", methods=["POST"])

@@ -142,34 +142,143 @@ def _select_front_view(candidates, slug: str, requests_mod, model=None):
             logger.info("identity mesh front-select: candidate unreadable (%s)", path)
             continue
         b64 = base64.b64encode(raw).decode("ascii")
-        # Only include ``model`` when the identity named one — an absent field is what
-        # keeps the default-VL (3B) path byte-identical to today (defaults-are-promises).
-        body = {"image_b64": b64, "prompt": _VISION_PROMPT}
-        if model:
-            body["model"] = model
-        try:
-            resp = requests_mod.post(url, json=body, timeout=_VISION_TIMEOUT_S)
-        except requests_mod.RequestException as exc:
-            logger.info("identity mesh front-select: /ml/vision unreachable for %s (%s)",
-                        path, exc)
+        # Only include ``model`` when one was chosen (per-identity setting or the auto-7B
+        # preference) — an absent field keeps the default-VL (3B) path byte-identical to
+        # today (defaults-are-promises). A FAILED with-model call retries once WITHOUT the
+        # model, so a 7B that can't load right now degrades to the 3B's judgment instead
+        # of no judgment at all ("7B if available" — availability is proven per call).
+        reply = None
+        for try_model in ((model, None) if model else (None,)):
+            body = {"image_b64": b64, "prompt": _VISION_PROMPT}
+            if try_model:
+                body["model"] = try_model
+            try:
+                resp = requests_mod.post(url, json=body, timeout=_VISION_TIMEOUT_S)
+            except requests_mod.RequestException as exc:
+                logger.info("identity mesh front-select: /ml/vision unreachable for %s "
+                            "(model=%s: %s)", path, try_model or "default", exc)
+                continue
+            if resp.status_code != 200:
+                logger.info("identity mesh front-select: /ml/vision HTTP %s for %s "
+                            "(model=%s)", resp.status_code, path, try_model or "default")
+                continue
+            try:
+                parsed = resp.json()
+            except ValueError:
+                logger.info("identity mesh front-select: non-JSON /ml/vision reply for %s", path)
+                continue
+            if not isinstance(parsed, dict) or parsed.get("ok") is False:
+                logger.info("identity mesh front-select: /ml/vision reported not-ok for %s "
+                            "(model=%s)", path, try_model or "default")
+                continue
+            reply = parsed
+            break
+        if reply is None:
             continue
-        if resp.status_code != 200:
-            logger.info("identity mesh front-select: /ml/vision HTTP %s for %s",
-                        resp.status_code, path)
-            continue
-        try:
-            body = resp.json()
-        except ValueError:
-            logger.info("identity mesh front-select: non-JSON /ml/vision reply for %s", path)
-            continue
-        if not isinstance(body, dict) or body.get("ok") is False:
-            logger.info("identity mesh front-select: /ml/vision reported not-ok for %s", path)
-            continue
-        if _reply_says_yes(body.get("text")):
+        if _reply_says_yes(reply.get("text")):
             logger.info("identity mesh front-select: %s qualifies as full-body (profile %s)",
                         path, slug)
             return path, checked
     return None, checked
+
+
+# ---- T-POSE POSE-NORMALIZATION STAGE (IDENTITY-VERSIONS-SLICE.md slice 5) ---------- #
+# Hunyuan3D meshes the INPUT pose: luigi's crossed arms occlude the torso and leave "the
+# unknown below them" (operator's words). The fix is 2D pose normalization BEFORE meshing
+# — render ONE identity-locked STILL of the character standing in a clean T-pose (arms
+# outstretched, full body, facing camera), and mesh THAT as the front. The still is
+# produced on the EXISTING Wan-VACE id_lock render path (``_render_identity_view``, the
+# reconstruction runner's SWAP SEAM) — this is that machinery's second life, exactly as
+# the slice doc anticipated.
+#
+# Geometry: the Wan-VACE id_lock ceiling is 480p (a 512² id_lock render fails
+# ``no_capable_model``); a square 480×480 @ 16fps matches the movie/reconstruction
+# id_lock default. KEEP THESE IDENTICAL to video_routes._TPOSE_RENDER_* so the route's
+# capability probe (which builds an id_lock spec at this geometry to decide "will this
+# delegate to a GPU worker") matches the render actually run here.
+_TPOSE_RENDER_W, _TPOSE_RENDER_H, _TPOSE_RENDER_FPS = 480, 480, 16
+# The pose-normalization prompt. Front-facing, arms out, full body head-to-feet — the
+# ambiguity-clearing stance. No profile DESCRIPTION is woven in: the reference images
+# already carry the identity (id_lock), and an extra description would only fight the
+# T-pose stance we are trying to force. A plain neutral background helps the service-side
+# rembg (background removal happens on the render service, applied to the front it meshes).
+#
+# CLEANUP-PROMPT slice (operator-requested 2026-07-15): this is the BASE stance. A cleanup
+# clause (``IdentityMeshSpec.cleanup_prompt`` — a positive-worded AVOID instruction like
+# "no object on her back, clean bare back") is APPENDED to it by ``_render_pose_front`` when
+# non-empty. That relaxes the "no description woven in" policy for CLEANUP only: removing a
+# prop does NOT fight the stance (unlike an identity description would). Empty cleanup_prompt
+# -> this exact constant, byte-identical to today. ``_tpose_prompt`` centralizes the assembly.
+_TPOSE_PROMPT = (
+    "the same person standing in a T-pose, arms outstretched horizontally to the sides, "
+    "full body visible from head to feet, feet fully in frame, facing the camera, "
+    "neutral standing stance, plain neutral background, even lighting"
+)
+
+
+def _tpose_prompt(cleanup_prompt: str = "") -> str:
+    """Assemble the effective T-pose front-render prompt: ``_TPOSE_PROMPT`` verbatim, plus
+    ``", " + cleanup_prompt`` when a non-empty cleanup clause is supplied.
+
+    An empty (or whitespace-only) ``cleanup_prompt`` returns the constant UNCHANGED — the
+    byte-identical-to-today guarantee (defaults-are-promises). The cleanup clause is a
+    positive-worded AVOID instruction (a prop-removal), NOT an identity description, so it
+    is allowed to ride the stance prompt (see the ``_TPOSE_PROMPT`` note above)."""
+    clause = (cleanup_prompt or "").strip()
+    return f"{_TPOSE_PROMPT}, {clause}" if clause else _TPOSE_PROMPT
+
+
+def _render_pose_front(refs, seed: int, slug: str, job_id: str, should_cancel=None,
+                       cleanup_prompt: str = "", negative_prompt: str = ""):
+    """Render ONE identity-locked T-pose STILL from the profile's reference images and
+    return its abs path, or ``None`` on ANY failure.
+
+    Reuses ``runners/identity_reconstruction._render_identity_view`` — the working
+    Wan-VACE id_lock render seam (delegated to the studio GPU worker on ae) — prompted
+    for a clean, full-body T-pose. VRAM contention resolves via the normal studio LRU-
+    yield (eviction is unblocked as of 0.1.178): this path routes through the standard
+    studio delegation, so we do NOT build a bespoke evictor.
+
+    CLEANUP-PROMPT slice: ``cleanup_prompt`` (a positive-worded avoid instruction from
+    ``IdentityMeshSpec.cleanup_prompt``) is woven into the effective T-pose prompt via
+    ``_tpose_prompt`` when non-empty; ``negative_prompt`` (from
+    ``IdentityMeshSpec.negative_prompt``) is forwarded as a TRUE negative to the studio
+    Wan-VACE render. BOTH default "" -> the effective prompt is the constant verbatim and
+    the negative is "" — byte-identical to today's render call.
+
+    HONEST DEGRADE (the ``IdentityMeshSpec.pose`` contract): a failed pose render must
+    NEVER fail the mesh job. Every failure — the studio worker offline, a render error,
+    a timeout, an import hiccup — returns ``None`` here; the caller then falls back to
+    the normal front-select flow. ``_render_identity_view`` already converts an unroutable
+    / errored render into a ``None`` (it never raises for expected failures), and we wrap
+    the whole thing so even a genuine import/programmer slip degrades rather than killing
+    a build whose mesh + turntable would otherwise succeed."""
+    try:
+        # Lazy import — the reconstruction runner pulls in the studio spine; keep this
+        # module boot-cheap (runners/__init__ imports it at boot).
+        from .identity_reconstruction import _render_identity_view
+
+        still = _render_identity_view(
+            refs, _tpose_prompt(cleanup_prompt), seed,
+            width=_TPOSE_RENDER_W, height=_TPOSE_RENDER_H, fps=_TPOSE_RENDER_FPS,
+            # A DISTINCT render_id (mirrors the reconstruction runner's per-render ids) so
+            # the worker never dedupes this against another render as one "exists" job.
+            render_id=f"{job_id}:{slug}:tpose_front",
+            should_cancel=should_cancel,
+            # CLEANUP-PROMPT slice: forward the TRUE negative to the studio Wan-VACE path.
+            # "" (default) -> the studio path's own default negative_prompt="", so today's
+            # exact call is reproduced (see _render_identity_view / run_produce_clip).
+            negative_prompt=negative_prompt,
+        )
+        if not still:
+            logger.info("identity mesh T-pose stage: render produced no still for %s "
+                        "(falling back to front-select)", slug)
+            return None
+        return still
+    except Exception:  # noqa: BLE001 — honest degrade: a pose-render failure never fails the job
+        logger.info("identity mesh T-pose stage: render raised for %s (falling back to "
+                    "front-select)", slug, exc_info=True)
+        return None
 
 
 def _dest_for(mesh_dir: str, turntable_dir: str, fpath: str) -> str:
@@ -243,17 +352,84 @@ def run_identity_mesh_build(spec, job_id: str) -> JobResult:
 
     headers = {"X-Identity-Render-Token": token}
 
+    # Cancel probe shared by the T-pose stage (relays the mesh job's cancel down to the
+    # id_lock render, mirroring identity_reconstruction's should_cancel). is_cancelling is
+    # already imported at the top of this function (used by the poll loop below).
+    should_cancel = lambda: is_cancelling(job_id)  # noqa: E731
+
+    view_sources = spec.view_sources or ()
+    candidates = tuple(getattr(spec, "view_candidates", ()) or ())
+
+    # ---- T-POSE POSE-NORMALIZATION STAGE (slice 5) — runs BEFORE front-select -------- #
+    # When the spec requests ``pose == "t-pose"``, render an identity-locked T-pose STILL
+    # (arms out, full body, no crossed-arm occlusion) and use THAT as the mesh front — it
+    # OVERRIDES front-select entirely (a clean full-body T-pose is a better front than any
+    # source photo we could pick). On ANY failure we fall through to the existing
+    # front-select flow: a failed pose render NEVER fails the mesh job (the honest-degrade
+    # contract documented on IdentityMeshSpec.pose). The outcome is recorded in mesh state
+    # as ``pose_stage`` so the GET mesh-status route surfaces what actually happened.
+    #
+    # The reference images the id_lock render conditions on are the profile's own refs —
+    # every ``view_sources`` path is one, and ``view_candidates`` (when present) is the
+    # profile's other refs; we hand the render the DISTINCT set of both (front first) so a
+    # cropped waist-up "front" isn't the sole conditioning image.
+    pose_requested = (getattr(spec, "pose", "none") or "none") == "t-pose"
+    pose_stage = None
+    tpose_front = None
+    if pose_requested:
+        pose_refs: list[str] = []
+        for _n, _p in view_sources:
+            if isinstance(_p, str) and _p and _p not in pose_refs:
+                pose_refs.append(_p)
+        for _p in candidates:
+            if isinstance(_p, str) and _p and _p not in pose_refs:
+                pose_refs.append(_p)
+        if not pose_refs:
+            pose_stage = {"requested": "t-pose", "applied": False,
+                          "reason": "no reference images to condition the T-pose render on"}
+        else:
+            tpose_front = _render_pose_front(
+                pose_refs, spec.seed, slug, job_id, should_cancel=should_cancel,
+                # CLEANUP-PROMPT slice: the spec's render-steer channels reach the T-pose
+                # render here. Both default "" on the spec -> _render_pose_front renders the
+                # exact constant + "" negative (byte-identical to today). getattr keeps an
+                # OLD spec (pre-cleanup, no field) working.
+                cleanup_prompt=getattr(spec, "cleanup_prompt", "") or "",
+                negative_prompt=getattr(spec, "negative_prompt", "") or "")
+            if tpose_front:
+                pose_stage = {"requested": "t-pose", "applied": True,
+                              "rendered_front": tpose_front,
+                              "reason": "rendered an id_lock T-pose still; using it as the mesh front"}
+                # The rendered T-pose still BECOMES the front and DISABLES front-select
+                # (candidates cleared) — there is nothing better to pick than a clean
+                # full-body T-pose we just rendered from the identity's own DNA.
+                view_sources = tuple(
+                    ("front", tpose_front) if n == "front" else (n, p)
+                    for n, p in view_sources)
+                if not any(n == "front" for n, _ in view_sources):
+                    view_sources = (("front", tpose_front),) + tuple(view_sources)
+                candidates = ()
+            else:
+                pose_stage = {"requested": "t-pose", "applied": False,
+                              "reason": "T-pose render failed or unavailable; fell back to "
+                                        "front-select on the source photos"}
+
     # ---- FLEET-VLM FRONT AUTO-SELECTION (module docstring) --------------------------- #
     # The route only hands >=2 view_candidates when the caller did NOT explicitly assign
     # a front — an explicit assignment is an operator override that auto-selection never
     # second-guesses. Every branch records an honest ``front_selection`` outcome; a VLM
     # miss/error NEVER fails the job — it just keeps the route's default front.
-    view_sources = spec.view_sources or ()
-    candidates = tuple(getattr(spec, "view_candidates", ()) or ())
+    # (When the T-pose stage above applied, ``candidates`` is now empty, so front-select
+    # short-circuits to the "explicit" branch on the just-rendered T-pose front.)
     default_front = next((p for n, p in view_sources if n == "front"), None)
     front_selection = {"mode": "explicit", "chosen": default_front, "checked": 0,
                        "full_body": None}
-    if not candidates:
+    if tpose_front:
+        # The T-pose still is the front — record it as the selection mode so mesh state
+        # tells the whole story (front came from the T-pose stage, not a source photo).
+        front_selection["mode"] = "t-pose"
+        front_selection["full_body"] = True
+    elif not candidates:
         front_selection["mode"] = "explicit"
     elif len(candidates) < 2:
         # Only one usable reference on the whole profile — nothing to choose between.
@@ -320,8 +496,11 @@ def run_identity_mesh_build(spec, job_id: str) -> JobResult:
         },
     }
 
-    _set_state({"status": "running", "error": None, "job_id": job_id,
-               "front_selection": front_selection})
+    running_patch = {"status": "running", "error": None, "job_id": job_id,
+                     "front_selection": front_selection}
+    if pose_stage is not None:
+        running_patch["pose_stage"] = pose_stage
+    _set_state(running_patch)
 
     # ---- POST the job ----
     try:
@@ -547,7 +726,7 @@ def run_identity_mesh_build(spec, job_id: str) -> JobResult:
     # reconstruction record when a turntable attached — including its "mesh" sub-dict —
     # so anything set only before that attach would otherwise vanish from the terminal
     # state a caller actually reads.
-    _set_state({
+    terminal_patch = {
         "status": "done",
         "error": None,
         "glb_path": glb_path,
@@ -559,7 +738,14 @@ def run_identity_mesh_build(spec, job_id: str) -> JobResult:
         "front_selection": front_selection,
         **auto_promote_extra,
         **version_extra,
-    })
+    }
+    # pose_stage re-included here (not just the "running" patch above) for the same reason
+    # front_selection is: attach_reconstruction(replace=True) rewrites the reconstruction
+    # record, so a field set only before that attach would vanish from the terminal state
+    # a caller actually reads.
+    if pose_stage is not None:
+        terminal_patch["pose_stage"] = pose_stage
+    _set_state(terminal_patch)
 
     _delete_remote()  # best-effort remote cleanup after a successful download
 

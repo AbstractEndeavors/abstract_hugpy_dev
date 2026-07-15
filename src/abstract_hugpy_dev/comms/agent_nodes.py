@@ -24,6 +24,15 @@ Three concerns, two tables, one db file (shared with the jobs mirror):
     agent_tasks  — the dispatch queue. Each dispatch appends a row; a node
                    pulls with a monotonic ``since`` cursor (the autoincrement
                    seq), so pulls are idempotent and need no delivery bit.
+                   P3.1b adds a completion channel: ``complete_task`` transitions
+                   a row queued → done/error with a size-capped ``result`` +
+                   ``finished_at``. LIFECYCLE CHOICE: the status transition lives
+                   ONLY on the result route — the pull (``tasks_since``) stays a
+                   pure, side-effect-free, re-pullable GET (its whole point is
+                   "no delivery bit"), so there is no ``running`` state written on
+                   pull; a task is queued until its node reports it done/error,
+                   and the node's heartbeat (busy + current_task=<seq>) is the
+                   in-flight signal meanwhile.
 
 Tokens: ``agt_`` + hex, sha256-hashed at rest (same shape as the enrollment /
 principal token stores). Authentication is (node_id, token) -> the token must
@@ -52,6 +61,13 @@ _TOKEN_PREFIX = "agt_"
 _NODE_PREFIX = "agn_"
 _TASK_PREFIX = "atsk_"
 
+# P3.1b — a completed task's stored result is size-capped (a run's answer is
+# operator-defined text; without a cap a node could push an unbounded blob into
+# the shared comms db). Over the cap the result is TRUNCATED (never rejected —
+# refusing would leave the task un-finalizable), with a byte-count marker.
+_MAX_RESULT_BYTES = 65536
+_TASK_TERMINAL = ("done", "error")
+
 _SCHEMA_NODES = """
 CREATE TABLE IF NOT EXISTS agent_nodes (
     id            TEXT PRIMARY KEY,
@@ -75,9 +91,20 @@ CREATE TABLE IF NOT EXISTS agent_tasks (
     node_id     TEXT NOT NULL,
     task        TEXT NOT NULL,
     status      TEXT NOT NULL DEFAULT 'queued',
-    created_at  REAL NOT NULL
+    created_at  REAL NOT NULL,
+    result      TEXT,
+    finished_at REAL
 );
 """
+
+# P3.1b additive columns, backfilled onto a db created before the result route
+# existed (SQLite ADD COLUMN is online + cheap). Applied idempotently in
+# _ensure, guarded by PRAGMA table_info — a fresh db already has them from
+# _SCHEMA_TASKS, so the guard makes this a no-op there.
+_TASK_MIGRATIONS = (
+    ("result", "ALTER TABLE agent_tasks ADD COLUMN result TEXT"),
+    ("finished_at", "ALTER TABLE agent_tasks ADD COLUMN finished_at REAL"),
+)
 
 _SCHEMA_TASK_INDEX = (
     "CREATE INDEX IF NOT EXISTS ix_agent_tasks_node_seq "
@@ -95,6 +122,22 @@ def _loads_list(raw: Any) -> list:
         return list(v) if isinstance(v, (list, tuple)) else []
     except Exception:
         return []
+
+
+def _cap_result(result: Any) -> Optional[str]:
+    """Coerce a reported result to a size-capped string. None stays None; a
+    non-str is JSON-encoded (so a node can report structured output); anything
+    over ``_MAX_RESULT_BYTES`` is truncated on a UTF-8 boundary with a
+    byte-count marker (the task still finalizes — see _MAX_RESULT_BYTES)."""
+    if result is None:
+        return None
+    s = result if isinstance(result, str) else json.dumps(result)
+    raw = s.encode("utf-8")
+    if len(raw) <= _MAX_RESULT_BYTES:
+        return s
+    marker = "\n…[truncated %d bytes]" % (len(raw) - _MAX_RESULT_BYTES)
+    keep = max(_MAX_RESULT_BYTES - len(marker.encode("utf-8")), 0)
+    return raw[:keep].decode("utf-8", "ignore") + marker
 
 
 class AgentNodeStore:
@@ -131,6 +174,11 @@ class AgentNodeStore:
                 conn.execute(_SCHEMA_NODES)
                 conn.execute(_SCHEMA_TASKS)
                 conn.execute(_SCHEMA_TASK_INDEX)
+                cols = {r["name"] for r in
+                        conn.execute("PRAGMA table_info(agent_tasks)")}
+                for col, ddl in _TASK_MIGRATIONS:
+                    if col not in cols:
+                        conn.execute(ddl)
             self._initialized = True
 
     # -- serialization -------------------------------------------------------
@@ -163,6 +211,8 @@ class AgentNodeStore:
             "task": task,
             "status": row["status"],
             "created_at": row["created_at"],
+            "result": row["result"],
+            "finished_at": row["finished_at"],
         }
 
     # -- node lifecycle ------------------------------------------------------
@@ -288,6 +338,58 @@ class AgentNodeStore:
                 "SELECT * FROM agent_tasks WHERE node_id=? AND seq>? "
                 "ORDER BY seq ASC", (node_id, since_i)).fetchall()
         return [self._task_view(r) for r in rows]
+
+    def get_task(self, node_id: str,
+                 seq: Any) -> Optional[dict[str, Any]]:
+        """One task's full view (incl. result/finished_at), scoped to its owning
+        node — the operator drill-in for P3.3. None if there is no such seq for
+        THIS node (a wrong-node or unknown seq → the route answers 404)."""
+        self._ensure()
+        try:
+            seq_i = int(seq)
+        except (TypeError, ValueError):
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM agent_tasks WHERE seq=? AND node_id=?",
+                (seq_i, node_id)).fetchone()
+        return self._task_view(row) if row else None
+
+    def complete_task(self, node_id: str, seq: Any, *, status: str,
+                      result: Any = None) -> dict[str, Any]:
+        """P3.1b — record a node's completion of task ``seq``. Transitions the
+        row queued → ``status`` (``done``/``error``), storing the size-capped
+        result + ``finished_at``. Scoped to the owning node (fail-closed).
+
+        Returns a small outcome dict the route maps to a status code:
+          * ``{"ok": True,  "task": <view>}``                 finalized → 200
+          * ``{"ok": False, "reason": "not_found"}``          no such seq for
+            this node (unknown/other node's task) → 404
+          * ``{"ok": False, "reason": "conflict", "task":…}`` already finalized
+            → 409; the FIRST report wins and is NOT overwritten (idempotent-safe
+            re-post; a node treats 200 AND 409 as 'recorded, advance cursor')."""
+        self._ensure()
+        try:
+            seq_i = int(seq)
+        except (TypeError, ValueError):
+            return {"ok": False, "reason": "not_found"}
+        status = status if status in _TASK_TERMINAL else "error"
+        capped = _cap_result(result)
+        now = time.time()
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM agent_tasks WHERE seq=?",
+                               (seq_i,)).fetchone()
+            if row is None or row["node_id"] != node_id:
+                return {"ok": False, "reason": "not_found"}
+            if row["status"] in _TASK_TERMINAL:
+                return {"ok": False, "reason": "conflict",
+                        "task": self._task_view(row)}
+            conn.execute(
+                "UPDATE agent_tasks SET status=?, result=?, finished_at=? "
+                "WHERE seq=?", (status, capped, now, seq_i))
+            row = conn.execute("SELECT * FROM agent_tasks WHERE seq=?",
+                               (seq_i,)).fetchone()
+        return {"ok": True, "task": self._task_view(row)}
 
 
 # Module singleton (mirrors job_store / principal_store / token_store). Points

@@ -37,6 +37,11 @@ from .identity_reconstruction import run_identity_reconstruction
 # has no GPU). Import-safe like the other identity runners: requests + the store imports
 # stay lazy INSIDE the runner, so this top-level import can never break app boot.
 from .identity_render_relay import run_identity_mesh_build
+# Identity VIDEO-EXTRACT (char360) — a RELAY to the SAME remote GPU render service (central
+# has no GPU and NEVER runs char360/cv2/insightface). Import-safe like the mesh relay:
+# requests + the store imports stay lazy INSIDE the runner, so this top-level import can
+# never break app boot AND never pulls a char360 dependency onto the central side.
+from .identity_video_extract_relay import run_identity_video_extract
 
 DISPATCH = {
     ("ffmpeg", "crop"): run_crop,
@@ -49,4 +54,5 @@ DISPATCH = {
     ("studio", "movie"): run_generate_studio_movie,
     ("identity", "reconstruction"): run_identity_reconstruction,
     ("identity", "mesh_build"): run_identity_mesh_build,
+    ("identity", "video_extract"): run_identity_video_extract,
 }

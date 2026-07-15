@@ -239,6 +239,16 @@ def _run_ml(task: str):
     kwargs = {k: v for k, v in body.items()
               if not k.startswith("_") and v is not None}
     kwargs["task"] = task  # the route fixes the task (any client `task` ignored)
+    # Model normalization: the resolver reads ``model_key`` only, but this
+    # route's documented surface (and the identity front-select relay) sends
+    # ``model``. Un-mapped it was SILENTLY IGNORED — the request ran on the
+    # task-default model while claiming nothing (e.g. an explicit VL-7B
+    # front-select judgment quietly answered by the 3B). Fold it in here;
+    # callers already sending model_key win untouched.
+    if "model_key" not in kwargs:
+        m = kwargs.pop("model", None)
+        if m:
+            kwargs["model_key"] = m
     # Vision payload normalization: the prompt pipeline (and the GGUF chat
     # runner's _attach_image) reads ``images`` (list of base64 / data URIs) or
     # ``file`` (server path) — but this route's documented surface also takes

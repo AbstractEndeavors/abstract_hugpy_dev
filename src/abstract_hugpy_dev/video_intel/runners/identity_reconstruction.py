@@ -65,6 +65,7 @@ def _render_identity_turntable(
     render_id: str,
     max_frames: int,
     should_cancel=None,
+    negative_prompt: str = "",
 ) -> "list[str] | None":
     """Turntable sibling of ``_render_identity_view`` (the SWAP SEAM): render ONE id_lock
     ``studio_i2v`` ORBIT clip (the subject rotating a full 360°) through the shared render
@@ -97,6 +98,9 @@ def _render_identity_turntable(
         vram_budget_gb=None,       # autofit — size to the serving worker's free VRAM
         seed=seed,
         prompt=prompt,
+        # CLEANUP-PROMPT slice: forward the TRUE negative (see _render_identity_view). ""
+        # (default) -> byte-identical to today's turntable render call.
+        negative=negative_prompt,
         reference_images=tuple(refs),
     )
     outcome = render_clip(i2v_spec, render_id=render_id, should_cancel=should_cancel)
@@ -136,6 +140,7 @@ def _render_identity_view(
     fps: int,
     render_id: str,
     should_cancel=None,
+    negative_prompt: str = "",
 ) -> "str | None":
     """====================== SWAP SEAM (option b -> option a) ======================
     THE SINGLE place the identity-render backend is chosen. TODAY it drives the WORKING
@@ -149,6 +154,14 @@ def _render_identity_view(
     still's abs path. Nothing else in the reconstruction flow (the route, the runner
     loop, the store) references the render mechanism — this is the only coupling point.
     ==============================================================================
+
+    CLEANUP-PROMPT slice: ``negative_prompt`` is a TRUE negative FORWARDED to the studio
+    Wan-VACE render (``make_studio_i2v(negative=...)`` -> ``StudioI2VSpec.negative`` ->
+    ``run_produce_clip`` -> ``produce_clip(negative_prompt=...)`` -> the manifest). The
+    studio path ALREADY accepts it, so this is a FORWARD, not a new capability. Default
+    "" -> the studio path's own default negative_prompt="" (``make_studio_i2v`` with a ""
+    negative and ``run_produce_clip``'s ``"" or ""``), so an empty negative reproduces
+    today's exact render call byte-for-byte.
 
     Returns the abs path of the produced still, or ``None`` on any render / extract
     failure (the runner converts a ``None`` into a clean error-as-data JobResult for
@@ -170,6 +183,10 @@ def _render_identity_view(
         vram_budget_gb=None,       # autofit — size to the serving worker's free VRAM
         seed=seed,
         prompt=prompt,
+        # CLEANUP-PROMPT slice: the TRUE negative rides StudioI2VSpec.negative. "" (default)
+        # -> run_produce_clip forwards negative_prompt="" -> the studio path's byte-identical
+        # today-behavior (produce_clip already defaults negative_prompt="").
+        negative=negative_prompt,
         reference_images=tuple(refs),
     )
     outcome = render_clip(i2v_spec, render_id=render_id, should_cancel=should_cancel)
@@ -225,6 +242,9 @@ def run_identity_reconstruction(spec, job_id: str) -> JobResult:
             render_id=f"{job_id}:{spec.recon_id}:turntable",
             max_frames=spec.turntable_max_frames,
             should_cancel=should_cancel,
+            # CLEANUP-PROMPT slice: forward the spec's TRUE negative. "" (default on the
+            # spec) -> byte-identical to today. getattr keeps an OLD spec (no field) working.
+            negative_prompt=getattr(spec, "negative_prompt", "") or "",
         )
         if not frames:
             if should_cancel():
@@ -278,6 +298,9 @@ def run_identity_reconstruction(spec, job_id: str) -> JobResult:
             width=spec.width, height=spec.height, fps=spec.fps,
             render_id=f"{job_id}:{spec.recon_id}:view_{i:02d}",
             should_cancel=should_cancel,
+            # CLEANUP-PROMPT slice: forward the spec's TRUE negative. "" (default on the
+            # spec) -> byte-identical to today. getattr keeps an OLD spec (no field) working.
+            negative_prompt=getattr(spec, "negative_prompt", "") or "",
         )
         if still is None:
             if should_cancel():

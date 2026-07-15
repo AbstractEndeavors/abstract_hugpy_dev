@@ -73,6 +73,19 @@ def client(monkeypatch):
     monkeypatch.setattr(wr, "verify_enrollment_token",
                         lambda tok: tok == VALID_TOKEN, raising=False)
 
+    # Give each test a FRESH global transfer-cap semaphore. worker_routes.py
+    # wraps /file and /archive in a module-level BoundedSemaphore (the
+    # 2026-07-15 "pin-30 survives" cap) whose permits are released when a
+    # streamed Response is closed/drained — but this test file predates that
+    # cap and never calls response.close()/get_data() on every 200 it makes
+    # (a real WSGI server always closes the iterable it's handed; Flask's
+    # bare test client does not, unless you drain or close explicitly). Without
+    # this reset, permits "leak" across tests in this file (not in
+    # production) and later tests would spuriously 503. Test isolation only —
+    # does not change any assertion below.
+    import threading as _th
+    monkeypatch.setattr(wr, "_transfer_sem", _th.BoundedSemaphore(wr._TRANSFER_CAP))
+
     app = Flask(__name__)
     app.register_blueprint(wr.worker_bp)
     return app.test_client()

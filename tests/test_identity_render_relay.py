@@ -569,6 +569,18 @@ def test_front_autoselect_second_candidate_wins():
 #      falls back to the existing default front (candidate 1); the job still succeeds.
 # --------------------------------------------------------------------------- #
 def test_front_autoselect_falls_back_on_no_or_error():
+    # Pin the AUTO vision-model preference off: this test's contract is the MODEL-LESS
+    # front-select path (exactly one /ml/vision call per candidate — no with-model
+    # retry). The auto-7B + retry behavior is covered by test_identity_vision_setting.
+    orig_pref = identity_profiles.preferred_identity_vision_model
+    identity_profiles.preferred_identity_vision_model = lambda: None
+    try:
+        _front_autoselect_falls_back_on_no_or_error_body()
+    finally:
+        identity_profiles.preferred_identity_vision_model = orig_pref
+
+
+def _front_autoselect_falls_back_on_no_or_error_body():
     _RECEIVED.clear()
     _VISION_SCRIPT.clear()
     _VISION_CALLS.clear()

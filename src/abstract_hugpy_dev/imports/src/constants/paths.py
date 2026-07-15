@@ -256,6 +256,20 @@ def candidate_model_dirs(model: dict, root: str = DEFAULT_ROOT) -> list:
     return out
 
 
+def _is_archived_path(path: str) -> bool:
+    """True when ``path`` sits under an ``_archive`` component — reconcile's
+    archive/de-dupe area (``<root>/models/_archive/...`` and
+    ``<root>/models/_archive/dedupes/...``), where the weight file is often a
+    SYMLINK back into /checkpoints and NOT a live serve/transfer source.
+
+    Component-matched (os.sep-aware), never a substring test — a repo
+    legitimately named e.g. ``foo_archive_bar`` must NOT false-positive. We
+    split on os.sep and require a component that is EXACTLY ``_archive``."""
+    if not path:
+        return False
+    return "_archive" in path.replace("\\", "/").split("/")
+
+
 def _safe_complete(directory: str, cfg) -> bool:
     """``model_looks_downloaded``, guarded and re-entrancy-safe.
 
@@ -299,15 +313,30 @@ def resolve_model_dir(model: dict, root: str = DEFAULT_ROOT, cfg=None,
                                 (so resume/delete/status act on the real partial
                                 files, never orphaning them), else the flat write
                                 target for a genuinely-new download.
-    """
+
+    ARCHIVE EXCLUSION: candidate_model_dirs() is also the reconcile survey set,
+    so it legitimately SURFACES dirs under <root>/models/_archive/... (reconcile's
+    archive/de-dupe area — weight files there are often SYMLINKs back into
+    /checkpoints, not a live copy). A dir under _archive is NEVER a valid live
+    serve/transfer source, so it is excluded from selection here entirely —
+    both the "complete" and "existing" passes only ever consider non-archive
+    candidates. If literally the only thing on disk is an archive copy, we do
+    NOT hand it out just because "something" exists: we fall all the way
+    through to flat_destination() (the real, safe write target) instead —
+    exactly like a genuinely-new download with nothing on disk yet. reconcile
+    is expected to notice the stranded archive-only case and re-materialize the
+    live copy; this resolver must never paper over that by pointing a
+    load/transfer at reconcile's own archive/de-dupe area."""
     _cfg = cfg if cfg is not None else _routing_as_cfg(model)
     cands = candidate_model_dirs(model, root)
-    for d in cands:
+    live_cands = [d for d in cands if not _is_archived_path(d)]
+
+    for d in live_cands:
         if os.path.isdir(d) and _safe_complete(d, _cfg):
             return d
     if require_complete:
         return None
-    for d in cands:
+    for d in live_cands:
         if os.path.isdir(d):
             return d
     return flat_destination(model, root)

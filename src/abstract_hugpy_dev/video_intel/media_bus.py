@@ -41,6 +41,7 @@ from .identity_reconstruction_schema import (
     identity_reconstruction_from_dict,
     identity_mesh_from_dict,
 )
+from .identity_video_extract_schema import identity_video_extract_from_dict
 from .result_schema import JobResult
 from .runners import DISPATCH
 
@@ -213,6 +214,11 @@ SPEC_DESERIALIZERS: Dict[str, Callable[[dict], object]] = {
     # validate-at-construction factory (identity_mesh_from_dict). The runner relays it
     # to the remote GPU render service (central has no GPU).
     "identity_mesh_build": identity_mesh_from_dict,
+    # Identity VIDEO-EXTRACT (char360) RELAY — rehydrates through its own validate-at-
+    # construction factory (identity_video_extract_from_dict). The runner relays the source
+    # video to the remote GPU render service, then writes the per-character view-sets back
+    # into identity profiles (central has no GPU + never runs char360).
+    "identity_video_extract": identity_video_extract_from_dict,
 }
 
 

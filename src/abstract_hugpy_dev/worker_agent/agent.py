@@ -2605,6 +2605,21 @@ class WorkerState:
         # pre-provision downloads, so central (and the console) can show a %.
         self._provision_progress: dict[str, dict] = {}
         self._provision_lock = threading.Lock()
+        # Thundering-herd guard (root-caused live 2026-07-15): a big assignment
+        # list used to spawn one _kick_provision background thread PER model
+        # simultaneously, each running its own segmented/parallel download —
+        # N assigned models meant N concurrent multi-threaded pulls hammering
+        # central at once (observed: 30 models, near-constant 503s, no
+        # convergence). Cap how many DIFFERENT models may provision at the
+        # same time; the rest queue and drain serially. Default 1 (fully
+        # serial) — the safe, calm default; raise via env if a box's link to
+        # central can actually take it. Read once here (like the other
+        # WorkerState fields) rather than re-reading the env on every kick.
+        _cap = _safe_int(os.environ.get("WORKER_PROVISION_CONCURRENCY"))
+        if _cap is None or _cap < 1:
+            _cap = 1
+        self.provision_concurrency: int = _cap
+        self._provision_semaphore = threading.BoundedSemaphore(self.provision_concurrency)
         # The live werkzeug HTTP server (set in main() once bound). The restart
         # path closes its listening socket to release :9100 cleanly before exit;
         # None until the server is created (and in test clients that never bind).
@@ -2766,7 +2781,29 @@ def _kick_provision(state: "WorkerState", model_key: str) -> None:
                     state._provisioning.discard(mk)
                     state._provision_progress.pop(mk, None)
 
-        threading.Thread(target=_bg, daemon=True).start()
+        def _bg_gated(mk=model_key):
+            # Thundering-herd gate: acquire a slot in the fleet-wide provision
+            # semaphore (default 1 = fully serial) BEFORE running the
+            # battle-tested _bg body above, release after — win, lose, or
+            # exception. This only throttles HOW MANY of these background
+            # threads may be doing the heavy ensure_model_present() work at
+            # once; it does NOT throttle the inference-triggered path
+            # (_ensure_present / _ensure_present_streaming), which calls
+            # ensure_model_present() directly and never goes through
+            # _kick_provision — so a live chat waiting on a model is never
+            # stuck behind a long queue of background assignment pre-fetches.
+            # Blocking here (not a timeout/try-acquire) is intentional: every
+            # assigned model must EVENTUALLY provision, just not all at once;
+            # the per-model _provisioning guard above already prevents the
+            # same key from queuing twice, so the wait is bounded by the
+            # number of genuinely distinct models still ahead of it.
+            state._provision_semaphore.acquire()
+            try:
+                _bg(mk)
+            finally:
+                state._provision_semaphore.release()
+
+        threading.Thread(target=_bg_gated, daemon=True).start()
 
 
 # ── UTIL-08: desired-state reconcile ─────────────────────────────────────────
@@ -3035,6 +3072,70 @@ def _worker_fit_check(model_key: str) -> bool:
     if fr is not None:
         return fr >= need
     return True
+
+
+def _vram_ceiling_frac() -> float:
+    """The real-VRAM ceiling as a fraction of total card VRAM
+    (HUGPY_VRAM_CEILING_FRAC, default 0.90). A load may proceed only if it leaves
+    the card at/under this fraction full — equivalently, at least (1 - frac) of
+    total VRAM free after the weights land. Clamped to a sane (0, 1] so a
+    fat-fingered env can never invert the gate."""
+    raw = os.environ.get("HUGPY_VRAM_CEILING_FRAC")
+    if raw is None or not str(raw).strip():
+        return 0.90
+    try:
+        val = float(raw)
+    except ValueError:
+        logger.warning("ignoring non-numeric HUGPY_VRAM_CEILING_FRAC=%r; using 0.90",
+                       raw)
+        return 0.90
+    if not (0.0 < val <= 1.0):
+        logger.warning("HUGPY_VRAM_CEILING_FRAC=%r out of (0,1]; using 0.90", raw)
+        return 0.90
+    return val
+
+
+def _total_vram_bytes() -> "int | None":
+    """Total INSTALLED VRAM (spill.total_vram_bytes) — RAW device capacity, or
+    None when no GPU / can't measure. Mirrors _free_vram_bytes' import guard so a
+    missing torch/nvidia-smi degrades to None, never raises."""
+    try:
+        from ..managers.spill import total_vram_bytes
+        return total_vram_bytes()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _worker_slot_fit_check(model_key: str) -> bool:
+    """Real-VRAM CEILING gate (slots.set_fit_check), Fix A (2026-07-15). True when
+    loading ``model_key`` would leave the card at/under the ~90% ceiling given
+    REAL current free VRAM — i.e. at least (1 - ceiling) of total VRAM remains
+    free AFTER the weights land. False when it would breach the ceiling (the slot
+    scheduler then evicts the coldest on-demand occupant(s) and re-checks).
+
+    This is distinct from _worker_fit_check (the in-process contention guard,
+    which asks "does it fit WITHOUT yielding a resident"): this gate answers "does
+    the WHOLE card stay under the ceiling", so it reacts to OUT-OF-BAND process
+    VRAM growth (ComfyUI) that managed-model bookkeeping is blind to — free VRAM
+    is the real device read (torch.cuda.mem_get_info, ComfyUI-visible).
+
+    Fails OPEN (True) when free VRAM, total VRAM, or the incoming need is unknown
+    (no GPU / can't tell) — NEVER block a load because we couldn't measure. That
+    keeps a no-GPU / unmeasurable box byte-identical to today (the gate is a
+    no-op there)."""
+    total = _total_vram_bytes()
+    if not total:
+        return True                          # no GPU / can't measure -> allow
+    fv = _free_vram_bytes()
+    if fv is None:
+        return True                          # can't read free VRAM -> allow
+    need = _incoming_need_bytes(model_key)
+    if not need:
+        return True                          # unknown weight size -> allow
+    headroom = int(total * (1.0 - _vram_ceiling_frac()))
+    # Loading consumes ~need; the card is OK if free-after-load still leaves the
+    # (1 - ceiling) reserve. Equivalent to "post-load fill <= ceiling".
+    return (fv - need) >= headroom
 
 
 def _worker_evictable(model_key: str) -> bool:
@@ -3325,6 +3426,126 @@ def _evict_model(state: "WorkerState", model_key: str,
     #    is OUT OF SCOPE for this slice — we never os.kill an arbitrary PID, so
     #    such a model simply reads as not-resident here. Idempotent no-op, HTTP 200.
     return _result("none", False, "not resident on this worker")
+
+
+# ── Fix B: ensure comfy headroom (evict-to-target-free-VRAM, operator: "always") ─
+def _comfy_target_free_bytes() -> int:
+    """Target free VRAM to clear before a ComfyUI gen
+    (HUGPY_COMFY_TARGET_FREE_GIB, default 7.0 GiB).
+
+    Reasoning for the 7.0 default: recon on ae observed ComfyUI's process VRAM
+    growing to ~6.5 GiB (5.5 -> 6.5 G) when it drove a gen — that footprint is
+    what topped out the 3090 and evicted nothing. 7.0 GiB is that observed peak
+    plus a small margin, so the common still/img2img/id_lock comfy gen has room
+    to allocate without OOM/under-offload. It's a knob, not a law: a box running
+    heavier SDXL/flux comfy graphs raises it; a tiny-model box lowers it. The
+    target is a CEILING on eviction effort, never a guarantee — if nothing is
+    evictable we proceed anyway (honest-degrade)."""
+    gib = os.environ.get("HUGPY_COMFY_TARGET_FREE_GIB")
+    if gib is None or not str(gib).strip():
+        val = 7.0
+    else:
+        try:
+            val = float(gib)
+        except ValueError:
+            logger.warning("ignoring non-numeric HUGPY_COMFY_TARGET_FREE_GIB=%r; "
+                           "using 7.0", gib)
+            val = 7.0
+    return int(max(0.0, val) * 2**30)
+
+
+def _comfy_headroom_candidates(exclude: str | None) -> list[str]:
+    """LRU-ordered (coldest first) on-demand managed model_keys that may be
+    evicted to free VRAM for a comfy gen. Union of live SLOT occupants (their
+    llama-server children hold real VRAM) and genuine IN-PROCESS residents —
+    slot-backed keys are excluded from ``loaded_model_keys`` by design, but they
+    are exactly what we must free here, so we add them back from a live slot
+    read. Static models are dropped (never evictable); the per-key ``_evict_gate``
+    inside ``_evict_model`` still guards in-flight generations. Excludes the comfy
+    model_key we're generating FOR. Ordered by dispatch's LRU clock so the coldest
+    yields first."""
+    keys: set[str] = set()
+    try:
+        keys.update(loaded_model_keys())         # genuine in-process residents
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from ..managers.serve.slots import SlotPool
+        for s in SlotPool().statuses():
+            mk = s.get("model_key")
+            if mk:
+                keys.add(mk)                     # slot children DO hold VRAM
+    except Exception:  # noqa: BLE001 — no slots / pool error -> in-process only
+        pass
+    if exclude:
+        keys.discard(exclude)
+    # Drop static (locked) — never a candidate. On-demand (incl. pinned, which
+    # yields per 2026-07-15 semantics) stays. The in-flight guard is applied
+    # per-key by _evict_model's gate at eviction time.
+    cands = [mk for mk in keys if _residency(mk) != "static"]
+    try:
+        last = _dispatch_last_used()
+    except Exception:  # noqa: BLE001
+        last = {}
+    cands.sort(key=lambda mk: last.get(mk, 0.0))
+    return cands
+
+
+def _dispatch_last_used() -> dict:
+    from ..managers.dispatch.dispatch import last_used_snapshot
+    return last_used_snapshot()
+
+
+def _worker_ensure_comfy_headroom(state: "WorkerState", model_key: str,
+                                  job_id=None) -> dict:
+    """Evict on-demand managed models (LRU, via the SAME _evict_model mechanism
+    the evict verb uses) until real free VRAM >= the comfy target, BEFORE a comfy
+    gen commits (Fix B). Runs UNCONDITIONALLY per the operator directive ("evict
+    down to free target vram always"); a no-op when already above target.
+
+    Honest-degrade at every seam: no GPU / can't read free VRAM -> no-op (return
+    early, never block); nothing left to evict but still short -> proceed anyway
+    with a logged warning (the comfy gen is NEVER blocked/hung). Returns a small
+    telemetry dict (used by the routine's own logging + tests). Best-effort — the
+    caller (comfy_runner) swallows any exception, but this stays defensive too."""
+    target = _comfy_target_free_bytes()
+    fv = _free_vram_bytes()
+    if fv is None:
+        # No GPU / can't measure: byte-identical to today — do nothing.
+        return {"target": target, "free_before": None, "free_after": None,
+                "evicted": [], "reached": None, "note": "no GPU / unmeasurable"}
+    evicted: list[str] = []
+    tried: set[str] = set()
+    while fv < target:
+        cands = [mk for mk in _comfy_headroom_candidates(exclude=model_key)
+                 if mk not in tried]
+        if not cands:
+            logger.warning(
+                "ensure-comfy-headroom: free VRAM %.2fGiB < target %.2fGiB but "
+                "nothing on-demand is evictable — proceeding with the comfy gen "
+                "anyway (honest-degrade; not blocking the request)",
+                fv / 2**30, target / 2**30)
+            break
+        victim = cands[0]
+        tried.add(victim)
+        try:
+            res = _evict_model(state, victim, force=False)
+        except Exception:  # noqa: BLE001 — one bad evict must not wedge the gen
+            logger.warning("ensure-comfy-headroom: evict of %s raised; skipping",
+                           victim, exc_info=True)
+            continue
+        if res.get("evicted"):
+            evicted.append(victim)
+            logger.info("ensure-comfy-headroom: evicted %s (%s) to free VRAM for "
+                        "comfy %s", victim, res.get("host_mode"), model_key)
+        # Re-read real free VRAM whether or not this one evicted (a gated model
+        # frees nothing; we still advanced `tried` so we won't loop on it).
+        fv = _free_vram_bytes()
+        if fv is None:
+            break
+    reached = (fv is not None and fv >= target)
+    return {"target": target, "free_after": fv, "evicted": evicted,
+            "reached": reached}
 
 
 def _prune_stale_residency(state: "WorkerState") -> None:
@@ -4374,11 +4595,32 @@ def main(argv: list[str] | None = None) -> int:
     # clear error instead of evicting.
     try:
         from ..managers.serve.slots import (set_eviction_policy,
-                                            set_residency_lookup)
+                                            set_residency_lookup,
+                                            set_fit_check as set_slot_fit_check)
         set_eviction_policy(lambda mk: _residency(mk) == "on-demand")
         set_residency_lookup(_residency)
+        # Real-VRAM ceiling gate (Fix A): the slot load/evict path now consults
+        # REAL device free VRAM (ComfyUI-visible), not slot-occupancy count, so a
+        # card topped out by an out-of-band process (ComfyUI) triggers an LRU
+        # on-demand eviction before seating a new model instead of OOM/under-
+        # offloading into a "free" seat on a full card. Degrades to allow when
+        # unmeasurable (no-GPU / can't read VRAM) — byte-identical to today.
+        set_slot_fit_check(_worker_slot_fit_check)
     except Exception as _exc:  # noqa: BLE001
         logger.warning("slot eviction policy not registered: %s", _exc)
+
+    # Fix B (2026-07-15): ensure headroom before every ComfyUI gen. comfy_runner
+    # is package-shared (central imports it), so it must not import worker/GPU
+    # internals — instead the worker registers a hook it calls if present (the
+    # same None-default indirection as the slot policy). Evicts on-demand managed
+    # models (LRU, via _evict_model) until real free VRAM reaches the target, so
+    # ComfyUI's demand is a first-class queue entry, not a silent squatter.
+    try:
+        from ..managers.comfy.comfy_runner import set_comfy_headroom_hook
+        set_comfy_headroom_hook(
+            lambda mk, job_id=None: _worker_ensure_comfy_headroom(state, mk, job_id))
+    except Exception as _exc:  # noqa: BLE001 — headroom prep must never break boot
+        logger.warning("comfy headroom hook not registered: %s", _exc)
 
     # Env-profiles (stage 1): register the model->profile resolver the runner
     # spawn seam consumes, then KICK materialization of every declared profile

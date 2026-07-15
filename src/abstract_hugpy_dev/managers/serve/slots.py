@@ -37,6 +37,22 @@ _EVICTION_POLICY = None
 # with a clear error instead. None (bare central) skips the check.
 _RESIDENCY_LOOKUP = None
 
+# Real-VRAM ceiling hook (Fix A, 2026-07-15): a callable mk -> bool answering
+# "will loading THIS model keep the card at/under the ~90% ceiling given REAL
+# current free VRAM (torch.cuda.mem_get_info — ComfyUI-visible, not managed-
+# model bookkeeping)?". Registered by the WORKER agent (_worker_slot_fit_check).
+# The gap this closes: an idle slot on a card 95%-full from a SEPARATE process
+# (ComfyUI) would happily /load into the seat, then the child silently offloads
+# fewer layers or OOMs — because slot routing keyed on slot-OCCUPANCY, never on
+# real device pressure. When registered and it says NO (would breach ceiling),
+# endpoint_for evicts the coldest on-demand occupant(s) via the SAME LRU
+# mechanism the all-busy branch uses and re-checks, until the gate passes or
+# nothing is evictable (then it proceeds anyway — honest-degrade, never HANG a
+# legitimate request; the child's autofit does its best). None (bare central,
+# no-GPU box, or a gate that can't measure) => byte-identical to today: the
+# gate is skipped, occupancy-only routing stands.
+_FIT_CHECK = None
+
 
 def set_eviction_policy(fn) -> None:
     global _EVICTION_POLICY
@@ -46,6 +62,15 @@ def set_eviction_policy(fn) -> None:
 def set_residency_lookup(fn) -> None:
     global _RESIDENCY_LOOKUP
     _RESIDENCY_LOOKUP = fn
+
+
+def set_fit_check(fn) -> None:
+    """Register the real-VRAM ceiling gate: ``fn(model_key) -> bool``, True when
+    loading the model keeps the card at/under the ~90% ceiling given real current
+    free VRAM. None disables the ceiling gate (bare central / no-GPU / can't
+    measure) — occupancy-only routing, byte-identical to before."""
+    global _FIT_CHECK
+    _FIT_CHECK = fn
 
 
 def _slot_count() -> int:
@@ -126,6 +151,49 @@ class SlotPool:
             out.append(status)
         return out
 
+    def _ceiling_ok(self, model_key: str) -> bool:
+        """Whether loading ``model_key`` keeps the card at/under the real-VRAM
+        ceiling. True (fits) when no ceiling gate is registered — bare central /
+        no-GPU / unmeasurable all degrade to the historical occupancy-only path.
+        A gate that raises is treated as "can't tell" => True (never block a load
+        because the measurement broke)."""
+        if _FIT_CHECK is None:
+            return True
+        try:
+            return bool(_FIT_CHECK(model_key))
+        except Exception:  # noqa: BLE001 — a broken gate must not crash serving
+            return True
+
+    def _evict_coldest_on_demand(self, statuses: list[dict],
+                                 model_key: str) -> "dict | None":
+        """Evict the single LRU idle on-demand slot occupant (the SAME candidate
+        rule the all-busy promotion branch uses) and return the evicted status
+        dict, or None when nothing is evictable. Reuses ``_EVICTION_POLICY`` (the
+        worker answers True only for on-demand — never static, never a busy slot,
+        never the incoming model). No-op (None) when no eviction policy is
+        registered."""
+        if _EVICTION_POLICY is None:
+            return None
+        candidates = [s for s in statuses
+                      if s.get("model_key") and s.get("healthy")
+                      and not s.get("busy")
+                      and s.get("model_key") != model_key]
+        try:
+            candidates = [s for s in candidates
+                          if _EVICTION_POLICY(s["model_key"])]
+        except Exception:  # noqa: BLE001 — a broken policy must not crash serving
+            return None
+        candidates.sort(key=lambda s: s.get("last_used") or 0)
+        for victim in candidates:
+            try:
+                self.unload(victim["_control"])
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("ceiling evict failed on %s: %s",
+                               victim["_control"], exc)
+                continue
+            return victim
+        return None
+
     def endpoint_for(self, model_key: str, *, load_timeout: float = 900.0,
                      opts: dict | None = None) -> str | None:
         """Resolve (and if needed load) the slot serving ``model_key``.
@@ -161,6 +229,35 @@ class SlotPool:
                 if not st.get("model_key"):
                     break                       # load aborted/failed — reload below
             break                               # not ready in time — fall through
+
+        # 1b. Real-VRAM CEILING gate (Fix A, 2026-07-15). Before we seat this
+        #     model — whether into an idle slot below or by promotion — check
+        #     that loading it keeps the card at/under the ~90% ceiling given REAL
+        #     current free VRAM (not slot-occupancy count). This catches the ae
+        #     case: a card 95%-full from a SEPARATE ComfyUI process but with an
+        #     idle slot would otherwise /load happily, then OOM/under-offload.
+        #     When over ceiling, evict the coldest on-demand occupant(s) via the
+        #     SAME LRU mechanism the all-busy branch uses (re-reading statuses so
+        #     each re-check sees the freed seat) until the gate passes OR nothing
+        #     is evictable. Nothing evictable + still over ceiling => proceed
+        #     anyway (honest-degrade: the child's autofit does its best; we never
+        #     HANG a legitimate request), with a clear warning. No-op when no
+        #     ceiling gate is registered (bare central / no-GPU / can't measure).
+        if not self._ceiling_ok(model_key):
+            while not self._ceiling_ok(model_key):
+                victim = self._evict_coldest_on_demand(statuses, model_key)
+                if victim is None:
+                    logger.warning(
+                        "VRAM ceiling: loading %s would exceed the real-VRAM "
+                        "ceiling and nothing on-demand is evictable — proceeding "
+                        "anyway (autofit will spill/offload; not hanging the "
+                        "request)", model_key)
+                    break
+                logger.info(
+                    "VRAM ceiling: evicted idle on-demand %s from %s to keep %s "
+                    "under the real-VRAM ceiling", victim["model_key"],
+                    victim["_control"], model_key)
+                statuses = self.statuses()   # re-read: the seat is now free
 
         # 2. an idle slot (reachable, nothing loaded)
         for s in statuses:

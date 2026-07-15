@@ -70,6 +70,11 @@ class IdentityReconstructionSpec:
                          (canonical set preferred over the raw uploads) before enqueue.
         base_prompt      the extra description woven into every view prompt (the
                          profile's notes by default; may be empty).
+        negative_prompt  a TRUE negative forwarded to the studio Wan-VACE render alongside
+                         base_prompt (CLEANUP-PROMPT slice). base_prompt already covers
+                         POSITIVE steering here (an avoid instruction can ride base_prompt),
+                         so the reconstruction spec adds only the NEGATIVE channel. Default
+                         "" -> today's exact call (defaults-are-promises).
         views            the ORDERED tuple of view names to render (>=1). A view-
                          specific prompt is derived per view in the runner.
         seed             base render seed (all views share it; the view differs by
@@ -88,6 +93,9 @@ class IdentityReconstructionSpec:
     source_images: Tuple[str, ...]
     views: Tuple[str, ...] = DEFAULT_VIEWS
     base_prompt: str = ""
+    # additive (CLEANUP-PROMPT slice): a TRUE negative forwarded to the studio Wan-VACE
+    # render alongside base_prompt. Default "" -> byte-identical to today.
+    negative_prompt: str = ""
     seed: int = 0
     width: int = _DEFAULT_WIDTH
     height: int = _DEFAULT_HEIGHT
@@ -115,6 +123,7 @@ def make_identity_reconstruction(
     source_images: Tuple[str, ...],
     views: Optional[Tuple[str, ...]] = None,
     base_prompt: str = "",
+    negative_prompt: str = "",
     seed: int = 0,
     width: int = _DEFAULT_WIDTH,
     height: int = _DEFAULT_HEIGHT,
@@ -169,6 +178,11 @@ def make_identity_reconstruction(
     if base_prompt is not None and not isinstance(base_prompt, str):
         raise ValueError(f"base_prompt must be a string or None; got {base_prompt!r}")
     base_prompt = base_prompt or ""
+    # negative_prompt: additive TRUE-negative channel (CLEANUP-PROMPT slice), validated
+    # exactly like base_prompt — a str (None coerces to ""), default "" -> today's call.
+    if negative_prompt is not None and not isinstance(negative_prompt, str):
+        raise ValueError(f"negative_prompt must be a string or None; got {negative_prompt!r}")
+    negative_prompt = negative_prompt or ""
     if not isinstance(seed, int) or isinstance(seed, bool):
         raise ValueError(f"seed must be an int; got {seed!r}")
     for name, val in (("width", width), ("height", height), ("fps", fps)):
@@ -201,6 +215,7 @@ def make_identity_reconstruction(
         source_images=source_images,
         views=views,
         base_prompt=base_prompt,
+        negative_prompt=negative_prompt,
         seed=seed,
         width=width,
         height=height,
@@ -225,6 +240,9 @@ def identity_reconstruction_from_dict(d: dict) -> IdentityReconstructionSpec:
         source_images=d.get("source_images") or (),
         views=d.get("views"),
         base_prompt=d.get("base_prompt", ""),
+        # additive (CLEANUP-PROMPT slice): round-trip the negative channel; an OLD spec has
+        # no key -> "" (== today's byte-identical render).
+        negative_prompt=d.get("negative_prompt", ""),
         seed=d.get("seed", 0),
         width=d.get("width", _DEFAULT_WIDTH),
         height=d.get("height", _DEFAULT_HEIGHT),
@@ -330,6 +348,22 @@ class IdentityMeshSpec:
     # the LIVE image-text-to-text registry check lives in the store (set_gen_settings) so
     # the spec factory stays import-cheap on the bus rehydrate path.
     vision_model: Optional[str] = None
+    # additive (CLEANUP-PROMPT slice, operator-requested): steer the FRONT render so the
+    # meshed front never carries an unwanted baked-in element (Hunyuan3D is image-to-3D —
+    # you cannot prompt the mesh step, so steering must happen on the source view that gets
+    # meshed). TWO channels, both default "" -> byte-identical to today (defaults-are-
+    # promises):
+    #   cleanup_prompt   a POSITIVE-worded avoid instruction (e.g. "no object on her back,
+    #                    clean bare back") WOVEN INTO the T-pose front render prompt. A
+    #                    cleanup clause removes a prop; it does NOT fight the T-pose stance,
+    #                    so (unlike an identity DESCRIPTION) it is allowed into _TPOSE_PROMPT.
+    #                    Empty -> the current constant verbatim.
+    #   negative_prompt  a TRUE negative forwarded to the studio Wan-VACE render (which
+    #                    ALREADY accepts negative_prompt). Empty -> today's exact call.
+    # Structural-only here (str, default ""); the relay weaves cleanup_prompt into the pose
+    # render and forwards negative_prompt to the id_lock render seam.
+    cleanup_prompt: str = ""
+    negative_prompt: str = ""
 
 
 # Cardinal views the remote render service accepts (front is required; the others
@@ -367,6 +401,8 @@ def make_identity_mesh(
     view_candidates=(),
     pose: str = "none",
     vision_model: Optional[str] = None,
+    cleanup_prompt: str = "",
+    negative_prompt: str = "",
 ) -> IdentityMeshSpec:
     """Validate every field and build the frozen ``IdentityMeshSpec`` (house discipline:
     a structurally-invalid spec is caller error caught at the boundary, never carried
@@ -448,6 +484,18 @@ def make_identity_mesh(
             raise ValueError(f"vision_model must be None or a string; got {vision_model!r}")
         vision_model = vision_model.strip() or None
 
+    # cleanup_prompt / negative_prompt: additive render-steer channels (CLEANUP-PROMPT
+    # slice). Both are plain strings validated exactly like the reconstruction spec's
+    # base_prompt — must be a str (None coerces to ""), default "" -> byte-identical to
+    # today's render (defaults-are-promises). The SEMANTICS (positive-avoid vs true
+    # negative) live in the relay/reconstruction wiring; here they are structural only.
+    if cleanup_prompt is not None and not isinstance(cleanup_prompt, str):
+        raise ValueError(f"cleanup_prompt must be a string or None; got {cleanup_prompt!r}")
+    cleanup_prompt = cleanup_prompt or ""
+    if negative_prompt is not None and not isinstance(negative_prompt, str):
+        raise ValueError(f"negative_prompt must be a string or None; got {negative_prompt!r}")
+    negative_prompt = negative_prompt or ""
+
     return IdentityMeshSpec(
         slug=slug,
         recon_id=recon_id,
@@ -471,6 +519,8 @@ def make_identity_mesh(
         view_candidates=tuple(norm_candidates),
         pose=pose,
         vision_model=vision_model,
+        cleanup_prompt=cleanup_prompt,
+        negative_prompt=negative_prompt,
     )
 
 
@@ -509,6 +559,11 @@ def identity_mesh_from_dict(d: dict) -> IdentityMeshSpec:
         # additive (per-identity VISION MODEL): round-trip vision_model; an OLD spec has no
         # key -> None (== the fleet-default VL model), so deserialization stays backward-compat.
         vision_model=d.get("vision_model"),
+        # additive (CLEANUP-PROMPT slice): round-trip the render-steer channels; an OLD spec
+        # has neither key -> "" (== today's byte-identical render), so deserialization stays
+        # backward-compat.
+        cleanup_prompt=d.get("cleanup_prompt", ""),
+        negative_prompt=d.get("negative_prompt", ""),
     )
 
 

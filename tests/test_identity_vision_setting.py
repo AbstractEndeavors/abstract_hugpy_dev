@@ -219,10 +219,26 @@ def test_generate_precedence_falls_back_to_gen_settings():
     assert spec.vision_model == key, spec.vision_model
 
 
-def test_generate_precedence_none_when_unset():
-    slug = _create_profile("Gen NoneDefault")
-    # No gen_settings vision_model + no body value -> None (== fleet default, no model sent).
+def test_generate_precedence_auto_when_unset():
+    """Unset everywhere -> the AUTO preference (operator 2026-07-15: '7B should be
+    default if it is available'): preferred_identity_vision_model() — a 7B key when
+    the live registry has one, else None (== fleet-default 3B, no model sent)."""
+    slug = _create_profile("Gen AutoDefault")
+    expected = identity_profiles.preferred_identity_vision_model()
     spec = _capture_generate_spec(slug, {})
+    assert spec.vision_model == expected, (spec.vision_model, expected)
+
+
+def test_generate_precedence_none_when_unset_and_no_7b():
+    """With NO 7B in the fleet (auto preference monkeypatched to None), unset
+    everywhere -> None — the original fleet-default contract still holds."""
+    slug = _create_profile("Gen NoneDefault")
+    orig = identity_profiles.preferred_identity_vision_model
+    identity_profiles.preferred_identity_vision_model = lambda: None
+    try:
+        spec = _capture_generate_spec(slug, {})
+    finally:
+        identity_profiles.preferred_identity_vision_model = orig
     assert spec.vision_model is None, spec.vision_model
 
 
@@ -320,7 +336,8 @@ CHECKS = [
     ("store: default vision_model is None (zero regression)", test_gen_settings_default_is_none_zero_regression),
     ("route: /generate precedence — request body wins", test_generate_precedence_request_body_wins),
     ("route: /generate precedence — falls back to gen_settings", test_generate_precedence_falls_back_to_gen_settings),
-    ("route: /generate precedence — None when unset", test_generate_precedence_none_when_unset),
+    ("route: /generate precedence — auto (7B) when unset", test_generate_precedence_auto_when_unset),
+    ("route: /generate precedence — None when unset and no 7B", test_generate_precedence_none_when_unset_and_no_7b),
     ("relay: _select_front_view includes model when set", test_select_front_view_includes_model_when_set),
     ("relay: _select_front_view omits model when None", test_select_front_view_omits_model_when_none),
     ("relay: _select_front_view omits model for empty string", test_select_front_view_empty_string_model_omits),
