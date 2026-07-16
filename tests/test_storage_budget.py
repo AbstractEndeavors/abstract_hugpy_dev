@@ -45,6 +45,11 @@ os.environ["HUGPY_WORKER_DISK_RESERVE_GIB"] = "50"
 def _worker(**over):
     w = {
         "id": "w", "name": "w", "url": "http://w",
+        # ALIVE. Added 2026-07-16: the provisioning guard is now liveness-gated
+        # (a dead worker's pull is not in flight), so a fixture with no
+        # last_seen reads as OFFLINE and its provisioning entries confer no
+        # protection. This fixture means "a healthy worker", so say so.
+        "last_seen": time.time(),
         "disk": {"free_bytes": 10 * GiB, "total_bytes": 500 * GiB},
         "model_last_picked": {"warm": 5000.0, "cold": 1000.0},
         "loaded_models": [], "loading": [], "provisioning": [],
@@ -112,8 +117,18 @@ check("cap mode: same LRU greedy (need 50 GiB -> never+cold)",
 
 
 # --- central redundant guard: slot-merged loaded/loading/provisioning --------
+# UPDATED 2026-07-16 (defect: stale `provisioning` never aged out). The
+# provisioning guard is now LIVENESS-GATED: it protects only a pull that is
+# genuinely in flight (owner alive AND bytes moving). This block always MEANT
+# "all candidates are live", so it now supplies the forward progress that makes
+# "warm" actually live. The old fixture asserted that a bare flag from a worker
+# with no liveness evidence at all protects a model — that was the bug (op sat
+# offline 2h+ with 4 immortal entries).
 guardw = _worker(loaded_models=["never"], loading=["cold"],
-                 provisioning=["warm"])
+                 provisioning=["warm"],
+                 provision_progress={"warm": {"done_bytes": 1 << 30,
+                                              "total_bytes": 50 << 30,
+                                              "progressed_at": time.time()}})
 pg = W.storage_proposal(guardw)
 check("central guard: nothing proposed when all candidates are live",
       pg["proposed_evictions"] == [])
@@ -122,8 +137,25 @@ check("central guard: slot-merged loaded -> protected/why=loaded",
       bg["never"]["protected"] and bg["never"]["why"] == "loaded")
 check("central guard: loading -> protected/why=loading",
       bg["cold"]["protected"] and bg["cold"]["why"] == "loading")
-check("central guard: provisioning -> protected/why=provisioning",
+check("central guard: LIVE provisioning -> protected/why=provisioning",
       bg["warm"]["protected"] and bg["warm"]["why"] == "provisioning")
+
+# --- NEW CONTRACT (2026-07-16): a DEAD pull protects nothing ----------------
+# The converse of the guard above, and the actual defect: a provisioning entry
+# whose owner is gone used to grant PERMANENT phantom eviction protection,
+# quietly shrinking the reclaimable pool on a full disk. Full coverage lives in
+# tests/test_provisioning_liveness.py; these two pin the behaviour here too,
+# next to the guard they qualify.
+deadw = _worker(provisioning=["warm"])           # alive, but ZERO bytes moving
+dg = {m["model_key"]: m for m in W.storage_proposal(deadw)["models"]}
+check("central guard: provisioning with NO progress -> NOT protected",
+      not dg["warm"]["protected"])
+
+offw = _worker(provisioning=["warm"])
+offw["last_seen"] = time.time() - 7750.0         # the op case: offline 2h+
+og = {m["model_key"]: m for m in W.storage_proposal(offw)["models"]}
+check("central guard: provisioning on an OFFLINE worker -> NOT protected",
+      not og["warm"]["protected"])
 
 
 # --- central guard: config residency=static / pinned map ---------------------

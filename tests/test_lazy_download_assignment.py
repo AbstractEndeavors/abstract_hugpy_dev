@@ -11,11 +11,24 @@ storm: N assigned models = N parallel provisions, central 503'ing, and four
 truncated GGUFs (~10.7GB) left on computron — all "designated" in
 worker_assignments.json.
 
-Now the default (on-demand) tier downloads only when CALLED, via the inference
-path's already-working ``_ensure_present``. Exactly two tiers still pre-pull,
-because lazy would break a promise they already make:
+Now every tier but one downloads only when CALLED, via the inference path's
+already-working ``_ensure_present``. Exactly ONE tier pre-pulls, because lazy
+would break a promise it already makes:
   * static  — operator-locked 2026-07-05 as "eager-warmed"
-  * pinned  — 📌 permanent attribution
+
+📌 pin was REMOVED from the eager set on 2026-07-16. The operator, asked what
+pinned means: "pinned doesnt mean anything aside from: 1) is the model
+attributed to a worker; if yes, then it always will be" — i.e. PERMANENT
+ATTRIBUTION, full stop. It says nothing about when bytes arrive. Treating it
+as eager made it a de-facto transfer order: on ae, 65/65 assigned models were
+pinned, so deleting them re-pulled all 65 via ``_reconcile_loop`` and filled
+the operator's workstation to 0 bytes free. "none should be pulling at all.
+they should be lazy."
+
+Tests below that assert pin is NOT eager are REGRESSION tests for that
+incident — they replaced tests that asserted the opposite. Pin's real meaning
+(eviction protection, unassign-409, surviving prune) is unaffected and is
+covered here + in tests/test_storage_budget*.py.
 
 These tests patch ``_kick_provision`` at the agent module and assert on WHO
 gets kicked; the download machinery itself is out of scope here (covered by
@@ -81,10 +94,17 @@ def _wait_until(cond, timeout=5.0, interval=0.02):
 
 
 # ── the tier predicate ──────────────────────────────────────────────────────
-def test_eager_pull_only_for_static_and_pinned():
+def test_eager_pull_only_for_static():
+    """🔒static is the ONLY eager tier. 📌pin is attribution, not a pre-fetch."""
     assert A._eager_pull("m-static") is True
-    assert A._eager_pull("m-pinned") is True
+    assert A._eager_pull("m-pinned") is False     # 2026-07-16: attribution only
     assert A._eager_pull("m-ondemand") is False   # the DEFAULT
+
+
+def test_eager_pull_ignores_pin_even_when_also_assigned():
+    """The ae shape: pinned + assigned is still LAZY. Pin never pre-pulls."""
+    assert A._pinned("m-pinned") is True, "fixture sanity: the model IS pinned"
+    assert A._eager_pull("m-pinned") is False
 
 
 def test_eager_pull_fails_lazy_when_settings_read_raises(monkeypatch):
@@ -108,21 +128,34 @@ def test_assigning_many_on_demand_models_kicks_nothing(kicks, fills):
     assert kicks == []
 
 
-# ── (2)/(3) static and pinned still pre-pull ────────────────────────────────
+# ── (2) static still pre-pulls; (3) pinned does NOT ─────────────────────────
 def test_assigning_static_model_kicks_provision(kicks, fills):
     A._sync_assignment(_state(), {"models": ["m-static"]})
     assert kicks == ["m-static"]
 
 
-def test_assigning_pinned_model_kicks_provision(kicks, fills):
+def test_assigning_pinned_model_does_not_kick_provision(kicks, fills):
+    """REGRESSION (2026-07-16). This test asserted the OPPOSITE until pin was
+    removed from _eager_pull: "assigning a pinned model DOES kick a provision".
+    That encoded the bug. Pin = permanent ATTRIBUTION; the bytes arrive on
+    first CALL, like every other lazy tier."""
     A._sync_assignment(_state(), {"models": ["m-pinned"]})
-    assert kicks == ["m-pinned"]
+    assert kicks == [], "pin is attribution, not a transfer order"
 
 
-def test_mixed_assignment_pulls_only_the_eager_tiers(kicks, fills):
+def test_mixed_assignment_pulls_only_static(kicks, fills):
     A._sync_assignment(
         _state(), {"models": ["m-ondemand", "m-static", "m-other", "m-pinned"]})
-    assert kicks == ["m-static", "m-pinned"]
+    assert kicks == ["m-static"]
+
+
+def test_assigning_many_pinned_models_kicks_nothing(kicks, fills):
+    """The ae shape exactly: every assigned model pinned => ZERO provisions.
+    Before the fix this fired 65 parallel pulls and filled the drive."""
+    models = [f"m-pin-{i}" for i in range(65)]
+    A._RUNTIME_SETTINGS["pinned"] = {mk: True for mk in models}
+    A._sync_assignment(_state(), {"models": models})
+    assert kicks == []
 
 
 # ── (5) seating still runs — it is not a download ───────────────────────────
@@ -176,11 +209,40 @@ def test_reconcile_does_not_rekick_missing_on_demand_model(
         "an assigned-but-absent on-demand model is the CORRECT resting state"
 
 
-def test_reconcile_rekicks_missing_static_and_pinned(
+def test_reconcile_rekicks_missing_static_only(
         kicks, _fast_reconcile, monkeypatch):
     monkeypatch.setattr(A, "_models_local", lambda state: [])
     A._reconcile_loop(_state(assigned=["m-ondemand", "m-static", "m-pinned"]))
-    assert kicks == ["m-static", "m-pinned"]
+    assert kicks == ["m-static"], "only 🔒static promises local presence"
+
+
+def test_reconcile_does_not_rekick_missing_pinned_model(
+        kicks, _fast_reconcile, monkeypatch):
+    """THE ae SYMPTOM (2026-07-16), regression-locked.
+
+    The operator deleted ae's models; _reconcile_loop saw 65 pinned-and-absent
+    models, called them drift, and re-pulled every one — 0 bytes free. A pinned
+    model that is absent is absent ON PURPOSE until something calls it.
+    """
+    monkeypatch.setattr(A, "_models_local", lambda state: [])   # operator deleted them
+    A._reconcile_loop(_state(assigned=["m-pinned"]))
+    assert kicks == [], \
+        "reconcile must NOT re-pull a pinned model nobody called"
+
+
+# ── pin's REAL meaning survives: attribution still protects what's here ─────
+def test_pinned_model_is_still_protected_from_eviction():
+    """Removing pin's PRE-FETCH must not weaken pin's PROTECTION.
+
+    Pin never promises the bytes arrive — but once they have, permanent
+    attribution says they aren't the reaper's to reclaim. (Central-side mirror:
+    storage_proposal's `pinned` guard in
+    flask_app/app/functions/imports/utils/workers.py.)
+    """
+    from abstract_hugpy_dev.worker_agent import budget as B
+    assert B._is_protected({"model_key": "m-pinned", "pinned": True}) == "pinned"
+    # ...while merely-assigned is still reclaimable (attribution != a keep order)
+    assert B._is_protected({"model_key": "m-cold", "assigned": True}) == ""
 
 
 def test_reconcile_does_not_rekick_a_model_already_on_disk(

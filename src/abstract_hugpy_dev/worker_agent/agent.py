@@ -48,6 +48,10 @@ import urllib.request
 import urllib.error
 import weakref
 
+# Storage-budget refusal (evict-to-fit path). Safe at module scope: budget.py
+# imports back from .agent lazily, inside functions, so there is no cycle.
+from .budget import BudgetRefusal
+
 from flask import Flask, request, jsonify, Response, stream_with_context
 
 logger = logging.getLogger("abstract_hugpy_dev.worker_agent")
@@ -500,8 +504,13 @@ class CentralClient:
 # ---------------------------------------------------------------------------
 # Local inference (reuses the same dispatch the central node uses)
 # ---------------------------------------------------------------------------
-def _ensure_present(payload: dict, central_url: str | None) -> None:
-    """Provision the requested model before inference (central-first, HF fallback)."""
+def _ensure_present(payload: dict, central_url: str | None, state=None) -> None:
+    """Provision the requested model before inference (central-first, HF fallback).
+
+    ``state`` opts the pull into the STORAGE BUDGET (evict-to-fit, else refuse).
+    A BudgetRefusal PROPAGATES: an unfittable model must fail loudly here rather
+    than fall through to a confusing downstream "model not found".
+    """
     model_key = payload.get("model_key")
     if not model_key:
         return
@@ -513,16 +522,29 @@ def _ensure_present(payload: dict, central_url: str | None) -> None:
         canonical = ensure_model_registered(model_key, central_url)
         if canonical and canonical != model_key:
             payload["model_key"] = canonical
-        ensure_model_present(payload.get("model_key"), central_url)
+        ensure_model_present(payload.get("model_key"), central_url, state=state)
+        if state is not None:
+            state.refused.pop(payload.get("model_key"), None)
+    except BudgetRefusal as exc:
+        if state is not None:
+            state.refused[payload.get("model_key") or model_key] = dict(exc.reason)
+        logger.error("provisioning of %s REFUSED: %s", model_key,
+                     exc.reason.get("reason"))
+        raise
     except Exception as exc:
         logger.warning("provisioning check for %s failed: %s", model_key, exc)
 
 
-def _ensure_present_streaming(payload: dict, central_url: str | None):
+def _ensure_present_streaming(payload: dict, central_url: str | None, state=None):
     """Provision the model, yielding SSE 'status' events with download progress.
 
     Yields encoded SSE lines (status/error). Returns normally once the model is
     present (or was already). Throttled so we don't flood the stream.
+
+    ``state`` opts the pull into the STORAGE BUDGET. A refusal is yielded as an
+    SSE 'error' event carrying the structured reason — the stream ends honestly
+    ("won't fit: needs X…") instead of showing a progress bar for a download
+    that was never going to start.
     """
     model_key = payload.get("model_key")
     if not model_key:
@@ -558,7 +580,8 @@ def _ensure_present_streaming(payload: dict, central_url: str | None):
 
         def _run():
             try:
-                result["ok"] = ensure_model_present(model_key, central_url, progress=_progress)
+                result["ok"] = ensure_model_present(model_key, central_url,
+                                                    progress=_progress, state=state)
             except Exception as exc:  # pragma: no cover
                 result["err"] = exc
             finally:
@@ -587,6 +610,16 @@ def _ensure_present_streaming(payload: dict, central_url: str | None):
             })
         th.join(timeout=1.0)
 
+        if isinstance(result["err"], BudgetRefusal):
+            # Storage verdict, not a transfer failure: the pull never started.
+            # Carry the structured reason so the UI can show WHY it's missing.
+            reason = result["err"].reason
+            if state is not None:
+                state.refused[model_key] = dict(reason)
+            yield _sse({"type": "error", "stage": "provision",
+                        "refused": reason,
+                        "message": f"{model_key} won't fit: {reason.get('reason')}"})
+            return
         if result["err"] is not None:
             yield _sse({"type": "error",
                         "message": f"provisioning failed: {result['err']}"})
@@ -736,6 +769,42 @@ def _local_caps() -> dict:
             except ValueError:
                 pass
     return out
+
+
+def _adopt_storage_inputs(state: "WorkerState", worker: dict | None) -> None:
+    """Store the STORAGE budget's two central-owned inputs on state.
+
+      * ``limits`` — carries ``disk_cache_gib``, central's storage allocation
+        for this box. The auto-evict path is OFF until it is set (budget.cap_bytes).
+      * ``model_last_picked`` — central's ``{model_key: epoch}`` LRU clock, the
+        FIFO key. The worker can't know it: central routes the calls.
+      * ``allocated`` — the ALLOCATION-LEVEL totals (operator, 2026-07-16: "show
+        how much is needed based on the total size of all models allocated").
+        Sizing the assignment set needs the MANIFEST, which only central holds:
+        doing it worker-side would mean one HTTP round-trip PER assigned model,
+        inside the single-flight provision lock, on the refusal path. Central
+        already computes this per read (storage_proposal.allocated_totals) and
+        every heartbeat reply carries it, so the worker just adopts the answer
+        and the refusal reason stays a pure, offline computation.
+
+    Never raises into the heartbeat: a malformed reply just leaves the previous
+    values in place (and an absent allocation simply keeps the budget unmanaged).
+    """
+    if not isinstance(worker, dict):
+        return
+    limits = worker.get("limits")
+    if isinstance(limits, dict):
+        state.limits = dict(limits)
+    lp = worker.get("model_last_picked")
+    if isinstance(lp, dict):
+        state.model_last_picked = dict(lp)
+    storage = worker.get("storage")
+    if isinstance(storage, dict) and storage.get("allocated_count") is not None:
+        state.allocated = {
+            "allocated_total_bytes": storage.get("allocated_total_bytes"),
+            "allocated_count": storage.get("allocated_count"),
+            "allocated_unknown_count": storage.get("allocated_unknown_count"),
+        }
 
 
 def _apply_central_limits(worker: dict | None) -> None:
@@ -1822,6 +1891,26 @@ def _storage_model_row(mk: str, size: int, loaded: set, loading: set,
     }
 
 
+def _refused_snapshot(state: "WorkerState") -> dict:
+    """A copy of the storage-REFUSED models, pruned of any that since landed.
+
+    A refusal is a point-in-time verdict: once the model's files are on disk
+    (the operator raised disk_cache_gib, or a later pull fit after evictions),
+    the "missing — won't fit" reason is stale and must not linger in the console.
+    """
+    out = {}
+    for mk, reason in list(getattr(state, "refused", {}).items()):
+        try:
+            from .provision import model_is_local
+            if model_is_local(mk):
+                state.refused.pop(mk, None)
+                continue
+        except Exception:  # noqa: BLE001 — a probe failure keeps the reason
+            pass
+        out[mk] = dict(reason)
+    return out
+
+
 def _worker_storage(state: "WorkerState") -> dict:
     """Heartbeat STORAGE view for one worker (60s-cached — _reap_scan os.walks
     every local model dir via _path_bytes; running that every beat would slow
@@ -1840,6 +1929,11 @@ def _worker_storage(state: "WorkerState") -> dict:
     now = time.time()
     cached = _STORAGE_CACHE["value"]
     if cached is not None and now - _STORAGE_CACHE["at"] < 60.0:
+        # The heavy part (per-model disk walk) stays cached, but REFUSALS are
+        # cheap and time-critical: a model refused seconds ago must read as
+        # missing-with-a-reason on the NEXT beat, not up to 60s later. Refresh
+        # just that key on the cached view.
+        cached["refused"] = _refused_snapshot(state)
         return cached
 
     scan = _reap_scan(state)
@@ -1874,6 +1968,11 @@ def _worker_storage(state: "WorkerState") -> dict:
         "cache_used_bytes": cache_used,
         "disk_free": int(disk.get("free_bytes", 0) or 0),
         "models": models,
+        # Models REFUSED for storage: the pull never started because even a full
+        # FIFO couldn't seat them. {model_key: {state:"refused", reason, ...}}.
+        # The console renders these as MISSING with the reason on hover — an
+        # honest "won't fit", never a phantom "pulling" that can't finish.
+        "refused": _refused_snapshot(state),
         # HOT-CACHE tier (box-local NVMe LRU of the main catalog). Honest section
         # so central/console can surface root/budget/used + per-entry last_called.
         # {"enabled": False} when HUGPY_HOT_CACHE_ROOT is unset (no behaviour).
@@ -1936,7 +2035,7 @@ def build_app(state: "WorkerState") -> Flask:
         # runner's error path, so the console shows the REAL cause.
         try:
             _apply_spill(payload.pop("spill", None))
-            _ensure_present(payload, state.central_url)
+            _ensure_present(payload, state.central_url, state=state)
             # Per-model generation gate: serialize entry into an in-process
             # (llama.cpp/transformers) runner so concurrent /infer calls can't
             # race the same non-reentrant native context and crash the worker.
@@ -1948,6 +2047,18 @@ def build_app(state: "WorkerState") -> Flask:
             # Honest structured busy — the runner is at capacity, not broken.
             return jsonify(busy.as_error(
                 {"id": state.worker_id, "name": state.name})), 503
+        except BudgetRefusal as exc:
+            # The model cannot fit on this box even after a full FIFO. NOT a
+            # crash and NOT a traceback: a storage-capacity verdict, so it gets
+            # its own honest code (507 Insufficient Storage) and the structured
+            # reason. Central can then route elsewhere instead of retrying a
+            # box that will never have room.
+            return jsonify({
+                "ok": False,
+                "error": exc.reason.get("reason"),
+                "refused": exc.reason,
+                "worker": {"id": state.worker_id, "name": state.name},
+            }), 507
         except Exception as exc:  # noqa: BLE001
             import traceback
             tb = traceback.format_exc()
@@ -1987,7 +2098,8 @@ def build_app(state: "WorkerState") -> Flask:
                 yield _sse({"type": "request", "request_id": req_id})
                 # Stream provisioning progress first (download from central/HF),
                 # then generation with auto-continuation. Both emit SSE lines.
-                yield from _ensure_present_streaming(payload, state.central_url)
+                yield from _ensure_present_streaming(payload, state.central_url,
+                                                     state=state)
                 yield from _stream_sync(payload, request_id=req_id)
             finally:
                 # Release on normal end, error, OR client disconnect (Flask closes
@@ -2601,6 +2713,28 @@ class WorkerState:
         # off a background provision for (so we don't re-trigger every beat).
         self.assigned_models: list[str] = []
         self._provisioning: set[str] = set()
+        # Central's per-worker allocations, adopted from the heartbeat reply
+        # (_apply_central_limits). The STORAGE budget reads limits
+        # ["disk_cache_gib"] from here; unset -> the budget is unmanaged and the
+        # auto-evict path stays off (see budget.cap_bytes).
+        self.limits: dict = {}
+        # Central's LRU clock {model_key: epoch} — when each model was last
+        # PICKED to serve on this box. The FIFO key for evict-to-fit; the worker
+        # cannot know it (central routes the calls), so central ships it in the
+        # heartbeat reply. Missing key -> 0 -> coldest -> evicted first.
+        self.model_last_picked: dict = {}
+        # Central's ALLOCATION-LEVEL totals for this box's assignment set:
+        # {allocated_total_bytes, allocated_count, allocated_unknown_count}.
+        # Sizing the set needs the manifest (central-only), so central computes
+        # it per read and ships it in the heartbeat reply; the refusal reason
+        # reads it from here rather than making N HTTP calls under the pull lock.
+        # Empty until the first beat -> the refusal simply omits the structural
+        # clause (an unknown total is never reported as a comfortable 0).
+        self.allocated: dict = {}
+        # Models REFUSED for storage: {model_key: {state:"refused", reason:...}}.
+        # Reported in the heartbeat so central/console render the model as
+        # MISSING with a hover reason instead of a phantom "pulling".
+        self.refused: dict = {}
         # key -> {done_bytes, total_bytes, frac}; populated while a background
         # pre-provision downloads, so central (and the console) can show a %.
         self._provision_progress: dict[str, dict] = {}
@@ -2646,22 +2780,31 @@ def _eager_pull(model_key: str) -> bool:
     truncated GGUFs (~10.7GB) on computron — every one of them "designated" in
     worker_assignments.json.
 
-    Exactly TWO tiers still pre-pull, because for them lazy would break a
-    promise the tier already makes:
+    Exactly ONE tier pre-pulls, because for it lazy would break a promise the
+    tier already makes:
 
       * static (:_residency) — operator-locked 2026-07-05 as "eager-warmed": a
         locked seat that paid full download latency on first call is a broken
-        promise (see the defaults-are-promises doctrine).
-      * pinned (:_pinned) — 📌 PERMANENT attribution; central refuses unassign
-        and files are never reaped, so the model belongs on this disk whether
-        or not anyone has called it yet.
+        promise (see the defaults-are-promises doctrine). Static is an
+        explicit, deliberately-chosen resident seat — the operator opts INTO
+        the download by choosing the tier.
 
-    Everything else (the on-demand DEFAULT) waits to be called. NOTE for
-    reconcile: for an on-demand model, "assigned but not on disk" is the
-    CORRECT resting state, not drift to converge.
+    📌 pin is NOT an eager tier (operator, 2026-07-16): "pinned doesnt mean
+    anything aside from: 1) is the model attributed to a worker; if yes, then
+    it always will be". Pin is PERMANENT ATTRIBUTION — it answers "does this
+    model belong to this worker?", not "when do the bytes arrive". A pinned
+    model is still a lazy download, same as any other. Pinning previously
+    implied a pre-pull here, which made pin a de-facto transfer order: on ae,
+    65/65 assigned models were pinned, so deleting them re-pulled all 65 via
+    _reconcile_loop and filled the operator's workstation to 0 bytes free
+    (2026-07-16). "none should be pulling at all. they should be lazy."
+
+    Everything else (the on-demand DEFAULT, and now 📌pin) waits to be called.
+    NOTE for reconcile: for a non-static model, "assigned but not on disk" is
+    the CORRECT resting state, not drift to converge.
     """
     try:
-        return _residency(model_key) == "static" or _pinned(model_key)
+        return _residency(model_key) == "static"
     except Exception:  # noqa: BLE001 — a settings read must not break adoption
         # Fail LAZY: the worst case is one first-call download, whereas failing
         # eager re-creates the storm this function exists to prevent.
@@ -2673,9 +2816,11 @@ def _sync_assignment(state: "WorkerState", worker: dict) -> None:
 
     Central owns the assignment (set in the UI). The agent reads it back from
     every register/heartbeat response. Adoption is LAZY (see _eager_pull):
-    being assigned a model does NOT download it — only static/📌pinned models
-    are pre-pulled here; the default on-demand tier downloads on first call.
-    Without this adoption the worker never knew about UI allocation changes.
+    being assigned a model does NOT download it — only 🔒static models are
+    pre-pulled here; every other tier (the on-demand default AND 📌pinned)
+    downloads on first call. Pin is permanent ATTRIBUTION, never a transfer
+    order. Without this adoption the worker never knew about UI allocation
+    changes.
 
     Seating is a SEPARATE concern from downloading: _fill_empty_slots still
     runs on every assignment change and seats models that are ALREADY LOCAL,
@@ -2702,12 +2847,12 @@ def _sync_assignment(state: "WorkerState", worker: dict) -> None:
         return
     logger.info("assignment updated: serving %s", models or "(nothing)")
 
-    # Lazy by default: pre-pull ONLY the tiers that promise presence (static /
-    # 📌pinned). On-demand models download on first call via _ensure_present.
+    # Lazy by default: pre-pull ONLY 🔒static, the one tier that promises local
+    # presence. Everything else — the on-demand default AND 📌pinned — downloads
+    # on first call via _ensure_present. Pin is attribution, not a pre-fetch.
     for model_key in models:
         if _eager_pull(model_key):
-            logger.info("pre-provisioning %s (%s — eager tier)", model_key,
-                        "pinned" if _pinned(model_key) else "static")
+            logger.info("pre-provisioning %s (static — eager tier)", model_key)
             _kick_provision(state, model_key)
     # Slice 9: already-local models can be seated right now — don't wait for
     # the maintenance tick. Background thread: fills block on slot loads.
@@ -2772,8 +2917,10 @@ def _kick_provision(state: "WorkerState", model_key: str) -> None:
                     _has_files = False
                 if not _has_files:
                     logger.info("pre-provisioning assigned model %s…", mk)
-                    ensure_model_present(mk, state.central_url, progress=_prog)
+                    ensure_model_present(mk, state.central_url, progress=_prog,
+                                         state=state)
                     logger.info("pre-provisioned %s", mk)
+                    state.refused.pop(mk, None)   # it fit after all
                 # Warm-up policy (v3 final semantics):
                 #   * slots box — seat assignment is the SLOT-FILLER's job
                 #     (slice 9, static-first): no in-process preload here, so
@@ -2823,6 +2970,13 @@ def _kick_provision(state: "WorkerState", model_key: str) -> None:
                             logger.info("preloaded %s (resident)", mk)
                     except Exception as exc:
                         logger.warning("preload of %s failed: %s", mk, exc)
+            except BudgetRefusal as exc:
+                # Not a failure — a DECISION, made before any bytes moved. Record
+                # it so the heartbeat reports the model as MISSING with an honest
+                # reason (hover text) instead of a pull that never starts.
+                state.refused[mk] = dict(exc.reason)
+                logger.error("pre-provision of %s REFUSED: %s", mk,
+                             exc.reason.get("reason"))
             except Exception as exc:
                 logger.warning("pre-provision of %s failed: %s", mk, exc)
             finally:
@@ -2892,16 +3046,22 @@ def _models_local(state: "WorkerState") -> list[str]:
 
 
 def _reconcile_loop(state: "WorkerState") -> None:
-    """Every reconcile_interval_s (default 600): any assigned model in an EAGER
-    tier (static / 📌pinned) that is NOT local and NOT already provisioning gets
-    its provisioning re-kicked. Converges failed pulls instead of drifting until
-    the next assignment change; the _provisioning guard + single-flight lock keep
-    it idempotent.
+    """Every reconcile_interval_s (default 600): any assigned 🔒static model that
+    is NOT local and NOT already provisioning gets its provisioning re-kicked.
+    Static is the ONLY tier that promises local presence. Converges failed pulls
+    instead of drifting until the next assignment change; the _provisioning guard
+    + single-flight lock keep it idempotent.
 
-    Lazy-download doctrine (2026-07-16): an on-demand model that is assigned but
+    Lazy-download doctrine (2026-07-16): a non-static model that is assigned but
     absent is NOT drift — it is the correct resting state, and it stays absent
     until something calls it. Re-kicking it here would silently rebuild the very
-    provision storm _sync_assignment stopped, just 10 minutes later."""
+    provision storm _sync_assignment stopped, just 10 minutes later.
+
+    That includes 📌pinned: pin is permanent ATTRIBUTION, not a residency
+    guarantee. This loop treating pin as eager IS the 2026-07-16 incident — the
+    operator deleted ae's models and all 65 (65/65 assigned there were pinned)
+    re-pulled from here within 10 minutes, filling his workstation to 0 bytes
+    free. A pinned model that is absent is absent on purpose until called."""
     while True:
         time.sleep(max(60, int(_RUNTIME_SETTINGS.get("reconcile_interval_s", 600))))
         if restart_requested():
@@ -2910,14 +3070,13 @@ def _reconcile_loop(state: "WorkerState") -> None:
             local = set(_models_local(state))
             for mk in list(state.assigned_models):
                 if not _eager_pull(mk):
-                    continue            # on-demand: absent is correct, not drift
+                    continue      # non-static: absent is correct, not drift
                 with state._provision_lock:
                     busy = mk in state._provisioning
                 if mk not in local and not busy:
-                    logger.warning("reconcile: %s model %s promises local "
+                    logger.warning("reconcile: static model %s promises local "
                                    "presence but is missing on disk — "
-                                   "re-kicking provisioning",
-                                   "pinned" if _pinned(mk) else "static", mk)
+                                   "re-kicking provisioning", mk)
                     _MODELS_LOCAL_CACHE["at"] = 0.0   # re-check after the pull
                     _kick_provision(state, mk)
         except Exception as exc:  # noqa: BLE001 — the loop must never die
@@ -3018,7 +3177,10 @@ def _residency(model_key: str) -> str:
         slot-less boxes). "serving"/"warm" are accepted legacy write-
         synonyms for this default; stored legacy entries read as it too.
       * "static" — the only stored override: locked seat, never swapped out
-        or yielded, eager-warmed; permanent when combined with 📌 pin.
+        or yielded, eager-warmed (the ONLY tier that pre-pulls — see
+        _eager_pull). Orthogonal to 📌 pin: pin makes the ATTRIBUTION
+        permanent (the override survives unassign-prune), but adds no
+        residency or presence promise of its own.
 
     "Serving" is purely a STATE (a model in a slot), never a policy.
     """
@@ -3027,10 +3189,26 @@ def _residency(model_key: str) -> str:
 
 
 def _pinned(model_key: str) -> bool:
-    """📌 pin (tiers v3 semantics, operator-locked 2026-07-05): PERMANENT
-    ATTRIBUTION of the model to this worker — central refuses unassign while
-    pinned, files are never reaped, and residency overrides survive. (Reaper
-    enforcement pending; advertised in the heartbeat config meanwhile.)"""
+    """📌 pin: PERMANENT ATTRIBUTION of the model to this worker — and NOTHING
+    else. Operator, 2026-07-16, asked what pinned means: "pinned doesnt mean
+    anything aside from: 1) is the model attributed to a worker; if yes, then
+    it always will be".
+
+    So pin answers exactly one question — "does this model belong to this
+    worker?" — with "yes, durably". It says NOTHING about when the bytes
+    arrive. Concretely, pin DOES:
+      * make central refuse unassign while pinned (409),
+      * protect the files from eviction/reaping (budget._is_protected,
+        workers.storage_proposal),
+      * keep residency overrides alive across the unassign-prune
+        (_prune_stale_residency) and restarts.
+
+    Pin does NOT: pre-fetch, eager-warm, guarantee residency, or promise the
+    files are on this disk. A pinned model is a LAZY download like any other —
+    it arrives on first CALL (_ensure_present). Do not re-add pin to
+    _eager_pull: that conflation filled the operator's workstation to 0 bytes
+    free on 2026-07-16 (ae: 65/65 assigned models pinned = every model eager).
+    """
     return bool((_RUNTIME_SETTINGS.get("pinned") or {}).get(model_key))
 
 
@@ -4409,6 +4587,10 @@ def _heartbeat_loop(client: CentralClient, state: WorkerState, args) -> None:
             _sync_assignment(state, worker)
             # Adopt central's resource limits (min of central + local config).
             _apply_central_limits(worker)
+            # Keep the STORAGE budget's two central-owned inputs on state: the
+            # disk allocation and the LRU clock the FIFO orders by. Both are
+            # facts only central holds; the pull path reads them off state.
+            _adopt_storage_inputs(state, worker)
             # Converge to central's required package version (restarts on update).
             _self_update_if_needed((worker or {}).get("required_pkg_version"), args, state)
         except WorkerRejected as exc:

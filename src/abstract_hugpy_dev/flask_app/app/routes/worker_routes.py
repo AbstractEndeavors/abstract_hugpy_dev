@@ -1228,8 +1228,25 @@ def workers_reap_approve(worker_id):
       (3) delegates the survivors to the SAME guarded reaper relay ``workers_reap``
           uses (POST /reap) — where the worker's ``_reap_reclaim`` re-proves EVERY
           guard per key at delete time and ``wipe_model`` is path-jailed.
-    NOTHING deletes except through this explicit, operator-gated, audited call;
-    there is no background monitoring and no auto-approval.
+    This BULK reclaim path deletes ONLY through this explicit, operator-gated,
+    audited call: no background monitoring, no timer, and no auto-approval —
+    central never widens or self-approves an operator's approved set.
+
+    SCOPE NOTE (amended 2026-07-16, storage-budget incident — op filled to 0
+    bytes free): this docstring used to open "NOTHING deletes except through
+    this call". That is no longer true FLEET-WIDE, and saying so would be a lie
+    (this codebase has a history of docs asserting behavior the code no longer
+    has), so the claim is now scoped to THIS route. A second, deliberately
+    NARROW delete path exists worker-side: ``worker_agent/budget.py``
+    (evict_to_fit) FIFO-evicts cold, unprotected models to make room for a model
+    that is ACTIVELY BEING PROVISIONED — the operator's rule "remove an existing
+    model and install the one that is being called". It is call-driven ONLY
+    (no call -> no delete), never a sweep or a timer, evicts the minimum needed,
+    and refuses the pull outright rather than over-delete. It changes NOTHING
+    about this route: the bulk operator-gated flow above still behaves exactly
+    as before, and BOTH paths funnel into the same single guarded delete choke
+    point (``_reap_reclaim`` -> ``wipe_model``), so neither can delete anything
+    the other's guards would protect.
 
     Body: ``{"model_keys": [...approved keys the console rendered...]}``.
     Returns the reaper's typed result (freed_bytes + per-key results) plus the

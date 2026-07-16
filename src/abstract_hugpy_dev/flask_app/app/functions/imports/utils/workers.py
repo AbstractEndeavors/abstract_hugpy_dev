@@ -91,6 +91,95 @@ def _default_workers_path() -> str:
 HEARTBEAT_TIMEOUT_SECONDS = 45.0
 
 
+def _provision_stall_seconds() -> float:
+    """Forward-progress silence (seconds) after which a provisioning entry stops
+    reading as an in-flight pull.
+
+    Same shape + rationale as comms.jobs._stall_seconds (the orphan-job fix):
+    read at COMPUTE time so an operator can retune without a restart, and a bad
+    value degrades to the default rather than raising into a read path.
+
+    Default 600s. Deliberately MUCH larger than the 45s heartbeat timeout: a
+    real pull can legitimately go quiet for minutes (a slow segment, a stalled
+    HF mirror, a big file's final flush), and calling a live transfer "dead"
+    would strip its eviction guard mid-write — the one truly destructive
+    mistake available here. Offline workers are already caught by the cheaper
+    liveness gate, so this window only has to cover the ONLINE-but-wedged case.
+    """
+    raw = (os.environ.get("HUGPY_PROVISION_STALL_SECONDS") or "").strip()
+    if not raw:
+        return 600.0
+    try:
+        v = float(raw)
+        return v if v > 0 else 600.0
+    except ValueError:
+        return 600.0
+
+
+def _live_provisioning(worker: Dict[str, Any]) -> set:
+    """The subset of ``worker['provisioning']`` that is a GENUINELY LIVE pull.
+
+    Defect (operator, 2026-07-16): a ``provisioning`` entry was immortal. The
+    worker announces the list in its heartbeat and removes an entry in a
+    ``finally``; if the process dies mid-pull, that ``finally`` never runs, so
+    central reported "provisioning" forever (observed: op offline 2h+, still 4
+    entries; ae online with 63 entries and ZERO bytes moving).
+
+    This is the orphan-job defect class — state that ages on writes which STOP
+    ARRIVING when the writer dies. The recorded lesson: age on PROGRESS, not on
+    presence-in-a-list. So an entry is live only when BOTH hold:
+
+      1. the worker is alive       -> REUSES ``_is_online`` (the single existing
+                                      staleness notion; no second rule invented)
+      2. its bytes are moving      -> a ``provision_progress`` entry whose
+                                      ``done_bytes`` advanced within the stall
+                                      window, per the central-stamped
+                                      ``progressed_at`` clock (see ``heartbeat``)
+
+    Why (2) needs a central clock rather than ``frac > 0``: op's dead pull is
+    frozen at ``frac=0.0722`` with 1.8GB done. A truthy frac only proves bytes
+    moved ONCE — never that they are moving NOW. Only elapsed-time-since-advance
+    can tell a live 7% from a corpse stuck at 7%.
+
+    QUEUED-NOT-STALLED (why absence of an entry is not evidence of death): the
+    worker adds a key to ``_provisioning`` at KICK time but only creates a
+    ``_provision_progress`` entry once its download callback fires, and
+    ``WORKER_PROVISION_CONCURRENCY`` defaults to 1. So ae's 63 progress-less
+    entries are models QUEUED behind the semaphore, not wedged ones — correctly
+    NOT in-flight (nothing is transferring), and equally correctly NOT
+    eviction-protected (they have no bytes on disk to protect).
+
+    Fail-SAFE toward the live case: if the clock is missing/garbage on an ONLINE
+    worker with a progress entry, treat it as live. A false "live" costs a
+    delayed console pill; a false "dead" could unprotect a real in-flight write.
+    """
+    prov = set(worker.get("provisioning") or [])
+    if not prov or not _is_online(worker):
+        # Offline/stale worker: nothing it last claimed is in flight, because
+        # nothing of it is running. This is the op case.
+        return set()
+    progress = worker.get("provision_progress") or {}
+    if not isinstance(progress, dict):
+        return set()
+    now = _now()
+    window = _provision_stall_seconds()
+    live = set()
+    for mk in prov:
+        entry = progress.get(mk)
+        if not isinstance(entry, dict):
+            continue          # queued behind the concurrency semaphore (ae case)
+        ts = entry.get("progressed_at")
+        if ts is None:
+            live.add(mk)      # fail-safe: pre-clock/legacy entry on a live worker
+            continue
+        try:
+            if (now - float(ts)) <= window:
+                live.add(mk)
+        except (TypeError, ValueError):
+            live.add(mk)      # fail-safe: never unprotect on a garbage clock
+    return live
+
+
 def tracked_pkg_name() -> str:
     """Distribution name workers track + central reports its version of.
 
@@ -186,6 +275,15 @@ def _public_view(worker: Dict[str, Any]) -> Dict[str, Any]:
         # here). Overwrites the raw ``storage`` heartbeat field with the enriched
         # console-facing shape (over_budget + proposed_evictions[]).
         "storage": storage_proposal(worker),
+        # IN-FLIGHT PULLS ONLY (2026-07-16). The raw record keeps whatever the
+        # worker last announced; the PUBLIC view reports only pulls that are
+        # actually moving, so a dead/stalled entry can never render as an
+        # active transfer ("defaults are promises" — a row that says "working
+        # on it" when nothing is working is a lie). Derived here, on every read,
+        # like status/storage above — no daemon, no sweep. The console's
+        # ⏳ pulling pill and its provision_progress % both key off this list,
+        # so an assigned-but-absent model correctly falls through to "missing".
+        "provisioning": sorted(_live_provisioning(worker)),
         "status": "online" if _is_online(worker) else "offline",
         "admission": worker.get("admission", "approved"),
         # SYSTEM-authored placement grants (Phase 1 item 2) — separate from the
@@ -409,15 +507,116 @@ def _disk_reserve_bytes() -> int:
     return int(gib * (1 << 30))
 
 
+def _model_size_bytes(model_key: str) -> Optional[int]:
+    """One ASSIGNED model's size per central's manifest, or None if unknowable.
+
+    The same source ``worker_agent/provision.central_total_bytes`` resolves for a
+    single pull, read LOCALLY here (central owns the manifest and the model dirs,
+    so this needs no HTTP — see allocated_totals for why that matters).
+
+    GGUF honesty: a GGUF dir holds SEVERAL quants, so its directory sum is NOT
+    what serving costs. ``effective_bytes`` (gguf_variants_detail) is the quant
+    that actually serves — the same number the Models tab shows. Falls back to
+    the mtime-cached directory footprint for transformers/comfy.
+
+    None is a FIRST-CLASS answer meaning "central cannot say" (not in the
+    manifest / not on disk / sizing raised). Callers MUST count it as unknown and
+    report it — never coerce it to 0, which would make an over-subscribed
+    assignment set read as comfortably fitting (the exact dishonesty this
+    feature exists to remove).
+    """
+    if not model_key:
+        return None
+    try:
+        # Import depths differ and are NOT interchangeable: this module sits at
+        # flask_app/app/functions/imports/utils/, so `routes` is 4 up while the
+        # TOP-LEVEL `imports` package (abstract_hugpy_dev.imports — a different
+        # tree from this one's own `imports` parent) is 6. Getting this wrong
+        # raises ModuleNotFoundError, which an over-broad except would swallow
+        # into a permanent "size unknown" — every model silently unsized, an
+        # over-subscribed set reading as empty. Logged loudly for that reason.
+        from ....routes.llm_storage_routes import _annotate_gguf_size, _annotate_size
+        from ......imports.config.models.models_config import get_models_dict
+    except Exception as exc:  # noqa: BLE001 — sizing must never break a read
+        logger.warning("allocation sizing unavailable (%s) — assigned-set totals "
+                       "will report as unknown", exc)
+        return None
+    try:
+        manifest = get_models_dict(dict_return=True) or {}
+        entry = manifest.get(model_key)
+        if not isinstance(entry, dict):
+            return None
+        # Work on a COPY: the annotators mutate the dict they are handed, and the
+        # registry entry is the cached, shared MODEL_REGISTRY_DICT row.
+        model = dict(entry)
+        _annotate_gguf_size(model, model_key)   # -> effective_bytes (GGUF quant)
+        _annotate_size(model, model_key)        # -> size_bytes (eff or dir sum)
+        size = model.get("size_bytes")
+        return int(size) if size else None
+    except Exception:  # noqa: BLE001 — unknown size is a valid answer here
+        return None
+
+
+def allocated_totals(worker: Dict[str, Any]) -> Dict[str, Any]:
+    """Size the worker's ASSIGNMENT SET against its budget — the STRUCTURAL view.
+
+    OPERATOR (2026-07-16): "it should also show how much is needed based on the
+    total size of all models allocated". The per-pull refusal ("this 23.5 GiB
+    pull won't fit") answers a different, smaller question. This answers: can the
+    ASSIGNED SET fit AT ALL? A worker assigned 12 models totalling 180 GiB
+    against a 50 GiB budget is over-subscribed BY CONSTRUCTION — no eviction
+    order rescues it, and it will wedge on some future call no matter which model
+    is unlucky enough to be the one that asks.
+
+    Domain = ``worker['models']`` — the OPERATOR DESIGNATION set written by
+    assign_model/unassign_model. NOT the on-disk inventory (lazy-download means
+    an assigned model routinely has no files yet — sizing only what landed would
+    UNDER-report an over-subscribed set, hiding the very thing this shows) and
+    NOT ``grants`` (system-authored, freely evictable, never operator intent).
+
+    Returns::
+
+        {"allocated_total_bytes": int,      # sum of the KNOWN-size models
+         "allocated_count": int,            # models in the assignment set
+         "allocated_unknown_count": int,    # sizes central couldn't resolve
+         "allocated_over_budget_bytes": int}  # total - budget, 0 when it fits
+
+    ``allocated_total_bytes`` is a FLOOR when allocated_unknown_count > 0: the
+    unknowns are counted and surfaced, never silently zeroed, so a reader can see
+    the number is incomplete rather than trust a comfortable-looking lie.
+    """
+    models = [m for m in (worker.get("models") or []) if m]
+    total = 0
+    unknown = 0
+    for mk in models:
+        size = _model_size_bytes(mk)
+        if size:
+            total += size
+        else:
+            unknown += 1
+    return {"allocated_total_bytes": total,
+            "allocated_count": len(models),
+            "allocated_unknown_count": unknown}
+
+
 def storage_proposal(worker: Dict[str, Any]) -> Dict[str, Any]:
     """Derive a worker's local-STORAGE view + a guarded LRU eviction PROPOSAL.
 
     A PURE read-time computation over already-stored heartbeat fields — no
-    daemon, no background loop, no persistent toggle, and it NEVER deletes
-    anything. It is spread into every worker read by ``_public_view`` (the
-    always-on storage monitoring depiction) and re-run by the ``/reap-approve``
-    route as its central second guard, so the console preview and the approval
-    share one source of truth.
+    daemon, no background loop, no persistent toggle, and THIS FUNCTION never
+    deletes anything (it returns a proposal; a caller must act on it). It is
+    spread into every worker read by ``_public_view`` (the always-on storage
+    monitoring depiction) and re-run by the ``/reap-approve`` route as its
+    central second guard, so the console preview and the approval share one
+    source of truth.
+
+    NOTE (2026-07-16): "no auto-fire" describes THIS central preview and the
+    operator-gated bulk reaper it feeds — it is NOT a fleet-wide claim. The
+    worker's ``worker_agent/budget.py`` auto-evicts on the PROVISION path
+    (call-driven only) to seat a model being pulled. That path deliberately
+    reuses THIS function's ordering + guard semantics (unprotected candidates,
+    ascending last_picked, largest-first among equally-cold) so the console's
+    preview and an auto-evict can never disagree about what would go.
 
     Inputs (all raw worker-record fields):
       - ``worker['storage']``   the worker-reported survey
@@ -475,7 +674,9 @@ def storage_proposal(worker: Dict[str, Any]) -> Dict[str, Any]:
     # loaded_model_keys() gap (it misses slot occupants / answering models).
     loaded_now = set(worker.get("loaded_models") or [])
     loading_now = set(worker.get("loading") or [])
-    provisioning_now = set(worker.get("provisioning") or [])
+    # LIVE pulls only — a stale/dead-owner entry is neither reported as
+    # in-flight nor granted eviction protection. See _live_provisioning.
+    provisioning_now = _live_provisioning(worker)
 
     reserve = _disk_reserve_bytes()
 
@@ -529,6 +730,21 @@ def storage_proposal(worker: Dict[str, Any]) -> Dict[str, Any]:
         # guard (slot-merged loaded/loading, provisioning, static, pin). A model
         # is a candidate ONLY if unprotected on BOTH sides.
         #
+        # PROVISIONING is the ONE guard in this chain that is liveness-gated
+        # (2026-07-16). The worker's own per-row ``m['provisioning']`` flag is
+        # NOT consulted here, unlike loaded/loading: it comes from the same dead
+        # heartbeat snapshot as the stale list, so honouring it would re-admit
+        # exactly the phantom protection this fix removes (op's dead pull still
+        # flags its row). Central instead trusts only _live_provisioning.
+        #
+        # This LOSES no protection for a real pull: an ONLINE worker with a
+        # moving pull is live by construction. And the worker keeps its OWN
+        # authoritative guard locally (worker_agent/budget.py's
+        # _PROTECTED_REASONS) — a box never deletes under its own live write on
+        # central's say-so. What it REMOVES is permanent phantom protection: a
+        # dead entry used to make a real, cold, reclaimable file un-evictable
+        # forever, silently shrinking the reclaimable pool on a full disk.
+        #
         # NOTE (Phase 1 item 2, grant markers): a SYSTEM grant is DELIBERATELY
         # ABSENT from this chain — the opposite of an operator "assigned"
         # designation. A model that is ONLY granted (not assigned/pinned/
@@ -550,7 +766,7 @@ def storage_proposal(worker: Dict[str, Any]) -> Dict[str, Any]:
                 protected, why = True, why or "loaded"
             elif mk in loading_now or m.get("loading"):
                 protected, why = True, why or "loading"
-            elif mk in provisioning_now or m.get("provisioning"):
+            elif mk in provisioning_now:
                 protected, why = True, why or "provisioning"
         models_out.append({
             "model_key": mk,
@@ -562,7 +778,10 @@ def storage_proposal(worker: Dict[str, Any]) -> Dict[str, Any]:
             "pinned": bool(m.get("pinned") or pinned_cfg.get(mk)),
             "loaded": bool(m.get("loaded") or mk in loaded_now),
             "loading": bool(m.get("loading") or mk in loading_now),
-            "provisioning": bool(m.get("provisioning") or mk in provisioning_now),
+            # LIVE pulls only (not the worker's stale per-row flag) — this is
+            # what the console renders as "⏳ pulling"; a dead pull must read
+            # as missing, never as an active transfer.
+            "provisioning": mk in provisioning_now,
             "assigned": bool(m.get("assigned")),
         })
         if not protected:
@@ -582,7 +801,20 @@ def storage_proposal(worker: Dict[str, Any]) -> Dict[str, Any]:
                              "last_picked": lp or None})
             proposed_free += b
 
+    # ── ALLOCATION-LEVEL view (operator, 2026-07-16) ────────────────────────
+    # Structural, and TRUE EVEN WHEN NO PULL IS HAPPENING: if the assigned set
+    # itself exceeds the budget, the worker is over-subscribed now — the console
+    # can surface that BEFORE some unlucky call wedges. Computed on every read
+    # (like the vram/ram summaries) and cheap: sizes come from the cached
+    # registry + mtime-cached dir walks, not per-model HTTP.
+    alloc = allocated_totals(worker)
+    alloc_over = 0
+    if budget is not None and alloc["allocated_total_bytes"] > budget:
+        alloc_over = alloc["allocated_total_bytes"] - budget
+    alloc["allocated_over_budget_bytes"] = alloc_over
+
     return {
+        **alloc,
         "reported": reported,
         "cache_used_bytes": cache_used,
         "disk_free": disk_free,
@@ -595,6 +827,16 @@ def storage_proposal(worker: Dict[str, Any]) -> Dict[str, Any]:
         "proposed_free_bytes": proposed_free,
         "proposed_evictions": proposed,
         "models": models_out,
+        # Storage REFUSALS reported by the worker: {model_key: {state:"refused",
+        # reason, needs_bytes, budget_bytes, reclaimable_bytes, blocked, ...}}.
+        # Models whose pull was refused BEFORE it started because even a full
+        # FIFO of the reclaimable models couldn't seat them. Passed through
+        # VERBATIM — this is the worker's own verdict about its own disk, and
+        # central has no better information to second-guess it with. They have
+        # no files on disk, so they are deliberately absent from `models` and
+        # never appear in a proposal; the console renders them as MISSING with
+        # the reason on hover.
+        "refused": (storage.get("refused") or {}) if reported else {},
     }
 
 
@@ -971,7 +1213,41 @@ class WorkerStore:
             if provisioning is not None:
                 worker["provisioning"] = provisioning
             if provision_progress is not None:
-                worker["provision_progress"] = provision_progress
+                # PROGRESS CLOCK (orphan-job lesson: age on PROGRESS, not on any
+                # write). The worker re-sends its whole progress map every
+                # heartbeat, so the ARRIVAL of this field proves only that the
+                # agent is alive — not that any pull is moving. A dead pull's
+                # last snapshot keeps replaying verbatim (op sat frozen at
+                # frac=0.0722 for 2h+). Carry a central ``progressed_at`` per
+                # model, bumped ONLY when done_bytes actually ADVANCES, so
+                # _live_provisioning can tell a live 7% from a corpse at 7%.
+                prev = worker.get("provision_progress") or {}
+                stamped: Dict[str, Any] = {}
+                for mk, entry in (provision_progress or {}).items():
+                    if not isinstance(entry, dict):
+                        stamped[mk] = entry
+                        continue
+                    entry = dict(entry)
+                    old = prev.get(mk) if isinstance(prev, dict) else None
+                    old = old if isinstance(old, dict) else {}
+
+                    def _done(e):
+                        try:
+                            return float(e.get("done_bytes") or 0)
+                        except (TypeError, ValueError):
+                            return 0.0
+
+                    advanced = _done(entry) > _done(old)
+                    carried = old.get("progressed_at")
+                    if advanced or carried is None:
+                        # First sighting counts as progress: a pull that just
+                        # started has moved no bytes yet and must not be born
+                        # already-stale.
+                        entry["progressed_at"] = _now()
+                    else:
+                        entry["progressed_at"] = carried
+                    stamped[mk] = entry
+                worker["provision_progress"] = stamped
             if spill is not None:
                 worker["spill"] = spill
             if pkg_version is not None:

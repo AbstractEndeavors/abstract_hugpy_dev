@@ -1092,12 +1092,48 @@ def fetch_from_hf(model_key: str) -> str:
     return ensure_model(model_key)
 
 
-def ensure_model_present(model_key: str, central_url: str | None, progress=None) -> bool:
+def central_total_bytes(central_url: str | None, model_key: str) -> int | None:
+    """The model's total on-disk size per central's manifest, or None.
+
+    The SIZE OF THE PULL, known BEFORE a byte is transferred — the input the
+    budget check needs to answer "will this fit?" without discovering the answer
+    from [Errno 28] halfway through. Cheap: the manifest is a small JSON that
+    every central pull already fetches first. Returns None when central can't
+    say (no URL / unreachable / 404 / no size in the manifest), which the caller
+    treats as "unknown size — pull as before" rather than as zero.
+    """
+    if not central_url:
+        return None
+    base = central_url.rstrip("/") + "/api/llm/models/" + urllib.parse.quote(model_key)
+    try:
+        manifest = _get_json(base + "/manifest")
+    except Exception:  # noqa: BLE001 — unknown size is a valid answer here
+        return None
+    if not isinstance(manifest, dict):
+        return None
+    total = manifest.get("total_bytes")
+    if not total:
+        total = sum((e.get("size") or 0) for e in (manifest.get("files") or []))
+    try:
+        total = int(total)
+    except (TypeError, ValueError):
+        return None
+    return total or None
+
+
+def ensure_model_present(model_key: str, central_url: str | None, progress=None,
+                         state=None) -> bool:
     """Make sure model_key is on local disk. Central-first, then HF fallback.
 
     ``progress(done_bytes, total_bytes, filename)`` is forwarded to the central
     download so callers can stream provisioning status. Returns True if the
     model is present (or already was), False if it could not be provisioned.
+
+    ``state`` (the WorkerState) opts this pull into the STORAGE BUDGET: before
+    any bytes move, the worker FIFO-evicts cold models to make room for this
+    one, and REFUSES the pull outright (raising ``budget.BudgetRefusal``) if
+    even a full eviction can't seat it. Omitted/None -> no budget check, i.e.
+    byte-for-byte the pre-feature behavior (standalone/CLI provisions).
     """
     # Teach the worker about the model first (central is the source of truth),
     # then provision against the canonical local key. This is what lets the
@@ -1120,6 +1156,20 @@ def ensure_model_present(model_key: str, central_url: str | None, progress=None)
         if model_is_local(canonical):
             logger.info("%s became available while waiting; using it", canonical)
             return True
+        # STORAGE BUDGET (incident 2026-07-16 — op filled to 0 bytes free).
+        # Evict-to-fit / refuse BEFORE the transfer, and INSIDE the single-flight
+        # lock: the check must see (and its evictions must land) without racing
+        # another pull of the same key. Raises BudgetRefusal when even a full
+        # FIFO can't seat this model — the caller surfaces that as MISSING with a
+        # reason instead of starting a doomed download.
+        if state is not None:
+            from .budget import evict_to_fit
+            need = central_total_bytes(central_url, canonical)
+            if need:
+                evict_to_fit(state, canonical, need)
+            else:
+                logger.info("budget: no manifest size for %s — pulling without a "
+                            "fit check (size unknown)", canonical)
         return _provision_now(canonical, central_url, progress=progress)
     finally:
         lock.release()
