@@ -225,7 +225,13 @@ class TodoKeeperNode:
             logger.info("already enrolled as %s", self.node_id)
             return
         headers = {}
-        api_key = _env("HUGPY_API_KEY")
+        # CONSOLE_API is the name the key already has in the share's env file
+        # (d-env/env), which the unit loads via EnvironmentFile. systemd does NOT
+        # shell-expand `Environment=HUGPY_API_KEY=${CONSOLE_API}` — that passes the
+        # literal string and 401s (verified 2026-07-16) — so read the real name
+        # directly. HUGPY_API_KEY still wins when explicitly set, for callers that
+        # pass a different key.
+        api_key = _env("HUGPY_API_KEY") or _env("CONSOLE_API")
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
         status, body = _request(

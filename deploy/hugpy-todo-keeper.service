@@ -52,8 +52,12 @@ Environment=HUGPY_TODO_KEEPER_STATE=/home/ubuntu/.config/hugpy/todo-keeper.json
 # enrollment then fails loudly with an explicit 401 message instead, which is the
 # honest failure. Once enrolled the node uses its own agt_ token; the console key
 # is only needed for the one-time bootstrap (and any re-enroll).
+# ⚠️ systemd does NOT shell-expand: `Environment=HUGPY_API_KEY=${CONSOLE_API}` passes the
+# LITERAL string "${CONSOLE_API}" (verified 2026-07-16 via `systemctl show -p Environment`),
+# and the node would 401 on enroll. EnvironmentFile already puts CONSOLE_API in the
+# environment under its own name — so the daemon reads CONSOLE_API directly and no
+# expansion is needed. Don't "fix" this back into an Environment= line.
 EnvironmentFile=-/srv/share/projects/hugpy/d-env/env
-Environment=HUGPY_API_KEY=${CONSOLE_API}
 
 # Hardening: this daemon needs the network, its state file, and nothing else.
 NoNewPrivileges=true
@@ -62,6 +66,13 @@ ProtectSystem=strict
 ProtectHome=read-only
 # ...except its own state directory, which it must write (the token + cursor).
 ReadWritePaths=/home/ubuntu/.config/hugpy
+# abstract_utilities' logger opens ~/.cache/abstract_utilities/logs/*.log at IMPORT
+# time — with ProtectHome=read-only that raises OSError [Errno 30] and the unit dies
+# 1/FAILURE before the daemon ever runs (hit 2026-07-16 on first start). Grant that
+# one path rather than loosening ProtectHome: the sandbox stays, the library gets its
+# log dir. If a future import needs another HOME path, add it here — do NOT downgrade
+# ProtectHome to false.
+ReadWritePaths=/home/ubuntu/.cache/abstract_utilities
 ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true

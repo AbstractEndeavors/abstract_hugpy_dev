@@ -2631,14 +2631,55 @@ class WorkerState:
             return {k: dict(v) for k, v in self._provision_progress.items()}
 
 
+def _eager_pull(model_key: str) -> bool:
+    """Should ASSIGNMENT alone pull this model's weights to local disk?
+
+    Lazy-download doctrine (operator, 2026-07-16): "models are attributed to be
+    routed to a worker though not immediately downloaded to the worker's drive,
+    they should be lazy download instead downloading to the drive only when
+    called". Assignment is ATTRIBUTION, not a transfer order — the download
+    happens on first CALL, via the inference path's already-working
+    _ensure_present / _ensure_present_streaming.
+
+    This is the structural fix for the 2026-07-15 provision storm: assigning N
+    models fired N parallel provisions, 503'ing central and leaving four
+    truncated GGUFs (~10.7GB) on computron — every one of them "designated" in
+    worker_assignments.json.
+
+    Exactly TWO tiers still pre-pull, because for them lazy would break a
+    promise the tier already makes:
+
+      * static (:_residency) — operator-locked 2026-07-05 as "eager-warmed": a
+        locked seat that paid full download latency on first call is a broken
+        promise (see the defaults-are-promises doctrine).
+      * pinned (:_pinned) — 📌 PERMANENT attribution; central refuses unassign
+        and files are never reaped, so the model belongs on this disk whether
+        or not anyone has called it yet.
+
+    Everything else (the on-demand DEFAULT) waits to be called. NOTE for
+    reconcile: for an on-demand model, "assigned but not on disk" is the
+    CORRECT resting state, not drift to converge.
+    """
+    try:
+        return _residency(model_key) == "static" or _pinned(model_key)
+    except Exception:  # noqa: BLE001 — a settings read must not break adoption
+        # Fail LAZY: the worst case is one first-call download, whereas failing
+        # eager re-creates the storm this function exists to prevent.
+        return False
+
+
 def _sync_assignment(state: "WorkerState", worker: dict) -> None:
-    """React to central's worker record: adopt its model list and pre-provision.
+    """React to central's worker record: adopt its model list.
 
     Central owns the assignment (set in the UI). The agent reads it back from
-    every register/heartbeat response and, for any newly-assigned model it
-    doesn't already have, downloads it in the background so the first chat
-    doesn't pay the full download latency. Without this the worker never knew
-    about UI allocation changes.
+    every register/heartbeat response. Adoption is LAZY (see _eager_pull):
+    being assigned a model does NOT download it — only static/📌pinned models
+    are pre-pulled here; the default on-demand tier downloads on first call.
+    Without this adoption the worker never knew about UI allocation changes.
+
+    Seating is a SEPARATE concern from downloading: _fill_empty_slots still
+    runs on every assignment change and seats models that are ALREADY LOCAL,
+    regardless of tier.
     """
     if not isinstance(worker, dict):
         return
@@ -2661,10 +2702,18 @@ def _sync_assignment(state: "WorkerState", worker: dict) -> None:
         return
     logger.info("assignment updated: serving %s", models or "(nothing)")
 
+    # Lazy by default: pre-pull ONLY the tiers that promise presence (static /
+    # 📌pinned). On-demand models download on first call via _ensure_present.
     for model_key in models:
-        _kick_provision(state, model_key)
+        if _eager_pull(model_key):
+            logger.info("pre-provisioning %s (%s — eager tier)", model_key,
+                        "pinned" if _pinned(model_key) else "static")
+            _kick_provision(state, model_key)
     # Slice 9: already-local models can be seated right now — don't wait for
     # the maintenance tick. Background thread: fills block on slot loads.
+    # NOT a download: this seats models whose files are ALREADY on disk, so it
+    # runs for every tier — an on-demand model that was downloaded by an
+    # earlier call still gets its seat back on an assignment change.
     threading.Thread(target=_fill_empty_slots, args=(state,), daemon=True).start()
 
 
@@ -2843,10 +2892,16 @@ def _models_local(state: "WorkerState") -> list[str]:
 
 
 def _reconcile_loop(state: "WorkerState") -> None:
-    """Every reconcile_interval_s (default 600): any assigned model that is
-    NOT local and NOT already provisioning gets its provisioning re-kicked.
-    Converges failed pulls instead of drifting until the next assignment
-    change; the _provisioning guard + single-flight lock keep it idempotent."""
+    """Every reconcile_interval_s (default 600): any assigned model in an EAGER
+    tier (static / 📌pinned) that is NOT local and NOT already provisioning gets
+    its provisioning re-kicked. Converges failed pulls instead of drifting until
+    the next assignment change; the _provisioning guard + single-flight lock keep
+    it idempotent.
+
+    Lazy-download doctrine (2026-07-16): an on-demand model that is assigned but
+    absent is NOT drift — it is the correct resting state, and it stays absent
+    until something calls it. Re-kicking it here would silently rebuild the very
+    provision storm _sync_assignment stopped, just 10 minutes later."""
     while True:
         time.sleep(max(60, int(_RUNTIME_SETTINGS.get("reconcile_interval_s", 600))))
         if restart_requested():
@@ -2854,11 +2909,15 @@ def _reconcile_loop(state: "WorkerState") -> None:
         try:
             local = set(_models_local(state))
             for mk in list(state.assigned_models):
+                if not _eager_pull(mk):
+                    continue            # on-demand: absent is correct, not drift
                 with state._provision_lock:
                     busy = mk in state._provisioning
                 if mk not in local and not busy:
-                    logger.warning("reconcile: assigned model %s is missing on "
-                                   "disk — re-kicking provisioning", mk)
+                    logger.warning("reconcile: %s model %s promises local "
+                                   "presence but is missing on disk — "
+                                   "re-kicking provisioning",
+                                   "pinned" if _pinned(mk) else "static", mk)
                     _MODELS_LOCAL_CACHE["at"] = 0.0   # re-check after the pull
                     _kick_provision(state, mk)
         except Exception as exc:  # noqa: BLE001 — the loop must never die
