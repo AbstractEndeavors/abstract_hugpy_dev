@@ -655,13 +655,23 @@ def run_identity_mesh_build(spec, job_id: str) -> JobResult:
             logger.warning("identity mesh: attach_reconstruction failed for %s/%s",
                            slug, recon_id, exc_info=True)
 
-    # ---- optional AUTO-PROMOTE: seed canonical from the cardinal turntable frames ----
+    # ---- optional AUTO-PROMOTE: seed canonical from the 45°-spaced turntable frames ----
     # The ONE-CLICK full-identity template (POST .../generate) sets spec.auto_promote so a
     # single action goes mesh -> turntable -> CANONICAL. Guardrails (all deliberate):
     #   * only when a turntable actually attached (a record with N views exists);
     #   * only when N >= 4 — a partial canonical would be a false promise, so skip entirely;
-    #   * promote the 4 CARDINAL indices [0, N//4, N//2, (3*N)//4] (deduped + clamped),
-    #     indexing the attached reconstruction's own view list (what promote validates).
+    #   * promote the frames NEAREST each SEMANTIC_VIEWS azimuth (0/45/90/135/180/225/270/
+    #     315°) via ``identity_profiles.canonical_frame_indices`` — SELECTION over frames the
+    #     orbit already rendered, indexing the attached reconstruction's own view list (what
+    #     promote validates). Nothing is re-rendered.
+    # WIDENED 4 -> 8 (operator 2026-07-16: "45 degree shots"). Selection is by DEGREES, not
+    # by index arithmetic: the old ``[0, N//4, N//2, 3N//4]`` shortcut only told the truth on
+    # a ring whose frame count divides evenly, whereas the azimuth walk reads
+    # ``degrees_per_frame`` off the record and is correct on any ring (a coarse ring simply
+    # yields fewer than 8 deduped views instead of duplicate bytes).
+    # NOTE (S5): the operator also asked for 2 AERIAL views (overhead / -overhead). They are
+    # NOT promoted here and must not be faked from this ring — the turntable is
+    # single-elevation (every frame's elevation_deg is 0.0). They need the mesh-render path.
     # LATEST-WINS (operator RESCINDED the never-clobber rule, 2026-07-14 night: "it is
     # less important now that we have a real base project as a whole to go from"):
     # auto-promote REPLACES any existing canonical with the newest generation's cardinals.
@@ -672,25 +682,35 @@ def run_identity_mesh_build(spec, job_id: str) -> JobResult:
     # is recorded in mesh state as ``auto_promote_error`` and the job still returns ok.
     auto_promote_extra: dict = {}
     promoted_canonical: list = []  # the canonical this run seeded (empty if none) -> the minted version's DNA
+    # The AZIMUTH of each promoted view (2026-07-16), positionally aligned with
+    # promoted_canonical — carried onto the minted version so the ACTIVE version's DNA (what
+    # the resolver actually serves) knows its own angles. Empty = no angle provenance.
+    promoted_angles: list = []
     if getattr(spec, "auto_promote", False) and attached_rec is not None:
         try:
             rec_views = list(attached_rec.get("views") or [])
             nv = len(rec_views)
             if nv < 4:
                 logger.info("identity mesh: auto-promote skipped for %s/%s — only %d "
-                            "turntable frames (need >=4 for a cardinal canonical set)",
+                            "turntable frames (need >=4 for a canonical set)",
                             slug, recon_id, nv)
             else:
-                cardinal: list[int] = []
-                for i in (0, nv // 4, nv // 2, (3 * nv) // 4):
-                    i = min(i, nv - 1)  # clamp (defensive; all < nv for nv>=4)
-                    if i not in cardinal:
-                        cardinal.append(i)  # dedupe, preserve angular order
-                promoted = identity_profiles.promote_reconstruction_views(slug, recon_id, cardinal)
+                # degrees_per_frame off the record; None -> canonical_frame_indices derives
+                # 360/N itself (the same fallback bank_views uses for older records).
+                chosen_idx = identity_profiles.canonical_frame_indices(
+                    nv, attached_rec.get("degrees_per_frame"))
+                logger.info("identity mesh: auto-promote selecting %d canonical views for "
+                            "%s/%s from a %d-frame ring (indices=%s)",
+                            len(chosen_idx), slug, recon_id, nv, chosen_idx)
+                promoted = identity_profiles.promote_reconstruction_views(slug, recon_id, chosen_idx)
                 auto_promote_extra["auto_promoted"] = True
                 if isinstance(promoted, dict):
                     promoted_canonical = [
                         p for p in (promoted.get("canonical") or []) if isinstance(p, str)]
+                    # promote_reconstruction_views persisted the angles alongside the paths;
+                    # read them back rather than recomputing, so the version can never
+                    # disagree with the profile about what angle a view is.
+                    promoted_angles = list(promoted.get("canonical_angles") or [])
         except Exception as exc:  # noqa: BLE001 — a promote failure never fails the job
             logger.warning("identity mesh: auto-promote failed for %s/%s",
                            slug, recon_id, exc_info=True)
@@ -710,7 +730,11 @@ def run_identity_mesh_build(spec, job_id: str) -> JobResult:
     version_extra: dict = {}
     try:
         kind = "textured" if bool(getattr(spec, "texture", False)) else "clay"
-        minted = identity_profiles.mint_version(slug, recon_id, kind, promoted_canonical)
+        # canonical_angles=None (not []) when this run promoted nothing, so mint_version
+        # reads it as "no angle information" exactly like every pre-2026-07-16 caller.
+        minted = identity_profiles.mint_version(
+            slug, recon_id, kind, promoted_canonical,
+            canonical_angles=promoted_angles or None)
         if isinstance(minted, dict):
             version_extra["version_id"] = minted.get("version_id")
             version_extra["version_name"] = minted.get("name")

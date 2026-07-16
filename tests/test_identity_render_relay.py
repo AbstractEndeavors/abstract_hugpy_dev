@@ -431,11 +431,14 @@ def test_generate_route_auto_promotes_when_canonical_empty():
     assert view["status"] == "done" and view["result"]["ok"] is True, view
     assert _RECEIVED[-1]["kind"] == "mesh_and_turntable", _RECEIVED[-1]
 
-    # AUTO-PROMOTE fired: canonical now holds the 4 cardinal turntable frames (n=4 mock
-    # frames -> cardinal indices [0,1,2,3]).
+    # AUTO-PROMOTE fired. Canonical is selected by NEAREST AZIMUTH to each SEMANTIC_VIEWS
+    # target (8 of them since 2026-07-16), NOT by a fixed count: this mock ring has only
+    # _FRAME_COUNT (=4) frames, so the 8 targets dedupe onto the 4 distinct frames available
+    # — the honest sparse-ring degrade (fewer views, never duplicate bytes). A real 72-frame
+    # ring yields all 8; that is covered in test_identity_views.py.
     prof = client.get(f"/video/identity-profiles/{slug}").get_json()["profile"]
     canon = prof["canonical"]
-    assert len(canon) == 4, canon
+    assert len(canon) == min(8, _FRAME_COUNT), canon
     assert all(os.path.isfile(p) for p in canon), canon
 
     # mesh state records the auto-promotion + the terminal build.
@@ -473,7 +476,8 @@ def test_generate_route_latest_wins_replaces_canonical():
 
     after = client.get(f"/video/identity-profiles/{slug}").get_json()["profile"]["canonical"]
     assert after != before, (before, after)          # prior set replaced
-    assert len(after) == 4, after                    # the 4 new cardinal frames
+    # min(8, _FRAME_COUNT): 8 semantic azimuths deduped onto this 4-frame mock ring.
+    assert len(after) == min(8, _FRAME_COUNT), after
     # and mesh state records the auto-promote.
     ms = identity_profiles.get_mesh_state(slug, recon_id)
     assert ms.get("auto_promoted") is True, ms

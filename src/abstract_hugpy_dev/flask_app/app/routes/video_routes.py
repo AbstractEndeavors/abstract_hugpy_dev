@@ -530,6 +530,10 @@ def video_studio_i2v():
     if _prof_err is not None:
         _pl, _st = _prof_err
         return jsonify(_pl), _st
+    # NOTE (2026-07-16): canonical may now hold 8 views, but _reference_images_from_body
+    # already narrows a profile-resolved set to the RENDER cap (4) before returning, so the
+    # >4 check below can never fire on an identity's own DNA. It still guards a caller's RAW
+    # reference_images list, where >4 stays a clean caller error.
     resolved_refs: list = []
     if reference_images_in is not None:
         if not isinstance(reference_images_in, list):
@@ -748,6 +752,8 @@ def video_studio_movie():
     if _prof_err is not None:
         _pl, _st = _prof_err
         return jsonify(_pl), _st
+    # NOTE (2026-07-16): an 8-view canonical is already narrowed to the RENDER cap (4) by
+    # _reference_images_from_body, so the >4 check below only ever guards a raw caller list.
     reference_asset_ids = body.get("reference_image_asset_ids")
     if reference_images_in is None and isinstance(reference_asset_ids, list):
         reference_images_in = []
@@ -819,8 +825,12 @@ def video_studio_movie():
                 logger.info("movie per-goal view: segment=%s view_source=%s no-ring -> inherit",
                             goal.segment_id, view_source)
                 continue
+            # K is the RENDER cap (4), not the canonical/storage cap: these frames go
+            # straight into ONE segment's id_lock conditioning. Was MAX_CANONICAL_IMAGES
+            # back when both numbers were 4; pinned to MAX_RENDER_REFS on 2026-07-16 when
+            # canonical widened to 8, so a per-goal view still conditions on 4 frames.
             picked = identity_profiles.nearest_bank_views(
-                bank, azimuth_deg, identity_profiles.MAX_CANONICAL_IMAGES)
+                bank, azimuth_deg, identity_profiles.MAX_RENDER_REFS)
             goal_uris, _g_err = _ingest_image_references([b["path"] for b in picked])
             if _g_err is not None:
                 _pl, _st = _g_err
@@ -1796,6 +1806,10 @@ def _reference_images_from_body(body):
     profile_canonical = [p for p in (profile.get("canonical") or []) if isinstance(p, str)]
     canonical = version_canonical or profile_canonical
     canonical_default = canonical if canonical else list(profile.get("reference_images") or [])
+    # Provenance: did the DNA come from the canonical RING (angle-ordered frames), or from
+    # the raw ``reference_images`` uploads (unordered photos)? Only a ring may be angle-
+    # strided down to the render cap — see the narrowing block at the end of this function.
+    from_canonical_ring = bool(canonical)
 
     # VIEW-AWARE DNA (IDENTITY-3D-CONTINUITY-PLAN.md S2): an optional ``identity_view`` hint
     # — a semantic name ("back", "left-profile", …) OR an ``{azimuth_deg, elevation_deg?}``
@@ -1807,8 +1821,9 @@ def _reference_images_from_body(body):
     #   * hint + a turntable bank exists -> the K angle-nearest bank frames (angle-spread) ;
     #   * hint but NO bank (versionless / clay-only / legacy profile) -> canonical_default.
     # So a hintless call is zero-regression and a hinted call on an identity without a ring
-    # still yields the working canonical set (defaults-are-promises). K matches the canonical
-    # cap (``MAX_CANONICAL_IMAGES``, i.e. up to 4). An invalid hint is a clean 400.
+    # still yields the working canonical set (defaults-are-promises). K matches the RENDER cap
+    # (``MAX_RENDER_REFS``, i.e. up to 4 — what one id_lock render can consume; the canonical
+    # STORAGE cap is 8 since 2026-07-16). An invalid hint is a clean 400.
     view_hint = body.get("identity_view")
     view_source = "canonical-default"
     chosen = canonical_default
@@ -1819,8 +1834,11 @@ def _reference_images_from_body(body):
         chosen_version_id = chosen_version.get("version_id") if chosen_version else None
         bank = identity_profiles.bank_views(profile, version_id=chosen_version_id)
         if bank:
+            # K = the RENDER cap (4). These frames become one render's id_lock refs, so this
+            # tracks MAX_RENDER_REFS, NOT the canonical/storage cap (8 since 2026-07-16).
+            # The two were the same number (4) when this was written.
             picked = identity_profiles.nearest_bank_views(
-                bank, azimuth_deg, identity_profiles.MAX_CANONICAL_IMAGES)
+                bank, azimuth_deg, identity_profiles.MAX_RENDER_REFS)
             chosen = [b["path"] for b in picked]
             view_source = "explicit-view"
         # else: no turntable ring for this version -> fall through on canonical_default.
@@ -1832,11 +1850,34 @@ def _reference_images_from_body(body):
     # (operator 2026-07-12). If this empties the set, the caller's non-empty
     # validation returns a clean 400 rather than a per-path "not found".
     chosen = [r for r in chosen if isinstance(r, str) and os.path.isfile(r)]
+
+    # CANONICAL 8 vs RENDER 4 (2026-07-16) — narrowed HERE, once, for every caller.
+    # The canonical STORAGE cap widened to 8 (the 45° ring) but ONE id_lock/VACE render
+    # still consumes at most 4 refs (a model constraint: each ref becomes a VACE reference
+    # latent). Every consumer of this resolver feeds a render channel that hard-rejects >4
+    # (/video/enqueue and /video/studio/movie 400; identity_reconstruction_schema and
+    # studio.job RAISE), so an 8-view identity would otherwise fail against its OWN approved
+    # DNA. This function is the ONE place that knows the refs came from a canonical RING, so
+    # it is the honest place to narrow: callers stay unchanged and can't forget.
+    # Striding (not [:4]) keeps the sample angle-spread — an 8-view set yields the 4
+    # cardinals (0/90/180/270), byte-identical DNA to a 4-view profile today, instead of the
+    # lopsided front+right half-turn [:4] would take. <=4 sets pass through untouched, so
+    # every profile on disk right now resolves EXACTLY as before (zero regression).
+    # The explicit-view path already asked the bank for MAX_RENDER_REFS, so it is a no-op
+    # there; this backstops the canonical-default path.
+    # SCOPED TO A CANONICAL RING ON PURPOSE: when a profile has NO canonical, this resolver
+    # falls back to the raw ``reference_images`` uploads (up to 12) — unordered photos, not
+    # ring frames. Those must NOT be strided (there is no angle to spread across, and their
+    # >4 handling is each caller's existing [:4]/400 contract). Only narrow what actually
+    # came from the canonical ring, so the legacy upload path is untouched.
+    n_before = len(chosen)
+    if from_canonical_ring:
+        chosen = identity_profiles.render_refs_from_canonical(chosen)
     # Record which DNA path served the resolve so a live enqueue is auditable (the return
     # SHAPE is unchanged; this is observability only). ``view_source`` is the S2 honesty
     # flag: explicit-view == the turntable ring served it; canonical-default == today's set.
-    logger.info("identity DNA resolved: slug=%s view_source=%s n_refs=%d",
-                slug.strip(), view_source, len(chosen))
+    logger.info("identity DNA resolved: slug=%s view_source=%s n_refs=%d (from %d canonical)",
+                slug.strip(), view_source, len(chosen), n_before)
     return list(chosen), None
 
 
@@ -2098,9 +2139,13 @@ def video_identity_profile_reconstruction(slug):
         payload, status = perr
         return jsonify(payload), status
     # id_lock reference channel accepts at most 4 (_MAX_CANONICAL_IMAGES). A profile may
-    # hold up to 12 SOURCE images; take the first 4 of the resolver's canonical-preferred,
-    # existence-filtered set (canonical wins via _reference_images_from_body) so a 12-ref
-    # identity doesn't 400 with "at most 4 ... accepted".
+    # hold up to 12 SOURCE images (and, since 2026-07-16, up to 8 CANONICAL views), so
+    # narrow the resolver's canonical-preferred, existence-filtered set to 4 rather than
+    # 400-ing with "at most 4 ... accepted".
+    # A canonical RING is already narrowed to 4 (ring-strided, so the 4 cardinals rather
+    # than a lopsided half-turn) inside _reference_images_from_body. This [:4] therefore
+    # only ever trims a raw 12-image UPLOAD set — unordered photos with no angle to spread
+    # across — so it keeps its original first-4 behavior, unchanged.
     refs_in = list(refs_in)[:4]
     if not refs_in:
         return jsonify({"error": "Profile has no valid reference images"}), 400

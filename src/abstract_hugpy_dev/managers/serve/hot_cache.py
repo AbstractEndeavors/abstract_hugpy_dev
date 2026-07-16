@@ -64,7 +64,26 @@ import shutil
 import threading
 import time
 
+from . import chunksum_verify as _cv
+
 logger = logging.getLogger(__name__)
+
+
+def _verify_staged(src: str, staged: str) -> tuple[str, str]:
+    """Content-verify a staged .part against its shared-store source's sidecar.
+
+    Split out from _promote so it is directly drivable in tests and so a
+    verification bug can never take down the promoter thread: an unexpected
+    exception degrades to UNVERIFIED (copy proceeds, as it did before this
+    gate existed) rather than turning the hot tier into a hard dependency on
+    the sidecar machinery. Only a POSITIVE corruption proof stops a promote.
+    """
+    try:
+        return _cv.verify_against_source(staged, src)
+    except Exception as exc:  # noqa: BLE001 — never fail a promote on our own bug
+        logger.warning("hot_cache: verification error for %s (%s) — treating as "
+                       "unverified", src, exc)
+        return _cv.UNVERIFIED, f"verifier error: {exc}"
 
 # --------------------------------------------------------------------------- #
 # Env knobs (read live so a systemd drop-in edit + restart takes effect; unset
@@ -183,10 +202,29 @@ def _gguf_file_set(src: str) -> list[str]:
     return sorted({f for f in out if os.path.isfile(f)})
 
 
+def _is_bookkeeping(name: str) -> bool:
+    """Transfer bookkeeping / staging remnants — NOT model content.
+
+    ``.chunksums-*.json`` sidecars are verification metadata that belong beside
+    the SOURCE; copying them to the hot drive spends the weight budget on
+    bookkeeping and makes them look like files needing verification (they have
+    no sidecar of their own -> a pointless "UNVERIFIED" line per promote).
+    ``.part``/``.state.json`` are a crashed pull's leftovers: promoting them
+    would carry a wedge onto the hot drive — the exact class of artifact that
+    misled this incident for 32h. Mirrors central's own exclusion list
+    (worker_routes.py: ``".chunksums-" in name or name.endswith((".part", …))``)
+    and reconcile.py's, so the three agree on what counts as real weight.
+    """
+    low = name.lower()
+    return ".chunksums-" in low or low.endswith((".part", ".state.json"))
+
+
 def _dir_file_set(d: str) -> list[str]:
     out: list[str] = []
     for root, _sub, files in os.walk(d):
         for f in files:
+            if _is_bookkeeping(f):
+                continue
             p = os.path.join(root, f)
             if os.path.isfile(p) and not os.path.islink(p):
                 out.append(p)
@@ -212,19 +250,48 @@ def _sizes(paths: list[str]) -> int:
 def is_complete(shared_path: str) -> bool:
     """True iff every file the call needs is on the hot drive with a matching
     size. The size match is the completeness gate: a truncated / in-flight copy
-    (the ``.part`` never renames until it size-checks) reads as incomplete and
-    transparently falls back to the shared array."""
+    (the ``.part`` never renames until it verifies) reads as incomplete and
+    transparently falls back to the shared array.
+
+    NOTE the size match here is a RESOLUTION gate, not a trust gate — content is
+    proven at promote time (_promote -> _verify_staged), which is the only place
+    that has the source beside the copy. Re-hashing every file on every call
+    would put minutes of IO inside a load."""
+    return not incomplete_reason(shared_path)
+
+
+def incomplete_reason(shared_path: str) -> str:
+    """Why the hot copy isn't usable — "" when it IS complete.
+
+    Exists because the incident's cost was diagnostic, not mechanical: a hot
+    tree of ``.part`` files read as a bare False, the loader silently fell back,
+    and the failure eventually surfaced as diffusers hunting a legacy ``.bin``
+    that was never the problem. Naming the real state (staging file present,
+    size mismatch, absent) is what turns 32h into 32 seconds.
+    """
     files = _file_set(shared_path)
     if not files:
-        return False
+        return "no source files in the shared store"
     for f in files:
         hp = hot_path(f)
         try:
-            if not (os.path.isfile(hp) and os.path.getsize(hp) == os.path.getsize(f)):
-                return False
-        except OSError:
-            return False
-    return True
+            if os.path.isfile(hp):
+                if os.path.getsize(hp) == os.path.getsize(f):
+                    continue
+                return (f"{os.path.basename(f)}: hot copy is "
+                        f"{os.path.getsize(hp)}B vs {os.path.getsize(f)}B in the "
+                        f"shared store (incomplete copy)")
+            if os.path.isfile(hp + ".part"):
+                st = os.stat(hp + ".part")
+                return (f"{os.path.basename(f)}: transfer never finished — a "
+                        f"staging .part ({st.st_size}B, {(time.time() - st.st_mtime) / 3600:.1f}h "
+                        f"old) is present but was never promoted. This model is "
+                        f"NOT usable from the hot cache; serving from the shared "
+                        f"store instead")
+            return f"{os.path.basename(f)}: absent from the hot cache"
+        except OSError as exc:
+            return f"{os.path.basename(f)}: {exc}"
+    return ""
 
 
 # --------------------------------------------------------------------------- #
@@ -473,6 +540,32 @@ def _promote(shared_path: str) -> None:
             if os.path.getsize(tmp) != src_size:
                 os.remove(tmp)
                 raise IOError(f"size mismatch copying {f} (source changed mid-copy?)")
+            # CONTENT gate, not a length gate. A size check is exactly what let
+            # the 2026-07-15 sd-turbo corruption through: the staged vae was
+            # 167335342 bytes — the CORRECT size — but the bytes were wrong, so
+            # it promoted, then surfaced 32h later as diffusers complaining
+            # about a missing legacy .bin (an error naming the wrong file
+            # entirely). Verify against the shared store's chunksums sidecar.
+            verdict, detail = _verify_staged(f, tmp)
+            if verdict == _cv.CORRUPT:
+                # Do NOT promote, and do NOT keep the bad bytes: leaving the
+                # .part is what wedged ae for 32h and misled the next reader.
+                # Dropping it makes the next promote a clean, succeeding retry.
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+                raise IOError(
+                    f"CORRUPT TRANSFER of {f} -> {dst}: {detail}. Refusing to "
+                    f"promote; staged copy discarded so the next call re-copies. "
+                    f"The shared-store source is unchanged.")
+            if verdict == _cv.UNVERIFIED:
+                # Absent/stale sidecar = no evidence either way. Copy proceeds
+                # (see chunksum_verify: blocking here would break every file
+                # that has no sidecar), but we say so rather than implying the
+                # bytes were checked.
+                logger.info("hot_cache: %s promoted UNVERIFIED (%s)",
+                            os.path.basename(f), detail)
             os.replace(tmp, dst)
         if is_complete(shared_path):
             _stamp_called(key, bytes_hint=need)
@@ -539,14 +632,61 @@ def use(shared_path: str, promote: bool = True) -> str:
         return shared_path                                    # already a hot path
     try:
         _load_index()
-        if is_complete(shared_path):
+        why = incomplete_reason(shared_path)
+        if not why:
             _stamp_called(_entry_key(shared_path), bytes_hint=_sizes(_file_set(shared_path)))
             return hot_path(shared_path)
+        # Say WHY we're serving cold. A wedged .part used to be indistinguishable
+        # from "not promoted yet" in the logs, which is how a 32h-stale staging
+        # file stayed invisible until a loader misreported it.
+        logger.info("hot_cache: serving %s from the shared store — %s",
+                    _entry_key(shared_path), why)
         if promote:
             _enqueue(shared_path)
     except Exception as exc:  # noqa: BLE001
         logger.warning("hot_cache: use() fell back to shared for %s: %s", shared_path, exc)
     return shared_path
+
+
+# --------------------------------------------------------------------------- #
+# Stale .part surfacing. A wedged staging file is junk that MISLEADS the next
+# reader — the sd-turbo tree sat as .part for 32h and the eventual error blamed
+# a missing .bin. We SURFACE them (heartbeat/status) rather than auto-deleting:
+# a .part younger than the threshold may be an in-flight copy on another
+# thread/process, and this module must never race a live transfer. Reaping is
+# left to the promoter, which already discards its own .part on a failed verify
+# and re-copies from scratch — so a surfaced stale .part is diagnostic, not a
+# leak. Scanning is confined to the hot root (_under_root); the shared store's
+# real weights are never touched.
+# --------------------------------------------------------------------------- #
+_STALE_PART_S = 3600.0        # 1h: far beyond any legitimate single-file copy
+
+
+def stale_parts(older_than_s: float = _STALE_PART_S) -> list[dict]:
+    """Wedged ``.part`` staging files under the hot root, oldest first."""
+    root = _root()
+    if not root or not os.path.isdir(root):
+        return []
+    now = time.time()
+    out: list[dict] = []
+    for dirpath, _sub, files in os.walk(root):
+        for f in files:
+            if not f.endswith(".part"):
+                continue
+            p = os.path.join(dirpath, f)
+            if not _under_root(p):
+                continue
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            age = now - st.st_mtime
+            if age < older_than_s:
+                continue
+            out.append({"path": p, "rel": os.path.relpath(p, root),
+                        "bytes": int(st.st_size), "age_s": round(age, 1)})
+    out.sort(key=lambda e: e["age_s"], reverse=True)
+    return out
 
 
 def status() -> dict:
@@ -567,8 +707,15 @@ def status() -> dict:
         with _STATE_LOCK:
             promoting = _INFLIGHT
             queued = sorted(_QUEUED - ({_INFLIGHT} if _INFLIGHT else set()))
+        # Surfaced so a wedged staging file is VISIBLE on the heartbeat instead
+        # of waiting 32h to reappear as a misleading loader error.
+        try:
+            stale = stale_parts()
+        except OSError:
+            stale = []
         return {
             "enabled": True,
+            "stale_parts": stale,
             "root": _root(),
             "budget_bytes": _budget_bytes(),
             "used_bytes": _index_used_bytes(),

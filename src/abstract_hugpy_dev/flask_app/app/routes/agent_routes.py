@@ -81,15 +81,29 @@ def _require_node_auth(node_id: str) -> dict:
 
 def _agent_gates_open() -> bool:
     """OPERATOR-DIRECTED open mode (2026-07-15: "can the agents feature be ungated
-    entirely for now?"): ``HUGPY_AGENT_OPEN`` truthy disables BOTH the register
-    API-key gate and the operator gate on nodes/dispatch. Node-TOKEN auth on
-    heartbeat/tasks stays — that's a node's identity, not a human gate; without it
-    any caller could read/claim another node's queue.
+    entirely for now?"): ``HUGPY_AGENT_OPEN`` truthy waives the OPERATOR gate on
+    ``/agent/nodes`` + ``/agent/<id>/dispatch`` for local testing.
+
+    ⚠️ SCOPE NARROWED 2026-07-16 (operator: *"if the hugpy_agent_open is bypassing
+    gating then rework the method so that it abides to the gate"*). It used to waive
+    the ``/agent/register`` API-key gate TOO — see ``_require_api_key``, which is now
+    PERMANENT and does NOT consult this function. That combination was the same
+    silent-reopen as the old sitewide-toggle coupling, just behind a different flag:
+    flip open mode for a test and the credential-minting bootstrap door reopened to
+    the internet. **Open mode can no longer waive the register key. Ever.**
+
+    What it still waives (deliberate, testing-only):
+      * the operator gate on ``nodes`` / ``dispatch`` / ``tasks/<seq>``.
+    What it NEVER waives:
+      * the ``/agent/register`` API key — the one endpoint that MINTS credentials;
+      * node-TOKEN auth on heartbeat/tasks/result — that's a node's identity, not a
+        human gate; without it any caller could read/claim another node's queue.
 
     ⚠ These routes are reachable from the PUBLIC INTERNET on this deployment (the
-    host front → :7001 → :7002 ``/api`` chain bypasses VM nginx allow-deny), so
-    open mode means anyone can enroll nodes and dispatch tasks. Deliberately an
-    env flag, defaulting CLOSED: unset the var + restart to restore the gates."""
+    host front → :7001 → :7002 ``/api`` chain bypasses VM nginx allow-deny), so open
+    mode still means anyone can LIST nodes and DISPATCH tasks to them. It remains a
+    deliberate env flag defaulting CLOSED — unset the var + restart to restore the
+    operator gate. It is a local-testing convenience, not a deployment posture."""
     return (os.getenv("HUGPY_AGENT_OPEN", "") or "").strip().lower() in (
         "1", "true", "yes", "on")
 
@@ -120,31 +134,53 @@ def _api_key_bearer() -> "str | None":
 
 
 def _require_api_key() -> None:
-    """API-key gate for the OPEN bootstrap ``/agent/register`` — the SAME policy
-    the general (``/v1``) and media (``/ml``) endpoints use (operator-directed
-    2026-07-14: "add an api gate to it just like the media and general endpoint
-    calling").
+    """PERMANENT API-key gate for the bootstrap ``/agent/register``.
 
-    ``/agent/register`` is reachable from the public internet on this deployment
-    (host front → :7001 devServer → :7002 forwards ``/api/agent/register`` from
-    localhost, which no connection-IP / nginx allow-deny can gate), and it minted
-    node tokens to anyone — demonstrated live by the operator. Requiring a valid
-    console API key closes that with the existing credential system: when the
-    site key policy is on (``api_key_required``), an enrolling node must present a
-    console-minted key, exactly like a ``/v1`` caller. Fails closed (401). When
-    the policy is off (an open/LAN-only deployment) register stays open, matching
-    ``/v1``'s own behaviour — so this never breaks a deployment that runs keyless.
+    OPERATOR RULING 2026-07-16 (verbatim): *"this agent key should be a separate
+    api category entirely"* — *"unlike the api key for v1 that gates or ungates the
+    entire schema sitewide with a click, [agent calls] should be gated permanently."*
 
-    NB register is the fleet BOOTSTRAP endpoint (a node has no credential yet), so
-    with the policy on, agent daemons must be handed a console API key to enroll."""
-    if _agent_gates_open():
-        return
+    THE FLAW THIS FIXES. Until now this gate read::
+
+        if api_key_required() and not verify_api_key(...):   # ← coupled
+
+    i.e. agent enrollment inherited the SITEWIDE key policy: flip ``/v1`` keyless
+    for a demo and ``/agent/register`` silently reopened too. Those two are
+    categorically different asks:
+
+      * ``/v1`` open  = a deliberate POSTURE choice ("this deployment is keyless"),
+        toggled from the console by design.
+      * ``/agent/register`` open = never intended. It is the fleet BOOTSTRAP — the
+        one endpoint that MINTS node credentials — and it is reachable from the
+        PUBLIC INTERNET here (host front → :7001 devServer → :7002 forwards
+        ``/api/agent/register`` from localhost, which no connection-IP / nginx
+        allow-deny can gate). Verified open live on 2026-07-16: a bare public POST
+        returned 201 and minted a node.
+
+    So the gate no longer consults ``api_key_required()``: a valid console-minted
+    key is required ALWAYS, independent of the sitewide toggle. ``verify_api_key``
+    already validates on the key's own merits (hash + revocation) and never read
+    that flag, so no key-system change was needed — only the decoupling.
+
+    Fails closed: an unloadable key module refuses rather than admits.
+
+    NOR does it consult ``_agent_gates_open()`` (operator 2026-07-16: *"if the
+    hugpy_agent_open is bypassing gating then rework the method so that it abides to
+    the gate"*). Open mode waiving this key was the SAME silent-reopen as the
+    sitewide coupling, just behind a different flag — flip it for a test and the
+    public bootstrap door swings open again. Open mode may still waive the OPERATOR
+    gate on nodes/dispatch (its testing purpose); it can never waive this one.
+
+    CONSEQUENCE (intended): every agent daemon must be handed a console API key to
+    enroll — including this VM's own todo-keeper node. Bootstrap is the hardest
+    door, not the softest. Keys are minted in the console under API access
+    (``POST /keys``) and are individually revocable (``DELETE /keys/<id>``)."""
     try:
-        from ..functions.imports.utils.api_keys import api_key_required, verify_api_key
+        from ..functions.imports.utils.api_keys import verify_api_key
     except Exception:
         # fail closed: if the key module can't load we cannot verify -> refuse
         abort(401, description="Agent registration key gate unavailable.")
-    if api_key_required() and not verify_api_key(_api_key_bearer()):
+    if not verify_api_key(_api_key_bearer()):
         abort(401, description=(
             "Agent registration requires a valid API key. Pass "
             "'Authorization: Bearer <key>' (create keys in the console under API access)."))

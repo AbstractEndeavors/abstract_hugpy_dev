@@ -84,7 +84,25 @@ from .identity_reconstruction_schema import IdentitySingleViewRegenSpec, Identit
 _LOCK = threading.Lock()
 
 MAX_SOURCE_IMAGES = 12
-MAX_CANONICAL_IMAGES = 4  # Canonical anchors stay capped at 4
+
+# CANONICAL CAP — the number of views the STORE may hold as an identity's approved DNA.
+# Widened 4 -> 8 (operator, 2026-07-16: "45 degree shots") so the canonical set is the full
+# 45°-spaced azimuth ring (``SEMANTIC_VIEWS``) rather than the 4 cardinals.
+#
+# ⚠ THIS IS *NOT* THE RENDER CAP. Two different numbers were conflated at 4 until now:
+#   * STORAGE  (this) — how many approved views an identity may HOLD. Now 8.
+#   * RENDER  (``identity_reconstruction_schema._MAX_CANONICAL_IMAGES``, ``studio.job.
+#     _MAX_REFERENCE_IMAGES``, both still 4) — how many refs ONE id_lock/VACE render may
+#     CONSUME. That 4 is a MODEL constraint (diffusers 0.39 prepends each reference as a
+#     VACE reference latent; more = more conditioning latents + VRAM), NOT a bookkeeping
+#     choice, so it deliberately does NOT move with this one.
+# Consumers that feed the render channel must therefore SELECT a <=4 subset of canonical
+# (see ``render_refs_from_canonical``); they must never pass the whole set through.
+MAX_CANONICAL_IMAGES = 8
+
+# The render-channel cap, mirrored here so the store can enforce the subset rule in one
+# place. Kept in lockstep with ``identity_reconstruction_schema._MAX_CANONICAL_IMAGES``.
+MAX_RENDER_REFS = 4
 
 # --------------------------------------------------------------------------- #
 # VERSIONS slice (operator-directed 2026-07-14; IDENTITY-VERSIONS-SLICE.md).
@@ -601,6 +619,20 @@ def _public(slug: str, entry: dict[str, Any]) -> dict[str, Any]:
         if isinstance(r, dict)
     ]
     out["canonical"] = list(entry.get("canonical") or [])
+    # ANGLE PROVENANCE (2026-07-16) — ``canonical_angles``: the azimuth in degrees of each
+    # ``canonical`` entry, POSITIONALLY aligned (``canonical_angles[i]`` describes
+    # ``canonical[i]``); an element may be ``null`` when that view's angle is unknown.
+    # Shape choice (deliberate): ``canonical`` STAYS a flat list of path strings and this
+    # rides alongside as a PARALLEL list. Changing canonical's element type to objects would
+    # break every existing consumer at once (the id_lock resolver, the Generate bar, Studio,
+    # the fixed 7-key version wire contract) for zero gain.
+    # BACK-COMPAT: OMITTED entirely for the profiles on disk today, which were promoted
+    # before angles were recorded and have no stored angle. Absent means "angles unknown" —
+    # a consumer must degrade to unlabeled ordinals, exactly as it behaves today. It is
+    # never faked: guessing 0.0 would read as "front" and be a lie.
+    canonical_angles = entry.get("canonical_angles")
+    if canonical_angles and len(canonical_angles) == len(out["canonical"]):
+        out["canonical_angles"] = list(canonical_angles)
     canonical_missing = entry.get("canonical_missing")
     if canonical_missing:
         out["canonical_missing"] = list(canonical_missing)
@@ -618,11 +650,19 @@ def _public(slug: str, entry: dict[str, Any]) -> dict[str, Any]:
 
 
 def _public_version(v: dict[str, Any]) -> dict[str, Any]:
-    """The FIXED wire shape for one version — exactly the seven contract keys (a
-    sibling UI is built to these). The internal-only ``base``/``archived`` flags stay
-    OFF the wire; the base version is identifiable by ``name == "base"`` + ``kind ==
-    "clay"``, and archived versions are omitted from the list entirely."""
-    return {
+    """The FIXED wire shape for one version — the seven contract keys (a sibling UI is
+    built to these), plus ``canonical_angles`` when — and only when — this version carries
+    real angle provenance. The internal-only ``base``/``archived`` flags stay OFF the wire;
+    the base version is identifiable by ``name == "base"`` + ``kind == "clay"``, and
+    archived versions are omitted from the list entirely.
+
+    ``canonical_angles`` (2026-07-16) is ADDITIVE and OPTIONAL: the per-view azimuth in
+    degrees, positionally aligned with ``canonical`` (an element may be ``null``). It is
+    omitted for every version minted before angles were recorded — i.e. everything on disk
+    today keeps EXACTLY the seven-key shape, byte-for-byte, so the sibling UI built to those
+    keys is unaffected. A reader must treat "absent" as "angles unknown" and fall back to
+    unlabeled ordinals; it must never assume 0.0."""
+    out = {
         "version_id": v.get("version_id"),
         "name": v.get("name", ""),
         "kind": v.get("kind", "clay"),
@@ -631,6 +671,11 @@ def _public_version(v: dict[str, Any]) -> dict[str, Any]:
         "canonical": list(v.get("canonical") or []),
         "notes": v.get("notes", ""),
     }
+    angles = v.get("canonical_angles")
+    # Length guard: if the two ever drift apart, drop the angles rather than mislabel a view.
+    if angles and len(angles) == len(out["canonical"]):
+        out["canonical_angles"] = list(angles)
+    return out
 
 
 def _merged_gen_settings(stored: Any) -> dict[str, Any]:
@@ -976,6 +1021,44 @@ def attach_reconstruction(
     return dict(record)
 
 
+def canonical_angles_for_indices(record: dict[str, Any], idxs: list[int]) -> list[Optional[float]]:
+    """The azimuth of each promoted ring index — the ANGLE PROVENANCE that ``canonical``
+    historically threw away (2026-07-16).
+
+    Before this, ``promote_reconstruction_views`` copied the frames at ``chosen_indices``
+    and stored ONLY the destination paths, so ``ref_02`` meant "the third view someone
+    promoted", never "180°". With 8 views that loss is worse than with 4: the operator's
+    intent is to pick the canonical view whose ANGLE matches the shot, which is impossible
+    if the angle isn't on the wire.
+
+    Azimuth is computed with the SAME convention as ``bank_views``
+    (``index * degrees_per_frame % 360``, ``degrees_per_frame`` off the record, else
+    ``360/len(views)``) so the bank and canonical can never disagree — degrees are the
+    canonical truth (see the ANGLE BANK section docstring).
+
+    Returns one entry per index, POSITIONALLY aligned with the promoted paths. An entry is
+    ``None`` when the angle is genuinely unknowable — a NON-turntable record (a ``sheet``
+    recon has no orbit, so its views carry no azimuth) or a bad index. ``None`` is honest:
+    it means "no angle", never a guessed 0.0 (which would read as "front" and be a lie)."""
+    if not isinstance(record, dict) or record.get("mode") != "turntable":
+        # sheet / video_extract / clay records carry no orbit -> no azimuth to report.
+        return [None] * len(idxs)
+    views = [v for v in (record.get("views") or []) if isinstance(v, str)]
+    if not views:
+        return [None] * len(idxs)
+    dpf = record.get("degrees_per_frame")
+    try:
+        dpf = float(dpf)
+        if dpf <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        dpf = 360.0 / len(views)
+    out: list[Optional[float]] = []
+    for i in idxs:
+        out.append(round((i * dpf) % 360.0, 4) if 0 <= i < len(views) else None)
+    return out
+
+
 def promote_reconstruction_views(
     slug: str,
     recon_id: str,
@@ -1035,11 +1118,26 @@ def promote_reconstruction_views(
                     f"view index {i} is out of range (this reconstruction has "
                     f"{len(views)} views)", code="invalid_profile")
             chosen_sources.append(views[i])
+        # ANGLE PROVENANCE (2026-07-16): capture each promoted view's azimuth BEFORE the
+        # copy, while we still know which ring index it came from — the information this
+        # function used to destroy. Computed off the SAME record, so it cannot drift from
+        # the bank. ``_materialize_refs`` keeps its output POSITIONALLY aligned with its
+        # input (a missing source keeps its original handle rather than being dropped), so
+        # angles[i] describes owned[i] for every i.
+        angles = canonical_angles_for_indices(record, idxs)
         # Never overwrite an existing canonical set — relocate it (never-delete).
         _supersede_existing_dir(canon_dir)
         owned, missing = _materialize_refs(canon_dir, chosen_sources)
         entry = dict(entry)  # edit a copy — nothing is written until _save
         entry["canonical"] = owned
+        # PARALLEL key, not a change to ``canonical``'s element type: ``canonical`` stays a
+        # flat list of path strings forever (every consumer + the fixed 7-key version wire
+        # contract depends on that). Written ONLY when at least one real angle is known, so
+        # a sheet-recon promote adds no misleading all-null key.
+        if len(angles) == len(owned) and any(a is not None for a in angles):
+            entry["canonical_angles"] = angles
+        else:
+            entry.pop("canonical_angles", None)  # stale angles must never outlive their set
         if missing:
             entry["canonical_missing"] = missing
         else:
@@ -1245,6 +1343,7 @@ def mint_version(
     kind: str,
     canonical: list[str],
     name: Optional[str] = None,
+    canonical_angles: Optional[list[Optional[float]]] = None,
 ) -> Optional[dict[str, Any]]:
     """Mint (or, on a re-run of the SAME ``recon_id``, update in place) a VERSION and
     make it ACTIVE (latest-wins).
@@ -1256,6 +1355,13 @@ def mint_version(
     ``recon_id``: a version already carrying this recon_id (e.g. a bus retry) is updated
     in place rather than duplicated, preserving its ``version_id``/``name``/base flag.
 
+    ``canonical_angles`` (optional, 2026-07-16) is the per-view AZIMUTH provenance,
+    positionally aligned with ``canonical`` (an element may be ``None`` = angle unknown).
+    Default ``None`` = "no angle information", which is exactly how every version minted
+    before this existed behaves — so all pre-existing callers are unaffected. Stored (and
+    put on the wire) only when it aligns with ``canonical`` and carries a real angle;
+    otherwise it is dropped rather than allowed to mislabel views.
+
     Append-only + never-delete: an existing version is never removed here. Returns the
     minted/updated version's PUBLIC shape, or ``None`` if the slug names no active
     profile (a best-effort caller — the relay — tolerates that)."""
@@ -1266,6 +1372,14 @@ def mint_version(
     if kind not in VERSION_KINDS:
         raise ProfileError(f"kind must be one of {list(VERSION_KINDS)}", code="invalid_profile")
     canon = [p for p in (canonical or []) if isinstance(p, str)]
+    # Angles ride along ONLY when they describe this exact set (same length) and carry at
+    # least one real value; anything else is dropped so a version can never mislabel its
+    # own views. ``None`` (every pre-2026-07-16 caller) simply means "no angles".
+    canon_angles: Optional[list[Optional[float]]] = None
+    if (canonical_angles is not None
+            and len(canonical_angles) == len(canon)
+            and any(a is not None for a in canonical_angles)):
+        canon_angles = list(canonical_angles)
     with _LOCK:
         data = _load()
         entry = data["profiles"].get(slug)
@@ -1282,6 +1396,12 @@ def mint_version(
             version = dict(versions[existing_idx])
             version["kind"] = kind
             version["canonical"] = canon
+            # Keep angles in lockstep with the set they describe: a re-run that supplies
+            # none must CLEAR any stale angles rather than leave them pointing at old views.
+            if canon_angles is not None:
+                version["canonical_angles"] = canon_angles
+            else:
+                version.pop("canonical_angles", None)
             if name is not None:
                 version["name"] = name
             versions[existing_idx] = version
@@ -1296,6 +1416,8 @@ def mint_version(
                 "canonical": canon,
                 "notes": "",
             }
+            if canon_angles is not None:
+                version["canonical_angles"] = canon_angles
             if is_base and name is None:
                 version["base"] = True  # the geometric ground truth — never archivable
             versions.append(version)
@@ -1564,11 +1686,14 @@ def set_gen_settings(slug: str, partial: dict[str, Any]) -> Optional[dict[str, A
 #     record; on an older record that predates that field it is derived as
 #     ``360.0 / len(views)`` (a full turn spread evenly over the frames rendered).
 #   * The orbit turns the subject so increasing azimuth first brings the subject's
-#     RIGHT side toward camera — hence 90° == right-profile, 180° == back, 270° ==
-#     left-profile. This left/right assignment is a DOCUMENTED convention, not yet
-#     eyeballed against the Blender orbit's real handedness; because azimuth degrees are
-#     canonical, if the real orbit turns the other way only ``SEMANTIC_VIEWS`` flips —
-#     no stored data, no azimuth math, and no bank index changes.
+#     LEFT side toward camera — hence 90° == left-profile, 180° == back, 270° ==
+#     right-profile. VERIFIED 2026-07-16: the operator eyeballed the labeled 8-view rows
+#     on two textured identities and confirmed "0 is front and 90 degrees is stage left"
+#     (stage left == the performer's left == the camera's right, so at 90° the camera
+#     sees the subject's own LEFT side). This SUPERSEDES the prior never-eyeballed guess
+#     (90° == right-profile), which was mirrored. Only ``SEMANTIC_VIEWS`` changed — the
+#     azimuth degrees were canonical and correct all along, so no stored data, no azimuth
+#     math, and no bank index changes were touched. 0°/180° are the mirror's fixed points.
 #   * ``elevation_deg`` is recorded as 0.0 for every ring frame: the turntable is
 #     single-elevation. Real elevations (overhead / low-angle) are a later slice (S5,
 #     on-demand novel views from the mesh); they are deliberately NOT synthesized here.
@@ -1584,15 +1709,32 @@ def set_gen_settings(slug: str, partial: dict[str, Any]) -> Optional[dict[str, A
 # the azimuthal views the single-elevation ring can actually serve are listed — a pure
 # elevation ask (e.g. "overhead") is intentionally absent and resolves to a clean error
 # rather than a wrong frame, until the mesh-render slice (S5) can serve elevations.
+# HANDEDNESS RESOLVED 2026-07-16 (operator eyeballed the labeled 8-view rows on two
+# textured identities — Luigi + keeper-mesh-live — verbatim: "the views are accurate 0 is
+# front and 90 degrees is stage left").
+#
+# STAGE LEFT is the PERFORMER's left, i.e. the camera's/viewer's RIGHT. So at azimuth 90°
+# the camera sees the subject's OWN LEFT side => 90° is the LEFT profile, not the right.
+# The prior assignment (90° == right-profile) was the documented-but-never-eyeballed guess
+# recorded in the section docstring; the real orbit turns the other way. This is a MIRROR,
+# not an offset: 0° front and 180° back are FIXED POINTS (confirmed — "0 is front"), and
+# only the sided names swap across them (45<->315, 90<->270, 135<->225).
+#
+# Per the convention, azimuth degrees are canonical, so this is the ONLY place that
+# changes: no stored bytes, no azimuth math, no bank/frame indices, no re-render. The
+# ring frame at 90° is the same pixels it always was — it is now named correctly.
+#
+# NB this also corrects `shot_intent.py`, which maps prompt text -> a view NAME: a prompt
+# asking for the subject's right side had been silently resolving to the mirrored frame.
 SEMANTIC_VIEWS: dict[str, float] = {
     "front": 0.0,
-    "three-quarter-right": 45.0,
-    "right-profile": 90.0,
-    "back-right": 135.0,
+    "three-quarter-left": 45.0,
+    "left-profile": 90.0,
+    "back-left": 135.0,
     "back": 180.0,
-    "back-left": 225.0,
-    "left-profile": 270.0,
-    "three-quarter-left": 315.0,
+    "back-right": 225.0,
+    "right-profile": 270.0,
+    "three-quarter-right": 315.0,
 }
 
 
@@ -1604,6 +1746,79 @@ def _angular_distance(a: float, b: float) -> float:
     0° rather than marching the long way back through 180°."""
     d = abs((a - b) % 360.0)
     return min(d, 360.0 - d)
+
+
+def canonical_frame_indices(view_count: int, degrees_per_frame: Optional[float] = None) -> list[int]:
+    """The ring-frame INDICES that back the canonical set — one per ``SEMANTIC_VIEWS``
+    azimuth, chosen by NEAREST ANGLE (operator 2026-07-16: "45 degree shots").
+
+    Selection is by DEGREES, never by name or by an index shortcut: for each target azimuth
+    in ``SEMANTIC_VIEWS`` this walks the ring and keeps the frame whose computed azimuth
+    (``index * degrees_per_frame % 360``, the section's convention) is angularly nearest
+    (``_angular_distance``, so 350° is 10° from 0°, not 350°). On the live rings (72 frames
+    @ 5°/frame) every 45° target lands EXACTLY on a rendered frame — 0/9/18/27/36/45/54/63 —
+    so this is a pure SELECTION over frames that already exist. Nothing is re-rendered,
+    interpolated, or synthesized.
+
+    Why nearest-angle and not ``N//8``: an index shortcut silently lies on any ring whose
+    frame count isn't a multiple of 8 (or whose ``degrees_per_frame`` doesn't close a full
+    turn). Nearest-angle degrades honestly — on a sparse ring two targets may resolve to the
+    same frame, so the result is DEDUPED and stays in ascending ring order. That means a
+    coarse ring simply yields FEWER than 8 canonical entries rather than duplicate bytes.
+
+    ``degrees_per_frame`` defaults to a full turn spread over the frames (``360/view_count``)
+    for older records lacking the field — the same derivation ``bank_views`` uses. Returns
+    ``[]`` for a non-positive ``view_count``.
+
+    NOTE (S5): the 2 AERIAL views the operator also asked for (overhead / -overhead) are NOT
+    here and must not be faked from this ring — the turntable is single-elevation
+    (``elevation_deg`` is 0.0 for every frame). They need the mesh-render path (S5).
+    """
+    if view_count <= 0:
+        return []
+    try:
+        dpf = float(degrees_per_frame)  # type: ignore[arg-type]
+        if dpf <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        dpf = 360.0 / view_count
+    picked: list[int] = []
+    for target in SEMANTIC_VIEWS.values():
+        best = min(
+            range(view_count),
+            key=lambda i: (_angular_distance(target, (i * dpf) % 360.0), i),
+        )
+        if best not in picked:
+            picked.append(best)  # dedupe: a sparse ring may map 2 targets onto 1 frame
+    return sorted(picked)
+
+
+def render_refs_from_canonical(canonical: list[str]) -> list[str]:
+    """The <=``MAX_RENDER_REFS`` subset of a canonical set that ONE id_lock/VACE render may
+    consume — the seam that lets the STORE hold 8 while the RENDER channel still takes 4.
+
+    Canonical is stored in ascending ring order (front, 45°, 90°, …), so the first 4 entries
+    of an 8-view set would be a LOPSIDED half-turn (0/45/90/135 — the subject's front and
+    right side only), which is worse identity DNA than today's 4 cardinals. Instead this
+    takes an evenly-STRIDED sample across the ring, which for an 8-view set yields exactly
+    the 4 cardinals (0°/90°/180°/270°) — i.e. byte-identical DNA to what a 4-view profile
+    feeds the renderer today. A 4-view set (every profile on disk right now) strides by 1
+    and passes through UNCHANGED, so existing identities render exactly as before.
+
+    Shorter sets pass through untouched. This never raises — an over-long set is sampled,
+    never rejected, because the caller is a render path, not a validator."""
+    refs = [p for p in (canonical or []) if isinstance(p, str)]
+    n = len(refs)
+    if n <= MAX_RENDER_REFS:
+        return refs
+    # Evenly spaced picks across the ring: for n=8 -> indices 0,2,4,6 == the cardinals.
+    stride = n / float(MAX_RENDER_REFS)
+    out: list[str] = []
+    for j in range(MAX_RENDER_REFS):
+        idx = int(j * stride)
+        if idx < n and refs[idx] not in out:
+            out.append(refs[idx])
+    return out
 
 
 def _resolve_version(profile: dict[str, Any], version_id: Optional[str]) -> Optional[dict[str, Any]]:

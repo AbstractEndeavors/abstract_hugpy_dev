@@ -42,44 +42,49 @@ def store(tmp_path):
     return AgentNodeStore(path=str(tmp_path / "agent.db"))
 
 
+_GOOD_KEY = "hp_test_valid_key"
+
+
 @pytest.fixture
 def client(store, monkeypatch):
     """A bare app with ONLY the agent blueprint — so the inline gates are what's
     under test (no central before_request gate installed), and the store is a
     fresh scratch db per test.
 
-    The site key policy (``api_key_required``) is forced OFF here so /agent/register
-    behaves as the open bootstrap these M2M-contract tests were written against —
-    otherwise the real dev box's key config (``require_key`` on) would leak into the
-    test process and 401 every enroll. The register KEY GATE itself is exercised
-    explicitly by ``_key_policy`` below."""
+    2026-07-16 permanent-gate ruling: ``/agent/register`` now requires a valid
+    console API key ALWAYS, independent of the sitewide ``api_key_required``
+    toggle (see ``agent_routes._require_api_key``). ``verify_api_key`` is
+    stubbed here to accept exactly ``_GOOD_KEY`` so the M2M-contract tests
+    (heartbeat/tasks/dispatch/etc.) can enroll via ``_enroll()`` without a real
+    key store; the gate itself — including its independence from the sitewide
+    toggle — is exercised explicitly by the ``test_register_gate_*`` tests
+    below using ``unkeyed_client``."""
     monkeypatch.setattr(agent_routes, "agent_node_store", store)
     from abstract_hugpy_dev.flask_app.app.functions.imports.utils import api_keys as _ak
-    monkeypatch.setattr(_ak, "api_key_required", lambda: False)
+    monkeypatch.setattr(_ak, "verify_api_key", lambda tok: tok == _GOOD_KEY)
     app = Flask(__name__)
     app.register_blueprint(agent_routes.agent_bp)
     return app.test_client()
 
 
 @pytest.fixture
-def keyed_client(store, monkeypatch):
-    """Like ``client`` but with the register API-key gate turned ON (site key
-    policy required) and key verification stubbed, so the gate on /agent/register
-    can be exercised without a real key store. Yields ``(test_client, good_key)``."""
+def unkeyed_client(store, monkeypatch):
+    """Like ``client``, but ``verify_api_key`` always refuses — for asserting
+    the gate's negative space (no key, bad key) without a real key store."""
     monkeypatch.setattr(agent_routes, "agent_node_store", store)
     from abstract_hugpy_dev.flask_app.app.functions.imports.utils import api_keys as _ak
-    good = "hp_test_valid_key"
-    monkeypatch.setattr(_ak, "api_key_required", lambda: True)
-    monkeypatch.setattr(_ak, "verify_api_key", lambda tok: tok == good)
+    monkeypatch.setattr(_ak, "verify_api_key", lambda tok: False)
     app = Flask(__name__)
     app.register_blueprint(agent_routes.agent_bp)
-    return app.test_client(), good
+    return app.test_client()
 
 
-def _enroll(client, name="luigi", host="10.0.0.9", caps=("chat",)):
+def _enroll(client, name="luigi", host="10.0.0.9", caps=("chat",),
+            key=_GOOD_KEY):
     r = client.post("/agent/register",
                     json={"name": name, "host": host,
-                          "capabilities": list(caps)})
+                          "capabilities": list(caps)},
+                    headers=_auth(key) if key else {})
     assert r.status_code == 201, r.get_json()
     return r.get_json()
 
@@ -216,52 +221,127 @@ def test_route_register_returns_201_with_token(client):
 
 
 def test_route_register_requires_name(client):
-    assert client.post("/agent/register", json={}).status_code == 400
-    assert client.post("/agent/register",
-                       json={"name": "  "}).status_code == 400
+    assert client.post("/agent/register", json={},
+                       headers=_auth(_GOOD_KEY)).status_code == 400
+    assert client.post("/agent/register", json={"name": "  "},
+                       headers=_auth(_GOOD_KEY)).status_code == 400
 
 
 def test_route_register_rejects_non_list_capabilities(client):
     r = client.post("/agent/register",
-                    json={"name": "n", "capabilities": "chat"})
+                    json={"name": "n", "capabilities": "chat"},
+                    headers=_auth(_GOOD_KEY))
     assert r.status_code == 400
 
 
-# ── register API-key gate (keeper 2026-07-14; operator-directed "just like the
-#    media and general endpoint calling") ─────────────────────────────────────
-def test_register_gate_open_when_key_policy_off(client):
-    """Site key policy OFF -> register stays the open bootstrap (matches /v1)."""
-    assert client.post("/agent/register", json={"name": "n"}).status_code == 201
+# ── register API-key gate (keeper 2026-07-16; PERMANENT — decoupled from the
+#    sitewide api_key_required() toggle, see agent_routes._require_api_key) ──
+def test_register_gate_refuses_without_key(unkeyed_client):
+    """No key at all -> 401."""
+    assert unkeyed_client.post(
+        "/agent/register", json={"name": "n"}).status_code == 401
 
 
-def test_register_gate_refuses_without_key_when_policy_on(keyed_client):
-    """Site key policy ON + no key -> 401. This is the demonstrated internet-open
-    hole closed: a keyless register no longer mints a token."""
-    kc, _good = keyed_client
-    assert kc.post("/agent/register", json={"name": "n"}).status_code == 401
-
-
-def test_register_gate_rejects_bad_key_when_policy_on(keyed_client):
-    kc, _good = keyed_client
-    r = kc.post("/agent/register", json={"name": "n"},
-                headers={"Authorization": "Bearer hp_wrong"})
+def test_register_gate_refuses_without_key_even_when_site_policy_off(
+        unkeyed_client, monkeypatch):
+    """THE regression this gate exists to close: a bare, keyless register must
+    401 even when the SITEWIDE api_key_required() toggle is OFF — the exact
+    live hole (2026-07-16, a public POST returned 201 with the toggle off).
+    The gate must never consult that flag."""
+    from abstract_hugpy_dev.flask_app.app.functions.imports.utils import api_keys as _ak
+    monkeypatch.setattr(_ak, "api_key_required", lambda: False)
+    r = unkeyed_client.post("/agent/register", json={"name": "n"})
     assert r.status_code == 401
 
 
-def test_register_gate_allows_valid_key_when_policy_on(keyed_client):
-    """A legit node presenting a valid console key still enrolls (bootstrap works)."""
-    kc, good = keyed_client
-    r = kc.post("/agent/register", json={"name": "n"},
-                headers={"Authorization": f"Bearer {good}"})
+def test_register_gate_refuses_without_key_even_in_agent_open_mode(
+        unkeyed_client, monkeypatch):
+    """The SECOND silent-reopen path, closed 2026-07-16 (operator: "if the
+    hugpy_agent_open is bypassing gating then rework the method so that it abides
+    to the gate").
+
+    ``HUGPY_AGENT_OPEN`` used to waive this key gate as well as the operator gate.
+    That made open mode a rename of the very bug we just fixed: flip it for a test
+    and the PUBLIC credential-minting bootstrap door reopens (these routes are
+    internet-reachable via the /api→:7001→:7002 chain). Open mode may still waive
+    the OPERATOR gate on nodes/dispatch — that's its testing purpose — but it must
+    NEVER waive the register key.
+    """
+    monkeypatch.setenv("HUGPY_AGENT_OPEN", "true")
+    r = unkeyed_client.post("/agent/register", json={"name": "n"})
+    assert r.status_code == 401, (
+        "open mode must not waive the register key gate — the bootstrap endpoint "
+        "mints credentials and is publicly reachable")
+
+
+def test_agent_open_still_waives_the_operator_gate(unkeyed_client, monkeypatch):
+    """The flip side: open mode KEEPS its documented testing purpose. It waives the
+    OPERATOR gate on nodes/dispatch (a human gate) — only the register key and the
+    node-token identity checks are non-waivable. Asserted so a future tightening
+    doesn't silently delete the escape hatch the operator asked to keep."""
+    monkeypatch.setenv("HUGPY_AGENT_OPEN", "true")
+    r = unkeyed_client.get("/agent/nodes")
+    assert r.status_code == 200
+
+
+def test_register_gate_rejects_bad_key(unkeyed_client):
+    r = unkeyed_client.post("/agent/register", json={"name": "n"},
+                            headers={"Authorization": "Bearer hp_wrong"})
+    assert r.status_code == 401
+
+
+def test_register_gate_rejects_revoked_key(store, monkeypatch):
+    """A key that verify_api_key refuses because it was revoked -> 401 (the
+    gate defers entirely to verify_api_key's own revocation check)."""
+    monkeypatch.setattr(agent_routes, "agent_node_store", store)
+    from abstract_hugpy_dev.flask_app.app.functions.imports.utils import api_keys as _ak
+    revoked = {"hp_was_good"}
+
+    def _verify(tok):
+        return tok is not None and tok not in revoked
+
+    monkeypatch.setattr(_ak, "verify_api_key", _verify)
+    app = Flask(__name__)
+    app.register_blueprint(agent_routes.agent_bp)
+    c = app.test_client()
+    r = c.post("/agent/register", json={"name": "n"},
+               headers=_auth("hp_was_good"))
+    assert r.status_code == 401
+
+
+def test_register_gate_allows_valid_key(client):
+    """A legit node presenting a valid console key enrolls (bootstrap works)."""
+    r = client.post("/agent/register", json={"name": "n"},
+                    headers=_auth(_GOOD_KEY))
     assert r.status_code == 201, r.get_json()
     assert r.get_json()["token"].startswith("agt_")
 
 
-def test_register_gate_accepts_key_via_query_param(keyed_client):
+def test_register_gate_accepts_key_via_query_param(client):
     """?api_key= is accepted too (same curl affordance /v1 and /ml give)."""
-    kc, good = keyed_client
-    r = kc.post(f"/agent/register?api_key={good}", json={"name": "n"})
+    r = client.post(f"/agent/register?api_key={_GOOD_KEY}", json={"name": "n"})
     assert r.status_code == 201, r.get_json()
+
+
+def test_register_gate_fails_closed_when_key_module_unimportable(
+        unkeyed_client, monkeypatch):
+    """If the key module can't even load, the gate must refuse rather than
+    admit — fail-closed on an unloadable dependency, not just a bad key."""
+    import builtins
+    real_import = builtins.__import__
+
+    def _boom_import(name, *a, **kw):
+        if name.endswith("utils.api_keys") or name == "api_keys":
+            raise ImportError("simulated: key module unavailable")
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", _boom_import)
+    try:
+        r = unkeyed_client.post("/agent/register", json={"name": "n"},
+                                headers=_auth(_GOOD_KEY))
+    finally:
+        monkeypatch.setattr(builtins, "__import__", real_import)
+    assert r.status_code == 401
 
 
 def test_route_heartbeat_requires_valid_token(client):

@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+"""Entry point for the todo-keeper agent node daemon.
+
+Run:  venv/bin/python bin/hugpy-todo-keeper
+Env:  HUGPY_CENTRAL             default http://127.0.0.1:7002
+      HUGPY_TODO_KEEPER_MODEL   default Qwen2.5-3B-Instruct-GGUF
+      HUGPY_TODO_KEEPER_STATE   default ~/.config/hugpy/todo-keeper.json
+      HUGPY_API_KEY             only needed if the site key policy is ON
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
+
+from abstract_hugpy_dev.comms.todo_keeper_daemon import main
+
+if __name__ == "__main__":
+    sys.exit(main())
