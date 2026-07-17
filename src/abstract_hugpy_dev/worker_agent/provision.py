@@ -37,6 +37,72 @@ logger = logging.getLogger("abstract_hugpy_dev.worker_agent.provision")
 
 _CHUNK = 8 * 1024 * 1024  # 8 MiB streaming chunks
 
+# ---------------------------------------------------------------------------
+# BUDGET-STATE PROVIDER (slice 8, Part A — gate EVERY transfer entry).
+# ---------------------------------------------------------------------------
+# The storage-budget gate (evict_to_fit) needs a WorkerState (limits, assigned,
+# last_picked). Historically only callers that HELD the state passed it, so
+# entry points that didn't — the /redownload route and the slot child's
+# _ensure_present — pulled bytes onto an over-budget store WITHOUT the gate (the
+# 2026-07-17 ae incident: chunks downloading while a different pid was actively
+# REFUSING the same model). This closes those: ensure_model_present now resolves
+# a budget state itself when the caller passes state=None.
+#
+# The worker agent registers its live WorkerState here at boot (in-process
+# callers — /redownload, reconcile — then gate against the REAL state). A
+# separate process (the slot child) has no such state; for it we synthesize a
+# MINIMAL state from env + on-disk truth (resolve_effective_cap reads the cap
+# from env — slice 4's projection; _worker_storage tolerates an empty assigned
+# set: the reap scan still enumerates on-disk models via get_models_dict). Either
+# way the gate runs before the first byte. NEVER gate a pull the gate already
+# admitted (see _ensure_model_present_inner's resume note).
+_BUDGET_STATE = None
+
+
+def set_budget_state(state) -> None:
+    """Register the live WorkerState so state-less entry points (the /redownload
+    route, and — in-process — anything that calls ensure_model_present without a
+    state) still run the storage-budget gate. Idempotent; called once at boot."""
+    global _BUDGET_STATE
+    _BUDGET_STATE = state
+
+
+class _MinimalBudgetState:
+    """A stand-in WorkerState for a process that has none (the slot child).
+
+    Carries only what evict_to_fit reads: limits (the cap — env-resolved via
+    resolve_effective_cap, so a slot honours the same disk_cache_gib the agent
+    does), an empty assigned set (the reap scan still finds on-disk models), and
+    empty last_picked/allocated (the FIFO falls back to on-disk mtime, and the
+    refusal simply omits the allocation clause). It is READ-only by the gate."""
+    def __init__(self):
+        self.assigned_models = []
+        self._provisioning = []
+        self.model_last_picked = {}
+        self.allocated = {}
+        self.refused = {}
+        # limits carry the central disk_cache_gib the agent projected into env
+        # (slice 4); evict_to_fit → resolve_effective_cap folds worker knobs in.
+        self.limits = {}
+        try:
+            raw = os.environ.get("_HUGPY_CENTRAL_DISK_CACHE_GIB")
+            if raw not in (None, ""):
+                self.limits = {"disk_cache_gib": float(raw)}
+        except (TypeError, ValueError):
+            self.limits = {}
+
+
+def _resolve_budget_state(state):
+    """The state the gate should run against for THIS pull. Explicit caller state
+    wins; else the agent-registered live state; else a minimal env/disk state so
+    a state-less process (slot child) still gates. Never None — the gate always
+    runs (Part A: gate-everywhere is unconditional)."""
+    if state is not None:
+        return state
+    if _BUDGET_STATE is not None:
+        return _BUDGET_STATE
+    return _MinimalBudgetState()
+
 
 # ---------------------------------------------------------------------------
 # Central chain-of-command: refusal is AUTHORITATIVE (operator ruling, ae 1.2TB
@@ -1466,20 +1532,37 @@ def _ensure_model_present_inner(model_key: str, central_url: str | None,
         if model_is_local(canonical):
             logger.info("%s became available while waiting; using it", canonical)
             return True
-        # STORAGE BUDGET (incident 2026-07-16 — op filled to 0 bytes free).
-        # Evict-to-fit / refuse BEFORE the transfer, and INSIDE the single-flight
-        # lock: the check must see (and its evictions must land) without racing
-        # another pull of the same key. Raises BudgetRefusal when even a full
-        # FIFO can't seat this model — the caller surfaces that as MISSING with a
-        # reason instead of starting a doomed download.
-        if state is not None:
-            from .budget import evict_to_fit
-            need = central_total_bytes(central_url, canonical)
-            if need:
-                evict_to_fit(state, canonical, need)
-            else:
-                logger.info("budget: no manifest size for %s — pulling without a "
-                            "fit check (size unknown)", canonical)
+        # STORAGE BUDGET (incident 2026-07-16 — op filled to 0 bytes free; and the
+        # 2026-07-17 ae incident — an UNGATED entry pulled chunks onto an over-cap
+        # store while a different pid was actively REFUSING the same model).
+        #
+        # Part A (slice 8): the gate is now UNCONDITIONAL — every transfer entry
+        # runs it before the first byte, not only callers that threaded a state.
+        # A state-less caller (/redownload; the slot child, a separate process)
+        # resolves a budget state via _resolve_budget_state (the agent's live
+        # state in-process, else a minimal env/disk state) so no path can download
+        # atop the cap. Evict-to-fit / refuse runs INSIDE the single-flight lock:
+        # the check must see (and its evictions must land) without racing another
+        # pull of the same key. Raises BudgetRefusal when even a full FIFO can't
+        # seat the model — the caller surfaces MISSING-with-a-reason.
+        #
+        # RESUME SEMANTICS (do not re-refuse an ALREADY-ADMITTED pull into a
+        # wedge): fit_plan counts the bytes THIS model already has on disk as
+        # headroom it doesn't need to re-take (its `have`/`delta` split), so a
+        # resumed/partial pull asks the gate only for its REMAINING delta, not the
+        # whole size again. A model that was admitted, started, and is resuming
+        # therefore re-passes the gate for free (delta shrinks as .part grows) and
+        # is never refused into a half-downloaded wedge. The verify-pass re-fetch
+        # (fetch_from_central's _run_unit) lives BELOW this gate, inside an
+        # already-admitted _provision_now, so it never re-enters here.
+        gate_state = _resolve_budget_state(state)
+        from .budget import evict_to_fit
+        need = central_total_bytes(central_url, canonical)
+        if need:
+            evict_to_fit(gate_state, canonical, need)
+        else:
+            logger.info("budget: no manifest size for %s — pulling without a "
+                        "fit check (size unknown)", canonical)
         return _provision_now(canonical, central_url, progress=progress)
     finally:
         lock.release()

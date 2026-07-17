@@ -191,21 +191,27 @@ class _patched_defaults:
         wr._IMMUTABLE_WARM_DEFAULTS = self.orig
 
 
-# an ae-like box: a big inventory, a couple defaults on disk, a few pins.
+# an ae-like box: a big on-disk set, a couple defaults on disk, a few pins.
+# NB the warm set reads ``models_local`` (heartbeat DISK TRUTH, UTIL-08) — the
+# ``models`` key is the operator DESIGNATION set and must never feed warming.
 _INV = ["junk-%d" % i for i in range(40)]
+_ON_DISK = ["def-chat", "def-vl"] + _INV + ["pin-x", "pin-off"]
 INV_WORKER = {
     "id": "wbig", "name": "aebox",
-    "models": ["def-chat", "def-vl"] + _INV + ["pin-x", "pin-off"],
+    "models": _ON_DISK,
+    "models_local": _ON_DISK,
     "config": {"pinned": {"pin-x": True, "pin-off": False}},
 }
 
 
-def test_curated_set_is_defaults_plus_pins_present_not_inventory():
+def test_curated_set_is_defaults_only_pins_excluded():
+    # 📌 pins are NOT warmed (operator ruling 2026-07-17: pin has no bearing on
+    # the pull; warming an absent pin CAUSES a pull — the ae evict→re-pull
+    # thrash). Only present defaults warm; the pinned-true entry stays lazy.
     with _patched_defaults({"def-chat", "def-vl", "def-not-on-disk"}):
         warm = wr._reconcile_warm_set(INV_WORKER)
-    # defaults present + pinned-true present — nothing from the 40-item inventory,
-    # not the absent default, not the pinned-false entry.
-    assert warm == ["def-chat", "def-vl", "pin-x"], warm
+    assert warm == ["def-chat", "def-vl"], warm
+    assert "pin-x" not in warm
 
 
 def test_curated_set_drops_the_whole_inventory():
@@ -218,7 +224,8 @@ def test_curated_set_drops_the_whole_inventory():
 def test_curated_set_honors_absent_default_is_not_invented():
     # A fleet default the box does NOT have on disk is never warmed (you can't
     # keep warm what isn't there) — guards against warming a missing model_key.
-    w = {"id": "w", "models": ["only-this"], "config": {}}
+    w = {"id": "w", "models": ["only-this"], "models_local": ["only-this"],
+         "config": {}}
     with _patched_defaults({"some-default", "another"}):
         assert wr._reconcile_warm_set(w) == []
 
@@ -226,6 +233,7 @@ def test_curated_set_honors_absent_default_is_not_invented():
 def test_curated_set_forward_compat_warm_whitelist_and_static():
     # config schema has neither today; honor them if a future writer sets them.
     w = {"id": "w", "models": ["a", "b", "c", "d"],
+         "models_local": ["a", "b", "c", "d"],
          "config": {"warm_whitelist": ["a"], "residency": {"b": "static", "c": "on_demand"}}}
     with _patched_defaults(set()):
         warm = wr._reconcile_warm_set(w)

@@ -1770,16 +1770,19 @@ def _store_root_copy_path(mk: str, cfg) -> str:
 
 def _reap_scan(state: "WorkerState") -> dict:
     """The reaper's read-only survey: which local model files are RECLAIMABLE
-    (on disk, but not assigned / static / loaded / loading), and which are
-    PROTECTED (and why). Never touches comfy rows — those are symlinks into the
-    operator's ComfyUI, not this worker's downloads.
+    (on disk, but not static / loaded / loading / provisioning, on a reapable
+    non-shared store), and which are PROTECTED (and why). Never touches comfy
+    rows — those are symlinks into the operator's ComfyUI, not this worker's
+    downloads.
 
-    📌 pin is NOT a protection reason here (operator, 2026-07-17): pin designates
-    only that the allocation/routing survives restarts — no bearing on eviction.
-    A pinned model's files are reclaimable; the pin survives the delete.
+    📌 pin AND assignment are NOT protection reasons here (operator, 2026-07-17):
+    both designate only ROUTING/attribution that survives restarts — no bearing on
+    eviction. An assigned OR pinned model's files are reclaimable; the assignment/
+    pin survives the delete and the bytes re-pull on next call. (Slice 7 aligned
+    the bulk path with budget._is_protected and central's proposal chain.)
 
     This is advisory: /reap re-checks every guard at delete time, because state
-    (an assign, a load, a pull) can change between preview and reclaim.
+    (a load, a pull) can change between preview and reclaim.
     """
     try:
         from .imports import get_models_dict, get_model_config, get_model_path
@@ -1886,19 +1889,26 @@ def _reap_scan(state: "WorkerState") -> dict:
                    else "model store not marked reapable")
             protected.append({"model_key": mk, "bytes": size, "why": why})
             continue
-        # 📌 pin does NOT protect files (operator, 2026-07-17): pin designates
-        # only that the ALLOCATION/routing survives restarts — it has no bearing
-        # on eviction/reaping. A pinned model's files are reclaimable like any
-        # other; the pin survives the delete and the bytes re-pull on next call.
-        # (assigned/static/loaded still guard here — the bulk reaper's own
-        # policy is unchanged; only pin's stale disk-shield is removed.)
+        # 📌 pin AND assignment do NOT protect files (operator, 2026-07-17):
+        # both designate only ROUTING/attribution that survives restarts — neither
+        # has any bearing on eviction/reaping. An assigned OR pinned model's files
+        # are reclaimable like any other; the assignment/pin survives the delete
+        # and the bytes re-pull on the next call. This is the BULK path catching
+        # up to the call-driven path (budget._is_protected dropped `assigned` at
+        # f1894b2): the preview and executor must agree with central's proposal
+        # chain, which already proposes assigned-but-cold models — otherwise an
+        # over-budget box whose cold models are ALL assigned (the normal case: ae
+        # designates everything) can never be cleared (slice 7, the "7 refused
+        # assigned" incident). ONLY the DURABLE-presence + live-use guards remain:
+        # 🔒static, loaded/loading; provisioning is guarded at reclaim time (a
+        # mid-pull delete corrupts the fetch). The store-reapable + shared/central
+        # sentinel gates above already ran; the path jail runs at wipe time.
         if _residency(mk) == "static":
             protected.append({"model_key": mk, "bytes": size, "why": "static"})
-        elif mk in assigned:
-            protected.append({"model_key": mk, "bytes": size, "why": "assigned"})
         elif mk in loaded or mk in loading:
             protected.append({"model_key": mk, "bytes": size, "why": "loaded"})
         else:
+            # Assigned-but-cold falls through here — a reclaimable candidate.
             # Store-root copy path travels on the row so _reap_reclaim/wipe act on
             # the hot copy — never the NAS (re-proven at delete time).
             reclaimable.append({"model_key": mk, "bytes": size, "path": path})
@@ -1927,16 +1937,18 @@ def _reap_scan(state: "WorkerState") -> dict:
 
 def _reap_reclaim(state: "WorkerState", model_keys: list[str]) -> dict:
     """Delete the local files of the named models — but ONLY after re-proving,
-    per key, that it is still reclaimable (not assigned/static/loaded/loading,
-    not comfy). The guard is re-run here, not trusted from a stale preview.
+    per key, that it is still reclaimable (not static/loaded/loading/provisioning,
+    not comfy, on a reapable non-shared store). The guard is re-run here, not
+    trusted from a stale preview.
 
-    📌 pin is deliberately NOT in that list (operator, 2026-07-17): pin
-    designates only that the allocation/routing survives restarts — no bearing
-    on eviction. A pinned model's files reap freely; the pin survives."""
+    📌 pin AND assignment are deliberately NOT in that list (operator,
+    2026-07-17): both designate only ROUTING/attribution that survives restarts —
+    no bearing on eviction. A pinned or assigned model's files reap freely; the
+    pin/assignment survives the delete and the bytes re-pull on next call. (This
+    matches budget._is_protected and central's proposal chain — see slice 7.)"""
     from .imports import get_model_config, get_model_path
     from .provision import model_is_local, wipe_model
 
-    assigned = set(state.assigned_models or [])
     # HARDEN (reaper guard): fold in slot-seated / answering models.
     # loaded_model_keys() is in-process only and MISSES models seated in the
     # slot pool that are actively serving a request. Union _slot_occupants()
@@ -1965,14 +1977,17 @@ def _reap_reclaim(state: "WorkerState", model_keys: list[str]) -> dict:
         if getattr(cfg, "framework", None) == "comfy":
             results.append({"model_key": mk, "ok": False, "reason": "comfy (symlink/operator files) — never reaped"})
             continue
-        # 📌 pin is NOT a reap guard (operator, 2026-07-17): pin means only that
-        # the allocation/routing survives restarts — no bearing on eviction. A
-        # pinned model's files are reclaimable; the pin survives the delete.
+        # 📌 pin AND assignment are NOT reap guards (operator, 2026-07-17): both
+        # mean only that ROUTING/attribution survives restarts — no bearing on
+        # eviction. A pinned OR assigned model's files are reclaimable; the pin/
+        # assignment survives the delete and the bytes re-pull on next call. This
+        # mirrors budget._is_protected (which dropped `assigned` at f1894b2) so
+        # the executor agrees with central's proposal and the scan preview — the
+        # slice-7 fix for "central proposes what the worker refuses". static +
+        # loaded/loading + provisioning still guard below; the store-reapable/
+        # shared-sentinel gates re-run inside wipe_model's path jail.
         if _residency(mk) == "static":
             results.append({"model_key": mk, "ok": False, "reason": "static"})
-            continue
-        if mk in assigned:
-            results.append({"model_key": mk, "ok": False, "reason": "assigned"})
             continue
         if mk in provisioning:
             results.append({"model_key": mk, "ok": False, "reason": "provisioning"})
@@ -2260,39 +2275,34 @@ def _storage_model_row(mk: str, size: int, loaded: set, loading: set,
     # real cause (the whole store is gated) behind a number that made the FIFO
     # look broken. The policy was always right; only this report lied.
     store_gated = bool((why_hint or "").strip())
-    # 📌 pin does NOT protect files (operator, 2026-07-17): pin means only that
-    # the allocation/routing survives restarts — no bearing on eviction. `pinned`
-    # is still reported below as ATTRIBUTION info, but it never sets `protected`.
-    # 🔒static is the durable local-presence guard; loaded/loading/provisioning
-    # are live-use guards. assigned still guards the bulk-reaper preview.
+    # 📌 pin AND assignment do NOT protect files (operator, 2026-07-17): both are
+    # ROUTING/attribution that survives restarts — no bearing on eviction. Both
+    # are still reported below as ATTRIBUTION (`pinned`/`assigned` flags + `why`),
+    # but NEITHER sets `protected`. This aligns the heartbeat row with _reap_scan,
+    # _reap_reclaim, and budget._is_protected (all of which treat assigned as a
+    # candidate) so preview, executor, and central agree (slice 7). 🔒static is the
+    # durable local-presence guard; loaded/loading/provisioning are live-use
+    # guards; the store gate (why_hint) is a hard filesystem fact.
     protected = (is_static or is_loaded or is_loading
-                 or is_provisioning or is_assigned or store_gated)
-    # Precedence for the human `why` (static > store-gate > assigned > loaded...).
-    #
-    # The store gate outranks `assigned` DELIBERATELY. `assigned` is a carve-out
-    # in budget._is_protected: a row whose why is a bare "assigned" is treated as
-    # a CANDIDATE (assignment is routing/attribution, never a disk shield —
-    # operator, 2026-07-17). But the store gate is a hard filesystem fact: those
-    # files CANNOT be deleted by the reaper no matter what central decides. On ae
-    # a store-gated model is typically ALSO assigned, so letting "assigned" win
-    # would ship protected=True/why="assigned", the carve-out would call it a
-    # candidate again, and the refusal would resume lying — the same bug, one
-    # layer down. A real, enforced reason must beat a routing label.
-    #
-    # Note pin is NOT a protection reason, so a pinned-but-otherwise-unprotected
-    # model reads why="pinned" purely as attribution while protected stays False.
+                 or is_provisioning or store_gated)
+    # Precedence for the human `why` (static > store-gate > loaded > loading >
+    # provisioning > assigned > pinned). The store gate outranks the attribution
+    # labels DELIBERATELY: those files CANNOT be deleted by the reaper regardless
+    # of central's verdict, so a real, enforced reason must beat a routing label.
+    # `assigned`/`pinned` read purely as ATTRIBUTION (protected stays False) — a
+    # bare-assigned or bare-pinned row is a reclaimable CANDIDATE.
     if is_static:
         why = "static"
     elif store_gated:
         why = why_hint
-    elif is_assigned:
-        why = "assigned"
     elif is_loaded:
         why = "loaded"
     elif is_loading:
         why = "loading"
     elif is_provisioning:
         why = "provisioning"
+    elif is_assigned:
+        why = "assigned"        # attribution only — protected stays False
     elif is_pinned:
         why = "pinned"          # attribution only — protected stays False
     else:
@@ -3089,7 +3099,10 @@ def build_app(state: "WorkerState") -> Flask:
                 pass
             ensure_model_registered(model_key, state.central_url)
             wiped = wipe_model(model_key)
-            ok = ensure_model_present(model_key, state.central_url)
+            # Gate the re-pull (Part A, slice 8): a /redownload wipes then re-pulls
+            # — it MUST run the storage gate too, or it re-fills an over-budget
+            # store the operator just tried to relieve. Pass state explicitly.
+            ok = ensure_model_present(model_key, state.central_url, state=state)
             return jsonify({"ok": bool(ok), "wiped": bool(wiped),
                             "redownloaded": bool(ok), "model_key": model_key,
                             "loaded_models": loaded_model_keys()})
@@ -5534,11 +5547,16 @@ def main(argv: list[str] | None = None) -> int:
     # in provision.py, so provisioning keeps working once central turns on
     # HUGPY_WORKER_ENROLL_REQUIRED. No-op (tokenless, exactly today's behavior)
     # when args.token is None.
-    from .provision import set_enroll_token, set_worker_id
+    from .provision import set_enroll_token, set_worker_id, set_budget_state
     set_enroll_token(args.token)
     # Identify this worker on central-transfer requests so central can apply its
     # per-worker storage budget to BACKGROUND pulls (2026-07-17 handshake).
     set_worker_id(state.worker_id)
+    # Register the live state so EVERY in-process transfer entry runs the storage
+    # gate even when its caller didn't thread `state` (Part A, slice 8): the
+    # /redownload route and any ensure_model_present(..., state=None) now gate
+    # against the real limits/assigned instead of pulling atop the cap.
+    set_budget_state(state)
 
     try:
         _register(client, state, args)

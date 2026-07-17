@@ -850,6 +850,21 @@ def storage_proposal(worker: Dict[str, Any]) -> Dict[str, Any]:
         if not protected:
             candidates.append((lp, is_pinned, b, mk))
 
+    # ── reclaimable-count trace (operator ask, 2026-07-17): "yell out the
+    # course of the reclaimable count". The worker half is traced by
+    # scan_keys_considered → scan_skip_reasons → scan_rows; this logs the
+    # CENTRAL half — rows in vs candidates out of the final-guard chain — and
+    # shouts when the chain zeroes a non-empty report (the collapse signature
+    # that cost a day to localize by hand).
+    _rows_in = len([m for m in (raw_models or []) if isinstance(m, dict) and m.get("model_key")])
+    if _rows_in and not candidates:
+        logger.warning(
+            "reclaimable collapse on %s: worker reported %d storage rows but 0 "
+            "survived central's guard chain (protected breakdown: %s)",
+            worker.get("name") or worker.get("id", "?")[:8], _rows_in,
+            {w: sum(1 for m in models_out if m.get("why") == w)
+             for w in {m.get("why") for m in models_out if m.get("protected")}})
+
     proposed: List[Dict[str, Any]] = []
     proposed_free = 0
     if over_budget and need_bytes > 0 and candidates:
@@ -980,6 +995,13 @@ def storage_proposal(worker: Dict[str, Any]) -> Dict[str, Any]:
         "budget_effective_bytes": (_as_int(storage.get("budget_effective_bytes"))) if reported else None,
         "budget_sources": (storage.get("budget_sources") or {}) if reported else {},
         "budget_cap_not_applicable": bool(storage.get("budget_cap_not_applicable")) if reported else False,
+        # AUTO-REAP MODE (slice 8, Part B) — the per-worker opt-in flag + the last
+        # time an auto-fire ran, so the console can show the mode ("auto" vs the
+        # default hand-approve) and when it last acted. Read from the WORKER record
+        # (central-owned policy), not the worker-reported storage. Default false /
+        # None — a worker never opted in reads as hand-approve, today's posture.
+        "auto_reap": bool(worker.get("auto_reap")),
+        "last_auto_reap_at": worker.get("last_auto_reap_at"),
     }
 
 
@@ -1514,6 +1536,35 @@ class WorkerStore:
             worker["pool"] = (pool or "").strip()
             return _public_view(worker)
 
+    def set_auto_reap(self, worker_id: str, enabled: bool) -> Optional[Dict[str, Any]]:
+        """Opt this worker into AUTO-REAP (slice 8, Part B; operator ask
+        2026-07-17 "there needs to be a way to auto approve this").
+
+        DEFAULT FALSE — the hand-approve flow stays the default posture (defaults
+        are promises: central does not self-approve deletions unless the operator
+        turned it on for THIS worker). When true, central's heartbeat ingest fires
+        EXACTLY the operator reap-approve flow (recompute → intersect → audit →
+        guarded relay) once per cooldown when the worker is over budget with a
+        non-empty proposal. Persisted on the worker record beside limits/pool, so
+        it survives heartbeats and is set through the same operator-gated route
+        family. Never widens the blast radius: an auto-fire reclaims at most the
+        proposal's need, exactly like a hand-approved one."""
+        with self._transaction() as workers:
+            worker = workers.get(worker_id)
+            if worker is None:
+                return None
+            worker["auto_reap"] = bool(enabled)
+            return _public_view(worker)
+
+    def record_auto_reap(self, worker_id: str, when: float) -> None:
+        """Stamp last_auto_reap_at (epoch) so the per-worker cooldown can gate the
+        next auto-fire and the console can show when auto-reap last acted. Plain
+        stamp — the eviction itself goes through the guarded relay, not here."""
+        with self._transaction() as workers:
+            worker = workers.get(worker_id)
+            if worker is not None:
+                worker["last_auto_reap_at"] = float(when)
+
     _ADMISSION_STATES = ("pending", "approved", "blocked")
 
     def set_admission(self, worker_id: str, state: str) -> Optional[Dict[str, Any]]:
@@ -1946,6 +1997,16 @@ def set_worker_pool(worker_id: str, pool: str) -> Optional[Dict[str, Any]]:
 
 def set_worker_limits(worker_id: str, limits) -> Optional[Dict[str, Any]]:
     return worker_store.set_limits(worker_id, limits)
+
+
+def set_worker_auto_reap(worker_id: str, enabled: bool) -> Optional[Dict[str, Any]]:
+    """Opt a worker into auto-reap (slice 8, Part B). Operator-gated route only."""
+    return worker_store.set_auto_reap(worker_id, enabled)
+
+
+def record_worker_auto_reap(worker_id: str, when: float) -> None:
+    """Stamp when an auto-reap last fired (cooldown gate + console)."""
+    worker_store.record_auto_reap(worker_id, when)
 
 
 def enroll_required() -> bool:

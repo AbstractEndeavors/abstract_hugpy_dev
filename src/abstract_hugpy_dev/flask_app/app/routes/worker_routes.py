@@ -42,6 +42,7 @@ from ....managers.serve.slots import SlotPool, slots_enabled, slot_install_steps
 from ..functions.imports.utils.workers import (
     required_pkg_version, pkg_index_dir, set_worker_admission, set_worker_pool,
     set_worker_limits, enroll_required, worker_storage_view,
+    set_worker_auto_reap, record_worker_auto_reap,
 )
 from ..functions.imports.utils.enrollment_tokens import (
     create_enrollment_token, verify_enrollment_token,
@@ -246,12 +247,20 @@ def _reconcile_warm_set(worker) -> list:
     if not present:
         return []
     cfg = worker.get("config") or {}
-    pinned = {k for k, v in (cfg.get("pinned") or {}).items() if v}
-    # ``residency``/``warm_whitelist`` aren't in the config schema today; honor
-    # them if a future worker/central ever sets them (forward-compat, no-op now).
+    # 📌 PIN IS NOT IN THE WARM SET (operator ruling 2026-07-17: "the pins only
+    # should designate that the model allocation survives restarts... neither
+    # [pin nor allocation] should have any bearing on the pull"). Warming a
+    # pinned model CAUSES a pull when its files are absent (warm → load →
+    # ensure_model_present → download), so pins-in-the-warm-set made pin bear
+    # on the pull — and, after an eviction, re-pulled the exact files the reap
+    # had just removed within the post-delete heartbeat-lag window (ae,
+    # 2026-07-17: the approved sweep freed 199G and reconcile re-downloaded
+    # ~91G of it minutes later). Only the tiers that PROMISE presence warm:
+    # the immutable task defaults ("defaults are promises") and 🔒static (the
+    # one durable local-presence tier), plus an explicit warm_whitelist.
     static = {k for k, v in (cfg.get("residency") or {}).items() if v == "static"}
     whitelist = set(cfg.get("warm_whitelist") or [])
-    curated = (_immutable_warm_defaults() | pinned | static | whitelist) & present
+    curated = (_immutable_warm_defaults() | static | whitelist) & present
     return sorted(curated)
 
 
@@ -731,6 +740,11 @@ def workers_heartbeat(worker_id):
                 _kick_warm(worker, warm_now, "reconcile")
     except Exception:
         pass  # readiness convergence must never fail a heartbeat
+    # AUTO-REAP (slice 8, Part B): event-driven — this beat is the trigger, no
+    # timer/daemon. Fires the guarded reap-approve flow ONLY when the worker
+    # opted in AND is over budget with a proposal AND the cooldown elapsed. Its
+    # own try/except means it can never fail a heartbeat.
+    _maybe_auto_reap(worker_id, worker)
     # Advertise the target version every beat, so a worker converges within one
     # heartbeat of central's required version changing.
     worker["required_pkg_version"] = required_pkg_version()
@@ -1223,6 +1237,128 @@ def workers_reap(worker_id):
                             timeout=120.0, action="reap")
 
 
+# ── AUTO-REAP (slice 8, Part B — opt-in, heartbeat-driven, guarded) ─────────
+# Operator ask 2026-07-17: "there needs to be a way to auto approve this". This
+# RETIRES the 'central never auto-approves' absolutism — but only as an OPT-IN
+# (auto_reap default false; the hand-approve flow stays the default posture).
+# When a worker has opted in, central's heartbeat ingest fires EXACTLY the
+# operator reap-approve flow (recompute → intersect-with-itself → audit →
+# guarded relay). NO new timer/daemon — it is driven only by the beats the
+# worker already sends. The worker-side re-prove chain (_reap_reclaim) is
+# untouched, so nothing loaded/static/provisioning/gated is ever deletable, and
+# an auto-fire reclaims at most the proposal's own need (never more).
+def _auto_reap_cooldown_s() -> float:
+    """Per-worker minimum seconds between auto-fires. Constant with an env
+    override so a wedged proposal can't hammer the relay every beat."""
+    try:
+        return float(os.environ.get("HUGPY_AUTO_REAP_COOLDOWN_S", "300"))
+    except (TypeError, ValueError):
+        return 300.0
+
+
+def _maybe_auto_reap(worker_id: str, worker: dict) -> None:
+    """Event-driven auto-reap check, run on heartbeat ingest. Fires the guarded
+    reap-approve flow ONCE when, and only when, ALL hold:
+      * the worker opted in (worker['auto_reap'] truthy);
+      * it is over budget with a NON-EMPTY proposal (the same read-only proposal
+        the console renders — proposed only when actually over budget);
+      * the per-worker cooldown has elapsed since the last auto-fire.
+    Best-effort: any failure here must never fail the heartbeat. Blast radius is
+    bounded to the proposal's own keys — central proposes exactly the `need`, and
+    the worker re-proves every guard at delete time."""
+    try:
+        if not worker.get("auto_reap"):
+            return                                    # default posture — hand-approve
+        proposal = worker_storage_view(worker_id) or {}
+        if not proposal.get("over_budget"):
+            return                                    # nothing to do
+        evictions = proposal.get("proposed_evictions") or []
+        if not evictions:
+            return                                    # over budget but nothing eligible
+        now = time.time()
+        last = worker.get("last_auto_reap_at")
+        try:
+            if last is not None and (now - float(last)) < _auto_reap_cooldown_s():
+                return                                # cooldown suppresses re-fire
+        except (TypeError, ValueError):
+            pass
+        keys = [e["model_key"] for e in evictions if e.get("model_key")]
+        if not keys:
+            return
+        # Stamp BEFORE firing so a slow relay can't let the next beat double-fire.
+        record_worker_auto_reap(worker_id, now)
+        _execute_reap(worker_id, worker, keys, trigger="auto")
+    except Exception as exc:  # noqa: BLE001 — a heartbeat must never fail on this
+        logger.warning("auto-reap check for %s skipped: %s", worker_id, exc)
+
+
+def _execute_reap(worker_id: str, worker: dict, approved_keys: list,
+                  trigger: str = "operator"):
+    """The SHARED reap-approve core used by BOTH the operator route and the
+    heartbeat auto-fire (no duplicated policy): recompute the proposal off live
+    state, INTERSECT the approved keys with it (defense against a stale render or
+    a since-protected model), AUDIT (the event name distinguishes operator vs
+    auto), and relay to the SAME guarded worker executor (/reap) where
+    _reap_reclaim re-proves every guard per key. Returns (data_dict, status).
+
+    ``trigger`` — "operator" (hand-approved) or "auto" (auto_reap fired). It only
+    changes the AUDIT event name + a marker in the result, never the guards."""
+    from .comms_routes import audit
+    proposal = worker_storage_view(worker_id) or {}
+    ev_by_key = {e["model_key"]: e
+                 for e in (proposal.get("proposed_evictions") or [])}
+    intersected = [k for k in approved_keys if k in ev_by_key]
+    dropped = [k for k in approved_keys if k not in ev_by_key]
+    approved_evictions = [ev_by_key[k] for k in intersected]
+
+    event = "worker.auto-reap" if trigger == "auto" else "worker.reap-approve"
+    audit(event, {
+        "worker_id": worker_id, "worker": worker.get("name"),
+        "trigger": trigger,
+        "approved": approved_keys, "dropped": dropped,
+        "evictions": approved_evictions,
+        "freed_estimate_bytes": sum(e.get("bytes") or 0
+                                    for e in approved_evictions),
+    })
+
+    if not intersected:
+        return {
+            "ok": True, "freed_bytes": 0, "results": [],
+            "approved": approved_keys, "reaped": [], "dropped": dropped,
+            "trigger": trigger,
+            "note": ("approved models are no longer eligible for reaping "
+                     "(loaded/assigned/pinned/provisioning, or the worker is back "
+                     "under budget) — nothing deleted"),
+        }, 200
+
+    resp, status = _relay_worker_op(
+        worker_id, "/reap", {"model_keys": intersected},
+        timeout=120.0, action=event.split(".", 1)[1])
+    data = resp.get_json(silent=True)
+    if isinstance(data, dict):
+        data.setdefault("approved", approved_keys)
+        data["reaped"] = intersected
+        data["dropped"] = dropped
+        data["trigger"] = trigger
+        return data, status
+    return {"ok": False, "trigger": trigger, "raw_status": status}, status
+
+
+@worker_bp.route("/llm/workers/<worker_id>/auto-reap", methods=["POST"])
+def workers_set_auto_reap(worker_id):
+    """Operator-gated opt-in for AUTO-REAP (slice 8, Part B). Body:
+    ``{"enabled": true|false}``. Default OFF — the hand-approve flow is the
+    default posture. When on, central's heartbeat ingest fires the guarded
+    reap-approve flow when the worker is over budget with a proposal (cooldown-
+    limited). Same operator-gated route family as limits/pool/admission."""
+    body = request.get_json(silent=True) or {}
+    enabled = bool(body.get("enabled"))
+    worker = set_worker_auto_reap(worker_id, enabled)
+    if worker is None:
+        abort(404, description="Unknown worker id.")
+    return jsonify(worker)
+
+
 @worker_bp.route("/llm/workers/<worker_id>/reap-approve", methods=["POST"])
 def workers_reap_approve(worker_id):
     """Operator-approved, LRU-guarded eviction of COLD local models when a worker
@@ -1276,53 +1412,12 @@ def workers_reap_approve(worker_id):
         abort(400, description='body must include a non-empty {"model_keys": [...]}')
     approved_keys = [str(k) for k in approved if k]
 
-    # (1)+(2) recompute + intersect — defense-in-depth against a render->approve
-    # race. The proposal is derived from the RAW record (not the public view).
-    proposal = worker_storage_view(worker_id) or {}
-    ev_by_key = {e["model_key"]: e
-                 for e in (proposal.get("proposed_evictions") or [])}
-    intersected = [k for k in approved_keys if k in ev_by_key]
-    dropped = [k for k in approved_keys if k not in ev_by_key]
-
-    # Audit the approved eviction with per-model bytes + last_picked (the exact
-    # {model_key, bytes, last_picked} rows the console rendered), plus what the
-    # central intersection dropped.
-    from .comms_routes import audit
-    approved_evictions = [ev_by_key[k] for k in intersected]
-    audit("worker.reap-approve", {
-        "worker_id": worker_id, "worker": worker.get("name"),
-        "approved": approved_keys, "dropped": dropped,
-        "evictions": approved_evictions,
-        "freed_estimate_bytes": sum(e.get("bytes") or 0
-                                    for e in approved_evictions),
-    })
-
-    if not intersected:
-        # Everything approved has since become protected or is no longer over
-        # budget. Report it as data (not a 5xx) so the console explains the drop.
-        return jsonify({
-            "ok": True, "freed_bytes": 0, "results": [],
-            "approved": approved_keys, "reaped": [], "dropped": dropped,
-            "note": ("approved models are no longer eligible for reaping "
-                     "(loaded/assigned/pinned/provisioning, or the worker is back "
-                     "under budget) — nothing deleted"),
-        })
-
-    # (3) delegate to the SAME guarded reaper relay; the worker re-proves every
-    # guard per key at delete time (the single delete path — never trusts a
-    # preview). _relay_worker_op audits worker.reap-approve too.
-    resp, status = _relay_worker_op(
-        worker_id, "/reap", {"model_keys": intersected},
-        timeout=120.0, action="reap-approve")
-    # Fold the central intersection outcome into the reaper's typed result so the
-    # console shows deleted-vs-skipped AND anything central dropped pre-relay.
-    data = resp.get_json(silent=True)
-    if isinstance(data, dict):
-        data.setdefault("approved", approved_keys)
-        data["reaped"] = intersected
-        data["dropped"] = dropped
-        return jsonify(data), status
-    return resp, status
+    # The recompute → intersect → audit → guarded relay core is SHARED with the
+    # heartbeat auto-fire (_execute_reap) so the two can never diverge; here the
+    # trigger is "operator" (hand-approved), which only changes the audit event.
+    data, status = _execute_reap(worker_id, worker, approved_keys,
+                                 trigger="operator")
+    return jsonify(data), status
 
 
 @worker_bp.route("/llm/workers/<worker_id>/update", methods=["POST"])

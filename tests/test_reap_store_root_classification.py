@@ -88,11 +88,9 @@ def test_store_root_copy_makes_the_model_a_candidate(stub_scan):
     complete store-root copy exists → the row must classify RECLAIMABLE with the
     HOT path + bytes, not "shared/central — never reaped".
 
-    The model is NOT in the assigned set here: an assigned row is protected as
-    "assigned" (a routing label budget._is_protected then carves back OUT to a
-    candidate), which would mask what this test proves — that the SHARED gate no
-    longer fires because the hot copy is what gets classified. Registry-only
-    (a staple/leftover) isolates exactly that."""
+    (Uses assigned=[] to isolate the SHARED-gate → hot-copy behaviour cleanly;
+    since slice 7 an assigned model is ALSO a reclaimable candidate, so the set
+    membership no longer changes the classification here either way.)"""
     stub_scan.setattr(A, "_store_root_copy_path", lambda mk, cfg: HOT)
     scan = A._reap_scan(_State(assigned=[]))
     assert scan["protected"] == []            # NOT shared-protected anymore
@@ -161,8 +159,9 @@ def test_scan_error_is_carried_and_never_a_bare_empty_list(stub_scan):
     scan = A._reap_scan(_State(assigned=["Owner~Repo"]))
     assert scan["error"].startswith("get_models_dict:")
     # The registry blew up, but the assignment key still produced a real row.
-    # (assigned → protected "assigned", which budget._is_protected carves back to
-    # a candidate; the point here is that a row exists at all and is not empty.)
+    # (assigned is NOT a protection reason as of slice 7 — an assigned-but-cold
+    # model is a reclaimable CANDIDATE; the point here is that a row exists at all
+    # and the scan is not empty.)
     assert scan["scan_rows"] == 1
     assert scan["scan_keys_considered"] >= 1
     assert (scan["reclaimable"] or scan["protected"])      # a real row, not empty
