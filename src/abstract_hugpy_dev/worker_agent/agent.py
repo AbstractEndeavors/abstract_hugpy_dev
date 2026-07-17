@@ -3008,6 +3008,46 @@ def build_app(state: "WorkerState") -> Flask:
                 settings["ctx_pct"] = cmerged
             else:
                 settings.pop("ctx_pct", None)
+        # t21 tolerance bands + priority (per-model maps, siblings of ctx_pct).
+        # A deviation is a percent-of-total tolerance (0..100; 0 == no band);
+        # priority is a non-negative integer (0 == normal). Same deep-merge /
+        # null-clears shape as ctx_pct. Additive + optional so a released worker
+        # that doesn't know these keys simply ignores them (no schema forbid on
+        # /ops/config) — the relay-wire landmine does not apply here.
+        for _band_key, _lo, _hi, _isint in (
+                ("ctx_deviation_pct", 0, 100, False),
+                ("vram_deviation_pct", 0, 100, False),
+                ("ram_deviation_pct", 0, 100, False),
+                ("priority", 0, None, True)):
+            if _band_key not in body:
+                continue
+            if not isinstance(body[_band_key], dict):
+                return jsonify({"ok": False, "error": {
+                    "code": "BadValue",
+                    "message": f'{_band_key} must be {{"<model_key>": number | null}}'}}), 400
+            _merged = dict(settings.get(_band_key) or {})
+            for mk, val in body[_band_key].items():
+                # Only explicit null/"" clears (see ctx_pct: 0 == False in Python
+                # so match None/"" exactly rather than truthiness).
+                if val is None or val == "":
+                    _merged.pop(mk, None)
+                    continue
+                try:
+                    pv = int(val) if _isint else float(val)
+                except (TypeError, ValueError):
+                    return jsonify({"ok": False, "error": {
+                        "code": "BadValue",
+                        "message": f"{_band_key}[{mk!r}] must be a number or null"}}), 400
+                if pv < _lo or (_hi is not None and pv > _hi):
+                    hi_txt = _hi if _hi is not None else "∞"
+                    return jsonify({"ok": False, "error": {
+                        "code": "BadValue",
+                        "message": f"{_band_key}[{mk!r}]={pv} out of range — must be {_lo}..{hi_txt}"}}), 400
+                _merged[mk] = pv
+            if _merged:
+                settings[_band_key] = _merged
+            else:
+                settings.pop(_band_key, None)
         if "comfy_url" in body:
             # Adopted-ComfyUI base URL (probe + job submission read it as the
             # COMFY_URL env). Settable here so central/console can point a worker
@@ -3844,9 +3884,22 @@ def _update_state_path(args) -> str:
 _SETTINGS_KEYS = {"slot_count", "residency", "on_demand_ttl_s",
                   "reconcile_interval_s", "pinned", "comfy_url",
                   "hot_cache_root", "profiles", "model_profiles",
-                  "ctx_pct"}   # widen key by key (ctx_pct: per-model context %, slice 11)
+                  "ctx_pct",   # widen key by key (ctx_pct: per-model context %, slice 11)
+                  # t21 tolerance bands (per-model maps, siblings of ctx_pct):
+                  # the deviation% each explicit allocation may flex under
+                  # contention, plus a compress-others priority. Populated by
+                  # central's projection of the spill bands (release-time bridge);
+                  # the flex engine (_vram_evict_to_fit) reads them here.
+                  "ctx_deviation_pct", "vram_deviation_pct",
+                  "ram_deviation_pct", "priority"}
 _SETTINGS_SOURCE: dict = {}              # key -> "settings" | "env" | "default"
 _RUNTIME_SETTINGS: dict = {}             # the loaded settings, for live readers
+# t21 flex: the ctx% the VRAM admission engine COMMITTED a model to under
+# contention (compressed toward its ctx band floor to fit without evicting). It
+# is read by _ctx_pct so the SERVED -c matches the KV admission reserved — never
+# reserve-small-then-serve-large (that OOMs). Cleared when the model is evicted
+# or when it later fits at target (uncontended). Empty == no active flex.
+_FLEX_CTX_FLOOR: dict = {}               # model_key -> committed compressed ctx%
 _COMFY_URL_BASE_ENV = "_HUGPY_COMFY_URL_BASE"  # sentinel: the pre-projection
 # COMFY_URL (systemd drop-in / env / none), captured once and carried across
 # os.execv so clearing the setting reverts to the real base, never the last
@@ -4027,7 +4080,18 @@ def _model_max_ctx(model_key: str, cfg: dict | None = None) -> int | None:
 def _ctx_pct(model_key: str) -> int | None:
     """Per-model ctx allocation percentage (1-100) from the worker settings map
     (same seam as residency/pinned). None when unset -> today's default ctx
-    behavior is byte-identical (no ctx_pct term forced)."""
+    behavior is byte-identical (no ctx_pct term forced).
+
+    t21: when the VRAM admission engine has COMMITTED this model to a compressed
+    ctx to fit under contention (_FLEX_CTX_FLOOR), that floor WINS — the served
+    -c must match the KV the admission reserved. The commit is itself within the
+    model's ctx band (never below the floor), so it is always a valid 1..100."""
+    floored = _FLEX_CTX_FLOOR.get(model_key)
+    if floored is not None:
+        try:
+            return max(1, min(100, int(floored)))
+        except (TypeError, ValueError):
+            pass
     val = (_RUNTIME_SETTINGS.get("ctx_pct") or {}).get(model_key)
     try:
         v = int(val)
@@ -4038,6 +4102,38 @@ def _ctx_pct(model_key: str) -> int | None:
     if v > 100:
         return 100
     return v
+
+
+def _ctx_deviation_pct(model_key: str) -> "float | None":
+    """Per-model ctx tolerance band (percent points, 0..100) from settings, or
+    None when unset. t21: how far the ctx allocation may flex under contention
+    (ctx is the cheapest flex). Reads the target ctx_pct from _RUNTIME_SETTINGS,
+    NOT the _FLEX_CTX_FLOOR override, so the band is always relative to the
+    operator's target, not a prior compression."""
+    val = (_RUNTIME_SETTINGS.get("ctx_deviation_pct") or {}).get(model_key)
+    try:
+        d = float(val)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, min(100.0, d))
+
+
+def _flex_priority(model_key: str) -> int:
+    """Per-model flex priority (0 == normal) from settings, via the ONE seam
+    (flex.flex_priority_key). Higher compresses/evicts lower-priority neighbours
+    first. The operator may change the priority SOURCE — see flex.py."""
+    from .flex import flex_priority_key
+    return flex_priority_key(
+        {"priority": (_RUNTIME_SETTINGS.get("priority") or {}).get(model_key)})
+
+
+def _flex_alloc(model_key: str) -> dict:
+    """The per-model explicit-allocation view the flex engine consumes:
+    ``{"priority", "ctx_deviation_pct"}``. Central projects the spill bands into
+    the settings maps this reads (release-time bridge); tests populate them
+    directly. Kept tiny + pure-ish so building subject/resident rows is cheap."""
+    return {"priority": (_RUNTIME_SETTINGS.get("priority") or {}).get(model_key),
+            "ctx_deviation_pct": _ctx_deviation_pct(model_key)}
 
 
 def _resolved_ctx(model_key: str, cfg: dict | None = None) -> "tuple[int | None, int | None, int | None]":
@@ -4448,6 +4544,9 @@ def _evict_model(state: "WorkerState", model_key: str,
                 "vram_freed": None, "ram_freed": None,
                 "reason": "missing model_key"}
     model_key = model_key.strip()
+    # t21: an evicted model's ctx flex commitment is void — a fresh load
+    # re-decides from target. Drop it so _ctx_pct doesn't serve a stale floor.
+    _FLEX_CTX_FLOOR.pop(model_key, None)
 
     vram_before = _free_vram_bytes()
     ram_before = _free_ram_bytes()
@@ -4687,6 +4786,10 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
        "freed_bytes": int, "reason": {...}|None}
     Fails OPEN (proceed) whenever VRAM/need is unmeasurable — an unmeasurable load
     proceeds exactly as today, never blocked because we couldn't measure."""
+    # t21: every admission re-decides from TARGET — drop any stale ctx flex
+    # commitment for this subject so the fit check below is against the
+    # operator's target ctx, not a prior compression (uncontended == target).
+    _FLEX_CTX_FLOOR.pop(model_key, None)
     total = _total_vram_bytes()
     if not total:
         return {"action": "proceed", "evicted": [], "freed_bytes": 0,
@@ -4716,7 +4819,7 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
     if ok:
         return {"action": "proceed", "evicted": [], "freed_bytes": 0, "reason": None}
 
-    # Over the ceiling — plan the minimum LRU eviction set.
+    # Over the ceiling — plan the minimum eviction set.
     busy_slots = _busy_slot_models()
     queued_ahead = _queued_ahead_of(model_key)
     try:
@@ -4747,10 +4850,67 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
             continue
         candidates.append(r)
 
-    # LRU order: coldest last-served first (a never-served warmed resident sorts
-    # oldest and yields first — exactly right). Then a larger candidate first
-    # among equal-age so we clear the ceiling in the fewest evictions.
-    candidates.sort(key=lambda r: (lru.get(r["model_key"], 0.0),
+    # ── t21 tolerance-band FLEX before evict (stage 1) ──────────────────────
+    # Try to fit WITHIN bands before evicting anyone. ctx is the CHEAPEST flex,
+    # so plan_flex (1) compresses the SUBJECT's own ctx toward its band floor,
+    # then (2) — for a strictly higher-priority subject — reclaims resident KV
+    # from lower-priority, UNPROTECTED neighbours within THEIR ctx bands.
+    # Protection is absolute: only `candidates` (already protection-filtered
+    # above) are offered as flex-eligible neighbours. The pure decision lives in
+    # flex.plan_flex; here we EXECUTE the piece that is safe worker-side now —
+    # the subject's own ctx compression, which lowers `need` so fewer (or no)
+    # residents must be evicted. In-place neighbour KV-shrink rides worker
+    # enforcement (next cut); until then a higher-priority subject's precedence
+    # manifests as the priority-ordered eviction below.
+    from .flex import plan_flex, flex_priority_key as _fpk, kv_at_ctx_pct as _kvat
+    flex_note = None
+    fv_now = _free_vram_bytes()
+    if fv_now is not None:
+        deficit = ceiling_reserve - (fv_now - need)      # >0 here (ok was False)
+        subject = {"weights_bytes": _det.get("weights"), "kv_bytes": _det.get("kv"),
+                   "ctx_pct": _det.get("ctx_pct"),
+                   "ctx_deviation_pct": _ctx_deviation_pct(model_key),
+                   "priority": _flex_priority(model_key)}
+        resident_rows = []
+        for r in candidates:                             # unprotected only
+            mk = r["model_key"]
+            try:
+                rkv, rdet = _kv_need_bytes(mk)
+            except Exception:  # noqa: BLE001 — a pricing gap must not break admission
+                rkv, rdet = 0, {}
+            resident_rows.append({
+                "model_key": mk, "kv_bytes": int(rkv or 0),
+                "ctx_pct": (rdet or {}).get("ctx_pct"),
+                "ctx_deviation_pct": _ctx_deviation_pct(mk),
+                "vram_bytes": int(r.get("vram_bytes") or 0),
+                "protected": False, "pinned": bool(r.get("pinned")),
+                "alloc": _flex_alloc(mk)})
+        plan = plan_flex(subject, resident_rows, deficit)
+        if plan.self_ctx_pct is not None and _det.get("kv"):
+            # Commit the subject to its compressed ctx so the SERVED -c and the
+            # KV admission reserved agree, and re-price `need` at that floor. The
+            # captured _fits() closure re-reads `need`, so this shrinks the fit
+            # target for both the flex re-check and the eviction loop.
+            _FLEX_CTX_FLOOR[model_key] = int(plan.self_ctx_pct)
+            new_kv = _kvat(_det.get("kv"), _det.get("ctx_pct"), plan.self_ctx_pct)
+            need = int(_det.get("weights") or 0) + int(new_kv or 0)
+        if plan.action == "flex" and _fits():
+            # Fits WITHIN bands — no eviction. (Neighbour compression in the plan
+            # is realised as reduced eviction / priority order until in-place
+            # resident shrink lands; self-flex alone already cleared the ceiling.)
+            return {"action": "proceed", "evicted": [], "freed_bytes": 0,
+                    "reason": None, "note": f"flex: {plan.note}",
+                    "flex": plan.as_dict()}
+        flex_note = plan.note
+
+    # ── stage 2: EVICT, lowest flex-priority first, then today's LRU order ───
+    # Priority-ascending so a higher-priority subject yields lower-priority
+    # neighbours BEFORE higher ones (the operator's "explicit priorities"); then
+    # coldest-first (LRU), then largest-first among equal age. With no priorities
+    # set (the default, priority==0 everywhere) this is byte-identical to the
+    # prior pure-LRU order.
+    candidates.sort(key=lambda r: (_fpk(_flex_alloc(r["model_key"])),
+                                   lru.get(r["model_key"], 0.0),
                                    -int(r.get("vram_bytes") or 0)))
 
     evicted: list[str] = []
@@ -4807,6 +4967,11 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
                        "host_mode": p.get("host_mode"), "why": p.get("why")}
                       for p in protected],
     }
+    if flex_note:
+        reason["flex_note"] = flex_note      # what the band flex tried, for hover
+    # The load is refused — void any ctx compression we committed for it so a
+    # future admission of this model re-decides from its target ctx.
+    _FLEX_CTX_FLOOR.pop(model_key, None)
     return {"action": "refuse", "evicted": evicted, "freed_bytes": freed,
             "reason": reason}
 

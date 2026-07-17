@@ -966,6 +966,12 @@ def central_provisioning():
 @worker_bp.route("/llm/workers/<worker_id>/assign", methods=["POST"])
 def workers_assign(worker_id):
     body = AssignRequest(**(request.get_json(silent=True) or {}))
+    # t21: range-check any tolerance-band keys on the spill (same guard the bulk
+    # path applies). The spill is a free-form dict on AssignRequest, so this is
+    # the single path's only band validation.
+    band_reason = _validate_band_values(body.spill)
+    if band_reason is not None:
+        return jsonify({"error": band_reason}), 400
     if body.model_key not in get_models_dict(dict_return=True):
         # JSON (not abort's HTML) so the UI surfaces a clean reason instead of a
         # raw 404 page. A key that isn't in the manifest is usually a name-vs-key
@@ -1409,8 +1415,15 @@ def workers_residency_all(worker_id):
 #   max GPU  -> {"n_gpu_layers": -1}   (all layers on GPU)
 #   CPU only -> {"n_gpu_layers": "off"}
 #   custom   -> {"gpu_mem_gib"?, "cpu_mem_gib"?, "threads"?}  explicit budgets
+# t21 tolerance-band keys ride the SAME spill contract (the explicit allocation),
+# additive + optional. gpu/cpu deviations are percent-of-honest-whole bands around
+# the gpu_mem_gib/cpu_mem_gib targets; ctx_pct is the CTX target (percent of the
+# model's max context) and ctx_deviation_pct its band; priority (int >=0, 0=normal)
+# lets a higher-priority allocation compress lower ones within their bands first.
+_BAND_SPILL_KEYS = {"gpu_mem_gib_deviation_pct", "cpu_mem_gib_deviation_pct",
+                    "ctx_pct", "ctx_deviation_pct", "priority"}
 _ALLOC_SPILL_KEYS = {"n_gpu_layers", "gpu_mem_gib", "cpu_mem_gib",
-                     "threads", "tensor_split"}
+                     "threads", "tensor_split"} | _BAND_SPILL_KEYS
 
 
 def _validate_alloc_spill(spill):
@@ -1434,7 +1447,45 @@ def _validate_alloc_spill(spill):
             isinstance(ngl, int) or ngl in ("auto", "off")
             or (isinstance(ngl, str) and ngl.lstrip("-").isdigit())):
         return None, 'n_gpu_layers must be an int, "auto", or "off"'
+    band_reason = _validate_band_values(spill)
+    if band_reason is not None:
+        return None, band_reason
     return dict(spill), None
+
+
+def _validate_band_values(spill) -> "str | None":
+    """Range-check the t21 tolerance-band keys on a spill, or None if clean.
+
+    Consumption clamps defensively (flex.band_bounds / ctx_band_bounds), so this
+    is a UX guard that rejects an obviously-wrong number at the door rather than a
+    safety gate. Shared by the single (/assign) and bulk (/alloc-all) paths so both
+    reject identically. Absent keys are fine (the bands are opt-in)."""
+    if not isinstance(spill, dict):
+        return None
+    for k in ("gpu_mem_gib_deviation_pct", "cpu_mem_gib_deviation_pct",
+              "ctx_deviation_pct"):
+        if k in spill and spill[k] is not None:
+            try:
+                v = float(spill[k])
+            except (TypeError, ValueError):
+                return f"{k} must be a number 0..100 (percent-of-total band)"
+            if not (0.0 <= v <= 100.0):
+                return f"{k}={spill[k]} out of range — must be 0..100"
+    if "ctx_pct" in spill and spill["ctx_pct"] is not None:
+        try:
+            v = int(spill["ctx_pct"])
+        except (TypeError, ValueError):
+            return "ctx_pct must be an integer 1..100 (percent of max context)"
+        if not (1 <= v <= 100):
+            return f"ctx_pct={spill['ctx_pct']} out of range — must be 1..100"
+    if "priority" in spill and spill["priority"] is not None:
+        try:
+            v = int(spill["priority"])
+        except (TypeError, ValueError):
+            return "priority must be a non-negative integer (0 = normal)"
+        if v < 0:
+            return f"priority={spill['priority']} out of range — must be >= 0"
+    return None
 
 
 # ── engine gating (operator ruling 2026-07-17, NARROWED by t26) ─────────────
@@ -1454,7 +1505,11 @@ def _validate_alloc_spill(spill):
 # transformers_max_memory / n_gpu_layers_intent — all-on-GPU / CPU-only /
 # fit-and-spill), so they are NO LONGER dead knobs for transformers and apply to
 # every engine. Only the explicit class skips/409s on non-GGUF.
-_EXPLICIT_BUDGET_KEYS = {"gpu_mem_gib", "cpu_mem_gib", "threads", "tensor_split"}
+# t21 bands ride the explicit allocation and are GGUF-only just like the budgets
+# they band (spec: "explicit budgets are GGUF-only"; the UI gates them the same
+# way). So a spill carrying ONLY a band/priority is still classified GGUF-only.
+_EXPLICIT_BUDGET_KEYS = ({"gpu_mem_gib", "cpu_mem_gib", "threads", "tensor_split"}
+                         | _BAND_SPILL_KEYS)
 
 
 def _alloc_is_gguf_only(spill) -> bool:
@@ -1943,10 +1998,35 @@ def _worker_fit(model_key, worker):
     fit = (need_raw <= capacity) if capacity else None
     gpu_resident = (vram is not None) and (need <= vram)
     where = worker.get("gpu") or "this worker"
+    # ── t21 central mirror: a model carrying an explicit VRAM tolerance band may,
+    # UNDER CONTENTION, be seated at its band FLOOR (a smaller gpu_mem_gib =
+    # fewer GPU layers, more CPU spill) rather than its target. So the feasibility
+    # math accepts the band floor as admissible even when the target doesn't fit
+    # free VRAM. Pure read of central's spill registry via the ONE band-math seam;
+    # additive fields, never changes the base fit/gpu_resident verdict.
+    band_floor_bytes = None
+    band_floor_admissible = None
+    spill = (worker.get("spill_by_model") or {}).get(model_key) or {}
+    gpu_target_gib = spill.get("gpu_mem_gib")
+    gpu_dev = spill.get("gpu_mem_gib_deviation_pct")
+    vram_total = worker.get("vram_total")
+    if gpu_target_gib is not None and gpu_dev and vram_total:
+        try:
+            from ....worker_agent.flex import band_floor as _band_floor
+            band_floor_bytes = int(_band_floor(
+                float(gpu_target_gib) * gib, gpu_dev, vram_total))
+            if vram is not None:
+                band_floor_admissible = band_floor_bytes <= vram
+        except Exception:  # noqa: BLE001 — band math is additive; never break fit
+            band_floor_bytes = None
     if fit is False:
         reason = (f"won't fit {where}: model is {need_raw/gib:.1f} GiB but only "
                   f"{(vram or 0)/gib:.1f} GiB VRAM + {(ram or 0)/gib:.1f} GiB RAM free "
                   f"({capacity/gib:.1f} GiB total)")
+    elif fit and not gpu_resident and band_floor_admissible:
+        reason = (f"fits GPU-resident at its VRAM band floor ({band_floor_bytes/gib:.1f} "
+                  f"GiB) under contention — target would offload to CPU; "
+                  f"{(vram or 0)/gib:.1f} GiB VRAM free on {where}")
     elif fit and not gpu_resident:
         reason = (f"fits but would partially offload to CPU: needs ~{need/gib:.1f} GiB, "
                   f"only {(vram or 0)/gib:.1f} GiB VRAM free on {where} — slower than GPU-resident")
@@ -1954,7 +2034,9 @@ def _worker_fit(model_key, worker):
         reason = None
     return {"fit": fit, "gpu_resident": gpu_resident, "need": need, "need_raw": need_raw,
             "vram_free": vram, "ram_free": ram, "capacity": capacity,
-            "headroom": VRAM_HEADROOM, "reason": reason}
+            "headroom": VRAM_HEADROOM, "reason": reason,
+            "band_floor_bytes": band_floor_bytes,
+            "band_floor_admissible": band_floor_admissible}
 
 
 def _worker_already_has(worker: dict, model_key: str) -> bool:

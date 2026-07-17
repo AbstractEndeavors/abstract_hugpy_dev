@@ -53,7 +53,30 @@ SLOT_PORT = int(os.environ.get("SLOT_PORT", str(_default_port())))
 SLOT_CHILD_PORT = int(os.environ.get("SLOT_CHILD_PORT", str(SLOT_PORT + 1000)))
 SLOT_ADVERTISE = os.environ.get("SLOT_ADVERTISE", "127.0.0.1")
 MAIN_GPU = os.environ.get("MAIN_GPU")
+# The FLOOR for the load hard-cap (back-compat: was the whole deadline). A cold
+# load gets at LEAST this long regardless of size.
 HEALTH_TIMEOUT = float(os.environ.get("SLOT_HEALTH_TIMEOUT", "180"))
+# STALL window (slice 12): the honest failure signal is a load making NO forward
+# progress (child RSS not growing / VRAM not dropping) for this long — NOT a
+# blind clock that ignores size. A 45.9G gguf cold-load off NVMe legitimately
+# exceeds 180s; killing it at the old flat deadline re-pages 46G every retry (the
+# ae thrash loop). We fail on STALL, not on the clock.
+STALL_TIMEOUT = float(os.environ.get("SLOT_LOAD_STALL_TIMEOUT", "60"))
+# The GENEROUS-BUT-BOUNDED hard cap: a truly-wedged child that somehow keeps
+# nudging RSS must still die eventually. Size-scaled — base + expected_bytes /
+# assumed throughput — with the HEALTH_TIMEOUT floor. Assumed effective cold-load
+# throughput (bytes/s): NVMe read + CUDA upload + repack; conservative so the cap
+# is generous. Override the divisor via env for a slow-disk box.
+_LOAD_THROUGHPUT_BPS = float(
+    os.environ.get("SLOT_LOAD_THROUGHPUT_MBPS", "200")) * 1024 * 1024  # 200 MB/s
+_HARD_CAP_MULT = float(os.environ.get("SLOT_LOAD_HARD_CAP_MULT", "3.0"))
+# Bytes-of-progress that count as "real" movement between samples (filter noise).
+_PROGRESS_EPSILON = 8 * 1024 * 1024   # 8 MiB
+# Repeated-failure backoff (slice 12): after N genuine load failures for a model,
+# refuse re-attempts for base × 2^(N-1), capped, so a doomed load doesn't re-page
+# 46G on every request. Success clears the counter.
+_LOAD_BACKOFF_BASE_S = float(os.environ.get("SLOT_LOAD_BACKOFF_BASE_S", "30"))
+_LOAD_BACKOFF_MAX_S = float(os.environ.get("SLOT_LOAD_BACKOFF_MAX_S", "600"))
 
 
 def _allowed_cpus():
@@ -391,6 +414,15 @@ class Slot:
         self.expected_bytes = None
         self.loaded_at = 0.0
         self.last_used = 0.0
+        # Free VRAM sampled at the start of the CURRENT load (slice 12): the
+        # baseline the stall-detector measures VRAM-consumed against.
+        self._load_free_vram_at_start = None
+        # Repeated-failure backoff (slice 12): consecutive genuine load failures
+        # for a model_key + when the last one happened, so per-request re-attempts
+        # don't hammer a doomed 46G re-page. Plus the last honest failure reason.
+        self._load_failures: dict = {}          # model_key -> consecutive count
+        self._load_backoff_until: dict = {}      # model_key -> epoch (retry after)
+        self.last_load_error: "str | None" = None
         self.lock = threading.Lock()
         # llama_cpp.server (python child) cannot take CONCURRENT streaming
         # requests — overlapping streams kill BOTH with an incomplete chunked
@@ -486,6 +518,10 @@ class Slot:
             # slot occupant's REAL VRAM (its type/ngl guess is not ground truth).
             "child_pid": self.proc.pid if self._child_alive() else None,
             "expected_bytes": self.expected_bytes,
+            # The last honest load-failure reason + backoff (slice 12), so the
+            # console can show WHY a model's row is degraded/retrying instead of a
+            # silent tight loop. None once a load succeeds.
+            "last_load_error": self.last_load_error,
         }
 
     # -- lifecycle ---------------------------------------------------------
@@ -496,6 +532,17 @@ class Slot:
             if self.model_key == model_key and self.healthy():
                 self.last_used = time.time()
                 return self.status()
+
+            # BACKOFF (slice 12): after repeated GENUINE load failures for this
+            # model, refuse a re-attempt for a growing window instead of hammering
+            # a doomed 46G re-page on every incoming request. Cleared on success.
+            until = self._load_backoff_until.get(model_key, 0.0)
+            if time.time() < until:
+                raise RuntimeError(
+                    f"slot {SLOT_ID}: {model_key} in load-backoff for "
+                    f"{until - time.time():.0f}s after "
+                    f"{self._load_failures.get(model_key, 0)} failed attempt(s)"
+                    + (f" — {self.last_load_error}" if self.last_load_error else ""))
 
             self._kill()
             self.profile_bin = profile_bin or None
@@ -542,21 +589,97 @@ class Slot:
             if not self._wait_healthy():
                 self._kill()
                 self.model_key = None
+                # Record the genuine failure and arm exponential backoff so
+                # per-request re-attempts don't thrash (slice 12). The message now
+                # names STALL vs hard-cap (the honest reason), not a flat clock.
+                n = self._load_failures.get(model_key, 0) + 1
+                self._load_failures[model_key] = n
+                backoff = min(_LOAD_BACKOFF_BASE_S * (2 ** (n - 1)),
+                              _LOAD_BACKOFF_MAX_S)
+                self._load_backoff_until[model_key] = time.time() + backoff
+                self.last_load_error = (
+                    f"did not become healthy (stall/hard-cap); attempt {n}, "
+                    f"backing off {backoff:.0f}s")
                 raise RuntimeError(
-                    f"slot {SLOT_ID}: {model_key} did not become healthy in "
-                    f"{HEALTH_TIMEOUT:.0f}s")
+                    f"slot {SLOT_ID}: {model_key} {self.last_load_error}")
+            # SUCCESS — clear the failure counters + backoff for this model.
+            self._load_failures.pop(model_key, None)
+            self._load_backoff_until.pop(model_key, None)
+            self.last_load_error = None
             logger.info("slot %s ready: %s on %s", SLOT_ID, model_key, self.child_base)
             return self.status()
 
+    def _hard_cap_s(self) -> float:
+        """Size-scaled generous-but-bounded hard cap. base (HEALTH_TIMEOUT) +
+        expected_bytes / assumed throughput, × a safety multiplier, floored at
+        HEALTH_TIMEOUT. A 46G model at 200 MB/s ~= 235s of transfer alone, so the
+        cap lands well above a legitimate cold load while still bounding a truly-
+        wedged child. Unknown size -> the flat floor (back-compat)."""
+        exp = self.expected_bytes
+        if not exp:
+            return HEALTH_TIMEOUT
+        transfer_s = float(exp) / max(_LOAD_THROUGHPUT_BPS, 1.0)
+        return max(HEALTH_TIMEOUT, (HEALTH_TIMEOUT + transfer_s) * _HARD_CAP_MULT)
+
+    def _load_progress_bytes(self) -> int:
+        """A monotonic-ish PROGRESS signal for an in-flight load: the child's
+        resident RAM (weights paging in) PLUS the VRAM consumed since we started
+        (free VRAM DROPPING as layers upload). Either one growing == the load is
+        moving. Best-effort: 0 on any read failure (a run of 0s reads as a stall,
+        which is the safe conservative verdict)."""
+        rss = 0
+        try:
+            if self._child_alive():
+                rss = _proc_rss_bytes(self.proc.pid) or 0
+        except Exception:  # noqa: BLE001
+            rss = 0
+        vram_used = 0
+        try:
+            from ..spill import free_vram_bytes
+            fv = free_vram_bytes()
+            if fv is not None and self._load_free_vram_at_start is not None:
+                vram_used = max(0, self._load_free_vram_at_start - fv)
+        except Exception:  # noqa: BLE001
+            vram_used = 0
+        return int(rss) + int(vram_used)
+
     def _wait_healthy(self) -> bool:
-        deadline = time.time() + HEALTH_TIMEOUT
-        while time.time() < deadline:
+        """Wait for the child to answer /health, failing on STALL not on a blind
+        clock (slice 12). While the child is alive AND making forward progress
+        (RSS growing / VRAM filling), keep waiting — a big cold load is SLOW, not
+        broken. Kill only when progress stalls for STALL_TIMEOUT, or when the
+        generous size-scaled hard cap is blown (a truly-wedged child must die)."""
+        try:
+            from ..spill import free_vram_bytes
+            self._load_free_vram_at_start = free_vram_bytes()
+        except Exception:  # noqa: BLE001
+            self._load_free_vram_at_start = None
+        start = time.time()
+        hard_cap = self._hard_cap_s()
+        last_progress = self._load_progress_bytes()
+        last_progress_ts = start
+        while True:
             if not self._child_alive():
-                return False
+                return False                     # child exited -> real failure
             if self.healthy():
-                return True
+                return True                      # up and answering
+            now = time.time()
+            if now - start >= hard_cap:
+                logger.warning("slot %s: load of %s blew the %.0fs hard cap "
+                               "(size-scaled) — treating as wedged",
+                               SLOT_ID, self.model_key, hard_cap)
+                return False
+            cur = self._load_progress_bytes()
+            if cur - last_progress >= _PROGRESS_EPSILON:
+                last_progress = cur              # real movement — reset the stall clock
+                last_progress_ts = now
+            elif now - last_progress_ts >= STALL_TIMEOUT:
+                logger.warning("slot %s: load of %s STALLED — no forward progress "
+                               "(RSS+VRAM) for %.0fs (last=%s); killing the wedged "
+                               "child", SLOT_ID, self.model_key, STALL_TIMEOUT,
+                               cur)
+                return False
             time.sleep(1.0)
-        return False
 
     def unload(self) -> dict:
         # Interrupt any in-progress load first: killing the child makes a blocking

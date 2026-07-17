@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 
 logger = logging.getLogger(__name__)
@@ -110,19 +111,108 @@ def _mmproj_bytes(model_dir: str) -> int:
     """Total bytes of the mmproj projector(s) beside the model. A vision GGUF is
     a PAIR (quant + mmproj-*.gguf), so the projector is part of what actually
     loads — it belongs in the model's effective size even though it isn't a
-    servable variant on its own."""
+    servable variant on its own. Recursive: a projector can be nested in a
+    subdir just like split shards are (see ``_servable_gguf_files``)."""
     try:
         from ...imports.src.utils import is_mmproj_file
     except Exception:  # noqa: BLE001
         is_mmproj_file = lambda p: "mmproj" in os.path.basename(str(p)).lower()
     total = 0
     try:
-        for fn in os.listdir(model_dir):
-            if fn.lower().endswith(".gguf") and is_mmproj_file(fn):
-                total += _file_bytes(model_dir, fn)
+        for root, _dirs, files in os.walk(model_dir):
+            for fn in files:
+                if fn.lower().endswith(".gguf") and is_mmproj_file(fn):
+                    try:
+                        total += int(os.path.getsize(os.path.join(root, fn)))
+                    except OSError:
+                        pass
     except OSError:
         pass
     return total
+
+
+# A split/sharded GGUF ships as N files ``<stem>-<NNNNN>-of-<MMMMM>.gguf``; they
+# are ONE logical model that llama.cpp loads from the first shard.
+_SHARD_RE = re.compile(r"^(?P<stem>.+)-(?P<idx>\d{5})-of-(?P<total>\d{5})\.gguf$",
+                       re.IGNORECASE)
+
+
+def _servable_gguf_files(model_dir: str) -> list:
+    """Recursively list servable .gguf files (relative paths + sizes), excluding
+    the mmproj projector.
+
+    RECURSIVE, unlike :func:`_gguf_basenames`: a split/sharded GGUF nests its
+    shards in a subdir (e.g. ``<quant>/<quant>-00001-of-00004.gguf``), and a
+    shallow ``os.listdir`` misses them entirely — the model then resolved to NO
+    servable variant and no ``effective_bytes`` at all (the sharded-GGUF
+    effective-size blind spot, t33). Mirrors ``get_gguf_file``'s recursive glob
+    so the two agree on what is servable.
+
+    Returns ``[(relpath, bytes), …]`` sorted by relpath.
+    """
+    try:
+        from ...imports.src.utils import is_mmproj_file
+    except Exception:  # noqa: BLE001
+        is_mmproj_file = lambda p: "mmproj" in os.path.basename(str(p)).lower()
+    out = []
+    try:
+        for root, _dirs, files in os.walk(model_dir):
+            for fn in files:
+                if not fn.lower().endswith(".gguf") or is_mmproj_file(fn):
+                    continue
+                full = os.path.join(root, fn)
+                rel = os.path.relpath(full, model_dir)
+                try:
+                    sz = int(os.path.getsize(full))
+                except OSError:
+                    sz = 0
+                out.append((rel, sz))
+    except OSError:
+        return []
+    return sorted(out)
+
+
+def _gguf_variant_groups(files: list) -> list:
+    """Collapse a recursive servable-gguf listing into pickable VARIANTS,
+    shard-aware.
+
+    A split GGUF presents as N shard files (``-00001-of-0000N.gguf`` …) that are
+    ONE logical model; they fold into a single variant whose ``bytes`` = SUM of
+    all shards and whose entrypoint/canonical filename is the ``-00001`` shard
+    (what ``get_gguf_file``/llama-server is actually pointed at). Every non-shard
+    .gguf is its own variant. Multiple quant families that are each sharded stay
+    separate (grouped by containing dir + shard stem), so they rank as distinct
+    variants exactly like single-file quants do.
+
+    ``files``: ``[(relpath, bytes), …]``. Returns ``[{filename, bytes, members}]``
+    where ``filename`` is the entrypoint basename and ``members`` are the
+    relpaths that make up the variant (one for a single file, N for shards).
+    """
+    groups: dict = {}
+    variants = []
+    for rel, sz in files:
+        base = os.path.basename(rel)
+        m = _SHARD_RE.match(base)
+        if not m:
+            variants.append({"filename": base, "bytes": int(sz),
+                             "members": [rel]})
+            continue
+        idx = int(m.group("idx"))
+        # Group by (containing dir, shard stem) so two sharded quant families in
+        # their own subdirs never merge.
+        key = (os.path.dirname(rel), m.group("stem").lower())
+        g = groups.setdefault(key, {"bytes": 0, "members": [],
+                                    "entry_rel": None, "entry_idx": None})
+        g["bytes"] += int(sz)
+        g["members"].append(rel)
+        if g["entry_idx"] is None or idx < g["entry_idx"]:
+            g["entry_idx"] = idx
+            g["entry_rel"] = rel
+    for g in groups.values():
+        variants.append({"filename": os.path.basename(g["entry_rel"]),
+                         "bytes": g["bytes"], "members": sorted(g["members"])})
+    variants.sort(key=lambda v: v["filename"].lower())
+    return variants
 
 
 def gguf_variants_detail(model_key: str, model_dir: str, cfg=None) -> dict:
@@ -138,32 +228,53 @@ def gguf_variants_detail(model_key: str, model_dir: str, cfg=None) -> dict:
 
     Returns ``{}`` for a dir with no servable .gguf (e.g. a transformers model or
     a not-yet-downloaded repo), so callers fall back to their existing size.
+
+    Shard-aware: a split GGUF is N shard files that are ONE model — they collapse
+    into a single variant whose bytes SUM the shards (see ``_gguf_variant_groups``),
+    so a sharded model resolves a real ``effective_bytes`` instead of ``None``
+    (t33: a ~48GB sharded coder model that read as no size at all).
     """
-    names = _gguf_basenames(model_dir)              # servable variants (no mmproj)
-    if not names:
+    files = _servable_gguf_files(model_dir)         # recursive; catches nested shards
+    if not files:
         return {}
     mmproj = _mmproj_bytes(model_dir)
-    eff = None
+    variants = _gguf_variant_groups(files)          # shard sets folded into one variant
+    # Resolve the effective entrypoint exactly as the runner does (operator
+    # gguf_file override -> cfg.filename -> deterministic auto-rank), then find
+    # which variant that resolved file belongs to (a shard maps to its group).
+    eff_full = None
     try:
         from ...imports.config.main import get_gguf_file
         prefer = (get_override(model_key) or {}).get("gguf_file") or None
         p = get_gguf_file(model_dir, cfg, prefer=prefer)
-        eff = os.path.basename(p) if p else None
+        eff_full = os.path.abspath(p) if p else None
     except Exception:  # noqa: BLE001 — resolution is best-effort
-        eff = None
-    if eff not in names:
-        eff = names[0] if len(names) == 1 else None
-    variants = [{"filename": n, "bytes": _file_bytes(model_dir, n),
-                 "is_effective": (n == eff)} for n in names]
-    eff_quant = next((v["bytes"] for v in variants if v["is_effective"]), 0)
+        eff_full = None
+    eff_variant = None
+    if eff_full:
+        eff_base = os.path.basename(eff_full).lower()
+        for v in variants:
+            member_fulls = {os.path.abspath(os.path.join(model_dir, m))
+                            for m in v["members"]}
+            if eff_full in member_fulls or any(
+                    os.path.basename(m).lower() == eff_base for m in v["members"]):
+                eff_variant = v
+                break
+    if eff_variant is None and len(variants) == 1:
+        eff_variant = variants[0]                    # single variant is unambiguously it
+    eff = eff_variant["filename"] if eff_variant else None
+    eff_quant = eff_variant["bytes"] if eff_variant else 0
+    out_variants = [{"filename": v["filename"], "bytes": v["bytes"],
+                     "is_effective": (v is eff_variant)} for v in variants]
     return {
-        "variants": variants,                       # [{filename, bytes, is_effective}]
+        "variants": out_variants,                   # [{filename, bytes, is_effective}]
         "mmproj_bytes": mmproj,
         "effective_gguf": eff,
         "effective_quant_bytes": eff_quant,
-        # What the model actually is on disk when served: the one quant + its
-        # projector (0 for text-only). None when the effective quant can't be
-        # resolved (multi-variant, no choice) — caller keeps its own size.
+        # What the model actually is on disk when served: the one quant (SUMMED
+        # across shards for a split GGUF) + its projector (0 for text-only). None
+        # only when no effective variant can be resolved among many — caller
+        # keeps its own size.
         "effective_bytes": (eff_quant + mmproj) if eff_quant else None,
     }
 
