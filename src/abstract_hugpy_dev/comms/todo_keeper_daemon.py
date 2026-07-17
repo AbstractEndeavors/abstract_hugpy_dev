@@ -62,7 +62,10 @@ DEFAULT_CENTRAL = "http://127.0.0.1:7002"
 # The console's live-verified model (2026-07-16) — the agent path and the
 # console's direct fallback MUST use the same model, or the operator feels a
 # behaviour change when one path takes over from the other.
-DEFAULT_MODEL = "Qwen2.5-3B-Instruct-GGUF"
+# (Renamed from the bare DEFAULT_MODEL 2026-07-17: that name means something
+# DIFFERENT in hugpy_agent and in central's model defaults — self-describing
+# names only, so a shared .env can never cross-configure components.)
+DEFAULT_TODO_KEEPER_MODEL = "Qwen2.5-3B-Instruct-GGUF"
 
 HEARTBEAT_SECONDS = 30.0
 POLL_SECONDS = 5.0
@@ -171,7 +174,7 @@ class TodoKeeperNode:
                  model: Optional[str] = None,
                  state_path: Optional[str] = None) -> None:
         self.central = (central or _env("HUGPY_CENTRAL", DEFAULT_CENTRAL)).rstrip("/")
-        self.model = model or _env("HUGPY_TODO_KEEPER_MODEL", DEFAULT_MODEL)
+        self.model = model or _env("HUGPY_TODO_KEEPER_MODEL", DEFAULT_TODO_KEEPER_MODEL)
         self.state_path = state_path or _state_path()
         self.state = load_state(self.state_path)
         self._stop = threading.Event()

@@ -76,7 +76,17 @@ _CONFIGURED_DEFAULTS = {
 CHAT_MODELS_REGISTRY: Dict[str, ModelConfig] = get_models_dict_by_tasks(tasks=["text-generation","text-generation-inference","text2text-generation"])
 DEFAULT_CHAT_MODEL = _reconcile_default(DEFAULT_CHAT_MODEL, CHAT_MODELS_REGISTRY,
                                         prefer_task="text-generation")
-DEFAULT_MODEL = DEFAULT_CHAT_MODEL
+# (The bare alias `DEFAULT_MODEL = DEFAULT_CHAT_MODEL` was DELETED 2026-07-17:
+# zero in-tree consumers, and the generic name collides with hugpy_agent's
+# brain and the todo-keeper's model — same-named keys resolve odd in a shared
+# .env. Say DEFAULT_CHAT_MODEL when you mean the chat default.)
+
+# The AGENT BRAIN (see constants.py — dedicated default for agent nodes/loops,
+# operator ask 2026-07-17). Reconciled like every other kind default: keep the
+# configured brain when the registry knows it, else stand in an installed chat
+# model rather than promising a download (defaults are promises).
+DEFAULT_AGENT_BRAIN = _reconcile_default(DEFAULT_AGENT_BRAIN, CHAT_MODELS_REGISTRY,
+                                         prefer_task="text-generation")
 
 
 VISION_MODELS_REGISTRY: Dict[str, ModelConfig] = get_models_dict_by_tasks(tasks=["image-text-to-text","text-to-image"])

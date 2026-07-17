@@ -332,7 +332,12 @@ def test_evict_to_fit_executes_evictions_through_the_guarded_reaper():
     state.refused = {}
 
     orig_storage, orig_reap = agent._worker_storage, agent._reap_reclaim
+    orig_shared = budget._store_is_shared
     try:
+        # This is the WORKER-BOX case (cap + FIFO). Pin the non-shared verdict so
+        # the test does not depend on the runner's own model-root mount (the dev
+        # VM's /mnt/llm_storage carries the central-catalog sentinel).
+        budget._store_is_shared = lambda: False
         agent._worker_storage = lambda s: {
             "cache_used_bytes": 45 * GIB, "disk_free": 0,
             "models": [_model("oldest", 10), _model("newest", 35)]}
@@ -341,6 +346,7 @@ def test_evict_to_fit_executes_evictions_through_the_guarded_reaper():
         budget.evict_to_fit(state, "caller", 20 * GIB)
     finally:
         agent._worker_storage, agent._reap_reclaim = orig_storage, orig_reap
+        budget._store_is_shared = orig_shared
 
     assert reaped[0] == "oldest"        # FIFO order reaches the real deleter
 
@@ -355,7 +361,11 @@ def test_evict_to_fit_raises_and_deletes_nothing_when_it_cannot_fit():
     state.refused = {}
 
     orig_storage, orig_reap = agent._worker_storage, agent._reap_reclaim
+    orig_shared = budget._store_is_shared
     try:
+        # Worker-box case (cap gate). Pin non-shared so the cap actually applies
+        # regardless of the runner's model-root mount (see the FIFO test above).
+        budget._store_is_shared = lambda: False
         agent._worker_storage = lambda s: {
             "cache_used_bytes": 48 * GIB, "disk_free": 0,
             "models": [_static("big", 48)]}   # static blocks; pin would not
@@ -364,6 +374,7 @@ def test_evict_to_fit_raises_and_deletes_nothing_when_it_cannot_fit():
             budget.evict_to_fit(state, "huge", 30 * GIB)
     finally:
         agent._worker_storage, agent._reap_reclaim = orig_storage, orig_reap
+        budget._store_is_shared = orig_shared
 
     assert reaped == []                 # a refusal deletes NOTHING
 
@@ -653,3 +664,305 @@ def test_adopting_a_pre_feature_reply_leaves_allocation_untouched():
     agent._adopt_storage_inputs(state, {"limits": {"disk_cache_gib": 50},
                                         "storage": {"cache_used_bytes": 0}})
     assert state.allocated["allocated_count"] == 12       # preserved
+
+
+# ── 9. the store-reapable gate is a REAL protection reason ──────────────────
+# THE ae REGRESSION (2026-07-17). ae refused a 91.1 GB pull with:
+#   "0 B reclaimable (1 loaded) — assigned set (65) totals 1.2 TB"
+# which read as a BROKEN FIFO and sent the operator hunting the eviction policy.
+# The policy was correct. The REPORT lied: _reap_scan correctly classified 101
+# on-disk models as protected by the store gate (_model_store_reapable false),
+# but _storage_model_row ignored its why_hint when setting `protected`, so all
+# 101 shipped to central as protected=False/why="" — unprotected rows with NO
+# reason. These tests hold the seam that lied.
+
+def _row(mk, **kw):
+    """Call the real _storage_model_row with the store gate's why_hint, holding
+    _pinned/_residency to plain values so the row reflects the ARGUMENTS."""
+    from abstract_hugpy_dev.worker_agent import agent
+
+    orig_pinned, orig_res = agent._pinned, agent._residency
+    try:
+        agent._pinned = lambda k: kw.pop("_is_pinned", False)
+        agent._residency = lambda k: kw.pop("_res", "on-demand")
+        return agent._storage_model_row(
+            mk, kw.get("size", 10 * GIB),
+            kw.get("loaded", set()), kw.get("loading", set()),
+            kw.get("provisioning", set()), kw.get("assigned", set()),
+            why_hint=kw.get("why_hint", ""))
+    finally:
+        agent._pinned, agent._residency = orig_pinned, orig_res
+
+
+def test_store_gated_row_is_reported_protected_with_its_reason():
+    """A model held ONLY by the store gate (none of static/loaded/loading/
+    provisioning/assigned) must ship protected=True and carry the reason."""
+    row = _row("m", why_hint="model store not marked reapable")
+    assert row["protected"] is True
+    assert row["why"] == "model store not marked reapable"
+
+
+def test_store_gated_row_is_blocked_not_silently_reclaimable():
+    """End-to-end: the row the worker actually ships must land in `blocked`, so
+    the refusal names the true cause instead of implying a tiny candidate set."""
+    rows = [_row(f"m{i}", why_hint="model store not marked reapable",
+                 size=10 * GIB) for i in range(3)]
+    plan = budget.fit_plan("huge", 90 * GIB, _storage(rows),
+                           {"disk_cache_gib": 100}, {})
+    assert plan["action"] == "refuse"
+    # The gated models are NOT counted as free bytes...
+    assert plan["reason"]["reclaimable_bytes"] == 0
+    assert plan["reason"]["reclaimable_count"] == 0
+    # ...they are named as the blocker, with the true COUNT.
+    assert plan["reason"]["blocked"] == {"model store not marked reapable": 3}
+    assert "3 model store not marked reapable" in plan["reason"]["reason"]
+
+
+def test_shared_central_storage_reason_also_protects():
+    """The gate's other verdict — the shared/central store — is equally real."""
+    row = _row("m", why_hint="shared/central storage — never reaped")
+    assert row["protected"] is True
+    assert budget._is_protected(row) == "shared/central storage — never reaped"
+
+
+def test_store_gate_outranks_assigned_so_the_carve_out_cannot_erase_it():
+    """ae's ACTUAL shape: store-gated AND assigned. `assigned` is a deliberate
+    carve-out in _is_protected (routing is never a disk shield), so if it won the
+    `why`, the carve-out would call this row a candidate and the refusal would
+    lie again. The enforced filesystem fact must outrank the routing label."""
+    row = _row("m", why_hint="model store not marked reapable",
+               assigned={"m"})
+    assert row["assigned"] is True          # attribution still reported
+    assert row["protected"] is True
+    assert row["why"] == "model store not marked reapable"
+    assert budget._is_protected(row) == "model store not marked reapable"
+
+
+def test_bare_assigned_row_remains_a_candidate():
+    """The carve-out still holds: assignment alone is routing, not protection.
+    An assigned-but-not-store-gated row must still be evictable."""
+    row = _row("m", assigned={"m"})         # no why_hint -> store is reapable
+    assert row["why"] == "assigned"
+    assert budget._is_protected(row) == ""  # CANDIDATE
+    # ...and the FIFO really does take it: "m" (10 GB, assigned) is the only
+    # thing on disk, and a 15 GB caller under a 20 GB cap needs it gone.
+    plan = budget.fit_plan("caller", 15 * GIB, _storage([row]),
+                           {"disk_cache_gib": 20}, {})
+    assert plan["action"] == "evict"
+    assert plan["evict"] == ["m"]
+
+
+def test_pin_still_never_protects_files_even_next_to_the_store_gate():
+    """Operator ruling 2026-07-17 preserved: a pinned row on a REAPABLE store is
+    still a candidate — the fix must not smuggle pin back in as a disk shield."""
+    row = _row("m", _is_pinned=True)
+    assert row["pinned"] is True
+    assert row["protected"] is False
+    assert row["why"] == "pinned"           # attribution only
+    assert budget._is_protected(row) == ""  # CANDIDATE
+
+
+def test_ungated_unflagged_row_is_still_a_plain_candidate():
+    """Guard against over-protecting: an empty why_hint must change nothing."""
+    row = _row("m", why_hint="")
+    assert row["protected"] is False
+    assert row["why"] == ""
+    assert budget._is_protected(row) == ""
+
+
+# ── 10. shared/central store: the per-worker CAP is not applicable ──────────
+# THE ae DEFECT (2026-07-17). ae's DEFAULT_ROOT IS the shared catalog (13T
+# volume). Its measured cache_used ≈ 693GB is the FLEET's resident catalog, not
+# ae's own consumption; cap = 400GB. So used > cap permanently, every candidate
+# is (correctly, post-sentinel) protected "shared/central storage — never
+# reaped", and every pull refuses forever. The cap protects a WORKER'S OWN drive
+# from fill-up; a shared/central volume has no such exposure (central governs
+# it). Fix: on a shared store, skip the cap gate entirely — proceed, never evict
+# — keeping only a disk-free floor so a genuinely full volume still refuses.
+# _store_is_shared() is exercised end-to-end in evict_to_fit's own tests below;
+# here we drive fit_plan directly with the flag the caller passes.
+
+def _shared_storage(models, disk_free):
+    """A storage view whose cache_used ≫ cap on purpose (the ae shape), with an
+    explicit disk_free so the volume's real headroom is under test."""
+    return {"cache_used_bytes": sum(m["bytes"] for m in models),
+            "models": models, "disk_free": int(disk_free)}
+
+
+def test_shared_store_over_cap_pull_proceeds_with_no_evictions_and_a_note():
+    """ae's exact shape: 693 GB resident, 400 GB cap, all rows store-protected.
+    Under the OLD code this refused forever. Now: proceed, evict NOTHING, and
+    carry an honest note saying WHY the configured cap is not enforced."""
+    catalog = [_static("resident_catalog", 693)]        # ≫ the 400 cap
+    catalog[0]["why"] = "shared/central storage — never reaped"
+    storage = _shared_storage(catalog, disk_free=4800 * GIB)   # ae: 4.8T free
+    plan = budget.fit_plan("newmodel", 91 * GIB, storage,
+                           {"disk_cache_gib": 400}, {}, shared_store=True)
+    assert plan["action"] == "proceed"
+    assert plan["evict"] == []
+    assert plan["reason"] is None
+    assert "shared/central" in plan["note"]
+    assert "not applicable" in plan["note"]
+
+
+def test_shared_store_still_refuses_when_the_real_volume_is_too_full():
+    """The op incident guard survives: a shared volume that is genuinely full
+    must NOT be written to [Errno 28]. A pull larger than (disk_free - reserve)
+    refuses with an honest disk-free reason — and STILL evicts nothing (those
+    files are the fleet's source of truth, never deletable from here)."""
+    catalog = [_static("resident_catalog", 693)]
+    catalog[0]["why"] = "shared/central storage — never reaped"
+    # Only 10 GB free, default 50 GB reserve — a 91 GB pull cannot land.
+    storage = _shared_storage(catalog, disk_free=10 * GIB)
+    plan = budget.fit_plan("newmodel", 91 * GIB, storage,
+                           {"disk_cache_gib": 400}, {}, shared_store=True)
+    assert plan["action"] == "refuse"
+    assert plan["evict"] == []                       # never evict on shared store
+    reason = plan["reason"]
+    assert reason["state"] == "refused"
+    assert reason["shared_store"] is True
+    assert reason["needs_bytes"] == 91 * GIB
+    assert reason["disk_free_bytes"] == 10 * GIB
+    assert "shared/central volume" in reason["reason"]
+    assert "91.0 GB" in reason["reason"]             # the honest need
+    # And it is a DISK-FREE refusal, NOT a cap/FIFO one:
+    assert "reclaimable" not in reason["reason"]
+    assert reason["note"].startswith("store is shared/central")
+
+
+def test_shared_store_small_pull_within_free_space_proceeds():
+    """A pull that comfortably fits the free volume proceeds even on a shared
+    store — the reserve floor only bites when the volume is actually tight."""
+    storage = _shared_storage([_static("resident_catalog", 693)],
+                              disk_free=4800 * GIB)
+    plan = budget.fit_plan("small", 5 * GIB, storage,
+                           {"disk_cache_gib": 400}, {}, shared_store=True)
+    assert plan["action"] == "proceed"
+    assert plan["evict"] == []
+
+
+def test_non_shared_box_behaviour_is_completely_unchanged():
+    """Regression fence: with shared_store=False (the default and every real
+    worker), the cap gate + FIFO behave EXACTLY as before this slice. A cold
+    candidate under an over-budget cap is still FIFO-evicted."""
+    storage = _storage([_model("cold", 40), _model("warm", 10)])
+    # Default call (no shared_store kwarg) must equal the explicit-False call.
+    plan_default = budget.fit_plan("caller", 30 * GIB, storage,
+                                   {"disk_cache_gib": 50},
+                                   {"cold": 1, "warm": 999})
+    plan_explicit = budget.fit_plan("caller", 30 * GIB, storage,
+                                    {"disk_cache_gib": 50},
+                                    {"cold": 1, "warm": 999},
+                                    shared_store=False)
+    assert plan_default == plan_explicit
+    assert plan_default["action"] == "evict"
+    assert plan_default["evict"] == ["cold"]         # oldest, over-budget -> FIFO
+    assert "note" not in plan_default or "shared" not in (plan_default.get("note") or "")
+
+
+def test_disk_reserve_bytes_honours_the_existing_env_and_default():
+    """The disk-free floor reuses the tree's ONE reserve knob — same env var and
+    default (50 GiB) as central-side _disk_reserve_bytes — never a new constant."""
+    import os
+    orig = os.environ.get("HUGPY_WORKER_DISK_RESERVE_GIB")
+    try:
+        os.environ.pop("HUGPY_WORKER_DISK_RESERVE_GIB", None)
+        assert budget.disk_reserve_bytes() == 50 * GIB       # default
+        os.environ["HUGPY_WORKER_DISK_RESERVE_GIB"] = "80"
+        assert budget.disk_reserve_bytes() == 80 * GIB       # override honoured
+        os.environ["HUGPY_WORKER_DISK_RESERVE_GIB"] = "-5"
+        assert budget.disk_reserve_bytes() == 0              # clamped >= 0
+    finally:
+        if orig is None:
+            os.environ.pop("HUGPY_WORKER_DISK_RESERVE_GIB", None)
+        else:
+            os.environ["HUGPY_WORKER_DISK_RESERVE_GIB"] = orig
+
+
+def test_evict_to_fit_detects_shared_store_and_never_evicts(monkeypatch):
+    """End-to-end at the impure seam: when _store_is_shared() is True,
+    evict_to_fit must proceed (no BudgetRefusal, no reaper call) even though the
+    cache is ≫ cap and the reaper would otherwise be consulted."""
+    from abstract_hugpy_dev.worker_agent import agent, provision, budget as b
+
+    reap_calls = []
+    monkeypatch.setattr(agent, "_worker_storage", lambda s: _shared_storage(
+        [_static("resident_catalog", 693)], disk_free=4800 * GIB))
+    monkeypatch.setattr(agent, "_reap_reclaim",
+                        lambda s, keys: reap_calls.append(keys) or {"freed_bytes": 0})
+    # Force the shared-store verdict through the REAL resolution helpers.
+    monkeypatch.setattr(agent, "_models_store_root", lambda: "/mnt/llm_storage")
+    monkeypatch.setattr(provision, "_on_shared_model_store", lambda rp: True)
+
+    state = type("S", (), {})()
+    state.limits = {"disk_cache_gib": 400}
+    state.model_last_picked = {}
+    state.allocated = {}
+    # Must NOT raise, must NOT evict.
+    b.evict_to_fit(state, "newmodel", 91 * GIB)
+    assert reap_calls == []
+
+
+def test_evict_to_fit_on_a_real_worker_still_uses_the_cap(monkeypatch):
+    """The complement: a NON-shared box (probe False) keeps the cap + FIFO, so an
+    over-budget pull still drives the guarded reaper. Proves the shared-store
+    skip is gated on the probe, not applied blanket."""
+    from abstract_hugpy_dev.worker_agent import agent, provision, budget as b
+
+    reap_calls = []
+    monkeypatch.setattr(agent, "_worker_storage", lambda s: _storage(
+        [_model("cold", 40), _model("warm", 10)]))
+    monkeypatch.setattr(agent, "_reap_reclaim",
+                        lambda s, keys: reap_calls.append(keys) or {"freed_bytes": 40 * GIB})
+    monkeypatch.setattr(agent, "_models_store_root", lambda: "/home/op/models")
+    monkeypatch.setattr(provision, "_on_shared_model_store", lambda rp: False)
+
+    state = type("S", (), {})()
+    state.limits = {"disk_cache_gib": 50}
+    state.model_last_picked = {"cold": 1, "warm": 999}
+    state.allocated = {}
+    b.evict_to_fit(state, "caller", 30 * GIB)
+    assert reap_calls == [["cold"]]          # cap gate + FIFO, unchanged
+
+
+# ── 11. central passes the scan diagnostics through verbatim (slice 3, B) ────
+# The ae 2026-07-17 defect: a broken reap scan surfaced to central as rows:0,
+# indistinguishable from a clean empty store, because storage_proposal rebuilds
+# the storage dict field-by-field and dropped the diagnostics. These lock the
+# passthrough so a broken scan can never masquerade as "nothing on disk".
+
+def test_scan_diagnostics_survive_centrals_storage_proposal():
+    from abstract_hugpy_dev.flask_app.app.functions.imports.utils.workers import (
+        storage_proposal)
+
+    out = storage_proposal({
+        "storage": {"cache_used_bytes": 784 * GIB, "disk_free": 900 * GIB,
+                    "models": [],
+                    "scan_error": "get_models_dict: discovery report unreadable",
+                    "scan_keys_considered": 65, "scan_rows": 0,
+                    "scan_row_errors": 0},
+        "disk": {"free_bytes": 900 * GIB, "total_bytes": 1700 * GIB},
+        "limits": {"disk_cache_gib": 400},
+    })
+    # The fingerprint of the ae failure reaches central intact: a scan that
+    # considered 65 keys but produced 0 rows, WITH an error string.
+    assert out["scan_error"] == "get_models_dict: discovery report unreadable"
+    assert out["scan_keys_considered"] == 65
+    assert out["scan_rows"] == 0
+
+
+def test_scan_diagnostics_degrade_for_a_pre_slice3_worker():
+    """An older agent reports none of these keys; central must yield falsy
+    defaults — never a KeyError, never a phantom error string."""
+    from abstract_hugpy_dev.flask_app.app.functions.imports.utils.workers import (
+        storage_proposal)
+
+    out = storage_proposal({
+        "storage": {"cache_used_bytes": 0, "disk_free": GIB, "models": []},
+        "disk": {}, "limits": {},
+    })
+    assert out["scan_error"] == ""
+    assert out["scan_keys_considered"] == 0
+    assert out["scan_rows"] == 0
+    # No survey at all -> still falsy, no crash.
+    assert storage_proposal({"disk": {}})["scan_error"] == ""

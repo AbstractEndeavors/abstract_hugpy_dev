@@ -221,6 +221,14 @@ ROLES = Literal[*ROLES]
 # Stock defaults: one model per task, every one a curated staple in
 # models_config.MODELS — efficiency-first picks (whole fleet ~17GB).
 DEFAULT_CHAT_MODEL = get_env_value("DEFAULT_CHAT_MODEL") or "Qwen2.5-3B-Instruct-GGUF"
+# The AGENT BRAIN — the model agent nodes/loops default to. A dedicated
+# variable (operator ask, 2026-07-17) so the agents' default is never
+# conflated with the generic chat default or the Discord bot's
+# DEFAULT_MODEL_KEY. Brain switch 2026-07-17 (P3.4 scorecard, reliability
+# over speed: coder 4/4 vs flux2-klein 3/4): Qwen3-Coder-Next. The
+# hugpy_agent CLIENT package carries the same default with its own
+# HUGPY_AGENT_BRAIN env knob; this is central's copy of the truth.
+DEFAULT_AGENT_BRAIN = get_env_value("DEFAULT_AGENT_BRAIN") or "Qwen~Qwen3-Coder-Next-GGUF"
 DEFAULT_VISION_MODEL = get_env_value("DEFAULT_VISION_MODEL") or "Qwen2.5-VL-3B-Instruct-GGUF"
 DEFAULT_WHISPER_MODEL = get_env_value("DEFAULT_WHISPER_MODEL") or "whisper-large-v3-turbo"
 DEFAULT_SUMMARIZE_MODEL = get_env_value("DEFAULT_SUMMARIZE_MODEL") or "flan-t5-large"

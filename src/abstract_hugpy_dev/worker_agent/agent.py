@@ -801,6 +801,21 @@ def _adopt_storage_inputs(state: "WorkerState", worker: dict | None) -> None:
     limits = worker.get("limits")
     if isinstance(limits, dict):
         state.limits = dict(limits)
+        # HOT-TIER ALIGNMENT (slice 4): project central's disk_cache_gib into an
+        # env var so the hot-cache tier (a different process context that never
+        # holds `state`) can fold it into its own min-wins when it shares the
+        # store drive. The tier reads this LIVE (hot_cache._store_disk_cap_gib),
+        # so a fresh heartbeat's number takes effect without a restart. Absent /
+        # cleared -> the tier simply has no central term. This is projection only;
+        # the AUTHORITATIVE budget gate stays budget.resolve_effective_cap.
+        try:
+            dc = limits.get("disk_cache_gib")
+            if dc in (None, ""):
+                os.environ.pop("_HUGPY_CENTRAL_DISK_CACHE_GIB", None)
+            else:
+                os.environ["_HUGPY_CENTRAL_DISK_CACHE_GIB"] = str(float(dc))
+        except (TypeError, ValueError):
+            os.environ.pop("_HUGPY_CENTRAL_DISK_CACHE_GIB", None)
     lp = worker.get("model_last_picked")
     if isinstance(lp, dict):
         state.model_last_picked = dict(lp)
@@ -1694,6 +1709,65 @@ def _path_bytes(path: str) -> int:
         return 0
 
 
+def _store_root_copy_path(mk: str, cfg) -> str:
+    """The path of this model's copy under the WORKER'S OWN store root, when one
+    exists and is complete — regardless of what get_model_path's read-through
+    prefers.
+
+    THE ae READ-THROUGH GAP (2026-07-17, slice 3). get_model_path resolves via
+    _resolved_local, which honours a NAS read-through: on a box like ae whose
+    DEFAULT_ROOT is the HOT drive but which ALSO mounts the shared/central NAS
+    (carrying the .hugpy-central-catalog sentinel), a model can resolve to its
+    NAS copy even though a re-promotable copy sits on the hot store root. That
+    NAS path classifies "shared/central — never reaped" -> protected -> the hot
+    copy never becomes an eviction candidate and _path_bytes counts the NAS size.
+
+    The reaper must classify the STORE-ROOT copy: resolve the model's dir with
+    the resolver PINNED to this worker's own store root (never the NAS), so the
+    reap row's path+bytes and its protection verdict are evaluated on the hot
+    copy (hot990 -> not shared -> reapable when the box flag is on). Returns ""
+    when no complete copy exists under the store root (then the caller falls back
+    to get_model_path — a model served straight from the NAS has no hot row).
+
+    Best-effort and never raises: any failure returns "" and the caller uses the
+    read-through path as before, so this can only ADD hot-copy candidates, never
+    remove an existing protection.
+    """
+    try:
+        root = _models_store_root()          # e.g. /mnt/hot990/hugpy-worker/models
+        if not root:
+            return ""
+        # _models_store_root returns the MODELS dir; resolve_model_dir expects the
+        # DEFAULT_ROOT (it joins "models"/ itself), so hand it the parent when the
+        # root ends in a models/ component, else the root as-is.
+        base = os.path.dirname(root) if os.path.basename(root) == "models" else root
+        from ..imports.src.constants.paths import resolve_model_dir
+        routing = {
+            "hub_id": getattr(cfg, "hub_id", None),
+            "framework": getattr(cfg, "framework", None),
+            "filename": getattr(cfg, "filename", None),
+            "include": getattr(cfg, "include", None),
+            "primary_task": getattr(cfg, "primary_task", None),
+            "tasks": getattr(cfg, "tasks", None),
+            "folder": getattr(cfg, "folder", None),
+        }
+        # require_complete=True: only a COMPLETE store-root copy is an evictable
+        # row. An incomplete/absent hot copy -> "" -> caller uses read-through.
+        d = resolve_model_dir(routing, root=base, cfg=cfg, require_complete=True)
+        if not d:
+            return ""
+        # Guard: the resolver is pinned to `base`, but be defensive — only accept
+        # a dir that really lives under the store root (never a NAS path that
+        # slipped through a symlinked candidate).
+        rp = os.path.realpath(d)
+        root_rp = os.path.realpath(base)
+        if rp == root_rp or rp.startswith(root_rp + os.sep):
+            return d
+        return ""
+    except Exception:  # noqa: BLE001 — never raise into the scan
+        return ""
+
+
 def _reap_scan(state: "WorkerState") -> dict:
     """The reaper's read-only survey: which local model files are RECLAIMABLE
     (on disk, but not assigned / static / loaded / loading), and which are
@@ -1709,9 +1783,14 @@ def _reap_scan(state: "WorkerState") -> dict:
     """
     try:
         from .imports import get_models_dict, get_model_config, get_model_path
-        from .provision import model_is_local, _on_shared_model_store, _model_store_reapable
+        from .provision import (model_is_local, _on_shared_model_store,
+                                _model_store_reapable)
     except Exception as exc:  # noqa: BLE001
-        return {"reclaimable": [], "protected": [], "error": str(exc)}
+        # HONESTY (slice 3, B): a scan that couldn't even import must NOT read as
+        # a clean empty store. Carry the error so _worker_storage/central surface
+        # "scan broken", never rows:0 masquerading as "nothing on disk".
+        return {"reclaimable": [], "protected": [], "error": str(exc),
+                "scan_keys_considered": 0, "scan_rows": 0}
 
     assigned = set(state.assigned_models or [])
     # HARDEN (reaper guard): fold in slot-seated / answering models.
@@ -1723,6 +1802,7 @@ def _reap_scan(state: "WorkerState") -> dict:
     loading = set(_loading_model_keys())
 
     reclaimable, protected = [], []
+    scan_error = ""
     try:
         # Enumerate the UNION, not just get_models_dict(): on a WORKER that dict is
         # the built-in staples + comfy sweep + on-disk discovery report and NEVER
@@ -1732,10 +1812,23 @@ def _reap_scan(state: "WorkerState") -> dict:
         # models_local, and slot-seated. Fold in assigned + loaded + loading; the
         # loop below skips any key that isn't model_is_local, so this only ADDS
         # on-disk models the staple-only dict missed.
-        keys = set(get_models_dict().keys()) | assigned | loaded | loading
+        registry_keys = set(get_models_dict().keys())
     except Exception as exc:  # noqa: BLE001
-        return {"reclaimable": [], "protected": [], "error": str(exc)}
+        # DON'T abandon the scan (slice 3, A defense): even if the registry build
+        # blew up (e.g. a discovery report unreadable for a process whose $HOME /
+        # store root wasn't ready at import), assignment + slot truth still name
+        # real on-disk models. Record the error, proceed with the key set we can
+        # trust, and fold in _models_local so central-registered copies resolve.
+        registry_keys = set()
+        scan_error = f"get_models_dict: {exc}"
+    try:
+        local_keys = set(_models_local(state))       # assigned ∩ on-disk (cached)
+    except Exception:  # noqa: BLE001
+        local_keys = set()
+    keys = registry_keys | assigned | loaded | loading | local_keys
 
+    considered = len(keys)
+    row_errors = 0
     for mk in keys:
         try:
             cfg = get_model_config(mk)
@@ -1747,12 +1840,24 @@ def _reap_scan(state: "WorkerState") -> dict:
             if not model_is_local(mk):
                 continue
         except Exception:
+            row_errors += 1
             continue
-        path = ""
+        # STORE-ROOT COPY classification (slice 3, C). Prefer the copy under THIS
+        # worker's own store root over get_model_path's read-through, which on ae
+        # can hand back a NAS path (shared/central -> protected) even when a
+        # re-promotable hot copy exists. Evaluate path+bytes+protection on the hot
+        # copy so it becomes a real candidate; fall back to the read-through path
+        # when there is no complete store-root copy (a model served straight off
+        # the NAS legitimately has no evictable hot row).
         try:
-            path = get_model_path(mk) or ""
-        except Exception:
+            path = _store_root_copy_path(mk, cfg)
+        except Exception:  # noqa: BLE001
             path = ""
+        if not path:
+            try:
+                path = get_model_path(mk) or ""
+            except Exception:
+                path = ""
         size = _path_bytes(path)
         # SAFE-BY-DEFAULT: a model is reapable only on a box that declared its
         # store local & disposable AND is not shared/central. Everything else is
@@ -1779,14 +1884,26 @@ def _reap_scan(state: "WorkerState") -> dict:
         elif mk in loaded or mk in loading:
             protected.append({"model_key": mk, "bytes": size, "why": "loaded"})
         else:
+            # Store-root copy path travels on the row so _reap_reclaim/wipe act on
+            # the hot copy — never the NAS (re-proven at delete time).
             reclaimable.append({"model_key": mk, "bytes": size, "path": path})
 
     reclaimable.sort(key=lambda r: r["bytes"], reverse=True)
-    return {
+    out = {
         "reclaimable": reclaimable,
         "protected": protected,
         "reclaimable_bytes": sum(r["bytes"] for r in reclaimable),
+        # DIAGNOSTICS (slice 3, B): make a broken/empty scan self-describing so it
+        # can never masquerade as a clean empty store. scan_keys_considered = the
+        # full key domain; scan_rows = rows actually classified (reclaimable +
+        # protected). considered≫rows with 0 rows is the ae symptom's fingerprint.
+        "scan_keys_considered": considered,
+        "scan_rows": len(reclaimable) + len(protected),
+        "scan_row_errors": row_errors,
     }
+    if scan_error:
+        out["error"] = scan_error
+    return out
 
 
 def _reap_reclaim(state: "WorkerState", model_keys: list[str]) -> dict:
@@ -1851,11 +1968,26 @@ def _reap_reclaim(state: "WorkerState", model_keys: list[str]) -> dict:
         except Exception:
             results.append({"model_key": mk, "ok": False, "reason": "locality check failed"})
             continue
+        # STORE-ROOT COPY (slice 3, C): target the hot copy the scan classified,
+        # not get_model_path's read-through (which on ae resolves to the NAS the
+        # shared gate correctly refuses). Re-resolve it here — same helper the
+        # scan used — so preview and delete can't diverge; fall back to the
+        # read-through path when there is no complete store-root copy. wipe_model
+        # re-proves the jail + shared gate on whichever realpath this is.
         try:
-            freed = _path_bytes(get_model_path(mk) or "")
+            target = _store_root_copy_path(mk, cfg)
+        except Exception:  # noqa: BLE001
+            target = ""
+        if not target:
+            try:
+                target = get_model_path(mk) or ""
+            except Exception:
+                target = ""
+        try:
+            freed = _path_bytes(target)
         except Exception:
             freed = 0
-        gone = wipe_model(mk)  # jailed against root/home/short paths
+        gone = wipe_model(mk, path=target)  # jailed + shared-gate re-proven on target
         _MODELS_LOCAL_CACHE["at"] = 0.0  # force a fresh local walk next beat
         results.append({"model_key": mk, "ok": bool(gone),
                         "freed_bytes": freed if gone else 0,
@@ -1987,6 +2119,24 @@ def _orphan_scan(state: "WorkerState", known_keys: set) -> dict:
     + assigned/loaded/loading). Anything on disk NOT matching one of these is
     orphaned. Conservative: an entry we cannot positively tie to a known model is
     reported (visible), never auto-deleted — this scan proposes nothing.
+
+    MATCHING (fixed 2026-07-17, over-report root cause): a dir is compared
+    against ``known_keys`` through ONE shared expansion —
+    ``provision.known_model_dir_forms`` — the same normalization
+    ``model_is_local``/the read-through resolver are built on. The old
+    comparison only lowercased+stripped, so a ``~``-qualified assignment key
+    (``owner~repo``, minted on an owner collision — see discover_models in
+    imports/apis/get_module.py) never textually matched a directory-derived
+    ``owner/repo`` name; it happened to still "work" only via an accidental
+    bare-repo-name fallback, which breaks the moment two owners share a repo
+    basename (exactly the case ``~`` exists to disambiguate). The dir is
+    matched BOTH by its relative path (catches a legacy nested-path copy of a
+    known model — legacy-path, not orphan) and by its best-effort hub-id guess
+    (catches a flat/marker-named dir). ``misc/comfy/**`` is excluded by policy
+    (provision.is_doctrine_excluded) — comfy checkpoints are symlinks the
+    reaper/storage accounting already treat as never-orphaned; operator
+    doctrine: "comfy is excluded from allocations, models can sit on the drive
+    unattributed."
     """
     now = time.time()
     cached = _ORPHAN_CACHE["value"]
@@ -2003,26 +2153,37 @@ def _orphan_scan(state: "WorkerState", known_keys: set) -> dict:
         from ..imports.src.constants.paths import (
             is_model_dir, is_directory_excluded, get_hub_id_from_directory,
         )
+        from .provision import (
+            known_model_dir_forms, dir_is_known_model, is_doctrine_excluded,
+            _dir_slug,
+        )
     except Exception:  # noqa: BLE001 — never break a heartbeat over this
         _ORPHAN_CACHE.update(at=now, value=out)
         return out
 
-    def _norm(s: str) -> str:
-        return str(s or "").strip("/").lower()
-
-    known = {_norm(k) for k in known_keys}
-    # also index by trailing repo name so hub_id 'owner/repo' matches a bare 'repo'
-    known |= {k.rsplit("/", 1)[-1] for k in list(known)}
+    known_forms = known_model_dir_forms(known_keys)
 
     items: list[dict] = []
     seen_dirs: set = set()
 
     def _is_orphan_dir(dirpath: str) -> bool:
+        rel = os.path.relpath(dirpath, root)
+        if is_doctrine_excluded(rel):
+            return False
+        if dir_is_known_model(rel, known_forms):
+            return False
+        # Secondary check: the best-effort hub-id guess (marker-first, then
+        # layout-aware path guess) — catches a dir whose relative path doesn't
+        # literally match a candidate dir (e.g. a legacy shape the resolver
+        # doesn't enumerate) but whose declared/guessed hub_id still resolves.
         hub = get_hub_id_from_directory(dirpath, models_home=root)
-        if not hub:
-            return True
-        h = _norm(hub)
-        return h not in known and h.rsplit("/", 1)[-1] not in known
+        if hub and _dir_slug(hub) in known_forms:
+            return False
+        if hub:
+            tail = str(hub).rsplit("/", 1)[-1]
+            if _dir_slug(tail) in known_forms:
+                return False
+        return True
 
     # Walk once: catch model dirs (leaves) AND .part-bearing dirs.
     for dirpath, dirnames, filenames in os.walk(root):
@@ -2066,18 +2227,45 @@ def _storage_model_row(mk: str, size: int, loaded: set, loading: set,
     is_loading = mk in loading
     is_provisioning = mk in provisioning
     is_assigned = mk in assigned
+    # `why_hint` carries _reap_scan's STORE-GATE verdict ("shared/central storage
+    # — never reaped" / "model store not marked reapable"). It is a GENUINE
+    # protection reason and the only one this row cannot re-derive from the flags
+    # below — it comes from _model_store_reapable(realpath), which the caller
+    # already resolved. Honour it.
+    #
+    # BUG (fixed 2026-07-17): `protected` used to ignore why_hint entirely, so a
+    # model protected ONLY by the store gate shipped to central as
+    # protected=False, why="" — an UNPROTECTED row with NO reason. On ae that
+    # silently mislabelled 101 store-gated models as eviction candidates, and
+    # fit_plan's refusal then reported "0 B reclaimable (1 loaded)" — hiding the
+    # real cause (the whole store is gated) behind a number that made the FIFO
+    # look broken. The policy was always right; only this report lied.
+    store_gated = bool((why_hint or "").strip())
     # 📌 pin does NOT protect files (operator, 2026-07-17): pin means only that
     # the allocation/routing survives restarts — no bearing on eviction. `pinned`
     # is still reported below as ATTRIBUTION info, but it never sets `protected`.
     # 🔒static is the durable local-presence guard; loaded/loading/provisioning
     # are live-use guards. assigned still guards the bulk-reaper preview.
     protected = (is_static or is_loaded or is_loading
-                 or is_provisioning or is_assigned)
-    # Precedence for the human `why` (static > assigned > loaded ...). Note pin
-    # is NOT a protection reason, so a pinned-but-otherwise-unprotected model
-    # reads why="pinned" purely as attribution while protected stays False.
+                 or is_provisioning or is_assigned or store_gated)
+    # Precedence for the human `why` (static > store-gate > assigned > loaded...).
+    #
+    # The store gate outranks `assigned` DELIBERATELY. `assigned` is a carve-out
+    # in budget._is_protected: a row whose why is a bare "assigned" is treated as
+    # a CANDIDATE (assignment is routing/attribution, never a disk shield —
+    # operator, 2026-07-17). But the store gate is a hard filesystem fact: those
+    # files CANNOT be deleted by the reaper no matter what central decides. On ae
+    # a store-gated model is typically ALSO assigned, so letting "assigned" win
+    # would ship protected=True/why="assigned", the carve-out would call it a
+    # candidate again, and the refusal would resume lying — the same bug, one
+    # layer down. A real, enforced reason must beat a routing label.
+    #
+    # Note pin is NOT a protection reason, so a pinned-but-otherwise-unprotected
+    # model reads why="pinned" purely as attribution while protected stays False.
     if is_static:
         why = "static"
+    elif store_gated:
+        why = why_hint
     elif is_assigned:
         why = "assigned"
     elif is_loaded:
@@ -2089,7 +2277,7 @@ def _storage_model_row(mk: str, size: int, loaded: set, loading: set,
     elif is_pinned:
         why = "pinned"          # attribution only — protected stays False
     else:
-        why = why_hint or ""
+        why = ""
     return {
         "model_key": mk,
         "bytes": int(size or 0),
@@ -2200,6 +2388,25 @@ def _worker_storage(state: "WorkerState") -> dict:
         orphans = _orphan_scan(state, known_keys)
     except Exception:  # noqa: BLE001 — a heartbeat must never fail on this
         orphans = {"items": [], "bytes": 0, "count": 0}
+    # EFFECTIVE BUDGET (slice 4, min-wins). Resolve the min over {central
+    # disk_cache_gib, worker same-drive declarations} for THIS box's store root
+    # and report the number + source map so the operator sees WHY a number
+    # governs. Not applicable on a shared/central store (the cap is skipped
+    # there — slice 2), so we mark it and omit the sources rather than imply a
+    # cap. Best-effort: any failure just omits the fields.
+    budget_effective_bytes = None
+    budget_sources: dict = {}
+    budget_not_applicable = False
+    try:
+        from . import budget as _budget
+        if _budget._store_is_shared():
+            budget_not_applicable = True
+        else:
+            store_root = _models_store_root() or ""
+            budget_effective_bytes, budget_sources = _budget.resolve_effective_cap(
+                getattr(state, "limits", None) or {}, store_root)
+    except Exception:  # noqa: BLE001 — a heartbeat must never fail on this
+        pass
     out = {
         "cache_used_bytes": measured if measured is not None else cache_used,
         "cache_used_measured_bytes": measured,      # None if root unresolved
@@ -2209,6 +2416,12 @@ def _worker_storage(state: "WorkerState") -> dict:
         "orphaned_count": orphans["count"],
         "orphaned_items": orphans["items"],
         "disk_free": int(disk.get("free_bytes", 0) or 0),
+        # EFFECTIVE per-drive budget (slice 4). budget_sources names every term
+        # in GiB (central_gib / worker_hot_cache_gib / …) plus effective_gib +
+        # effective_source. Shared store -> budget_cap_not_applicable True.
+        "budget_effective_bytes": budget_effective_bytes,
+        "budget_sources": budget_sources,
+        "budget_cap_not_applicable": budget_not_applicable,
         "models": models,
         # Models REFUSED for storage: the pull never started because even a full
         # FIFO couldn't seat them. {model_key: {state:"refused", reason, ...}}.
@@ -2219,6 +2432,21 @@ def _worker_storage(state: "WorkerState") -> dict:
         # so central/console can surface root/budget/used + per-entry last_called.
         # {"enabled": False} when HUGPY_HOT_CACHE_ROOT is unset (no behaviour).
         "hot_cache": _hot_cache_status(),
+        # SCAN DIAGNOSTICS (slice 3, B). Carry the reaper survey's own telemetry
+        # so a broken/degraded scan can NEVER masquerade as a clean empty store
+        # (the ae 2026-07-17 defect: rows:0 while 65 models were on disk, because
+        # a swallowed scan error surfaced identically to "nothing here"). Central
+        # passes these through verbatim; the console can surface them later.
+        #   scan_error            — set when the registry build failed (scan still
+        #                           ran on assignment/slot/local keys)
+        #   scan_keys_considered  — size of the full key domain the scan walked
+        #   scan_rows             — rows actually classified (reclaimable+protected)
+        #   scan_row_errors       — per-model probe failures skipped
+        # considered≫0 with rows:0 is the fingerprint of the ae failure.
+        "scan_error": scan.get("error") or "",
+        "scan_keys_considered": int(scan.get("scan_keys_considered") or 0),
+        "scan_rows": int(scan.get("scan_rows") or 0),
+        "scan_row_errors": int(scan.get("scan_row_errors") or 0),
     }
     _STORAGE_CACHE.update(at=now, value=out)
     return out

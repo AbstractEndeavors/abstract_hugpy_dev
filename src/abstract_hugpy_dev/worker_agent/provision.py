@@ -471,6 +471,154 @@ def model_is_local(model_key: str) -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# ONE dir<->key normalization, shared by _orphan_scan (agent.py) and every
+# locality predicate (model_is_local above, models_local heartbeat). This is
+# the fix for the 2026-07-17 over-report: _orphan_scan used to compare a
+# path-sliced "hub id" against known keys with only a lowercase/strip
+# normalization — a designated key like ``Qwen~Qwen3-Coder-Next-GGUF`` (the
+# ``~``-qualifier discover_models() mints on an owner collision, see
+# imports/apis/get_module.py) was compared VERBATIM against directory-derived
+# names that only ever contain ``/``, never ``~``. The two never collided on
+# their own; the scan only survived by an accidental bare-repo-name fallback
+# match, which breaks the moment two owners share a repo basename (the exact
+# case ``~`` exists to disambiguate). Route every "is this on-disk dir a known
+# model" decision through the SAME expansion so the two can't diverge again.
+# ---------------------------------------------------------------------------
+
+def _dir_slug(value: str) -> str:
+    """Collapse a key / hub_id / relative-path into one comparable slug.
+
+    ``~``, ``/``, ``_``, ``-``, whitespace all collapse to a single ``_`` and
+    case is folded — so ``Qwen~Qwen3-Coder-Next-GGUF`` (assignment key),
+    ``Qwen/Qwen3-Coder-Next-GGUF`` (hub_id / on-disk path), and
+    ``qwen_qwen3_coder_next_gguf`` all land on the same slug. This mirrors
+    ``managers/resolvers/assure_model_key._slugify`` (the resolver already
+    proven to bridge key/hub_id/folder forms) so the orphan scan's notion of
+    "known" can never quietly diverge from the resolver's.
+    """
+    import re
+    return re.sub(r"[^A-Za-z0-9.]+", "_", str(value or "").strip()).strip("_").lower()
+
+
+def known_model_dir_forms(known_keys) -> set:
+    """Expand ``known_keys`` (assignment/catalog/loaded/etc. model_keys) into
+    every SLUG a legitimately-present on-disk directory might produce.
+
+    For each key this folds in:
+      * the key itself (``owner~repo``, a bare staple name, a hub_id, …);
+      * the bare trailing component (``repo`` alone) — handles a dir whose
+        path-derived name lost its owner segment;
+      * the resolved model's ``hub_id`` (``owner/repo``) when the key is
+        known to this worker's registry;
+      * the RELATIVE PATH (root-relative, slash form) of every dir
+        ``candidate_model_dirs`` would accept for that model — the flat
+        target AND every legacy task-dir / other-runtime-family shape the
+        read-through resolver (``resolve_model_dir``) honors. This is what
+        makes a legacy nested-path copy of a KNOWN model read as legacy-path,
+        never orphan, without this helper having to reimplement layout
+        knowledge that already lives in imports/src/constants/paths.py.
+
+    Best-effort per key: a key this worker can't resolve to a config just
+    contributes its own slug forms and is skipped for the candidate-dir
+    expansion — it still narrows nothing incorrectly, it just can't widen.
+    """
+    from .imports import get_model_config
+    try:
+        from ..imports.src.constants.paths import candidate_model_dirs
+        from ..imports.src.constants.constants import DEFAULT_ROOT, MODELS_HOME
+    except Exception:  # noqa: BLE001 — never let import shape break the scan
+        candidate_model_dirs = None
+        DEFAULT_ROOT = MODELS_HOME = None
+
+    root = None
+    if MODELS_HOME:
+        root = str(MODELS_HOME)
+    elif DEFAULT_ROOT:
+        import os as _os
+        root = _os.path.join(str(DEFAULT_ROOT), "models")
+
+    forms: set = set()
+    for k in known_keys:
+        if not k:
+            continue
+        forms.add(_dir_slug(k))
+        tail = str(k).replace("~", "/").rsplit("/", 1)[-1]
+        forms.add(_dir_slug(tail))
+
+        cfg = None
+        try:
+            cfg = get_model_config(k)
+        except Exception:
+            cfg = None
+        if cfg is None:
+            continue
+
+        hub_id = getattr(cfg, "hub_id", None)
+        if hub_id:
+            forms.add(_dir_slug(hub_id))
+            forms.add(_dir_slug(str(hub_id).rsplit("/", 1)[-1]))
+
+        if candidate_model_dirs is None or not root:
+            continue
+        try:
+            routing = {
+                "hub_id": hub_id, "framework": getattr(cfg, "framework", None),
+                "filename": getattr(cfg, "filename", None),
+                "include": getattr(cfg, "include", None),
+                "primary_task": getattr(cfg, "primary_task", None),
+                "tasks": getattr(cfg, "tasks", None),
+                "folder": getattr(cfg, "folder", None),
+                "dir": getattr(cfg, "dir", None),
+            }
+            for d in candidate_model_dirs(routing, root):
+                try:
+                    import os as _os
+                    rel = _os.path.relpath(d, root)
+                except Exception:
+                    continue
+                if rel.startswith(".."):
+                    continue                       # outside the store root
+                forms.add(_dir_slug(rel))
+        except Exception:  # noqa: BLE001 — best-effort widening only
+            continue
+    return forms
+
+
+def dir_is_known_model(rel_path: str, known_forms: set) -> bool:
+    """True when ``rel_path`` (a model dir, root-relative) matches something in
+    ``known_forms`` — either the exact relative-path slug (covers a legacy
+    nested-path copy of a known model verbatim) or the bare trailing-component
+    slug (covers a hub-id-derived / path-sliced fallback). Single choke point
+    so _orphan_scan and any future locality check compare dirs the same way.
+    """
+    slug = _dir_slug(rel_path)
+    if slug in known_forms:
+        return True
+    tail = str(rel_path).replace("~", "/").rsplit("/", 1)[-1]
+    return _dir_slug(tail) in known_forms
+
+
+# Doctrinally-unattributed on-disk classes: never orphaned regardless of
+# catalog membership. comfy checkpoints sit under models/misc/comfy/** as
+# symlinks into <root>/checkpoints (see models_config._sweep_comfy_checkpoints)
+# and are explicitly excluded from the storage/allocation accounting the
+# reaper and heartbeat use (agent.py's _reap_scan / _storage_model_row skip
+# framework=="comfy" rows outright) — the operator doctrine is "comfy is
+# excluded from allocations; models can sit on the drive unattributed". The
+# orphan scan must honor the same exclusion so misc/comfy/* is never reported
+# as unattributed-on-disk residue.
+DOCTRINE_EXCLUDED_PREFIXES = ("misc/comfy/", "misc\\comfy\\")
+
+
+def is_doctrine_excluded(rel_path: str) -> bool:
+    """True when ``rel_path`` (root-relative) belongs to a class the operator
+    has declared never-orphaned regardless of catalog membership (comfy)."""
+    norm = str(rel_path or "").strip("/\\").replace("\\", "/")
+    return any(norm == p.rstrip("/") or norm.startswith(p.replace("\\", "/"))
+               for p in DOCTRINE_EXCLUDED_PREFIXES)
+
+
 def _on_shared_model_store(rp: str) -> bool:
     """True when `rp` lives on SHARED/central model storage — the canonical
     catalog other fleet nodes read — so it must NEVER be deleted from here.
@@ -514,7 +662,7 @@ def _model_store_reapable(rp: str) -> bool:
     return os.environ.get("HUGPY_MODEL_STORE_REAPABLE", "").strip().lower() in ("1", "true", "yes", "on")
 
 
-def wipe_model(model_key: str) -> bool:
+def wipe_model(model_key: str, path: str = "") -> bool:
     """Delete the model's local files so the next provision re-downloads it.
 
     Used by the `redownload` path: a plain provision only fetches when the model
@@ -522,14 +670,29 @@ def wipe_model(model_key: str) -> bool:
     removing it first. Returns True if the path is gone afterwards. Jailed against
     obviously-wrong targets (root/home/short paths) AND against shared/central
     model storage — the operator invariant that no reap may touch the central
-    drive."""
+    drive.
+
+    ``path`` (slice 3, C) — an EXPLICIT delete target: the STORE-ROOT copy the
+    reaper classified, used instead of get_model_path's read-through. On a box
+    like ae (hot store root + a mounted shared/central NAS) get_model_path can
+    resolve to the NAS copy, which the shared gate below correctly refuses — so
+    without this the hot copy the scan wants gone would never be deleted. The
+    SAME jail + shared-gate re-proof runs on the resolved realpath regardless of
+    where it came from: a caller-supplied NAS path is still refused, so this only
+    lets the reaper act on the hot copy it already vetted, never widens what may
+    be deleted."""
     import os
     import shutil
-    try:
-        from .imports import get_model_path
-        path = get_model_path(model_key)
-    except Exception:
-        return False
+    if path:
+        # Caller supplied the exact copy to delete (the reaper's store-root row).
+        # Re-prove every guard on THIS realpath below — never trust the caller.
+        pass
+    else:
+        try:
+            from .imports import get_model_path
+            path = get_model_path(model_key)
+        except Exception:
+            return False
     if not path:
         return False
     rp = os.path.realpath(path)

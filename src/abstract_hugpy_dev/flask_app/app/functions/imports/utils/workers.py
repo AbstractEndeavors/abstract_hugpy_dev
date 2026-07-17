@@ -953,6 +953,25 @@ def storage_proposal(worker: Dict[str, Any]) -> Dict[str, Any]:
         # never appear in a proposal; the console renders them as MISSING with
         # the reason on hover.
         "refused": (storage.get("refused") or {}) if reported else {},
+        # SCAN DIAGNOSTICS (slice 3, B) — passed through VERBATIM from the worker
+        # survey so a broken/degraded reap scan can never masquerade as a clean
+        # empty store (the ae 2026-07-17 defect: rows:0 while 65 models were on
+        # disk). The console can surface scan_error / considered≫rows. Absent on a
+        # pre-slice-3 worker -> falsy defaults (feature simply off).
+        "scan_error": (storage.get("scan_error") or "") if reported else "",
+        "scan_keys_considered": (_as_int(storage.get("scan_keys_considered")) or 0) if reported else 0,
+        "scan_rows": (_as_int(storage.get("scan_rows")) or 0) if reported else 0,
+        "scan_row_errors": (_as_int(storage.get("scan_row_errors")) or 0) if reported else 0,
+        # EFFECTIVE BUDGET (slice 4, min-wins) — the worker's own resolved
+        # min(central disk_cache_gib, worker same-drive declarations) + the source
+        # map, passed through VERBATIM so the console can show WHY a number
+        # governs (e.g. central 400 wins over worker hot 1500). Absent on a
+        # pre-slice-4 worker -> None/{}/False (feature simply off). This is the
+        # WORKER's own resolution; central's `budget`/`over_budget` above are its
+        # own view and unchanged.
+        "budget_effective_bytes": (_as_int(storage.get("budget_effective_bytes"))) if reported else None,
+        "budget_sources": (storage.get("budget_sources") or {}) if reported else {},
+        "budget_cap_not_applicable": bool(storage.get("budget_cap_not_applicable")) if reported else False,
     }
 
 

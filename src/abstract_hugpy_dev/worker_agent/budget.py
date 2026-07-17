@@ -156,6 +156,153 @@ def cap_bytes(limits: dict | None) -> int | None:
     return int(val * (1 << 30))
 
 
+def _drive_id(path: str):
+    """Filesystem device id (st_dev) of the drive holding ``path`` (or its
+    nearest existing parent), or None if it can't be resolved.
+
+    st_dev is THE reliable same-drive signal (slice 4): a symlinked or
+    bind-mounted hot root that points at the store root's own filesystem shares
+    its st_dev, where a realpath-prefix compare would wrongly call them separate
+    drives (or miss a symlink entirely). Two roots with the same st_dev are the
+    same physical drive → their byte budgets contend for the same space and the
+    stricter one must govern. A different st_dev is a genuinely different drive
+    whose budget must NOT drag into the store drive's min."""
+    p = path or ""
+    for _ in range(64):
+        try:
+            return os.stat(p).st_dev
+        except OSError:
+            parent = os.path.dirname(p)
+            if not parent or parent == p:
+                return None
+            p = parent
+    return None
+
+
+def worker_declared_caps(store_root: str) -> list[tuple[str, int]]:
+    """Every WORKER-declared byte budget that governs the same drive as
+    ``store_root``, as ``[(source_name, cap_bytes), ...]``.
+
+    The operator's min-wins ruling (2026-07-17): "worker designation beats out
+    central, UNLESS central designation for that worker's drive is lower than the
+    worker designation" → the effective per-drive cap is the MIN across central's
+    disk_cache_gib and the worker's own declarations that sit on the SAME drive.
+    "the real issue for the workers is overcrowding of the HDD."
+
+    The worker's own tiers (knob map, slice 4):
+      * hot_cache (managers/serve/hot_cache.py): root HUGPY_HOT_CACHE_ROOT,
+        budget HUGPY_HOT_CACHE_GIB (default 225). ae's ACTIVE tier — 1500 GiB.
+      * model_cache (managers/serve/model_cache.py): dir HUGPY_MODEL_CACHE
+        (default /var/cache/hugpy-models), budget HUGPY_MODEL_CACHE_MAX_GIB
+        (default 450) → CACHE_MAX_BYTES.
+    (HUGPY_DISK_CACHE_MAX_GIB is NOT here — it is projected into central's
+    disk_cache_gib by the worker's own _clamp_limits, so it already rides
+    cap_bytes; adding it here would double-count.)
+
+    A tier contributes ONLY when its root shares the store root's drive (same
+    st_dev): a hot tier on a genuinely different NVMe has its own space and must
+    not constrain the store drive. Missing/unset knobs contribute nothing.
+    Best-effort: any resolution failure just omits that tier."""
+    out: list[tuple[str, int]] = []
+    store_dev = _drive_id(store_root) if store_root else None
+    if store_dev is None:
+        return out
+    GIB = 1 << 30
+
+    def _consider(source: str, root: str, gib_env: str, default_gib: float | None):
+        if not root:
+            return
+        try:
+            if _drive_id(root) != store_dev:
+                return                       # different physical drive — skip
+        except Exception:  # noqa: BLE001
+            return
+        raw = os.environ.get(gib_env)
+        if raw in (None, ""):
+            if default_gib is None:
+                return                       # tier active but no explicit cap
+            gib = default_gib
+        else:
+            try:
+                gib = float(raw)
+            except (TypeError, ValueError):
+                return
+        if gib <= 0:
+            return
+        out.append((source, int(gib * GIB)))
+
+    # hot_cache: only when a root is configured (unset root == tier disabled).
+    hot_root = (os.environ.get("HUGPY_HOT_CACHE_ROOT") or "").strip()
+    _consider("worker_hot_cache_gib", hot_root, "HUGPY_HOT_CACHE_GIB", 225.0)
+    # model_cache: "on" only when its dir is a real, WRITABLE dir (mirrors
+    # model_cache.enabled() — an unwritable/absent CACHE_DIR disables the tier).
+    # Its default cap (450) then applies when it shares the store drive.
+    mc_dir = (os.environ.get("HUGPY_MODEL_CACHE") or "/var/cache/hugpy-models").strip()
+    try:
+        mc_on = bool(mc_dir) and os.path.isdir(mc_dir) and os.access(mc_dir, os.W_OK)
+    except OSError:
+        mc_on = False
+    if mc_on:
+        _consider("worker_model_cache_gib", mc_dir, "HUGPY_MODEL_CACHE_MAX_GIB", 450.0)
+    return out
+
+
+def resolve_effective_cap(limits: dict | None,
+                          store_root: str = "") -> tuple[int | None, dict]:
+    """The EFFECTIVE per-drive cap (bytes) and a machine-readable source map.
+
+    Min-wins over {central disk_cache_gib, worker same-drive declarations}. Any
+    term optional; NONE declared → (None, sources) meaning unmanaged — decision D
+    is unchanged. ``sources`` always names every contributing term (in GiB) so
+    the operator can see WHY a number governs, e.g.
+    ``{"central_gib": 400, "worker_hot_cache_gib": 1500}`` → effective 400.
+
+    Pure w.r.t. its inputs EXCEPT it reads env + stats the drive (that is what
+    makes it the impure resolver the pure fit_plan is handed the RESULT of)."""
+    GIB = 1 << 30
+    terms: list[tuple[str, int]] = []
+    sources: dict = {}
+    central = cap_bytes(limits)              # central disk_cache_gib -> bytes|None
+    if central is not None:
+        terms.append(("central_gib", central))
+        sources["central_gib"] = round(central / GIB, 3)
+    try:
+        for name, cap in worker_declared_caps(store_root):
+            terms.append((name, cap))
+            sources[name] = round(cap / GIB, 3)
+    except Exception:  # noqa: BLE001 — a knob probe must never break the pull
+        pass
+    if not terms:
+        return None, sources
+    name, eff = min(terms, key=lambda t: t[1])
+    sources["effective_gib"] = round(eff / GIB, 3)
+    sources["effective_source"] = name
+    return eff, sources
+
+
+def disk_reserve_bytes() -> int:
+    """Free-space reserve (bytes) to keep on the model-root volume after a pull.
+
+    Mirrors the CENTRAL-side ``_disk_reserve_bytes`` (utils/workers.py) exactly —
+    same env var, same default — so the worker's own disk-free floor reads the
+    same number central's display budget uses. Sized to comfortably exceed the
+    largest single pull (~45 GiB) so provisioning never drives a volume to
+    [Errno 28]. Override with ``HUGPY_WORKER_DISK_RESERVE_GIB`` (default 50).
+
+    This is the ONLY floor that applies on a shared/central store: the per-worker
+    CAP is a category error there (that volume is centrally managed), but a full
+    volume still corrupts everyone's pull — the op incident — so the disk-free
+    check stays. Do NOT invent a second reserve constant; this is the tree's one.
+    """
+    try:
+        gib = float(os.environ.get("HUGPY_WORKER_DISK_RESERVE_GIB", "50"))
+    except (TypeError, ValueError):
+        gib = 50.0
+    if gib < 0:
+        gib = 0.0
+    return int(gib * (1 << 30))
+
+
 def _is_protected(row: dict) -> str:
     """The reason ``row`` may NOT be auto-evicted, or "" if it is a candidate.
 
@@ -241,11 +388,23 @@ def _allocation_clause(allocated: dict | None, cap: int) -> tuple[str, dict]:
 
 def fit_plan(model_key: str, need_bytes: int, storage: dict,
              limits: dict | None, last_picked: dict | None = None,
-             allocated: dict | None = None) -> dict:
+             allocated: dict | None = None, shared_store: bool = False,
+             effective_cap: int | None = None,
+             budget_sources: dict | None = None) -> dict:
     """Decide how to seat ``need_bytes`` of ``model_key`` under the budget.
 
     PURE — computes, never deletes. The caller (evict_to_fit) executes it. Being
     pure is what lets the tests assert the ORDER and the REFUSAL without a disk.
+
+    ``effective_cap`` / ``budget_sources`` (slice 4, min-wins) — the EFFECTIVE
+    per-drive cap in bytes and its source map, resolved by the impure caller
+    (resolve_effective_cap) as ``min`` over {central disk_cache_gib, worker
+    same-drive declarations}. When ``effective_cap`` is None the cap falls back
+    to ``cap_bytes(limits)`` (central only) — so every existing caller/test is
+    byte-identical. ``budget_sources`` is reported verbatim in the plan/refusal so
+    the operator can see WHY a number governs (e.g. central 400 wins over hot
+    1500). The verdict is a function of this ONE effective number; passing it in
+    (rather than reading env here) keeps fit_plan pure.
 
     ``allocated`` — central's ALLOCATION-LEVEL totals for this worker's
     assignment set (``{allocated_total_bytes, allocated_count,
@@ -253,19 +412,39 @@ def fit_plan(model_key: str, need_bytes: int, storage: dict,
     purely ADDITIVE: it changes no decision, only what a refusal REPORTS. The
     fit verdict stays a function of real bytes on real disk.
 
+    ``shared_store`` — True when this box's model root IS the shared/central
+    catalog (ae on the NAS: DEFAULT_ROOT == the 13T fleet volume). The caller
+    (evict_to_fit) resolves this via provision._on_shared_model_store. On such a
+    box the per-worker CAP does NOT apply: the cap exists to stop a WORKER'S OWN
+    drive filling up, but a shared/central volume is centrally managed (central's
+    own transfer/budget gates + the operator-gated reaper govern it), and its
+    measured cache_used is the WHOLE FLEET'S resident catalog, not this box's
+    consumption — so ``used > cap`` is permanently true and every pull would
+    refuse forever (the ae defect). Skip cap logic entirely, evict NOTHING (those
+    files are the fleet's source of truth — never deletable from here), and keep
+    only the DISK-FREE floor so a genuinely full volume still refuses honestly
+    (the op [Errno 28] incident) rather than being written to failure.
+
     Returns::
 
         {"action": "proceed"|"evict"|"refuse",
          "evict": [model_key, ...],        # FIFO order, oldest-first
-         "reason": {...} | None}           # machine-readable, only on refuse
+         "reason": {...} | None,           # machine-readable, only on refuse
+         "note": "..."?}                   # why a gate was/ wasn't applied
 
     Decision table:
+      * shared/central store       -> "proceed" (disk-free permitting), no evict
       * no explicit cap            -> "proceed" (D: unset != evict everything)
       * fits under the cap as-is   -> "proceed", nothing evicted
       * fits after evicting a FIFO prefix of reclaimable candidates -> "evict"
       * even a FULL FIFO can't free enough -> "refuse" (+ an honest reason)
     """
-    cap = cap_bytes(limits)
+    # EFFECTIVE cap (slice 4): the min-wins number the impure caller resolved.
+    # Fall back to central-only cap_bytes when the caller didn't supply one, so
+    # every legacy caller/test is unchanged. budget_sources is carried through to
+    # the plan/refusal verbatim for operator visibility.
+    cap = effective_cap if effective_cap is not None else cap_bytes(limits)
+    srcs = dict(budget_sources or {})
     rows = [r for r in (storage.get("models") or [])
             if isinstance(r, dict) and r.get("model_key")]
     used = int(storage.get("cache_used_bytes") or 0)
@@ -282,6 +461,35 @@ def fit_plan(model_key: str, need_bytes: int, storage: dict,
             break
     delta = max(0, need - have)          # NEW bytes this pull will add
 
+    # ── SHARED/CENTRAL STORE: the worker cap is not applicable ──────────────
+    # Skip cap+FIFO entirely. Never evict (shared files are the fleet SoT). Keep
+    # ONLY the disk-free floor: if the NEW bytes won't fit under the reserve on
+    # the real volume, refuse honestly — a full shared volume must not be driven
+    # to [Errno 28] (the op incident), and central/console read the reason.
+    if shared_store:
+        free = int(storage.get("disk_free") or 0)
+        reserve = disk_reserve_bytes()
+        note = ("store is shared/central — worker cap gate not applicable; "
+                "volume is centrally managed")
+        if delta and free and (free - delta) < reserve:
+            reason = {
+                "state": "refused",
+                "model_key": model_key,
+                "reason": (
+                    f"won't fit on shared/central volume: needs {_human(delta)}, "
+                    f"{_human(free)} free, {_human(reserve)} reserve kept — "
+                    f"the worker cap does not apply here (centrally managed), but "
+                    f"the volume is too full to land this pull safely"
+                ),
+                "needs_bytes": delta,
+                "disk_free_bytes": free,
+                "disk_reserve_bytes": reserve,
+                "shared_store": True,
+                "note": note,
+            }
+            return {"action": "refuse", "evict": [], "reason": reason}
+        return {"action": "proceed", "evict": [], "reason": None, "note": note}
+
     # ── D: no explicit allocation -> no auto-eviction ───────────────────────
     # A worker with no disk_cache_gib has no declared ceiling, so there is no
     # honest way to say what is "over". Deliberately NOT falling back to the
@@ -296,7 +504,8 @@ def fit_plan(model_key: str, need_bytes: int, storage: dict,
                 "note": "no disk_cache_gib allocation set — budget unmanaged"}
 
     if used + delta <= cap:
-        return {"action": "proceed", "evict": [], "reason": None}
+        return {"action": "proceed", "evict": [], "reason": None,
+                "budget_effective_bytes": cap, "budget_sources": srcs}
 
     # ── over budget: FIFO the reclaimable candidates, oldest first ──────────
     lp_map = last_picked or {}
@@ -361,6 +570,13 @@ def fit_plan(model_key: str, need_bytes: int, storage: dict,
         # fit"; this says WHY it never will if the assigned set is itself
         # over-subscribed. Additive — it never changes the verdict above.
         alloc_text, alloc_fields = _allocation_clause(allocated, cap)
+        # When the effective cap comes from a WORKER declaration beating central
+        # (or vice-versa), name the winning source so the refusal is honest about
+        # WHICH number governs — the operator's min-wins visibility requirement.
+        eff_text = ""
+        eff_src = srcs.get("effective_source")
+        if eff_src and len(srcs) > 2:            # >1 real term contributed
+            eff_text = f" [effective cap {_human(cap)} = min via {eff_src}]"
         reason = {
             "state": "refused",
             "model_key": model_key,
@@ -368,11 +584,13 @@ def fit_plan(model_key: str, need_bytes: int, storage: dict,
                 f"won't fit: needs {_human(delta)}, budget {_human(cap)}, "
                 f"{_human(reclaimable_total)} reclaimable"
                 + (f" ({blocked_str})" if blocked_str else "")
-                + alloc_text
+                + alloc_text + eff_text
             ),
             **alloc_fields,
             "needs_bytes": delta,
             "budget_bytes": cap,
+            "budget_effective_bytes": cap,
+            "budget_sources": srcs,
             "used_bytes": used,
             "must_free_bytes": must_free,
             "reclaimable_bytes": reclaimable_total,
@@ -383,7 +601,31 @@ def fit_plan(model_key: str, need_bytes: int, storage: dict,
         return {"action": "refuse", "evict": [], "reason": reason}
 
     return {"action": "evict", "evict": evict, "reason": None,
-            "freed_bytes": freed, "must_free_bytes": must_free}
+            "freed_bytes": freed, "must_free_bytes": must_free,
+            "budget_effective_bytes": cap, "budget_sources": srcs}
+
+
+def _store_is_shared() -> bool:
+    """True when this box's model store root lives on the SHARED/central catalog.
+
+    Resolves the store root the SAME way the reaper/heartbeat resolve it
+    (agent._models_store_root) and asks provision._on_shared_model_store about
+    its realpath — the identical signal (sentinel file or HUGPY_SHARED_MODEL_STORE
+    env) that already makes _model_store_reapable False on such a box. So the cap
+    skip and the delete protection can never disagree about what "shared" means.
+
+    Fail SAFE: any resolution failure returns False, so the per-worker cap keeps
+    applying — a probe error must never silently disable a real worker's cap.
+    """
+    try:
+        from .agent import _models_store_root
+        from .provision import _on_shared_model_store
+        root = _models_store_root()
+        if not root:
+            return False
+        return bool(_on_shared_model_store(os.path.realpath(root)))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def evict_to_fit(state, model_key: str, need_bytes: int) -> None:
@@ -407,8 +649,29 @@ def evict_to_fit(state, model_key: str, need_bytes: int) -> None:
         # Central-computed allocation totals (heartbeat reply). Absent before the
         # first beat -> the refusal simply omits the structural clause.
         allocated = getattr(state, "allocated", None) or {}
+        # Is this box's model root the SHARED/central catalog (ae on the NAS)?
+        # Resolved the SAME way the reap paths resolve the root: the store root
+        # realpath through provision._on_shared_model_store (sentinel + env). On
+        # a shared store the per-worker cap is a category error — fit_plan skips
+        # it (see there). Fail SAFE: if the probe raises, treat as NOT shared so
+        # the cap still applies (never accidentally disable a real worker's cap).
+        shared_store = _store_is_shared()
+        # EFFECTIVE cap (slice 4, min-wins): resolve min over {central
+        # disk_cache_gib, worker same-drive declarations} against THIS box's
+        # store root, and hand fit_plan the number + source map. Not consulted on
+        # a shared store (fit_plan skips the cap there). Best-effort — a resolve
+        # failure yields (None, {}) and fit_plan falls back to central-only.
+        effective_cap, budget_sources = None, {}
+        if not shared_store:
+            try:
+                from .agent import _models_store_root
+                store_root = _models_store_root() or ""
+            except Exception:  # noqa: BLE001
+                store_root = ""
+            effective_cap, budget_sources = resolve_effective_cap(limits, store_root)
         plan = fit_plan(model_key, need_bytes, storage, limits, last_picked,
-                        allocated)
+                        allocated, shared_store=shared_store,
+                        effective_cap=effective_cap, budget_sources=budget_sources)
     except BudgetRefusal:
         raise
     except Exception as exc:  # noqa: BLE001

@@ -53,7 +53,9 @@ from abstract_hugpy_dev.worker_agent import agent as A
 def kicks(monkeypatch):
     """Record _kick_provision calls instead of downloading anything."""
     seen: list[str] = []
-    monkeypatch.setattr(A, "_kick_provision", lambda state, mk: seen.append(mk))
+    monkeypatch.setattr(
+        A, "_kick_provision",
+        lambda state, mk, purpose="reconcile": seen.append(mk))
     return seen
 
 

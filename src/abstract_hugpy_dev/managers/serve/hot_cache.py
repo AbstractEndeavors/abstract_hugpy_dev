@@ -104,11 +104,67 @@ def _root() -> str:
     return (os.environ.get(_ENV_ROOT) or "").strip()
 
 
-def _budget_bytes() -> int:
+def _own_budget_bytes() -> int:
+    """The hot tier's OWN declared budget (HUGPY_HOT_CACHE_GIB), unclamped."""
     try:
         return int(float(os.environ.get(_ENV_GIB, _DEFAULT_GIB)) * GiB)
     except (TypeError, ValueError):
         return int(_DEFAULT_GIB * GiB)
+
+
+def _store_disk_cap_gib() -> float | None:
+    """Central's disk_cache_gib for this box, projected into env by the worker
+    agent's _adopt_storage_inputs (read LIVE). None when unset."""
+    raw = os.environ.get("_HUGPY_CENTRAL_DISK_CACHE_GIB")
+    if raw in (None, ""):
+        return None
+    try:
+        v = float(raw)
+        return v if v > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _same_drive(a: str, b: str) -> bool:
+    """True when paths a and b live on the same physical drive (same st_dev),
+    walking up to the nearest existing parent. Mirrors budget._drive_id's signal
+    so the hot tier and the pull gate agree on 'same drive'."""
+    def _dev(p: str):
+        p = p or ""
+        for _ in range(64):
+            try:
+                return os.stat(p).st_dev
+            except OSError:
+                parent = os.path.dirname(p)
+                if not parent or parent == p:
+                    return None
+                p = parent
+        return None
+    da, db = _dev(a), _dev(b)
+    return da is not None and da == db
+
+
+def _budget_bytes() -> int:
+    """The EFFECTIVE hot-tier budget (slice 4, min-wins). The tier's own
+    HUGPY_HOT_CACHE_GIB, floored by central's disk_cache_gib WHEN the hot root
+    shares the store root's drive — so a promote/admit can never write bytes past
+    the effective cap the pull gate would refuse (the ae 400-vs-1500 same-dir
+    overcrowding). Different drive → the tiers don't contend → own budget stands.
+    Unset central term or unresolvable roots → own budget, unchanged."""
+    own = _own_budget_bytes()
+    central_gib = _store_disk_cap_gib()
+    if central_gib is None:
+        return own
+    root = _root()
+    store = _models_home()
+    if not root or not store:
+        return own
+    try:
+        if not _same_drive(root, store):
+            return own                       # separate drive — no contention
+    except Exception:  # noqa: BLE001 — a drive probe must never break a load
+        return own
+    return min(own, int(central_gib * GiB))
 
 
 def _min_residency_s() -> float:
@@ -717,7 +773,12 @@ def status() -> dict:
             "enabled": True,
             "stale_parts": stale,
             "root": _root(),
-            "budget_bytes": _budget_bytes(),
+            "budget_bytes": _budget_bytes(),          # EFFECTIVE (min-wins)
+            # Visibility (slice 4): the tier's own declared budget vs the central
+            # disk_cache_gib floor, so the operator can see WHY budget_bytes is
+            # what it is when the hot root shares the store drive.
+            "budget_own_bytes": _own_budget_bytes(),
+            "budget_central_disk_cache_gib": _store_disk_cap_gib(),
             "used_bytes": _index_used_bytes(),
             "free_bytes": _free_bytes(),
             "min_residency_s": _min_residency_s(),

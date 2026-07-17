@@ -96,12 +96,42 @@ def get_model_dirs(models_home=None):
     return found
 
 def get_hub_id_from_directory(directory, models_home=None):
-    """Repo id = the path of the model dir relative to its task dir.
-    (directory is the longer path; strip the task-dir prefix off the FRONT.)"""
+    """Best-effort repo id (``owner/repo[/subfolder]``) for a dir under the
+    model store, marker-first.
+
+    ``hugpy.json`` (when present) names the repo authoritatively — read it
+    first via :func:`hub_id_for`, exactly like discovery does. Only a dir with
+    no marker falls back to a PATH GUESS, and that guess must match the
+    CURRENT layout: the store is flat (operator-locked 2026-07-11) —
+    ``models/<runtime>/<owner>/<repo>[/<subfolder>]`` — a 3+-segment relative
+    path with exactly ONE leading runtime segment, not the old
+    ``family/task/owner/repo`` shape this used to assume. Unconditionally
+    dropping 2 leading segments on a 3-segment flat path stripped the OWNER
+    too, collapsing every hub id to a bare repo name (the 2026-07-17 orphan
+    over-report root cause — see worker_agent/provision.py's
+    known_model_dir_forms, which no longer trusts this alone for matching but
+    this must still return the truest guess it can for display/lookup).
+    Legacy ``runtime/task/owner/repo`` dirs (task an unknown-length single
+    segment) still parse wrong here by path alone — that's inherent to a
+    positional guess with no task vocabulary; callers needing correctness
+    across legacy layouts must go through the read-through resolver
+    (``candidate_model_dirs``/``resolve_model_dir``), not this function.
+    """
+    marker = hub_id_for(directory)
+    if marker:
+        return marker
     root = get_model_home(models_home=models_home)
     rel = directory[len(root):].strip("/")
     parts = rel.split("/")
-    # rel = family/task/owner/repo[/subfolder]; drop family+task, keep the rest
+    if len(parts) <= 1:
+        return rel
+    # Flat layout: exactly 1 leading runtime segment (gguf/transformers/misc/
+    # safetensors) -> drop only that one, keep owner/repo[/subfolder] whole.
+    if parts[0] in RUNTIME_FAMILIES and len(parts) >= 3:
+        return "/".join(parts[1:])
+    # Unknown/legacy shape: fall back to the old best-effort guess (drop 2)
+    # rather than assume flat, so a genuine 4-segment legacy dir isn't made
+    # worse; still layout-guessing, so callers should prefer the resolver.
     return "/".join(parts[2:]) if len(parts) > 2 else rel
 
 def is_directory_excluded(directory):
