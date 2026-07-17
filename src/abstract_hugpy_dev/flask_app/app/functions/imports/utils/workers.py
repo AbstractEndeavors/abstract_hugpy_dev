@@ -962,6 +962,10 @@ def storage_proposal(worker: Dict[str, Any]) -> Dict[str, Any]:
         "scan_keys_considered": (_as_int(storage.get("scan_keys_considered")) or 0) if reported else 0,
         "scan_rows": (_as_int(storage.get("scan_rows")) or 0) if reported else 0,
         "scan_row_errors": (_as_int(storage.get("scan_row_errors")) or 0) if reported else 0,
+        # SKIP-REASON HISTOGRAM (slice 5) — passed through VERBATIM so the console
+        # can name the ae failure class (not_local/no_config/comfy). Absent on a
+        # pre-slice-5 worker -> {} (feature off).
+        "scan_skip_reasons": (storage.get("scan_skip_reasons") or {}) if reported else {},
         # EFFECTIVE BUDGET (slice 4, min-wins) — the worker's own resolved
         # min(central disk_cache_gib, worker same-drive declarations) + the source
         # map, passed through VERBATIM so the console can show WHY a number

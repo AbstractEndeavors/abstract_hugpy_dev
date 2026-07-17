@@ -174,25 +174,69 @@ def _min_residency_s() -> float:
         return _DEFAULT_MIN_RESIDENCY_S
 
 
-def enabled() -> bool:
-    """True only when a hot root is configured AND usable (exists + writable).
-    A misconfigured root disables the tier rather than raising into a load."""
-    root = _root()
-    if not root:
-        return False
-    try:
-        os.makedirs(root, exist_ok=True)
-        return os.path.isdir(root) and os.access(root, os.W_OK)
-    except OSError:
-        return False
-
-
 def _models_home() -> str:
     try:
         from ...imports.src.constants.constants import MODELS_HOME
         return str(MODELS_HOME)
     except Exception:  # noqa: BLE001
         return "/mnt/llm_storage/models"
+
+
+def _paths_overlap(a: str, b: str) -> bool:
+    """True when realpath(a) and realpath(b) are the same dir OR one contains the
+    other. Component-aware (commonpath), so /x/models and /x/models2 do NOT
+    overlap but /x/models and /x/models/gguf do."""
+    if not a or not b:
+        return False
+    try:
+        ra, rb = os.path.realpath(a), os.path.realpath(b)
+        if ra == rb:
+            return True
+        common = os.path.commonpath([ra, rb])
+        return common == ra or common == rb
+    except (ValueError, OSError):
+        return False
+
+
+def _degenerate_root() -> bool:
+    """True when the hot root OVERLAPS the canonical model store (MODELS_HOME) —
+    a 'cache of itself' (ae: HUGPY_HOT_CACHE_ROOT == MODEL_HOME).
+
+    THE ae 2026-07-17 DATA-LOSS ROOT CAUSE. When the hot root is the store root,
+    hot_path(f)==f (identity), _rebuild_index adopts EVERY canonical model dir as
+    a hot 'entry', and _make_room's LRU eviction then rmtree's real model weights
+    out of MODELS_HOME to hit the (min-wins-floored) budget — silently deleting
+    the store it was meant to accelerate. models_local fell 65→0 as slice-4's
+    400 GiB floor turned this eviction aggressive against 672 GiB present.
+
+    In this configuration the tier CANNOT promote or evict without operating on
+    the canonical store, so both are disabled (enabled()→False). Serving is
+    unaffected: use() already returns under-root paths unchanged (the files are
+    already 'hot'), so loads still run straight off MODELS_HOME. The operator's
+    remedy is a hot root on a SEPARATE dir/drive; until then the tier is inert
+    rather than destructive."""
+    root = _root()
+    if not root:
+        return False
+    return _paths_overlap(root, _models_home())
+
+
+def enabled() -> bool:
+    """True only when a hot root is configured, usable (exists + writable), AND
+    NOT degenerate (does not overlap MODELS_HOME). A misconfigured or degenerate
+    root disables the tier rather than raising into a load — critically, a
+    degenerate root must never promote/evict, or it deletes the canonical store
+    (the ae data-loss incident; see _degenerate_root)."""
+    root = _root()
+    if not root:
+        return False
+    if _degenerate_root():
+        return False
+    try:
+        os.makedirs(root, exist_ok=True)
+        return os.path.isdir(root) and os.access(root, os.W_OK)
+    except OSError:
+        return False
 
 
 # --------------------------------------------------------------------------- #
@@ -562,6 +606,12 @@ def _promote(shared_path: str) -> None:
     """Copy a model's file set into the hot cache, evicting LRU first. Returns
     nothing; logs outcomes. Abandons cleanly (removes the .part) if the source
     changes/vanishes mid-copy."""
+    # SAFETY (ae data-loss guard): never promote/evict when the hot root overlaps
+    # MODELS_HOME — _make_room would rmtree canonical model dirs. use() already
+    # gates on enabled() (False here), but the promoter thread is a second entry
+    # point, so re-check at the choke point. See _degenerate_root.
+    if not enabled():
+        return
     key = _entry_key(shared_path)
     files = _file_set(shared_path)
     if not files:
@@ -748,6 +798,16 @@ def stale_parts(older_than_s: float = _STALE_PART_S) -> list[dict]:
 def status() -> dict:
     """Honest hot-cache overview for the worker storage view / console."""
     if not enabled():
+        # Name the degenerate case explicitly (hot root == store) so the
+        # heartbeat shows WHY the tier is off rather than a bare disabled — this
+        # is the ae misconfiguration that caused data loss before the guard.
+        if _degenerate_root():
+            return {"enabled": False, "disabled_reason": "degenerate_root",
+                    "root": _root(), "models_home": _models_home(),
+                    "detail": ("hot root overlaps MODELS_HOME — promotion/eviction "
+                               "disabled so the tier cannot delete the canonical "
+                               "store; point HUGPY_HOT_CACHE_ROOT at a separate "
+                               "dir/drive to enable hot-caching")}
         return {"enabled": False}
     try:
         _load_index()

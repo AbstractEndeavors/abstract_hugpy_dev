@@ -1829,18 +1829,33 @@ def _reap_scan(state: "WorkerState") -> dict:
 
     considered = len(keys)
     row_errors = 0
+    # SKIP-REASON HISTOGRAM (slice 5). Cheap, permanent per-key accounting of why
+    # a considered key produced NO row. This is what would have named the ae
+    # 2026-07-17 incident (74 considered, 0 rows) in a single heartbeat:
+    # {"not_local": 74} points straight at presence, distinguishing it from
+    # {"no_config": 74} (registry/resolution) or {"comfy": N}. Rows that DO
+    # classify are not counted here (they land in reclaimable/protected).
+    skip_reasons: dict[str, int] = {}
+
+    def _skip(reason: str):
+        skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+
     for mk in keys:
         try:
             cfg = get_model_config(mk)
         except Exception:
+            _skip("no_config")
             continue
         if getattr(cfg, "framework", None) == "comfy":
+            _skip("comfy")
             continue  # symlinks / operator-owned — reaper stays clear
         try:
             if not model_is_local(mk):
+                _skip("not_local")
                 continue
         except Exception:
             row_errors += 1
+            _skip("locality_error")
             continue
         # STORE-ROOT COPY classification (slice 3, C). Prefer the copy under THIS
         # worker's own store root over get_model_path's read-through, which on ae
@@ -1900,6 +1915,10 @@ def _reap_scan(state: "WorkerState") -> dict:
         "scan_keys_considered": considered,
         "scan_rows": len(reclaimable) + len(protected),
         "scan_row_errors": row_errors,
+        # SKIP-REASON HISTOGRAM (slice 5): why each considered key produced no
+        # row — {"not_local": N, "no_config": N, "comfy": N, "locality_error": N}.
+        # considered≫rows is now self-explaining in one heartbeat.
+        "scan_skip_reasons": skip_reasons,
     }
     if scan_error:
         out["error"] = scan_error
@@ -2447,6 +2466,10 @@ def _worker_storage(state: "WorkerState") -> dict:
         "scan_keys_considered": int(scan.get("scan_keys_considered") or 0),
         "scan_rows": int(scan.get("scan_rows") or 0),
         "scan_row_errors": int(scan.get("scan_row_errors") or 0),
+        # SKIP-REASON HISTOGRAM (slice 5): why considered keys produced no row —
+        # names the ae failure class (not_local / no_config / comfy / …) in one
+        # heartbeat instead of leaving considered≫rows unexplained.
+        "scan_skip_reasons": scan.get("scan_skip_reasons") or {},
     }
     _STORAGE_CACHE.update(at=now, value=out)
     return out
