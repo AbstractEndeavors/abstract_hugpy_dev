@@ -96,6 +96,16 @@ def last_used_snapshot() -> Dict[str, float]:
     return dict(_LAST_USED)
 
 
+class LoadRefusal(Exception):
+    """A GPU load that can't fit even after evicting every permissible resident
+    (slice 10). Raised by ensure_headroom_for_load's cross-tier make-room BEFORE
+    any CUDA allocation, carrying the typed reason so the caller surfaces an
+    honest 'won't fit' instead of an admit-then-OOM crash."""
+    def __init__(self, reason: dict):
+        self.reason = reason or {}
+        super().__init__(self.reason.get("reason") or "won't fit on GPU")
+
+
 # ---------------------------------------------------------------------------
 # Contention hooks — registered by the worker agent; None on bare central.
 #
@@ -108,6 +118,13 @@ def last_used_snapshot() -> Dict[str, float]:
 _FIT_CHECK = None        # (model_key) -> bool: does loading it fit in current headroom?
 _EVICTABLE = None        # (model_key) -> bool: is it a yieldable on-demand in-process resident?
 _POST_EVICT = None       # () -> None: reclaim host RAM / CUDA cache after an eviction
+# (model_key) -> dict: CROSS-TIER VRAM make-room (slice 10). The in-process LRU
+# yield below only sees _INSTANCES residents; a SLOT CHILD (subprocess) squatting
+# the GPU is invisible to it. The worker registers a make-room hook that sees ALL
+# residents (in-process + slot + comfy) from the pid-registry measured truth and
+# evicts the minimum permissible set through the /ops/evict verb — closing the
+# blind admit-then-OOM the incident exposed. None -> the old in-process-only path.
+_MAKE_ROOM = None
 _CONTENTION_LOCK = threading.Lock()
 
 
@@ -132,6 +149,16 @@ def set_post_evict_hook(fn) -> None:
     the next headroom re-check sees the freed memory. None -> skipped."""
     global _POST_EVICT
     _POST_EVICT = fn
+
+
+def set_make_room(fn) -> None:
+    """Register the CROSS-TIER VRAM make-room (slice 10): ``fn(model_key) -> dict``
+    with {"action": "proceed"|"evicted"|"refuse", "reason": {...}|None}. Called
+    after the in-process LRU yield so a SLOT-CHILD squatter (invisible to the
+    in-process path) is also evicted, and an unfittable load is REFUSED before any
+    CUDA allocation. None -> the historical in-process-only contention path."""
+    global _MAKE_ROOM
+    _MAKE_ROOM = fn
 
 
 def _next_lru_evictable(exclude: str) -> Optional[str]:
@@ -171,29 +198,53 @@ def ensure_headroom_for_load(model_key: str) -> List[str]:
     only ADDS room, it never changes the too-big error envelope.
 
     No-op on bare central / when no fit-guard is registered. Returns the list of
-    yielded model_keys (for logging + tests)."""
-    if _FIT_CHECK is None:
-        return []
+    yielded model_keys (for logging + tests).
+
+    CROSS-TIER (slice 10): after the in-process LRU yield, a registered make-room
+    hook (set_make_room) runs a SECOND pass that also evicts SLOT-CHILD squatters
+    (subprocess VRAM the in-process path cannot see) and REFUSES an unfittable
+    load before any CUDA allocation (raising LoadRefusal). Without the hook the
+    behavior is byte-identical to before."""
     evicted: List[str] = []
-    with _CONTENTION_LOCK:
-        while not _FIT_CHECK(model_key):
-            cand = _next_lru_evictable(exclude=model_key)
-            if cand is None:
-                break                        # nothing to yield -> load as today
-            logger.info("contention evict: yielding LRU on-demand resident %s to "
-                        "make room for %s (doctrine 2026-07-11: keep models hot, "
-                        "yield only under memory pressure)", cand, model_key)
-            try:
-                evict(cand)
-            except Exception:                # noqa: BLE001 — one bad evict must not wedge the load
-                logger.warning("contention evict of %s failed", cand, exc_info=True)
-                break
-            evicted.append(cand)
-            if _POST_EVICT is not None:
+    if _FIT_CHECK is not None:
+        with _CONTENTION_LOCK:
+            while not _FIT_CHECK(model_key):
+                cand = _next_lru_evictable(exclude=model_key)
+                if cand is None:
+                    break                    # nothing to yield in-process -> below
+                logger.info("contention evict: yielding LRU on-demand resident %s to "
+                            "make room for %s (doctrine 2026-07-11: keep models hot, "
+                            "yield only under memory pressure)", cand, model_key)
                 try:
-                    _POST_EVICT()            # trim so the next fit re-check sees the freed room
-                except Exception:            # noqa: BLE001
-                    logger.warning("post-evict reclaim failed", exc_info=True)
+                    evict(cand)
+                except Exception:            # noqa: BLE001 — one bad evict must not wedge the load
+                    logger.warning("contention evict of %s failed", cand, exc_info=True)
+                    break
+                evicted.append(cand)
+                if _POST_EVICT is not None:
+                    try:
+                        _POST_EVICT()        # trim so the next fit re-check sees the freed room
+                    except Exception:        # noqa: BLE001
+                        logger.warning("post-evict reclaim failed", exc_info=True)
+
+    # CROSS-TIER make-room + honest refusal (slice 10). The in-process yield above
+    # cannot see a slot child; this hook sees ALL residents and evicts the minimum
+    # permissible set (slot children included), then REFUSES if still short.
+    if _MAKE_ROOM is not None:
+        try:
+            verdict = _MAKE_ROOM(model_key)
+        except LoadRefusal:
+            raise
+        except Exception:                    # noqa: BLE001 — a broken hook never blocks a load
+            logger.warning("cross-tier make-room failed for %s", model_key,
+                           exc_info=True)
+            verdict = None
+        if isinstance(verdict, dict):
+            evicted.extend(v for v in (verdict.get("evicted") or [])
+                           if v not in evicted)
+            if verdict.get("action") == "refuse":
+                raise LoadRefusal(verdict.get("reason") or
+                                  {"reason": "won't fit on GPU", "model_key": model_key})
     return evicted
 
 

@@ -58,6 +58,22 @@ CREATE TABLE IF NOT EXISTS jobs (
 # so it is NEVER reaped by the progress-sweep.
 _ORPHAN_ACTIVE = ("processing", "streaming", "running")
 
+# Pending-orphan expiry (slice 9, defect 2): a `pending` job with no worker and
+# no forward progress this long was NEVER dispatched (model unresolvable, or no
+# capable worker) — it will never run, so it transitions to a terminal `expired`
+# state. Aged on `progressed_at` (the movement-only clock — NEVER `updated`,
+# which view/recompute writes bump; that resurrection bug was fixed once and must
+# not return). Env-overridable; default 30 min.
+def _pending_expiry_seconds() -> float:
+    raw = (os.environ.get("HUGPY_JOB_PENDING_EXPIRY_SECONDS") or "").strip()
+    if not raw:
+        return 1800.0
+    try:
+        v = float(raw)
+        return v if v > 0 else 1800.0
+    except ValueError:
+        return 1800.0
+
 MAX_FAILURES = 5
 
 
@@ -184,6 +200,93 @@ class SqliteMirror:
         except Exception as exc:
             self._note_failure("request_cancel", exc)
             return False
+
+    def force_terminal(self, job_id: str, status: str, message: str = "") -> bool:
+        """Force a LIVE mirror row terminal (slice 9) — the authoritative cancel /
+        orphan-expiry path for a row NO process holds in memory (the immortal
+        pending job that survived restarts). Updates the persisted `status`
+        column AND rewrites the row's JSON `data` blob so /llm/jobs reads the
+        terminal state consistently. Only acts on a row that is NOT already
+        terminal (first-terminal-wins); returns True if a live row was retired.
+
+        Goes through the store's own connection (never a caller-side raw sqlite
+        channel) — the DB write discipline stays in one place."""
+        if not self._ensure():
+            return False
+        term = str(status or "cancelled")
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT data FROM jobs WHERE id=? "
+                    "AND status NOT IN ('done','cancelled','failed','expired')",
+                    (job_id,)).fetchone()
+                if not row:
+                    return False           # unknown or already terminal
+                try:
+                    data = json.loads(row[0]) if row[0] else {}
+                except Exception:
+                    data = {}
+                data["id"] = job_id
+                data["status"] = term
+                if message:
+                    data["message"] = message
+                data["ended_ts"] = data.get("ended_ts") or time.time()
+                if term == "cancelled":
+                    data["cancel_requested"] = True
+                conn.execute(
+                    "UPDATE jobs SET status=?, data=?, updated=? WHERE id=?",
+                    (term, json.dumps(data), time.time(), job_id))
+            self._ok()
+            return True
+        except Exception as exc:
+            self._note_failure("force_terminal", exc)
+            return False
+
+    def expire_pending_orphans(self) -> list[str]:
+        """Transition never-dispatched pending jobs to terminal `expired` (slice 9,
+        defect 2). A `pending` row with no worker whose `progressed_at` is older
+        than the pending-expiry threshold was never picked up (unresolvable model
+        or no capable worker); it will never run. Aged on `progressed_at` — the
+        movement-only clock, NEVER `updated` (view/recompute writes bump `updated`,
+        and aging on it is exactly the resurrection bug already fixed once). A NULL
+        progressed_at is fail-open (never expired here — we only act when we
+        positively know it is old). Rewrites the JSON `data` blob so /llm/jobs
+        reads the honest terminal state + message. Returns the expired ids."""
+        if not self._ensure():
+            return []
+        cutoff = time.time() - _pending_expiry_seconds()
+        msg = ("never dispatched — model unresolvable or no capable worker "
+               "(auto-expired)")
+        expired: list[str] = []
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT id, data FROM jobs WHERE status='pending' "
+                    "AND progressed_at IS NOT NULL AND progressed_at < ?",
+                    (cutoff,)).fetchall()
+                for job_id, data_json in rows:
+                    try:
+                        data = json.loads(data_json) if data_json else {}
+                    except Exception:
+                        data = {}
+                    # A pending job that somehow has a worker assigned is being
+                    # dispatched — leave it (belt-and-braces; the query already
+                    # only takes pending, but a worker means an owner exists).
+                    if data.get("worker"):
+                        continue
+                    data["id"] = job_id
+                    data["status"] = "expired"
+                    data["message"] = msg
+                    data["ended_ts"] = data.get("ended_ts") or time.time()
+                    conn.execute(
+                        "UPDATE jobs SET status='expired', data=?, updated=? "
+                        "WHERE id=?",
+                        (json.dumps(data), time.time(), job_id))
+                    expired.append(job_id)
+            self._ok()
+        except Exception as exc:
+            self._note_failure("expire_pending_orphans", exc)
+        return expired
 
     def clear_cancel(self, job_id: str) -> None:
         """Deliberate resurrection (download retry) starts a fresh run."""

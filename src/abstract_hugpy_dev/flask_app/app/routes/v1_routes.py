@@ -156,6 +156,29 @@ def v1_chat_completions():
     except (ValueError, TypeError) as exc:
         return _openai_error(str(exc), 400)
 
+    # REJECT-AT-INTAKE (slice 9, defect 3): a request naming a model that resolves
+    # to NOTHING (not in the registry/catalog, no worker designation) must be
+    # rejected NOW with a 4xx + known-keys hint — never accepted into a
+    # pending-forever job (the operator's immortal flux2-klein row). We reuse the
+    # DISPATCHER'S OWN resolution (resolve_model_key -> assure_model_key), so the
+    # boundary is exact: a model that IS known but merely not local/loaded still
+    # RESOLVES (registry membership, not disk presence) and queues — lazy download
+    # is the design. Only a truly-unresolvable explicit key rejects. A None/
+    # "default" model_key (no preference) is left for the engine to default.
+    _mk = prompt_kwargs.get("model_key")
+    if _mk:
+        try:
+            from abstract_hugpy_dev.managers.resolvers.model_resolver import (
+                resolve_model_key)
+            resolve_model_key(model_key=_mk)
+        except KeyError as exc:
+            # KeyError carries the "Unknown model_key=...; known: [...]" hint.
+            return _openai_error(str(exc).strip("'\""), 400)
+        except Exception:
+            # A non-resolution error (registry probe failed) must NOT reject a
+            # legitimate request — fall through and let the engine try.
+            pass
+
     # A tool call is one short, bounded turn — never auto-continue it. A
     # continuation pass is exactly what rambled the captured 2026-07-14
     # incident and would splice "Continue…" text into the JSON block. An

@@ -56,6 +56,15 @@ def llm_jobs():
     kind = (request.args.get("kind") or "").strip() or None
     transport = (request.args.get("transport") or "").strip() or None
     live = (request.args.get("live") or "1").strip() not in ("0", "false")
+    # Pending-orphan expiry is EVENT-DRIVEN (slice 9, defect 2): this view is a
+    # natural trigger — no timer thread. Retire never-dispatched pending jobs
+    # BEFORE the snapshot so the operator never sees an immortal pending row.
+    # Aged on progressed_at inside the store, so reading this view can never
+    # RESET the clock (the resurrection bug stays fixed).
+    try:
+        job_store.expire_pending_orphans()
+    except Exception:
+        pass
     rows = job_store.snapshot(kinds={kind} if kind else None,
                               live_only=live)
     if transport:
@@ -76,10 +85,19 @@ def llm_job_cancel(job_id):
     from abstract_hugpy_dev.comms import job_store
     body = request.get_json(silent=True) or {}
     reason = str(body.get("reason") or "")
-    ok = job_store.cancel(job_id, reason)
+    # AUTHORITATIVE, HONEST cancel (slice 9, defect 1): a live owner is relayed;
+    # an owner-less job (pending/worker-null, or a mirror-only immortal row) is
+    # force-marked terminal in the store — persisted, surviving restarts. The
+    # `mode` says which happened, and a cancel that changes NOTHING returns
+    # cancelled:false (no more lying cancelled:true on a stuck job).
+    res = job_store.cancel_authoritative(job_id, reason)
+    ok = bool(res.get("cancelled"))
+    mode = res.get("mode")
     job = job_store.get(job_id)
     transport = getattr(job, "transport", None) if job is not None else None
-    comms_status = job.to_dict()["status"] if job is not None else None
+    comms_status = res.get("status")
+    if comms_status is None and job is not None:
+        comms_status = job.to_dict()["status"]
     # Reach the execution plane UNCONDITIONALLY. media_bus.cancel is a safe no-op
     # for a non-media id (unknown -> {cancelled:False, status:None}, a pure read),
     # so calling it always also covers a QUEUED media job — which has no local
@@ -92,11 +110,15 @@ def llm_job_cancel(job_id):
     mb_known = mb.get("status") is not None or bool(mb.get("cancelled"))
     if mb_known and transport is None:
         transport = "media"  # queued media, inferred from the execution plane
-    cancelled = bool(ok) or bool(mb.get("cancelled"))
+    if mb.get("cancelled") and not ok:
+        # The comms plane found nothing but the media plane did — report honestly.
+        ok = True
+        mode = mode if mode not in (None, "noop") else "media"
+    cancelled = ok
     status = mb.get("status") if mb_known else comms_status
     audit("job.cancel", {"job_id": job_id, "transport": transport,
-                         "cancelled": cancelled, "reason": reason})
-    return jsonify({"job_id": job_id, "cancelled": cancelled,
+                         "cancelled": cancelled, "mode": mode, "reason": reason})
+    return jsonify({"job_id": job_id, "cancelled": cancelled, "mode": mode,
                     "status": status, "transport": transport})
 
 

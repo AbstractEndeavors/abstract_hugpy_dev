@@ -438,53 +438,149 @@ def _has_usable_gpu(worker: Dict[str, Any]) -> bool:
     return any((g.get("memory_free") or 0) > 0 for g in (worker.get("gpus") or []))
 
 
-def _vram_summary(worker: Dict[str, Any]) -> Dict[str, Any]:
-    """Flat, normalized GPU/VRAM rollup derived from the per-GPU ``gpus[]`` list.
+_GIB = 2 ** 30
 
-    The registry stores VRAM only nested inside ``gpus[]`` (refreshed every
-    heartbeat), so each consumer had to dig — and the worker summary read as
-    "gpu: None" even for a box with a real card. This surfaces a single primary
-    GPU name plus summed totals so the console and a VRAM-fit ("worker slot")
-    allocator can read flat fields, exactly the way the local slot pool reads a
-    flat RAM number. All counts are bytes; ``None`` where unknown (never
-    fabricated — an empty/again-unreported ``gpus`` yields None, not 0).
+
+def _limit_bytes(worker: Dict[str, Any], key: str) -> Optional[int]:
+    """A central limit (limits.<key> in GiB) as bytes, or None if unset."""
+    v = (worker.get("limits") or {}).get(key)
+    if v is None:
+        return None
+    try:
+        return int(float(v) * _GIB)
+    except (TypeError, ValueError):
+        return None
+
+
+def _honest_bar(physical_total, central_limit, worker_usage, external_usage):
+    """Thin wrapper over spill.budget_bar so both summaries share ONE import of
+    the operator's spec math. Degrades to None (legacy caller decides) on any
+    import failure — the summary must never 500 the worker list."""
+    try:
+        from ......managers.spill import budget_bar
+        return budget_bar(physical_total, central_limit, worker_usage, external_usage)
+    except Exception:  # noqa: BLE001 — never fail _public_view over the bar math
+        return None
+
+
+def _vram_summary(worker: Dict[str, Any]) -> Dict[str, Any]:
+    """Flat GPU/VRAM rollup + the honest budget bar (t13/t14).
+
+    ``vram_total``/``vram_free``/``vram_used`` stay the box-wide driver figures
+    from ``gpus[]`` (unchanged — the physical truth). ON TOP, when the worker
+    reports the pid_registry split (vram_attributed_bytes) this computes the
+    operator's honest bar against the central GPU limit (limits.gpu_mem_gib):
+    worker_usage = attributed model VRAM, external_usage = box driver-used minus
+    attributed (ComfyUI + foreign + non-hugpy). bar_* fields carry bar_used/
+    remaining/encroachment/over_limit + the raw figures; ``bar_semantics`` is
+    "central" (a limit is set), "physical" (no limit) or "legacy" (a pre-slice
+    worker that never reported the attributed split — the UI then labels it
+    honestly instead of drawing a mixed-universe bar).
+    All counts are bytes; ``None`` where unknown (never fabricated).
     """
     gpus = [g for g in (worker.get("gpus") or []) if isinstance(g, dict)]
     if not gpus:
-        return {"gpu": None, "gpu_count": 0, "vram_total": None, "vram_free": None, "vram_used": None}
+        return {"gpu": None, "gpu_count": 0, "vram_total": None,
+                "vram_free": None, "vram_used": None,
+                "vram_bar_semantics": "legacy", "bar_semantics": "legacy"}
     name   = next((g.get("name") for g in gpus if g.get("name")), None)
     totals = [g.get("memory_total") for g in gpus if g.get("memory_total")]
     frees  = [g.get("memory_free")  for g in gpus if g.get("memory_free") is not None]
     vram_total = sum(totals) if totals else None
     vram_free  = sum(frees)  if frees  else None
     vram_used  = (vram_total - vram_free) if (vram_total is not None and vram_free is not None) else None
-    return {
+    out = {
         "gpu": name,
         "gpu_count": len(gpus),
         "vram_total": vram_total,
         "vram_free": vram_free,
         "vram_used": vram_used,
     }
+    attributed = worker.get("vram_attributed_bytes")
+    if attributed is None:
+        # Pre-slice worker: no honest split available. Leave the driver figures
+        # as-is and flag legacy so the UI labels the bar honestly.
+        out["vram_bar_semantics"] = "legacy"
+        return out
+    limit = _limit_bytes(worker, "gpu_mem_gib")
+    # external = whatever the driver shows used beyond hugpy's attributed models
+    # (ComfyUI, foreign squatters, other apps, CUDA-context slack).
+    external = (max(0, vram_used - attributed)
+                if vram_used is not None else worker.get("vram_unattributed_bytes"))
+    bar = _honest_bar(vram_total, limit, attributed, external)
+    out.update(_bar_public_fields(bar, prefix="vram_"))
+    return out
 
 
 def _ram_summary(worker: Dict[str, Any]) -> Dict[str, Any]:
-    """Flat RAM rollup — the CPU-tier mirror of _vram_summary.
+    """Flat RAM rollup + the honest budget bar (t13/t14) — the CPU-tier mirror.
 
-    ``ram_total`` is the box's RAW installed memory (MemTotal, reported by the
-    agent). ``ram_used`` is derived as ``ram_total - free_ram`` — but note
-    free_ram is reserve-adjusted AND HUGPY_RAM_MAX_GIB-capped, so this reads as
-    "used incl. reserve/headroom", NOT pure model RSS (the console labels it so).
-    None where unknown (never fabricated — mirrors _vram_summary's discipline);
-    clamped to >=0 so reserve accounting can't yield a negative width.
+    ``ram_total`` is the box's RAW installed memory. The old ``ram_used`` =
+    ``ram_total − free_ram`` was an ARTIFACT: free_ram is ceiling-clamped, so on
+    an under-budget box it algebraically collapsed to physical − central_limit
+    (ae's phantom "28.9 GB used" = 124.9 − 96). The honest bar replaces it: when
+    the worker reports ram_worker_bytes/ram_external_bytes this computes the
+    operator's spec against the RAM ceiling (limits.ram_max_gib), and ``ram_used``
+    becomes the SPEC bar_used (the fill the chip draws). bar_* fields + raw
+    figures ride alongside; ``bar_semantics`` is central/physical/legacy.
+    Pre-slice workers (no ram_worker_bytes) keep the OLD ram_used and are flagged
+    legacy so the UI can say so rather than draw a mixed-universe bar.
+    None where unknown (never fabricated); clamped ≥0.
     """
     ram_total = worker.get("ram_total")
-    free_ram = worker.get("free_ram")
-    ram_used = (
-        max(0, ram_total - free_ram)
-        if (ram_total is not None and free_ram is not None)
-        else None
-    )
-    return {"ram_total": ram_total, "ram_used": ram_used}
+    worker_usage = worker.get("ram_worker_bytes")
+    if worker_usage is None:
+        # Pre-slice worker: keep the historical (acknowledged-imperfect) figure,
+        # flagged legacy. free_ram is the clamped field, matching old behavior.
+        free_ram = worker.get("free_ram")
+        ram_used = (max(0, ram_total - free_ram)
+                    if (ram_total is not None and free_ram is not None) else None)
+        return {"ram_total": ram_total, "ram_used": ram_used,
+                "ram_bar_semantics": "legacy", "bar_semantics": "legacy"}
+    external = worker.get("ram_external_bytes")
+    limit = _limit_bytes(worker, "ram_max_gib")
+    bar = _honest_bar(ram_total, limit, worker_usage, external)
+    out = {"ram_total": ram_total}
+    fields = _bar_public_fields(bar, prefix="ram_")
+    out.update(fields)
+    # ram_used IS the bar fill the chip draws (spec bar_used), so the existing
+    # chip prop keeps working while gaining honest semantics.
+    out["ram_used"] = fields.get("bar_used")
+    return out
+
+
+def _bar_public_fields(bar: Optional[Dict[str, Any]],
+                       prefix: str = "") -> Dict[str, Any]:
+    """Project spill.budget_bar's result onto the flat fields the console reads,
+    PREFIXED so RAM and VRAM (both spread onto the same record in _public_view)
+    never collide: prefix="ram_" -> ram_bar_semantics/ram_bar_used/…; prefix=
+    "vram_" -> vram_bar_*. The un-prefixed generic ``bar_*`` keys are ALSO
+    written for wire-compat with any caller that reads the shared names (the
+    LAST summary spread wins those — RAM, applied second in _public_view). A None
+    bar degrades to bar_semantics="legacy" with no numbers so the UI labels
+    honestly."""
+    def _keyed(d):
+        # emit both the prefixed and the generic keys
+        out = {}
+        for k, v in d.items():
+            out[f"{prefix}{k}"] = v
+            out[k] = v
+        return out
+    if not bar:
+        return _keyed({"bar_semantics": "legacy"})
+    return _keyed({
+        "bar_semantics": bar.get("semantics"),
+        "bar_used": bar.get("bar_used"),
+        "bar_total": bar.get("total"),
+        "bar_remaining": bar.get("remaining"),
+        "bar_raw_used": bar.get("raw_used"),
+        "bar_encroachment": bar.get("encroachment"),
+        "bar_over_limit": bool(bar.get("over_limit")),
+        "bar_over_by": bar.get("over_by") or 0,
+        "bar_worker_usage": bar.get("worker_usage"),
+        "bar_external_usage": bar.get("external_usage"),
+        "bar_external_headroom": bar.get("external_headroom"),
+    })
 
 
 def _disk_reserve_bytes() -> int:
@@ -1328,6 +1424,11 @@ class WorkerStore:
         rpc_endpoint: Optional[str] = None,
         free_ram: Optional[int] = None,
         ram_total: Optional[int] = None,
+        free_ram_raw: Optional[int] = None,
+        ram_worker_bytes: Optional[int] = None,
+        ram_external_bytes: Optional[int] = None,
+        vram_attributed_bytes: Optional[int] = None,
+        vram_unattributed_bytes: Optional[int] = None,
         disk: Optional[Dict[str, Any]] = None,
         engine: Optional[Dict[str, Any]] = None,
         pool: Optional[str] = None,
@@ -1345,6 +1446,7 @@ class WorkerStore:
         slot_capable: Optional[bool] = None,
         slot_incapable_reason: Optional[str] = None,
         task_capabilities: Optional[Dict[str, bool]] = None,
+        vram_evictions: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Mark a worker alive and refresh its live GPU / loaded-model stats."""
         with self._transaction() as workers:
@@ -1425,6 +1527,19 @@ class WorkerStore:
                 worker["free_ram"] = free_ram
             if ram_total is not None:
                 worker["ram_total"] = ram_total
+            # Honest budget-bar inputs (t13/t14) — stored verbatim; _ram_summary/
+            # _vram_summary compute the spec bar from them. Absent -> the summary
+            # flags bar_semantics="legacy" and shows today's numbers.
+            if free_ram_raw is not None:
+                worker["free_ram_raw"] = free_ram_raw
+            if ram_worker_bytes is not None:
+                worker["ram_worker_bytes"] = ram_worker_bytes
+            if ram_external_bytes is not None:
+                worker["ram_external_bytes"] = ram_external_bytes
+            if vram_attributed_bytes is not None:
+                worker["vram_attributed_bytes"] = vram_attributed_bytes
+            if vram_unattributed_bytes is not None:
+                worker["vram_unattributed_bytes"] = vram_unattributed_bytes
             if disk is not None:
                 worker["disk"] = disk   # model-root volume free/total (preflight)
             if engine is not None:
@@ -1448,6 +1563,10 @@ class WorkerStore:
                 # vram + unattributed foreign squatters. Stored verbatim;
                 # _public_view spreads it so the console renders it per worker.
                 worker["pid_registry"] = pid_registry
+            if vram_evictions is not None:
+                # VRAM eviction churn (slice 10): stored verbatim so the console
+                # can surface GPU evict-to-fit churn beside the disk reaps.
+                worker["vram_evictions"] = vram_evictions
             if storage is not None:
                 # Worker-reported local-storage survey (per-model on-disk bytes +
                 # protection flags + cache_used_bytes). Stored verbatim; the

@@ -2,15 +2,18 @@
 
 Replaces the clock-based on-demand eviction. Doctrine: an on-demand model loads
 on call and STAYS resident (hot) until a NEW load needs its resources — then the
-least-recently-used on-demand resident yields. static/pinned/gate-busy/slot-backed
-residents never yield. The idle clock (on_demand_ttl_s) becomes OPT-IN.
+least-recently-used yieldable resident gives way. 🔒static/gate-busy/slot-backed
+residents never yield; 📌PINNED residents DO yield (operator 2026-07-15: pin is
+DESIGNATION/routing persistence, not a resource lock — re-affirmed 2026-07-17).
+The idle clock (on_demand_ttl_s) becomes OPT-IN.
 
 Covered here:
   * dispatch.ensure_headroom_for_load — the contention mechanism, on fake runners
     with a fake headroom fn:
       (a) idle 10x the old TTL -> STAYS (no idle eviction by default);
       (b) a new load needing room -> the LRU on-demand resident yields, it fits;
-      (c) static + pinned never yield, even under pressure;
+      (c) static never yields under pressure, but a PINNED model does
+          (pin = designation, not a VRAM lock);
       (d) a model mid-generation (gate permits) is skipped, the next LRU chosen,
           and it yields only after its permits release;
       (f) nothing yieldable + still doesn't fit -> no new error (load proceeds
@@ -152,17 +155,29 @@ try:
 finally:
     restore()
 
-# --- (c) static + pinned never yield, even under pressure --------------------
-# S=static, P=pinned(modelled as static here), OD=on-demand. Only OD may yield.
+# --- (c) static never yields; a PINNED model DOES yield under pressure --------
+# Doctrine RE-CLARIFIED by the operator 2026-07-15 (and re-affirmed 2026-07-17):
+# 📌 pin = the worker is DESIGNATED that model (routing persistence across
+# restarts), NOT a resource lock — a pinned model yields to contention like any
+# on-demand resident (its pin/designation is untouched; it reloads on call).
+# 🔒 static is the ONLY residency lock and never yields.
+# S=static, P=pinned-but-on-demand, OD=plain on-demand. Only S is protected.
 box = FakeBox(capacity=12, sizes={"S": 6, "P": 6, "OD": 6, "B": 6})
 for mk in ("S", "P", "OD"):
     box.load(mk)                           # 18 > 12: already over — max pressure
-evicted, restore = install(box, residency={"S": "static", "P": "static"})
+# P is pinned but its RESIDENCY is on-demand (pin never sets residency=static),
+# so the evictable predicate (residency-only) treats it as a candidate — exactly
+# how _worker_evictable treats a pin (it checks static/in-flight/slot, never pin).
+# _LAST_USED order == load order (S, P, OD): S is coldest but PROTECTED (static),
+# so the coldest CANDIDATE is P — it yields first. Only 1 yield (6 GiB) is needed
+# to seat B (12 - 6 static - 6 freed = room), so OD is never touched.
+evicted, restore = install(box, residency={"S": "static"})
 try:
     out = dispatch.ensure_headroom_for_load("B")
-    check("(c) only the on-demand resident yielded", out == ["OD"])
     check("(c) static never yields", "S" not in evicted)
-    check("(c) pinned never yields", "P" not in evicted)
+    check("(c) a pinned-but-on-demand model DOES yield under contention "
+          "(pin is designation, not a VRAM lock — 2026-07-15)", "P" in evicted)
+    check("(c) the coldest candidate (pinned P) yielded first", out[0] == "P")
 finally:
     restore()
 
@@ -275,8 +290,9 @@ try:
     _slotkeys.slot_backed_model_keys = lambda: {"m-slot"}
     check("_worker_evictable: static never yields",
           agent._worker_evictable("m-stat") is False)
-    check("_worker_evictable: pinned never yields",
-          agent._worker_evictable("m-pin") is False)
+    check("_worker_evictable: a pinned model DOES yield (pin = designation, not "
+          "a VRAM lock — operator 2026-07-15)",
+          agent._worker_evictable("m-pin") is True)
     check("_worker_evictable: mid-generation (gate permits) never yields",
           agent._worker_evictable("m-busy") is False)
     check("_worker_evictable: slot-backed never yields (weights elsewhere)",

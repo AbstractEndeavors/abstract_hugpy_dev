@@ -47,8 +47,13 @@ from typing import Any, Callable, Optional
 from .shared import SqliteMirror
 
 CANONICAL_STATUSES = ("pending", "processing", "streaming",
-                      "done", "cancelled", "failed")
-TERMINAL_STATUSES = frozenset(("done", "cancelled", "failed"))
+                      "done", "cancelled", "failed", "expired")
+# `expired` (slice 9): a terminal state for a pending job that was NEVER
+# dispatched (no worker, no progress past the orphan threshold) — distinct from
+# `cancelled` (an operator/owner asked) and `failed` (it ran and errored). Making
+# it terminal means the orphan sweep + the authoritative cancel can retire a
+# stuck pending row that no owner will ever finish.
+TERMINAL_STATUSES = frozenset(("done", "cancelled", "failed", "expired"))
 
 # The media_bus job kinds bridged in via video_intel.job_bridge (transport
 # "media"). snapshot(live_only=False) surfaces a sibling process's *terminal*
@@ -483,32 +488,119 @@ class JobStore:
         self._fire(fire)
 
     def cancel(self, job_id: str, reason: str = "") -> bool:
-        """Request cancellation. Returns True if the job was live anywhere —
-        here, or (via the mirror) in a sibling process, which notices the
-        shared flag on its next token. Never force-marks cancelled — the
-        owning stream's teardown does (first terminal state wins keeps the
-        just-finished case honest)."""
+        """Back-compat bool wrapper. Returns True when the cancel took effect
+        (relayed to a live owner OR force-marked terminal in the store). See
+        cancel_authoritative for the honest {cancelled, mode} result."""
+        return self.cancel_authoritative(job_id, reason)["cancelled"]
+
+    def cancel_authoritative(self, job_id: str, reason: str = "") -> dict:
+        """AUTHORITATIVE, HONEST cancel (slice 9, defect 1).
+
+        Returns ``{"cancelled": bool, "mode": "relayed"|"store"|"noop",
+        "status": str|None}``.
+
+          * A job with a LIVE OWNER (a local stream has attached a cancel handle,
+            OR a sibling process holds a live mirror row) -> RELAY: request cancel,
+            fire the handle, raise the shared flag. The owner's teardown marks it
+            terminal. mode="relayed".
+          * A job with NO live owner (pending/worker-null, or a local row that is
+            terminal/handle-less AND no live sibling) -> STORE: force-mark it
+            terminal `cancelled` DIRECTLY, persisted via the mirror, surviving
+            restarts. This is the fix for the immortal pending row that answered
+            cancelled:true forever while nothing changed. mode="store".
+          * Nothing anywhere claims the id -> {cancelled:false, mode:"noop"}. A
+            cancel that changes nothing must NOT lie cancelled:true (the cardinal
+            sin this slice closes).
+
+        "Live owner" = a cancel handle attached HERE (a real streaming producer in
+        THIS process). When one exists we relay only and let its teardown write
+        the terminal status (first-terminal-wins). Otherwise we ALWAYS raise the
+        shared flag (so a live sibling's watcher can still act — the cross-process
+        relay) AND force-terminal the row, so an owner-less immortal job goes
+        terminal immediately instead of answering cancelled:true forever. When a
+        sibling DOES own it, its watcher fires the handle and its finish() no-ops
+        against the already-terminal row (first-terminal-wins) — the handle still
+        runs, so cross-process teardown is preserved."""
         fire = None
-        local_live = False
+        has_local_owner = False          # a real producer attached a handle HERE
         with self._lock:
             job = self._jobs.get(job_id)
             if job is not None and not job.terminal:
-                local_live = True
+                has_local_owner = job._cancel is not None
                 job.cancel_requested = True
                 if reason:
                     job.message = reason
                 job.updated_at = _utcnow_iso()
                 fire, job._cancel = job._cancel, None   # fire at most once
         self._fire(fire)
-        remote_live = False
+
+        if has_local_owner:
+            # A live LOCAL stream is being torn down; its teardown writes the
+            # terminal status (first-terminal-wins keeps a just-finished job
+            # honest). Relay only — do NOT force-terminal out from under it.
+            if self.mirror is not None:
+                try:
+                    self.mirror.request_cancel(job_id)
+                except Exception:
+                    pass
+                self._mirror_upsert(job)
+            return {"cancelled": True, "mode": "relayed",
+                    "status": normalize_status(job.status) if job else None}
+
+        # No live LOCAL owner. Raise the shared cancel flag FIRST so a live
+        # sibling's watcher (if any) still fires its handle and tears its stream
+        # down — the existing cross-process relay is preserved. Then force-mark
+        # the row terminal so an owner-less immortal job (the operator's case) is
+        # retired NOW, not left for a watcher that will never come. First-terminal-
+        # wins means a genuine sibling finish() after this is a no-op — the handle
+        # still ran, so nothing cross-process is lost.
         if self.mirror is not None:
             try:
-                remote_live = self.mirror.request_cancel(job_id)
+                self.mirror.request_cancel(job_id)
             except Exception:
                 pass
-            if local_live:
-                self._mirror_upsert(job)
-        return local_live or remote_live
+        marked = self._force_cancel_terminal(job_id, reason)
+        if marked is not None:
+            return {"cancelled": True, "mode": "store", "status": "cancelled"}
+
+        # Nothing anywhere claims this id — do NOT claim success.
+        return {"cancelled": False, "mode": "noop", "status": None}
+
+    def _force_cancel_terminal(self, job_id: str, reason: str = "") -> Optional[str]:
+        """Mark an owner-less job terminal `cancelled`, in the store AND the
+        mirror (persisted). Handles a LOCAL row and — critically for the immortal
+        pending case — a MIRROR-ONLY row this process never held in memory.
+        Returns "cancelled" if a row was retired, else None (nothing to cancel).
+        Idempotent: an already-terminal row is left as-is (first-terminal wins)."""
+        # Local row present?
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is not None:
+                if job.terminal:
+                    return None            # already terminal — nothing to change
+                job.status = "cancelled"
+                job.cancel_requested = True
+                if reason:
+                    job.message = reason
+                if job.ended_ts is None:
+                    job.ended_ts = time.time()
+                job.updated_at = _utcnow_iso()
+                prior = "pending"
+        if job is not None:
+            self._emit(job, prior)
+            self._mirror_upsert(job)
+            return "cancelled"
+        # No local row — force the MIRROR row terminal directly through the store
+        # layer (never a raw sqlite side-channel). Only when a LIVE row exists to
+        # retire; a truly-unknown id returns None so the caller reports noop.
+        if self.mirror is not None:
+            try:
+                if self.mirror.force_terminal(job_id, "cancelled",
+                                               reason or "cancelled (no live owner)"):
+                    return "cancelled"
+            except Exception:
+                pass
+        return None
 
     @staticmethod
     def _fire(handle: Optional[Callable[[], None]]) -> None:
@@ -586,6 +678,48 @@ class JobStore:
                       if d["status"] in ("pending", "processing"))
         active = sum(1 for d in snap if d["status"] == "streaming")
         return {"waiting": waiting, "active": active, "total": len(snap)}
+
+    def expire_pending_orphans(self) -> list[str]:
+        """Expire never-dispatched pending jobs (slice 9, defect 2). Event-driven
+        (called from the /llm/jobs view + heartbeat ingest — NO timer thread).
+        Expires LOCAL pending rows with no worker and stale progressed_at, and —
+        via the mirror — mirror-only rows (the immortal cross-process case). Ages
+        on progressed_at, never `updated` (no view-driven resurrection). Returns
+        the ids retired this pass. Best-effort: never raises into a view."""
+        from .shared import _pending_expiry_seconds
+        expired: list[str] = []
+        try:
+            cutoff = time.time() - _pending_expiry_seconds()
+            msg = ("never dispatched — model unresolvable or no capable worker "
+                   "(auto-expired)")
+            with self._lock:
+                for jid, job in list(self._jobs.items()):
+                    if (normalize_status(job.status) == "pending"
+                            and not job.worker
+                            and float(job.progressed_at or 0) < cutoff):
+                        job.status = "expired"
+                        job.message = msg
+                        if job.ended_ts is None:
+                            job.ended_ts = time.time()
+                        job.updated_at = _utcnow_iso()
+                        expired.append(jid)
+                        job._pending_prior = "pending"
+            for jid in expired:
+                job = self._jobs.get(jid)
+                if job is not None:
+                    self._emit(job, "pending")
+                    self._mirror_upsert(job)
+        except Exception:
+            pass
+        # Mirror-only pending rows (a row no process holds in memory — the exact
+        # shape of the operator's immortal flux2 job after a restart).
+        if self.mirror is not None:
+            try:
+                mirror_expired = self.mirror.expire_pending_orphans()
+                expired.extend(x for x in mirror_expired if x not in expired)
+            except Exception:
+                pass
+        return expired
 
     # -- retention ---------------------------------------------------------
     def _prune_locked(self) -> None:

@@ -74,6 +74,20 @@ LLAMA_SWAP_TTL = int(get_env_value("LLAMA_SWAP_TTL") or 600)   # on-demand unloa
 # the model lost its framing and looped with no stop. The env override wins.
 DEFAULT_LLAMA_CTX = int(get_env_value("DEFAULT_LLAMA_CTX") or 16384)
 DEFAULT_LLAMA_THREADS = int(get_env_value("DEFAULT_LLAMA_THREADS") or 6)
+
+# CONTEXT-as-allocation resolver (slice 11 / t27). The worker agent (which owns
+# _RUNTIME_SETTINGS / ctx_pct) registers fn(model_key, cfg) -> resolved_ctx|None
+# here at boot — same reverse-injection pattern as slots.set_residency_lookup, so
+# managers/serve never imports worker_agent. When set AND it returns a ctx, that
+# RESOLVED value is what gets served (-c) — the allocation is a contract the load
+# HONORS, not a hint. None (unset resolver, or no ctx_pct for the model) ->
+# today's default ctx path, byte-identical.
+_CTX_RESOLVER = None
+
+
+def set_ctx_resolver(fn) -> None:
+    global _CTX_RESOLVER
+    _CTX_RESOLVER = fn
 # GPU offload for llama-server. -1 = put every layer on the GPU (the right
 # default for a CUDA-built llama-server); 0 = CPU only; N = first N layers.
 # Without this flag llama-server defaults to CPU — the usual "GPU sits idle".
@@ -154,6 +168,20 @@ def _ctx_for(cfg, model_key, extra=None):
     extra = extra if extra is not None else _effective_extra(model_key, cfg)
     if extra.get("llama_ctx"):
         return int(extra["llama_ctx"])
+    # CONTEXT allocation (slice 11): if the worker set a ctx_pct for this model,
+    # SERVE the resolved value — the allocation is a contract, so the served -c
+    # equals what fit/admission reserved KV for. The resolver already clamps to
+    # DEFAULT_LLAMA_CTX (the 'capping' logic is now enforcement of the RESOLVED
+    # value). Unset resolver / no ctx_pct -> falls through to today's default.
+    if _CTX_RESOLVER is not None:
+        try:
+            resolved = _CTX_RESOLVER(model_key, cfg)
+            if resolved:
+                logger.info("%s: serving -c %s (ctx allocation — ctx_pct)",
+                            model_key, int(resolved))
+                return int(resolved)
+        except Exception:  # noqa: BLE001 — a broken resolver never breaks serving
+            pass
     mml = getattr(cfg, "model_max_length", None) or DEFAULT_LLAMA_CTX
     capped = min(int(mml), DEFAULT_LLAMA_CTX)
     if capped < int(mml):

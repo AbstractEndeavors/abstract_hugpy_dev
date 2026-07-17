@@ -15,8 +15,11 @@ and static (locked seat; permanent with 📌 pin). "Serving" is purely a STATE
   * Slot promotion: never picks a static or busy occupant; an all-static
     pool fails a load with a clear error instead of evicting.
   * Warm-up on a slot-less box: static always; default on-demand only behind
-    the WORKER_PRELOAD gate. On a slots box _kick_provision defers to the
-    filler (no double-loading).
+    the WORKER_PRELOAD gate. On a slots box _kick_provision ALSO kicks the slot
+    filler (GGUF seating) AND still warms a STATIC model in-process — the
+    transformers-on-slots-box fix, so a static transformers model isn't left a
+    hollow 0-VRAM shell; a model already SEATED in a slot is not double-loaded
+    (the _slot_occupants guard, not by skipping the warm branch).
   * Prune: residency overrides are assignment-scoped unless pinned.
 
 Runs like the other tests here: venv/bin/python tests/test_residency_static.py
@@ -311,14 +314,36 @@ try:
     check("no slots: default on-demand DOES warm behind the gate "
           "(old on-demand-never-preloads rule retired)", "m-default" in _warmed)
 
-    # slots box: _kick_provision defers to the filler — no direct warm
+    # slots box: the slot filler is kicked for slot-eligible (GGUF) seating, AND
+    # a STATIC model still warms IN-PROCESS. Doctrine FIX (see _kick_provision,
+    # 2026-07): the old `elif _has_slots` skipped the warm branch on a slots box,
+    # so a STATIC TRANSFORMERS model (the slot filler only seats GGUF) was left a
+    # hollow 0-VRAM shell that read "loaded". Now static warms here regardless of
+    # slots; the seated-GGUF double-load is avoided by the _slot_occupants() check,
+    # not by skipping the branch. m-static2 is static -> it warms in-process.
     _warmed.clear()
     slots.slots_enabled = lambda: True
     agent._fill_empty_slots = lambda s: _fills.append(True)
     agent._kick_provision(st, "m-static2")
     check("provision thread finished (slots box)", _wait_done(st))
-    check("slots box: no in-process preload (no double-loading)", _warmed == [])
-    check("slots box: the slot filler is kicked instead", _fills == [True])
+    check("slots box: a STATIC model still warms in-process (transformers-on-"
+          "slots-box fix — no hollow 0-VRAM shell)", _warmed == ["m-static2"])
+    check("slots box: the slot filler is ALSO kicked (GGUF seating)",
+          _fills == [True])
+
+    # no double-loading (the ORIGINAL intent, via the CURRENT mechanism): a model
+    # already SEATED IN A SLOT is skipped by the _slot_occupants() guard, so a
+    # seated GGUF is never warmed a second time in-process.
+    _warmed.clear(); _fills.clear()
+    _occ_orig = agent._slot_occupants
+    try:
+        agent._slot_occupants = lambda *a, **k: {"m-static2"}   # already seated
+        agent._kick_provision(st, "m-static2")
+        check("provision thread finished (seated static)", _wait_done(st))
+        check("slots box: a SEATED model is NOT double-loaded in-process",
+              _warmed == [])
+    finally:
+        agent._slot_occupants = _occ_orig
 finally:
     (provision.ensure_model_present, provision.model_is_local,
      provision.ensure_model_registered) = _prov_orig

@@ -96,6 +96,106 @@ def ram_reserve_bytes() -> int:
     return int((4.0 if gib is None else gib) * 2**30)
 
 
+# ---------------------------------------------------------------------------
+# Honest budget-bar semantics (t13/t14, operator spec 2026-07-17, REFINED)
+# ---------------------------------------------------------------------------
+# The console resource bars used to draw a numerator and denominator from
+# different universes (physical-derived "used" vs central-limit "total"), so on
+# any under-budget box the bar collapsed to physical_total − central_limit — an
+# ARTIFACT, not usage. The operator specified the honest model, adopted as
+# doctrine. It is IDENTICAL for RAM and VRAM, so it lives here once and is used
+# by BOTH the central summary (the bar) and the worker allocator (budgetable
+# free) — bar and admission can then never disagree.
+#
+# Final formula (both clamps mandatory — operator refinement 2026-07-17,
+# "the limit can never lead into negative, but the limit should not be
+#  encroached by ram unless it exceeds the difference in worker process"):
+#
+#   external_headroom = physical_total − central_limit    # never the worker's
+#   encroachment      = max(0, external_usage − external_headroom)
+#   bar_used          = min(central_limit, worker_usage + encroachment)  # ≤ limit
+#   remaining         = max(0, central_limit − worker_usage − encroachment)  # ≥ 0
+#
+# The central_limit is the WORKER'S budget. External consumers (a desktop
+# session, ComfyUI, another app) first spend their OWN headroom (physical above
+# the limit); only what they use BEYOND that headroom encroaches on the worker's
+# budget. Worked example (operator): 128 physical / 90 limit / 20 worker / 10
+# external → headroom 38, encroachment 0, bar 20/90, 70 to go. External grows to
+# 50 → encroachment 12 → bar 32/90, 58 to go.
+#
+# OVER-LIMIT HONESTY (operator, 2026-07-17): the CLAMPS are a RENDER/admission
+# rule — the display never goes negative and the fill never overflows — but a
+# genuine overrun (raw worker_usage + encroachment > central_limit) is never
+# hidden behind a clean full bar. So the payload carries BOTH the clamped
+# figures (bar_used/remaining, for the fill + admission) AND the RAW ones
+# (raw_used, over_limit, over_by) so central/console can pin the chip at 100%
+# and surface an explicit over-limit warning. The allocator floors remaining at
+# 0 the same way: an over-limit box admits nothing new until it drains.
+def budget_bar(physical_total: Optional[int],
+               central_limit: Optional[int],
+               worker_usage: Optional[int],
+               external_usage: Optional[int]) -> dict:
+    """Compute the honest bar (t13/t14 spec, refined) from the four measured
+    inputs.
+
+    All arguments are bytes (or None where unmeasured). Returns a dict:
+      * ``semantics="central"`` when a central_limit is set: bar_used/remaining
+        follow the clamped spec; ``total`` is the limit; ``raw_used`` is the
+        UNCLAMPED worker+encroachment; ``over_limit`` / ``over_by`` flag a true
+        overrun.
+      * ``semantics="physical"`` when NO central_limit is set: headroom is
+        undefined, so the bar shows plain measured usage (worker+external)
+        against the physical total; no encroachment, never over-limit.
+    ``bar_used``/``remaining`` are None only when the necessary inputs are
+    missing (never fabricated)."""
+    w = worker_usage if worker_usage is not None else None
+    x = external_usage if external_usage is not None else None
+    # No central limit -> physical-total semantics (plain measured usage).
+    if not central_limit or central_limit <= 0:
+        parts = [v for v in (w, x) if v is not None]
+        bar_used = sum(parts) if parts else None
+        total = physical_total
+        remaining = (max(0, total - bar_used)
+                     if (total is not None and bar_used is not None) else None)
+        return {"semantics": "physical", "total": total,
+                "bar_used": bar_used, "remaining": remaining,
+                "raw_used": bar_used, "over_limit": False, "over_by": 0,
+                "encroachment": 0, "worker_usage": w, "external_usage": x,
+                "external_headroom": None}
+    # Central-limit semantics (the spec).
+    headroom = None
+    if physical_total is not None:
+        headroom = max(0, physical_total - central_limit)
+    encroachment = 0
+    if x is not None and headroom is not None:
+        encroachment = max(0, x - headroom)
+    elif x is not None and headroom is None:
+        # No physical read to derive headroom from — the safe, non-fabricating
+        # choice is to treat all external usage as encroachment (the limit is
+        # the only denominator we trust). Rare: a box that reports a limit but
+        # no physical total.
+        encroachment = x
+    # RAW (unclamped) worker+encroachment — the truth central/console must keep.
+    raw_used = None
+    if w is not None:
+        raw_used = w + encroachment
+    elif encroachment:
+        raw_used = encroachment
+    # CLAMPED fill: never overflows the limit (the ≤ clamp).
+    bar_used = min(central_limit, raw_used) if raw_used is not None else None
+    # CLAMPED remaining: never negative (the ≥0 clamp). Derived from the raw
+    # worker+encroachment, floored at 0 — the figure admission also uses.
+    remaining = (max(0, central_limit - raw_used)
+                 if raw_used is not None else None)
+    over_by = (max(0, raw_used - central_limit) if raw_used is not None else 0)
+    over_limit = over_by > 0
+    return {"semantics": "central", "total": central_limit,
+            "bar_used": bar_used, "remaining": remaining,
+            "raw_used": raw_used, "over_limit": over_limit, "over_by": over_by,
+            "encroachment": encroachment, "worker_usage": w,
+            "external_usage": x, "external_headroom": headroom}
+
+
 def free_vram_bytes() -> Optional[int]:
     """Budgetable free VRAM on the primary GPU (raw minus the operator
     reserve), or None if no GPU / can't tell."""
@@ -126,20 +226,108 @@ def total_vram_bytes() -> Optional[int]:
     return _total_vram(_env_int("HUGPY_MAIN_GPU") or 0)
 
 
-def free_ram_bytes() -> Optional[int]:
-    """Budgetable free RAM: raw minus the operator reserve, optionally hard-
-    capped by HUGPY_RAM_MAX_GIB (an allocation CEILING for this box — "hugpy
-    may use at most N GiB" — regardless of how much is actually free)."""
+def ram_worker_bytes() -> Optional[int]:
+    """RSS of THIS worker's own process tree (the agent + every slot child it
+    spawned), in bytes. This is ``worker_usage`` for the budget-bar spec: the
+    RAM hugpy itself holds, distinct from external processes central can't see.
+    Best-effort via psutil (children(recursive=True)); None if unmeasurable."""
+    try:
+        import psutil
+        me = psutil.Process()
+        total = me.memory_info().rss
+        for child in me.children(recursive=True):
+            try:
+                total += child.memory_info().rss
+            except Exception:  # noqa: BLE001 — a child may exit mid-walk
+                continue
+        return int(total)
+    except Exception:  # noqa: BLE001 — no psutil / permission: don't fabricate
+        return None
+
+
+def ram_external_bytes() -> Optional[int]:
+    """RAM used by everything OUTSIDE this worker's process tree, in bytes:
+    (box used) − (worker own RSS). ``external_usage`` for the budget-bar spec.
+
+    Box-used = physical total − MemAvailable, read against the SAME psutil
+    snapshot as the total so the two can't skew. Clamped ≥0. None when either
+    side is unmeasurable (never fabricated)."""
+    try:
+        import psutil
+        vm = psutil.virtual_memory()
+        box_used = int(vm.total) - int(vm.available)
+    except Exception:  # noqa: BLE001
+        return None
+    own = ram_worker_bytes()
+    if own is None:
+        return None
+    return max(0, box_used - own)
+
+
+def ram_max_bytes() -> Optional[int]:
+    """The central/local RAM CEILING in bytes (HUGPY_RAM_MAX_GIB), or None if
+    unset. Set by _apply_central_limits from central's limits.ram_max_gib; the
+    budget-bar spec's ``central_limit`` for RAM."""
+    cap = _env_float("HUGPY_RAM_MAX_GIB")
+    return int(cap * 2**30) if cap is not None else None
+
+
+def free_ram_raw_bytes() -> Optional[int]:
+    """Reserve-adjusted budgetable free RAM, UNCLAMPED by the RAM ceiling:
+    ``max(0, MemAvailable − reserve)``. This is the honest "free after reserve"
+    the console needs to show physical-semantics bars and that the ceiling-aware
+    budget below is derived from. None if the raw read fails."""
     from .._platform.hardware import free_ram_bytes as _free_ram
 
     raw = _free_ram()
     if raw is None:
         return None
-    value = max(0, raw - ram_reserve_bytes())
-    cap = _env_float("HUGPY_RAM_MAX_GIB")
-    if cap is not None:
-        value = min(value, int(cap * 2**30))
-    return value
+    return max(0, raw - ram_reserve_bytes())
+
+
+def free_ram_bytes() -> Optional[int]:
+    """Budgetable free RAM the allocator's fit decisions consume.
+
+    Reworked for the t13/t14 budget-bar spec so the bar and admission can NEVER
+    disagree: the budgetable free is the SPEC's ``remaining`` for RAM, floored
+    by the reserve-only free —
+
+        budgetable = min(free_after_reserve, limit − worker_usage − encroachment)
+
+    Interaction with HUGPY_RAM_RESERVE_GIB: the reserve is applied FIRST (in
+    free_ram_raw_bytes) so a load can never consume MemAvailable to the OOM
+    floor — that floor is independent of the central ceiling and always binds.
+    The ceiling term then further constrains it to the WORKER'S budget: the
+    limit minus what the worker already uses minus any external ENCROACHMENT
+    (external usage that has spilled past the physical headroom into the
+    worker's budget — spill.budget_bar). Where no ceiling is set, this is the
+    old reserve-only behavior verbatim (limit term absent → min() is a no-op)."""
+    raw = free_ram_raw_bytes()
+    if raw is None:
+        return None
+    limit = ram_max_bytes()
+    if limit is None:
+        # No ceiling -> reserve-only behavior, exactly as before.
+        return raw
+    from .._platform.hardware import free_ram_bytes as _free_ram
+    physical = None
+    try:
+        import psutil
+        physical = int(psutil.virtual_memory().total)
+    except Exception:  # noqa: BLE001
+        physical = None
+    bar = budget_bar(physical_total=physical, central_limit=limit,
+                     worker_usage=ram_worker_bytes(),
+                     external_usage=ram_external_bytes())
+    remaining = bar.get("remaining")
+    if remaining is None:
+        # Couldn't compute the spec remaining (missing worker/external reads) —
+        # degrade to the historical hard cap so behavior never gets LOOSER than
+        # before: min(free_after_reserve, limit).
+        return min(raw, limit)
+    # The allocator's free is the tighter of the reserve floor and the spec
+    # remaining — the bar's number, so admission and the console agree.
+    return min(raw, remaining)
 
 
 def cpu_resident_bytes(model_path: str, n_gpu_layers: int) -> Optional[int]:
@@ -157,18 +345,30 @@ def cpu_resident_bytes(model_path: str, n_gpu_layers: int) -> Optional[int]:
     return int(file_bytes * frac)
 
 
-def _gguf_layer_count(model_path: str) -> Optional[int]:
-    """Read ``*.block_count`` from a GGUF header. Best-effort; None on any issue."""
+def _gguf_metadata(model_path: str, want_suffixes: tuple) -> dict:
+    """Scan a GGUF header's KV table and return the values whose keys END WITH any
+    of ``want_suffixes`` (e.g. ``.block_count``, ``.attention.head_count_kv``,
+    ``.embedding_length``, ``.context_length``). Best-effort; {} on any issue.
+
+    The GGUF geometry keys are namespaced by architecture (``qwen2.block_count``,
+    ``llama.attention.head_count_kv``, …), so suffix-matching is arch-agnostic —
+    verified 2026-07-17 against a real Qwen2.5-Coder-3B q4 gguf:
+      qwen2.block_count=36, qwen2.attention.head_count=16,
+      qwen2.attention.head_count_kv=2, qwen2.embedding_length=2048,
+      qwen2.context_length=32768.
+    (GGUF spec: github.com/ggml-org/ggml/blob/master/docs/gguf.md — the
+    general/architecture KVs are the canonical model geometry.)"""
+    out: dict = {}
     try:
         import struct
 
         with open(model_path, "rb") as fh:
             magic = fh.read(4)
             if magic != b"GGUF":
-                return None
+                return out
             version = struct.unpack("<I", fh.read(4))[0]
             if version < 2:
-                return None
+                return out
             struct.unpack("<Q", fh.read(8))[0]              # tensor count
             n_kv = struct.unpack("<Q", fh.read(8))[0]
 
@@ -195,11 +395,145 @@ def _gguf_layer_count(model_path: str) -> Optional[int]:
                 key = read_str()
                 vtype = struct.unpack("<I", fh.read(4))[0]
                 val = read_val(vtype)
-                if key.endswith(".block_count"):
-                    return int(val)
+                for suf in want_suffixes:
+                    if key.endswith(suf):
+                        out[suf] = val
+                        break
     except Exception:
+        return out
+    return out
+
+
+def _gguf_layer_count(model_path: str) -> Optional[int]:
+    """Read ``*.block_count`` from a GGUF header. Best-effort; None on any issue."""
+    bc = _gguf_metadata(model_path, (".block_count",)).get(".block_count")
+    try:
+        return int(bc) if bc is not None else None
+    except (TypeError, ValueError):
         return None
-    return None
+
+
+# ── KV-cache quantification (slice 11 / t27) ────────────────────────────────
+# Operator (2026-07-17): "the context can necessarily be quantified into ram
+# needed correct? ... this should be a variable as well based on percentage max."
+#
+# The KV cache is the attention key/value tensors held for every token in the
+# context window — the RAM/VRAM tax that fit/admission ignored (weights-only).
+# The exact cache size is a function of the model's real geometry and the ctx:
+#
+#   kv_bytes = 2 (K and V) × n_layers × ctx_tokens × n_kv_heads × head_dim
+#              × dtype_bytes
+#
+# n_kv_heads (NOT n_attention_heads) is what modern GQA/MQA models actually
+# cache — Qwen2.5-Coder-3B has 16 attention heads but only 2 KV heads, an 8×
+# reduction, so using attention-heads would over-count KV by 8×. head_dim =
+# embedding_length / attention_head_count when not stated explicitly.
+#
+# dtype: llama.cpp caches fp16 by default (2 bytes); a quantized-KV config
+# (-ctk/-ctv q8_0 / q4_0) lowers it. transformers caches in the model's compute
+# dtype (torch_dtype: bf16/fp16 = 2, fp32 = 4) unless a cache override says else.
+_KV_DTYPE_BYTES = {
+    "f32": 4.0, "float32": 4.0, "fp32": 4.0,
+    "f16": 2.0, "float16": 2.0, "fp16": 2.0, "bf16": 2.0, "bfloat16": 2.0,
+    "q8_0": 1.0, "q8": 1.0, "int8": 1.0,
+    "q5_0": 0.65, "q5_1": 0.69,
+    "q4_0": 0.5, "q4_1": 0.56, "q4": 0.5, "int4": 0.5,
+}
+# When geometry is unavailable we NEVER silently return zero (that reintroduces
+# the unplanned tax). A stated conservative heuristic: bytes per token per layer
+# for a typical mid-size GQA model, cross-checked against the exact formula for
+# Qwen2.5-Coder-3B (36L × 2kv × 128hd × 2B × 2 = ~256 KiB/token total ≈
+# 7.3 KiB/token/layer → round UP to be conservative). Used only as a floor when
+# real geometry can't be read; a WARN says so at the call site.
+_KV_HEURISTIC_BYTES_PER_TOKEN_PER_LAYER = 8 * 1024  # 8 KiB, deliberately generous
+
+
+def _kv_dtype_bytes(name: Optional[str], default: float = 2.0) -> float:
+    if not name:
+        return default
+    return _KV_DTYPE_BYTES.get(str(name).strip().lower(), default)
+
+
+def _gguf_kv_geometry(model_path: str) -> dict:
+    """Layers / kv-heads / head-dim / trained ctx from a GGUF header, or {}.
+    head_dim falls back to embedding_length / attention.head_count (llama.cpp's
+    own derivation) when a *.attention.key_length is absent."""
+    md = _gguf_metadata(model_path, (
+        ".block_count", ".attention.head_count", ".attention.head_count_kv",
+        ".embedding_length", ".attention.key_length", ".context_length"))
+    if not md:
+        return {}
+    n_layers = md.get(".block_count")
+    n_heads = md.get(".attention.head_count")
+    n_kv = md.get(".attention.head_count_kv") or n_heads      # MHA: kv == heads
+    emb = md.get(".embedding_length")
+    head_dim = md.get(".attention.key_length")
+    if not head_dim and emb and n_heads:
+        try:
+            head_dim = int(emb) // int(n_heads)
+        except (TypeError, ValueError, ZeroDivisionError):
+            head_dim = None
+    out = {}
+    for k, v in (("n_layers", n_layers), ("n_kv_heads", n_kv),
+                 ("head_dim", head_dim), ("ctx_train", md.get(".context_length"))):
+        try:
+            if v is not None:
+                out[k] = int(v)
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
+def _transformers_kv_geometry(config: dict) -> dict:
+    """Layers / kv-heads / head-dim / dtype from a transformers config.json dict.
+    Mirrors HF conventions: num_key_value_heads defaults to num_attention_heads
+    (MHA) when absent; head_dim defaults to hidden_size / num_attention_heads."""
+    if not isinstance(config, dict):
+        return {}
+    n_layers = config.get("num_hidden_layers")
+    n_heads = config.get("num_attention_heads")
+    n_kv = config.get("num_key_value_heads") or n_heads      # MHA fallback
+    head_dim = config.get("head_dim")
+    if not head_dim and config.get("hidden_size") and n_heads:
+        try:
+            head_dim = int(config["hidden_size"]) // int(n_heads)
+        except (TypeError, ValueError, ZeroDivisionError):
+            head_dim = None
+    out: dict = {"dtype": config.get("torch_dtype")}
+    for k, v in (("n_layers", n_layers), ("n_kv_heads", n_kv),
+                 ("head_dim", head_dim),
+                 ("ctx_train", config.get("max_position_embeddings"))):
+        try:
+            if v is not None:
+                out[k] = int(v)
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
+def kv_bytes(*, ctx_tokens: int, n_layers: Optional[int] = None,
+             n_kv_heads: Optional[int] = None, head_dim: Optional[int] = None,
+             dtype_bytes: float = 2.0) -> Optional[int]:
+    """KV-cache bytes for ``ctx_tokens`` given the model geometry, or a stated
+    conservative HEURISTIC when geometry is missing (never silently zero).
+
+    kv = 2 × n_layers × ctx × n_kv_heads × head_dim × dtype_bytes. Returns None
+    only when ctx is non-positive (no cache). When n_layers is known but the
+    per-head geometry is not, falls back to the bytes-per-token-per-layer
+    heuristic (× n_layers × ctx); when even n_layers is unknown, uses an assumed
+    layer count so the caller still gets a non-zero, conservative reserve."""
+    try:
+        ctx = int(ctx_tokens)
+    except (TypeError, ValueError):
+        return None
+    if ctx <= 0:
+        return None
+    if n_layers and n_kv_heads and head_dim:
+        return int(2 * int(n_layers) * ctx * int(n_kv_heads) * int(head_dim)
+                   * float(dtype_bytes))
+    # Geometry incomplete — conservative heuristic, never zero.
+    layers = int(n_layers) if n_layers else _ASSUMED_LAYERS
+    return int(layers * ctx * _KV_HEURISTIC_BYTES_PER_TOKEN_PER_LAYER)
 
 
 # ---------------------------------------------------------------------------
@@ -403,6 +737,45 @@ def llama_kwargs(model_path: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# placement intent — one wire field (n_gpu_layers), interpreted PER ENGINE
+# ---------------------------------------------------------------------------
+# The console's Autofit / Max GPU / CPU only controls are ENGINE-AGNOSTIC
+# PLACEMENT INTENT (operator ruling 2026-07-17: "the autofit, maxgpu and cpu only
+# should still be on the table as its easy to infer what those would indicate for
+# a transformer"). They ride the SAME wire field the GGUF path uses —
+# HUGPY_N_GPU_LAYERS (-1 / "off" / "auto") — but that field NAMES llama.cpp layer
+# counts. For a GGUF model it IS a layer count (gguf_gpu_layers). For a
+# transformers model there are no "gpu layers" to count, so the field is read as
+# PLACEMENT INTENT and mapped onto the transformers device_map/max_memory world:
+#   * -1  ("Max GPU")  -> put the WHOLE model on the GPU (no CPU budget)
+#   * 0/"off" ("CPU only") -> keep it entirely on CPU (gpu budget 0)
+#   * unset/"auto"     -> today's autofit (shard to fit VRAM, spill to CPU)
+# Same wire, per-engine interpretation — placement intent, NOT layer counts.
+def n_gpu_layers_intent() -> str:
+    """Decode HUGPY_N_GPU_LAYERS into an engine-agnostic PLACEMENT class:
+    ``"gpu"`` (all-on-GPU, from -1), ``"cpu"`` (CPU-only, from 0/"off"/"cpu"/
+    "none"), or ``"auto"`` (fit-and-spill, from unset/"auto"/a positive int).
+
+    A positive int is a llama.cpp partial-offload count with no transformers
+    analogue, so for the transformers path it reads as ``"auto"`` (fit as much as
+    fits) — the honest 'some on GPU' behavior — rather than inventing a split."""
+    raw = _env("HUGPY_N_GPU_LAYERS")
+    if raw is None:
+        return "auto"
+    low = raw.strip().lower()
+    if low in ("auto", ""):
+        return "auto"
+    if low in ("off", "cpu", "none"):
+        return "cpu"
+    if low == "-1":
+        return "gpu"
+    try:
+        return "cpu" if int(low) == 0 else "auto"
+    except ValueError:
+        return "auto"
+
+
+# ---------------------------------------------------------------------------
 # transformers
 # ---------------------------------------------------------------------------
 def _gib(n: float) -> str:
@@ -414,10 +787,34 @@ def transformers_max_memory() -> Optional[dict]:
 
     Explicit env budgets win; otherwise autofit from detected free VRAM/RAM.
     Returns None when no GPU is visible (let transformers stay on CPU).
-    """
+
+    PLACEMENT INTENT (t26): HUGPY_N_GPU_LAYERS is honored here as engine-agnostic
+    placement, NOT a layer count (see n_gpu_layers_intent):
+      * "cpu"  (n_gpu_layers 0/"off") -> gpu budget 0 GiB so device_map='auto'
+        places the whole model on CPU. Returned as a map (not None) so the
+        intent BINDS even when a GPU is present — the operator asked for CPU.
+      * "gpu"  (n_gpu_layers -1)      -> no CPU budget: the model is forced onto
+        the card (accelerate raises honestly if it truly can't fit, rather than
+        us silently spilling against an explicit 'all on GPU').
+      * "auto"                        -> today's fit-and-spill behavior, unchanged.
+    An EXPLICIT gpu_mem_gib/cpu_mem_gib budget still wins over the intent-derived
+    default for that axis (the GGUF-only explicit class; when present here it is
+    simply honored)."""
+    intent = n_gpu_layers_intent()
     gpu_gib = _env_float("HUGPY_GPU_MEM_GIB")
     cpu_gib = _env_float("HUGPY_CPU_MEM_GIB")
     n_gpu = _env_int("HUGPY_N_GPU") or 1
+
+    # CPU-only intent: force everything off the GPU. Bind even with a GPU present
+    # (an explicit CPU-only placement, not autofit) — gpu budget 0, generous CPU.
+    if intent == "cpu":
+        if cpu_gib is None:
+            fr = free_ram_bytes()
+            cpu_gib = (fr * 0.8) / 2**30 if fr else 16.0
+        mm_cpu: dict[Any, str] = {i: _gib(0.0) for i in range(max(n_gpu, 1))}
+        mm_cpu["cpu"] = _gib(cpu_gib)
+        logger.info("transformers placement=cpu-only max_memory=%s", mm_cpu)
+        return mm_cpu
 
     if gpu_gib is None:
         fv = free_vram_bytes()
@@ -425,13 +822,23 @@ def transformers_max_memory() -> Optional[dict]:
             return None                     # no GPU -> no spill map
         gpu_gib = (fv * _VRAM_SAFETY) / 2**30
 
+    # All-on-GPU intent: no CPU budget so accelerate keeps the whole model on the
+    # card. Skip the CPU-spill fallback below (a bare gpu-only max_memory). An
+    # explicit cpu_mem_gib still wins if the operator set one alongside.
+    if intent == "gpu":
+        mm_gpu: dict[Any, str] = {i: _gib(gpu_gib) for i in range(max(n_gpu, 1))}
+        if cpu_gib is not None:
+            mm_gpu["cpu"] = _gib(cpu_gib)
+        logger.info("transformers placement=all-gpu max_memory=%s", mm_gpu)
+        return mm_gpu
+
     if cpu_gib is None:
         fr = free_ram_bytes()
         cpu_gib = (fr * 0.8) / 2**30 if fr else 16.0
 
     mm: dict[Any, str] = {i: _gib(gpu_gib) for i in range(max(n_gpu, 1))}
     mm["cpu"] = _gib(cpu_gib)
-    logger.info("transformers max_memory=%s", mm)
+    logger.info("transformers placement=auto max_memory=%s", mm)
     return mm
 
 

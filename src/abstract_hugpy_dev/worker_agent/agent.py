@@ -316,12 +316,46 @@ def _safe_int(value) -> int | None:
 def _free_ram_bytes() -> int | None:
     """Available RAM in bytes — feeds the allocator's CPU tier. Best-effort.
 
-    Reserve-adjusted (managers.spill honors HUGPY_RAM_RESERVE_GIB) so central
-    plans against RAM this box can actually spare — local processes central
-    can't see keep their headroom."""
+    Reserve-adjusted (managers.spill honors HUGPY_RAM_RESERVE_GIB) AND, when a
+    central RAM ceiling is set, further constrained to the budget-bar spec's
+    ``remaining`` (t13/t14) so admission and the console bar can never disagree.
+    Wire-compat: this stays the historical ``free_ram`` field; the UNCLAMPED
+    reserve-only figure rides alongside as ``free_ram_raw`` (below)."""
     try:
         from ..managers.spill import free_ram_bytes
         return free_ram_bytes()
+    except Exception:
+        return None
+
+
+def _free_ram_raw_bytes() -> int | None:
+    """Reserve-adjusted budgetable free RAM, UNCLAMPED by the central ceiling
+    (t13/t14). Central shows the honest physical-semantics bar and derives the
+    ceiling-aware budget from this, so it must ride the heartbeat unclamped —
+    distinct from ``free_ram`` (clamped, kept for wire-compat)."""
+    try:
+        from ..managers.spill import free_ram_raw_bytes
+        return free_ram_raw_bytes()
+    except Exception:
+        return None
+
+
+def _ram_worker_bytes() -> int | None:
+    """RSS of THIS worker's own process tree (agent + slot children) — the
+    budget-bar spec's ``worker_usage`` for RAM. Best-effort (spill.py)."""
+    try:
+        from ..managers.spill import ram_worker_bytes
+        return ram_worker_bytes()
+    except Exception:
+        return None
+
+
+def _ram_external_bytes() -> int | None:
+    """RAM held by everything OUTSIDE this worker's tree (box used − own RSS) —
+    the budget-bar spec's ``external_usage`` for RAM. Best-effort (spill.py)."""
+    try:
+        from ..managers.spill import ram_external_bytes
+        return ram_external_bytes()
     except Exception:
         return None
 
@@ -1130,6 +1164,56 @@ def _inprocess_gpu_bytes() -> dict:
         device = "cuda" if cuda > 0 else ("cpu" if cpu > 0 else None)
         out[mk] = {"vram_bytes": cuda, "device": device}
     return out
+
+
+def _vram_split_from_pidlog(pid_log: "dict | None") -> dict:
+    """Split the SAME pid_registry snapshot central will store into the two
+    VRAM figures the budget-bar spec needs (t13/t14):
+
+      * ``vram_attributed_bytes`` — sum of the attributed MODEL rows (rows with
+        a real ``model_key``): the VRAM hugpy's own served models hold. This is
+        the spec's VRAM ``worker_usage``. cuda_context (the agent's own CUDA
+        context) counts as worker infra too, so it's folded in — it IS the
+        worker's usage, just not a served model. ComfyUI and genuinely-foreign/
+        unattributed rows are EXTERNAL, excluded here.
+      * ``vram_unattributed_bytes`` — sum of the ``unattributed`` squatter rows
+        (mib→bytes): genuinely foreign GPU use the console surfaces as overhead.
+
+    Sampled from the pid_log produced the SAME beat as detect_gpus(), so the
+    attribution and the driver totals are one snapshot. Degrades to
+    ``{"vram_attributed_bytes": None, "vram_unattributed_bytes": None}`` when
+    there's no pid_log (no GPU / older agent) — never fabricated."""
+    if not isinstance(pid_log, dict):
+        return {"vram_attributed_bytes": None, "vram_unattributed_bytes": None}
+    attributed = 0
+    for row in (pid_log.get("models") or []):
+        if not isinstance(row, dict):
+            continue
+        mode = row.get("host_mode")
+        # comfy rows are EXTERNAL (adopted, out-of-pool) — not worker usage.
+        if mode == "comfy":
+            continue
+        vb = row.get("vram_bytes")
+        if vb is None:
+            continue
+        # A worker row counts when it's a served model (has model_key) OR the
+        # worker's own cuda_context infra lump. Foreign rows have neither.
+        if row.get("model_key") or mode == "cuda_context":
+            try:
+                attributed += int(vb)
+            except (TypeError, ValueError):
+                continue
+    _MIB_LOCAL = 1024 * 1024
+    unattributed = 0
+    for row in (pid_log.get("unattributed") or []):
+        if not isinstance(row, dict):
+            continue
+        try:
+            unattributed += int(row.get("mib") or 0) * _MIB_LOCAL
+        except (TypeError, ValueError):
+            continue
+    return {"vram_attributed_bytes": attributed,
+            "vram_unattributed_bytes": unattributed}
 
 
 def _allocations(slot_statuses: "list | None" = None) -> list:
@@ -2892,6 +2976,38 @@ def build_app(state: "WorkerState") -> Flask:
                 settings["pinned"] = pmerged
             else:
                 settings.pop("pinned", None)
+        if "ctx_pct" in body:
+            # Per-model CONTEXT allocation (slice 11 / t27): {"model": 1..100 | null}
+            # — percent of the model's max context reserved for KV in fit/serving.
+            # Deep-merged, same shape as residency/pinned. null clears (default ctx).
+            if not isinstance(body["ctx_pct"], dict):
+                return jsonify({"ok": False, "error": {
+                    "code": "BadValue",
+                    "message": 'ctx_pct must be {"<model_key>": 1..100 | null}'}}), 400
+            cmerged = dict(settings.get("ctx_pct") or {})
+            for mk, val in body["ctx_pct"].items():
+                # ONLY an explicit null/"" clears (default ctx). Do NOT treat 0/
+                # False as a clear: `0 in (None, "", False)` is True in Python
+                # (0 == False), which would silently clear on an out-of-range 0
+                # instead of rejecting it — so match None/"" explicitly.
+                if val is None or val == "":
+                    cmerged.pop(mk, None)
+                    continue
+                try:
+                    pv = int(val)
+                except (TypeError, ValueError):
+                    return jsonify({"ok": False, "error": {
+                        "code": "BadValue",
+                        "message": f"ctx_pct[{mk!r}] must be an integer 1..100 or null"}}), 400
+                if not (1 <= pv <= 100):
+                    return jsonify({"ok": False, "error": {
+                        "code": "BadValue",
+                        "message": f"ctx_pct[{mk!r}]={pv} out of range — must be 1..100"}}), 400
+                cmerged[mk] = pv
+            if cmerged:
+                settings["ctx_pct"] = cmerged
+            else:
+                settings.pop("ctx_pct", None)
         if "comfy_url" in body:
             # Adopted-ComfyUI base URL (probe + job submission read it as the
             # COMFY_URL env). Settable here so central/console can point a worker
@@ -3727,7 +3843,8 @@ def _update_state_path(args) -> str:
 
 _SETTINGS_KEYS = {"slot_count", "residency", "on_demand_ttl_s",
                   "reconcile_interval_s", "pinned", "comfy_url",
-                  "hot_cache_root", "profiles", "model_profiles"}   # widen key by key
+                  "hot_cache_root", "profiles", "model_profiles",
+                  "ctx_pct"}   # widen key by key (ctx_pct: per-model context %, slice 11)
 _SETTINGS_SOURCE: dict = {}              # key -> "settings" | "env" | "default"
 _RUNTIME_SETTINGS: dict = {}             # the loaded settings, for live readers
 _COMFY_URL_BASE_ENV = "_HUGPY_COMFY_URL_BASE"  # sentinel: the pre-projection
@@ -3885,6 +4002,157 @@ def _incoming_need_bytes(model_key: str) -> "int | None":
         return None
 
 
+# ── Context (KV) as an allocation variable (slice 11 / t27) ─────────────────
+def _model_max_ctx(model_key: str, cfg: dict | None = None) -> int | None:
+    """The model's MAX context window (tokens) — the 100% ceiling ctx_pct scales.
+    Registry model_max_length first (central's truth), else the trained ctx from
+    the model's own metadata (gguf .context_length / config max_position_embeddings)."""
+    try:
+        from ..imports.config.main import get_model_config
+        cfg = cfg if cfg is not None else get_model_config(model_key, dict_return=True)
+        mml = (cfg or {}).get("model_max_length") or (cfg or {}).get("tokenizer_model_max_length")
+        if mml:
+            return int(mml)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        geo = _model_kv_geometry(model_key, cfg)
+        if geo.get("ctx_train"):
+            return int(geo["ctx_train"])
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _ctx_pct(model_key: str) -> int | None:
+    """Per-model ctx allocation percentage (1-100) from the worker settings map
+    (same seam as residency/pinned). None when unset -> today's default ctx
+    behavior is byte-identical (no ctx_pct term forced)."""
+    val = (_RUNTIME_SETTINGS.get("ctx_pct") or {}).get(model_key)
+    try:
+        v = int(val)
+    except (TypeError, ValueError):
+        return None
+    if v < 1:
+        return 1
+    if v > 100:
+        return 100
+    return v
+
+
+def _resolved_ctx(model_key: str, cfg: dict | None = None) -> "tuple[int | None, int | None, int | None]":
+    """Resolve the ctx to plan/serve for this model: (ctx_resolved, pct, max).
+
+    ctx_resolved = pct% × model_max, clamped to the engine/server cap that exists
+    today (serve.DEFAULT_LLAMA_CTX for llama.cpp). When ctx_pct is UNSET, returns
+    (None, None, max) so callers fall back to today's default ctx path — the
+    variable is opt-in and back-compat by construction."""
+    pct = _ctx_pct(model_key)
+    mx = _model_max_ctx(model_key, cfg)
+    if pct is None or not mx:
+        return None, pct, mx
+    ctx = max(1, int(mx * pct / 100.0))
+    # Clamp to the engine/server cap the loader would apply anyway (the existing
+    # 'capping -c' logic — enforcement of the RESOLVED value, not a blind cap).
+    try:
+        from ..managers.serve.serve import DEFAULT_LLAMA_CTX
+        framework = str((cfg or {}).get("framework") or "").lower()
+        if framework in ("gguf", "llama_cpp"):
+            ctx = min(ctx, int(DEFAULT_LLAMA_CTX))
+    except Exception:  # noqa: BLE001
+        pass
+    return ctx, pct, mx
+
+
+def _model_kv_geometry(model_key: str, cfg: dict | None = None) -> dict:
+    """Per-engine KV geometry for a model: {n_layers, n_kv_heads, head_dim,
+    ctx_train, dtype}. GGUF reads the served quant's header; transformers reads
+    config.json. {} when neither resolves (caller uses the heuristic)."""
+    try:
+        from ..imports import route_destination
+        from ..imports.config.main import get_model_config
+        from ..managers import spill
+        cfg = cfg if cfg is not None else get_model_config(model_key, dict_return=True)
+        framework = str((cfg or {}).get("framework") or "").lower()
+        path = route_destination(cfg)
+        if not path:
+            return {}
+        if framework in ("gguf", "llama_cpp"):
+            # The served quant file (same resolution the loader/need use).
+            gguf_path = path
+            try:
+                from ..managers.serve.serve import _model_file_for
+                picked = _model_file_for(model_key, get_model_config(model_key))
+                if picked:
+                    gguf_path = picked
+            except Exception:  # noqa: BLE001
+                pass
+            return spill._gguf_kv_geometry(gguf_path)
+        # transformers/other: config.json geometry.
+        import json
+        cfgp = os.path.join(path, "config.json") if os.path.isdir(path) else ""
+        if cfgp and os.path.isfile(cfgp):
+            with open(cfgp, "r", encoding="utf-8") as fh:
+                return spill._transformers_kv_geometry(json.load(fh))
+    except Exception:  # noqa: BLE001
+        pass
+    return {}
+
+
+def _kv_need_bytes(model_key: str, cfg: dict | None = None) -> "tuple[int, dict]":
+    """KV-cache bytes for this model at its RESOLVED ctx, plus a detail dict for
+    honest reporting. Returns (0, {...}) when ctx_pct is unset (no ctx term —
+    today's behavior). Never silently zero when ctx_pct IS set: geometry-missing
+    falls to spill.kv_bytes' conservative heuristic (logged)."""
+    from ..imports.config.main import get_model_config
+    cfg = cfg if cfg is not None else get_model_config(model_key, dict_return=True)
+    ctx, pct, mx = _resolved_ctx(model_key, cfg)
+    if ctx is None:
+        return 0, {"ctx_pct": None, "ctx_resolved": None, "ctx_max": mx,
+                   "geometry_source": None}
+    from ..managers import spill
+    geo = _model_kv_geometry(model_key, cfg)
+    framework = str((cfg or {}).get("framework") or "").lower()
+    if framework in ("gguf", "llama_cpp"):
+        dtype_bytes = 2.0                    # llama.cpp caches fp16 by default
+    else:
+        dtype_bytes = spill._kv_dtype_bytes(geo.get("dtype"))
+    source = "geometry" if (geo.get("n_layers") and geo.get("n_kv_heads")
+                            and geo.get("head_dim")) else "heuristic"
+    if source == "heuristic":
+        logger.warning("kv: no full geometry for %s — using conservative "
+                       "heuristic for the ctx reserve (%s tok @ %s%%)",
+                       model_key, ctx, pct)
+    kv = spill.kv_bytes(ctx_tokens=ctx, n_layers=geo.get("n_layers"),
+                        n_kv_heads=geo.get("n_kv_heads"),
+                        head_dim=geo.get("head_dim"), dtype_bytes=dtype_bytes)
+    return int(kv or 0), {"ctx_pct": pct, "ctx_resolved": ctx, "ctx_max": mx,
+                          "geometry_source": source, "kv_bytes": int(kv or 0)}
+
+
+def _incoming_need_detail(model_key: str) -> dict:
+    """THE authoritative fit-NEED for a model: weights + KV(resolved ctx), with
+    the SPLIT for honest reporting. All fit paths (contention, slot ceiling,
+    vision-fit, slice-10 admission) compute need through this so no path diverges.
+
+    Returns {total, weights, kv, ...ctx detail}. ``total`` is None only when the
+    WEIGHT size is unmeasurable (fail-open, exactly as _incoming_need_bytes did).
+    The kv term is 0 when ctx_pct is unset — so a model with no ctx allocation is
+    byte-identical to today."""
+    weights = _incoming_need_bytes(model_key)
+    if not weights:
+        return {"total": None, "weights": weights, "kv": 0,
+                "ctx_pct": None, "ctx_resolved": None, "ctx_max": None,
+                "geometry_source": None}
+    try:
+        kv, det = _kv_need_bytes(model_key)
+    except Exception:  # noqa: BLE001 — KV is additive; never break a working fit
+        kv, det = 0, {"ctx_pct": None, "ctx_resolved": None, "ctx_max": None,
+                      "geometry_source": None}
+    return {"total": int(weights) + int(kv or 0), "weights": int(weights),
+            "kv": int(kv or 0), **det}
+
+
 def _worker_fit_check(model_key: str) -> bool:
     """Contention fit-guard (dispatch.set_fit_check). True when the incoming load
     fits in current headroom WITHOUT yielding a resident; False = memory pressure
@@ -3896,8 +4164,12 @@ def _worker_fit_check(model_key: str) -> bool:
     GPU (doctrine: minimize load time, keep models hot); when nothing is left to
     yield the loop stops and the normal autofit path spills to CPU exactly as
     today. CPU-only box: contention is on RAM. Fails OPEN when the size or both
-    pools are unmeasurable — an unmeasurable load proceeds exactly as today."""
-    need = _incoming_need_bytes(model_key)
+    pools are unmeasurable — an unmeasurable load proceeds exactly as today.
+
+    NEED = weights + KV(resolved ctx) (slice 11): the ctx tax is planned, not
+    discovered at OOM. _incoming_need_detail is the ONE authoritative need; kv is
+    0 when ctx_pct is unset (byte-identical to today)."""
+    need = _incoming_need_detail(model_key).get("total")
     if not need:
         return True
     fv = _free_vram_bytes()
@@ -3964,7 +4236,9 @@ def _worker_slot_fit_check(model_key: str) -> bool:
     fv = _free_vram_bytes()
     if fv is None:
         return True                          # can't read free VRAM -> allow
-    need = _incoming_need_bytes(model_key)
+    # NEED = weights + KV(resolved ctx) (slice 11) — the ONE authoritative need,
+    # so the ceiling gate reserves the ctx tax too. kv=0 when ctx_pct unset.
+    need = _incoming_need_detail(model_key).get("total")
     if not need:
         return True                          # unknown weight size -> allow
     headroom = int(total * (1.0 - _vram_ceiling_frac()))
@@ -4261,6 +4535,280 @@ def _evict_model(state: "WorkerState", model_key: str,
     #    is OUT OF SCOPE for this slice — we never os.kill an arbitrary PID, so
     #    such a model simply reads as not-resident here. Idempotent no-op, HTTP 200.
     return _result("none", False, "not resident on this worker")
+
+
+# ── VRAM evict-to-fit at admission (slice 10, the VRAM twin of disk evict-to-fit) ─
+# The operator's ruling (2026-07-17): "everything is on demand — the process not
+# actively replying and not ahead of the subject in the queue, as well as not
+# 'static', should be evicted to allow the subject process to proliferate."
+#
+# THE INCIDENT: a transformers load OOM'd because an IDLE 21.3G coder SLOT CHILD
+# squatted the card and NOTHING evicted it first. The in-process contention path
+# (dispatch.ensure_headroom_for_load) only ever saw _INSTANCES residents and its
+# _worker_evictable predicate REFUSED slot-backed models — so a subprocess
+# squatter was invisible to an in-process load's make-room. This choke point sees
+# ALL residents (in-process + slot child + comfy) from the pid-registry MEASURED
+# truth, applies the protection rules, evicts the minimum LRU set through the SAME
+# _evict_model verb the operator proved live via /ops/evict, re-checks, and
+# refuses HONESTLY before any CUDA allocation (never admit-then-OOM).
+
+# VRAM eviction counter — the churn the operator watches must now include VRAM
+# evictions, not just disk. Surfaced on the heartbeat (see _worker_storage /
+# the beat body). A simple monotonic count + the last event, cheap and honest.
+_VRAM_EVICTIONS: dict = {"count": 0, "last": None, "last_at": 0.0}
+
+
+def _note_vram_eviction(victim: str, subject: str, freed: "int | None",
+                        host_mode: str) -> None:
+    _VRAM_EVICTIONS["count"] += 1
+    _VRAM_EVICTIONS["last"] = {
+        "victim": victim, "subject": subject, "host_mode": host_mode,
+        "vram_freed": freed, "at": time.time()}
+    _VRAM_EVICTIONS["last_at"] = time.time()
+    logger.info("VRAM evict-to-fit: evicted %s (%s, freed %s) to make room for %s",
+                victim, host_mode, _human_bytes(freed), subject)
+
+
+def _human_bytes(n: "int | None") -> str:
+    if not n:
+        return "0 B"
+    v = float(n)
+    for u in ("B", "KB", "MB", "GB", "TB"):
+        if v < 1024 or u == "TB":
+            return f"{v:.1f} {u}"
+        v /= 1024
+    return f"{n} B"
+
+
+def _need_split_str(det: dict) -> str:
+    """The honest weights+kv breakdown for a refusal (slice 11), e.g.
+    ' = 21.3 GB weights + 2.8 GB kv@50%ctx'. Empty when there is no ctx (kv=0),
+    so a model with no ctx allocation reads exactly as today."""
+    kv = int(det.get("kv") or 0)
+    if kv <= 0:
+        return ""
+    pct = det.get("ctx_pct")
+    tag = f"@{pct}%ctx" if pct else ""
+    return (f" = {_human_bytes(det.get('weights'))} weights + "
+            f"{_human_bytes(kv)} kv{tag}")
+
+
+def _actively_replying(model_key: str, slot_busy: "set | None" = None) -> bool:
+    """MEASURED 'actively replying' (operator: protect an in-flight reply), NOT
+    inferred from residency. True when the model has an in-flight in-process
+    generation (gen_gate) OR its slot is flagged busy this instant. Fail-safe: if
+    we can't tell, treat as busy (never rip a possibly-replying model)."""
+    try:
+        if gen_gate.in_flight(model_key) > 0:
+            return True
+    except Exception:  # noqa: BLE001 — can't tell -> protect
+        return True
+    if slot_busy is not None:
+        return model_key in slot_busy
+    return False
+
+
+def _busy_slot_models() -> set:
+    """Model_keys whose slot is BUSY right now (a live request in the child) —
+    the slot-side 'actively replying' signal. Empty on any read failure."""
+    try:
+        from ..managers.serve.slots import SlotPool
+        return {s.get("model_key") for s in SlotPool().statuses()
+                if s.get("model_key") and s.get("busy")}
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def _queued_ahead_of(subject: str) -> set:
+    """Model_keys with pending work queued AHEAD of the subject's request —
+    protected for this pass (operator: 'not ahead of the subject in the queue').
+
+    On-box the worker has no central queue; the honest local signal is the
+    provision/warm queue plus any model with WAITING gen-gate entrants (a request
+    parked on the gate is queued work targeting that resident). Best-effort — an
+    empty set on any failure just means nothing is queue-protected this pass, and
+    the in-flight guard still protects an actively-replying model."""
+    ahead: set = set()
+    try:
+        # A model with more gate entrants than are in-flight has requests WAITING
+        # on it — queued work the very next release will serve. Protect it.
+        for mk, g in list(getattr(gen_gate, "_gates", {}).items()):
+            try:
+                if g.active() >= g.limit and mk != subject:
+                    ahead.add(mk)          # gate saturated -> a waiter is queued
+            except Exception:  # noqa: BLE001
+                continue
+    except Exception:  # noqa: BLE001
+        pass
+    return ahead
+
+
+def _vram_residents(state: "WorkerState") -> "list[dict]":
+    """Every GPU-resident model this box holds, from the pid-registry MEASURED
+    snapshot (in_process + slot subprocess + comfy), each with its real
+    vram_bytes and host_mode. This is the resident TRUTH the eviction planner
+    ranks — it includes the slot child ('max GPU' alloc and all: alloc is a
+    sizing preference, not a residency shield) that the in-process contention
+    path was blind to. Comfy rows are surfaced but EXCLUDED from eviction here
+    (0.1.137: comfy is out of allocations; it has its own Fix B headroom path)."""
+    out: list[dict] = []
+    try:
+        from . import pid_registry as _pidreg
+        snap = _pidreg.snapshot_for_heartbeat() or {}
+        for row in snap.get("models") or []:
+            mk = row.get("model_key")
+            if not mk:
+                continue                    # cuda_context lump / idle comfy: no model
+            out.append({
+                "model_key": mk,
+                "vram_bytes": int(row.get("vram_bytes") or 0),
+                "host_mode": row.get("host_mode") or "",
+                "alive": bool(row.get("alive", True)),
+            })
+    except Exception:  # noqa: BLE001 — no registry -> nothing to plan against
+        pass
+    return out
+
+
+def _vram_evict_to_fit(state: "WorkerState", model_key: str,
+                       need: "int | None" = None) -> dict:
+    """THE VRAM admission choke point. Make room for ``model_key`` to land on the
+    GPU under the ~90% ceiling by evicting the minimum LRU set of EVICTABLE
+    residents, or refuse HONESTLY before any CUDA allocation.
+
+    Protection (operator ruling): NEVER evict a 🔒static resident, a model that is
+    ACTIVELY REPLYING (measured: in-flight gen / busy slot), a model with work
+    QUEUED AHEAD of the subject, comfy (its own path), or the subject itself.
+    EVERYTHING else is a candidate — on-demand idle residents, SLOT CHILDREN
+    included ('max GPU' alloc included) — LRU/coldest-first, minimum set to fit.
+
+    Returns a typed verdict:
+      {"action": "proceed"|"evicted"|"refuse", "evicted": [mk...],
+       "freed_bytes": int, "reason": {...}|None}
+    Fails OPEN (proceed) whenever VRAM/need is unmeasurable — an unmeasurable load
+    proceeds exactly as today, never blocked because we couldn't measure."""
+    total = _total_vram_bytes()
+    if not total:
+        return {"action": "proceed", "evicted": [], "freed_bytes": 0,
+                "reason": None, "note": "no GPU / unmeasurable — gate is a no-op"}
+    # NEED = weights + KV(resolved ctx) (slice 11): the ctx tax is reserved BEFORE
+    # the load, and the split is carried for an honest refusal ("24.1G = 21.3G
+    # weights + 2.8G kv@50%ctx"). When the caller passed an explicit `need` (a
+    # test / a pre-computed total) it wins; otherwise the authoritative detail.
+    _det = _incoming_need_detail(model_key)
+    if need is None:
+        need = _det.get("total")
+    if not need:
+        return {"action": "proceed", "evicted": [], "freed_bytes": 0,
+                "reason": None, "note": "unknown weight size — fail open"}
+    ceiling_reserve = int(total * (1.0 - _vram_ceiling_frac()))
+
+    def _fits() -> "bool | None":
+        fv = _free_vram_bytes()
+        if fv is None:
+            return None                      # can't read -> fail open at the caller
+        return (fv - need) >= ceiling_reserve
+
+    ok = _fits()
+    if ok is None:
+        return {"action": "proceed", "evicted": [], "freed_bytes": 0,
+                "reason": None, "note": "can't read free VRAM — fail open"}
+    if ok:
+        return {"action": "proceed", "evicted": [], "freed_bytes": 0, "reason": None}
+
+    # Over the ceiling — plan the minimum LRU eviction set.
+    busy_slots = _busy_slot_models()
+    queued_ahead = _queued_ahead_of(model_key)
+    try:
+        from ..managers.dispatch.dispatch import last_used_snapshot as _lus
+        lru = _lus()
+    except Exception:  # noqa: BLE001
+        lru = {}
+
+    residents = _vram_residents(state)
+    candidates: list[dict] = []
+    protected: list[dict] = []
+    for r in residents:
+        mk = r["model_key"]
+        if mk == model_key:
+            continue
+        if str(r.get("host_mode")) == "comfy":
+            protected.append({**r, "why": "comfy (own headroom path; excluded "
+                                          "from allocations — 0.1.137)"})
+            continue
+        if _residency(mk) == "static":
+            protected.append({**r, "why": "static (locked residency)"})
+            continue
+        if _actively_replying(mk, busy_slots):
+            protected.append({**r, "why": "actively replying (in-flight/busy)"})
+            continue
+        if mk in queued_ahead:
+            protected.append({**r, "why": "queued ahead of the subject"})
+            continue
+        candidates.append(r)
+
+    # LRU order: coldest last-served first (a never-served warmed resident sorts
+    # oldest and yields first — exactly right). Then a larger candidate first
+    # among equal-age so we clear the ceiling in the fewest evictions.
+    candidates.sort(key=lambda r: (lru.get(r["model_key"], 0.0),
+                                   -int(r.get("vram_bytes") or 0)))
+
+    evicted: list[str] = []
+    freed = 0
+    for r in candidates:
+        chk = _fits()
+        if chk:
+            break
+        mk = r["model_key"]
+        res = _evict_model(state, mk)        # the SAME verb /ops/evict uses
+        if res.get("evicted"):
+            fb = res.get("vram_freed")
+            freed += int(fb) if fb else 0
+            evicted.append(mk)
+            _note_vram_eviction(mk, model_key, fb, res.get("host_mode") or "")
+            _trim_host_ram()                 # so the next _fits() sees the room
+
+    final = _fits()
+    if final:
+        return {"action": "evicted", "evicted": evicted,
+                "freed_bytes": freed, "reason": None}
+
+    # Still short after a full permissible eviction -> HONEST refusal (never
+    # admit-then-OOM). Carry what's resident, what's protected + why, what we
+    # evicted, and the numbers, in the C4 vision-fit style.
+    fv = _free_vram_bytes()
+    reason = {
+        "state": "refused",
+        "model_key": model_key,
+        "reason": (
+            f"won't fit on GPU: needs {_human_bytes(need)}{_need_split_str(_det)}, "
+            f"{_human_bytes(fv)} free of {_human_bytes(total)} "
+            f"({_human_bytes(ceiling_reserve)} ceiling reserve); "
+            f"evicted {len(evicted)} idle resident(s) freeing "
+            f"{_human_bytes(freed)}, but {len(protected)} protected resident(s) "
+            f"still hold the card"
+        ),
+        "needs_bytes": need,
+        # The weights+kv SPLIT (slice 11) — the honest report the operator asked
+        # for: what the ctx allocation costs vs the weights.
+        "needs_weights_bytes": _det.get("weights"),
+        "needs_kv_bytes": _det.get("kv"),
+        "ctx_pct": _det.get("ctx_pct"),
+        "ctx_resolved": _det.get("ctx_resolved"),
+        "ctx_max": _det.get("ctx_max"),
+        "kv_geometry_source": _det.get("geometry_source"),
+        "free_vram_bytes": fv,
+        "total_vram_bytes": total,
+        "ceiling_reserve_bytes": ceiling_reserve,
+        "evicted": evicted,
+        "evicted_freed_bytes": freed,
+        "protected": [{"model_key": p["model_key"],
+                       "vram_bytes": p.get("vram_bytes"),
+                       "host_mode": p.get("host_mode"), "why": p.get("why")}
+                      for p in protected],
+    }
+    return {"action": "refuse", "evicted": evicted, "freed_bytes": freed,
+            "reason": reason}
 
 
 # ── Fix B: ensure comfy headroom (evict-to-target-free-VRAM, operator: "always") ─
@@ -4561,6 +5109,10 @@ def _effective_config() -> dict:
         out["residency"] = dict(_RUNTIME_SETTINGS["residency"])
     if _RUNTIME_SETTINGS.get("pinned"):
         out["pinned"] = dict(_RUNTIME_SETTINGS["pinned"])
+    if _RUNTIME_SETTINGS.get("ctx_pct"):
+        # Per-model context allocation (slice 11) — rides the heartbeat config map
+        # to central so the console can show the ctx % the worker will serve.
+        out["ctx_pct"] = dict(_RUNTIME_SETTINGS["ctx_pct"])
     out["comfy_url"] = (os.environ.get("COMFY_URL")
                         or "http://127.0.0.1:8188").rstrip("/")
     out["comfy_url_source"] = _SETTINGS_SOURCE.get("comfy_url", "default")
@@ -4791,11 +5343,77 @@ def _fill_empty_slots(state: "WorkerState") -> None:
         _SLOT_FILL_LOCK.release()
 
 
+def _vram_headroom_sweep(state: "WorkerState") -> None:
+    """90% HEADROOM TRIGGER (slice 10 addendum). Admission-time evict-to-fit only
+    fires when a NEW load arrives. The second incident had NO new load: ComfyUI
+    grew out-of-band while an IDLE non-grower slot child squatted, and the card
+    reached 100% and DEADLOCKED — the keeper had to /evict by hand. This closes
+    that: on every residency beat, if the card is at/over the ceiling (free VRAM
+    below the (1 - ceiling) reserve), evict the coldest EVICTABLE idle resident
+    (same protection rules — static / actively-replying / queued-ahead / comfy are
+    never touched) to claw back to headroom. No new timer: it rides the existing
+    60s residency loop. A no-op when unmeasurable or already under the ceiling.
+
+    Deliberately evicts AT MOST ONE resident per beat: a single reclaim (21G here)
+    is enough to break a deadlock, and one-per-beat avoids over-evicting a box
+    that's merely near the line — the next beat re-checks and takes another only
+    if still pressured."""
+    total = _total_vram_bytes()
+    if not total:
+        return
+    fv = _free_vram_bytes()
+    if fv is None:
+        return
+    reserve = int(total * (1.0 - _vram_ceiling_frac()))
+    if fv >= reserve:
+        return                               # under the ceiling — nothing to do
+    # Over the ceiling with no load driving admission. Evict the coldest EVICTABLE
+    # idle resident, applying the SAME protection rules as _vram_evict_to_fit.
+    busy_slots = _busy_slot_models()
+    try:
+        from ..managers.dispatch.dispatch import last_used_snapshot as _lus
+        lru = _lus()
+    except Exception:  # noqa: BLE001
+        lru = {}
+    residents = _vram_residents(state)
+    cands = []
+    for r in residents:
+        mk = r["model_key"]
+        if str(r.get("host_mode")) == "comfy":
+            continue                         # comfy has its own path; never here
+        if _residency(mk) == "static":
+            continue
+        if _actively_replying(mk, busy_slots):
+            continue
+        # No `queued_ahead` here — there is no subject load this pass; a resident
+        # with in-flight work is already protected by _actively_replying above.
+        cands.append(r)
+    if not cands:
+        logger.warning("VRAM headroom: card at/over the %.0f%% ceiling (%s free of "
+                       "%s) but nothing evictable — every resident is static or "
+                       "actively replying; leaving it (autofit/degrade)",
+                       _vram_ceiling_frac() * 100, _human_bytes(fv),
+                       _human_bytes(total))
+        return
+    cands.sort(key=lambda r: (lru.get(r["model_key"], 0.0),
+                              -int(r.get("vram_bytes") or 0)))
+    victim = cands[0]["model_key"]
+    logger.info("VRAM headroom: card at/over the %.0f%% ceiling (%s free) with no "
+                "load driving admission — evicting coldest idle resident %s "
+                "(operator addendum: no human is the eviction policy)",
+                _vram_ceiling_frac() * 100, _human_bytes(fv), victim)
+    res = _evict_model(state, victim)
+    if res.get("evicted"):
+        _note_vram_eviction(victim, "headroom-sweep", res.get("vram_freed"),
+                            res.get("host_mode") or "")
+        _trim_host_ram()
+
+
 def _residency_sweep_loop(state: "WorkerState") -> None:
-    """Residency maintenance every 60s: fill empty slots (slice 9), then run the
-    idle TTL sweep — which is a no-op unless the operator opted into
-    on_demand_ttl_s (contention governs residency by default; see
-    _residency_sweep_once and dispatch.ensure_headroom_for_load)."""
+    """Residency maintenance every 60s: fill empty slots (slice 9), enforce the
+    90% VRAM headroom (slice 10 addendum), then run the idle TTL sweep — which is
+    a no-op unless the operator opted into on_demand_ttl_s (contention governs
+    residency by default; see _residency_sweep_once + ensure_headroom_for_load)."""
     started_at = time.time()
     while True:
         time.sleep(60.0)
@@ -4803,6 +5421,10 @@ def _residency_sweep_loop(state: "WorkerState") -> None:
             _fill_empty_slots(state)
         except Exception as exc:  # noqa: BLE001 — the loop must never die
             logger.warning("slot fill pass failed: %s", exc)
+        try:
+            _vram_headroom_sweep(state)
+        except Exception as exc:  # noqa: BLE001 — the loop must never die
+            logger.warning("VRAM headroom sweep failed: %s", exc)
         try:
             _residency_sweep_once(started_at)
         except Exception as exc:  # noqa: BLE001 — the loop must never die
@@ -5136,6 +5758,10 @@ def _heartbeat_loop(client: CentralClient, state: WorkerState, args) -> None:
             except Exception as _pe:  # noqa: BLE001 — telemetry must never break the beat
                 logger.debug("pid_registry snapshot failed: %s", _pe)
                 _pid_log = None
+            # Honest budget-bar VRAM inputs (t13/t14): split the SAME pid_log into
+            # attributed (worker) vs unattributed (foreign) — sampled this beat,
+            # alongside detect_gpus() below, so the two are one snapshot.
+            _vram_split = _vram_split_from_pidlog(_pid_log)
             worker = client.heartbeat(
                 state.worker_id,
                 {
@@ -5153,6 +5779,17 @@ def _heartbeat_loop(client: CentralClient, state: WorkerState, args) -> None:
                     "rpc_endpoint": state.rpc_endpoint,
                     "free_ram": _free_ram_bytes(),
                     "ram_total": _ram_total_bytes(),
+                    # Honest budget-bar inputs (t13/t14). free_ram stays the
+                    # CLAMPED wire-compat field; these are the spec's raw inputs
+                    # so central computes bar_used/encroachment/over-limit for RAM
+                    # (ram_worker + ram_external) and VRAM (vram_attributed +
+                    # vram_unattributed) without guessing. Absent on older agents
+                    # -> central degrades to legacy bar semantics.
+                    "free_ram_raw": _free_ram_raw_bytes(),
+                    "ram_worker_bytes": _ram_worker_bytes(),
+                    "ram_external_bytes": _ram_external_bytes(),
+                    "vram_attributed_bytes": _vram_split.get("vram_attributed_bytes"),
+                    "vram_unattributed_bytes": _vram_split.get("vram_unattributed_bytes"),
                     "disk": _disk_status(),
                     "engine": llama_cpp_cuda_status(),
                     "pool": os.environ.get("WORKER_POOL", ""),
@@ -5168,6 +5805,12 @@ def _heartbeat_loop(client: CentralClient, state: WorkerState, args) -> None:
                     # mib}]}. None on older/no-GPU boxes -> central just omits it.
                     "pid_registry": _pid_log,
                     "storage": _worker_storage(state),
+                    # VRAM eviction churn (slice 10): the eviction the operator was
+                    # watching for now surfaces — count + last event {victim,
+                    # subject, host_mode, vram_freed, at}. Silent before; a VRAM
+                    # evict-to-fit at admission increments this so the churn data
+                    # includes GPU evictions, not just disk reaps.
+                    "vram_evictions": dict(_VRAM_EVICTIONS),
                     "install": _install_shape(),
                     # Concurrency hardening (2026-07-11): advertise this box's
                     # safe in-process concurrency + whether it can seat a native
@@ -5435,7 +6078,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         from ..managers.serve.slots import (set_eviction_policy,
                                             set_residency_lookup,
-                                            set_fit_check as set_slot_fit_check)
+                                            set_fit_check as set_slot_fit_check,
+                                            set_make_room as set_slot_make_room)
         set_eviction_policy(lambda mk: _residency(mk) == "on-demand")
         set_residency_lookup(_residency)
         # Real-VRAM ceiling gate (Fix A): the slot load/evict path now consults
@@ -5445,8 +6089,32 @@ def main(argv: list[str] | None = None) -> int:
         # offloading into a "free" seat on a full card. Degrades to allow when
         # unmeasurable (no-GPU / can't read VRAM) — byte-identical to today.
         set_slot_fit_check(_worker_slot_fit_check)
+        # CROSS-TIER make-room (slice 10): once slot-side eviction is exhausted,
+        # this reclaims VRAM held by an IN-PROCESS resident (invisible to the slot
+        # scheduler) so a slot load isn't OOM'd by a sibling transformers model.
+        set_slot_make_room(lambda mk: _vram_evict_to_fit(state, mk))
     except Exception as _exc:  # noqa: BLE001
         logger.warning("slot eviction policy not registered: %s", _exc)
+
+    # CONTEXT-as-allocation (slice 11): register the ctx resolver so the served
+    # -c honours the per-model ctx_pct — the value fit/admission reserved KV for.
+    # Reverse-injection (serve never imports worker_agent). Returns the resolved
+    # ctx int, or None (no ctx_pct) -> serve's default ctx path, byte-identical.
+    try:
+        from ..managers.serve.serve import set_ctx_resolver
+
+        def _ctx_resolver(mk, cfg=None):
+            _cfg = None
+            try:
+                from ..imports.config.main import get_model_config
+                _cfg = get_model_config(mk, dict_return=True)
+            except Exception:  # noqa: BLE001
+                _cfg = None
+            ctx, _pct, _mx = _resolved_ctx(mk, _cfg)
+            return ctx
+        set_ctx_resolver(_ctx_resolver)
+    except Exception as _exc:  # noqa: BLE001
+        logger.warning("ctx resolver not registered: %s", _exc)
 
     # Fix B (2026-07-15): ensure headroom before every ComfyUI gen. comfy_runner
     # is package-shared (central imports it), so it must not import worker/GPU
@@ -5512,10 +6180,17 @@ def main(argv: list[str] | None = None) -> int:
     # (_residency_sweep_once) is now opt-in behind on_demand_ttl_s.
     try:
         from ..managers.dispatch.dispatch import (set_fit_check, set_evictable,
-                                                  set_post_evict_hook)
+                                                  set_post_evict_hook,
+                                                  set_make_room)
         set_fit_check(_worker_fit_check)
         set_evictable(_worker_evictable)
         set_post_evict_hook(_trim_host_ram)
+        # CROSS-TIER VRAM make-room (slice 10): the in-process LRU yield is blind
+        # to a slot-child squatter — this hook sees ALL residents (pid-registry
+        # measured) and evicts the minimum permissible set through the /ops/evict
+        # verb, then REFUSES an unfittable load before any CUDA allocation. Bound
+        # to the live state so the eviction verb can act.
+        set_make_room(lambda mk: _vram_evict_to_fit(state, mk))
     except Exception as _exc:  # noqa: BLE001
         logger.warning("contention residency hooks not registered: %s", _exc)
 

@@ -73,6 +73,22 @@ def set_fit_check(fn) -> None:
     _FIT_CHECK = fn
 
 
+# CROSS-TIER make-room (slice 10): the slot ceiling loop above evicts only SLOT
+# occupants — it is blind to an IN-PROCESS transformers resident squatting the
+# card. This hook (registered by the worker) evicts ALL permissible residents
+# (in-process included) from the pid-registry measured truth. Called once the
+# slot-side eviction is exhausted, so a slot load can also reclaim VRAM held by a
+# sibling in-process model. None -> the historical slot-only path.
+_MAKE_ROOM = None
+
+
+def set_make_room(fn) -> None:
+    """Register the cross-tier VRAM make-room (slice 10): ``fn(model_key) -> dict``.
+    None -> slot-only ceiling eviction, byte-identical to before."""
+    global _MAKE_ROOM
+    _MAKE_ROOM = fn
+
+
 def _slot_count() -> int:
     global _LOGGED_COUNT
     raw = os.environ.get("SLOT_COUNT")
@@ -247,11 +263,25 @@ class SlotPool:
             while not self._ceiling_ok(model_key):
                 victim = self._evict_coldest_on_demand(statuses, model_key)
                 if victim is None:
+                    # Slot-side eviction exhausted. CROSS-TIER (slice 10): an
+                    # IN-PROCESS transformers resident (invisible to the slot
+                    # scheduler) may still be squatting the card — the make-room
+                    # hook evicts ALL permissible residents from the pid-registry
+                    # measured truth. If it evicts something, re-check the ceiling;
+                    # if it REFUSES (nothing left to evict), honest-degrade below.
+                    if _MAKE_ROOM is not None:
+                        try:
+                            verdict = _MAKE_ROOM(model_key)
+                        except Exception:  # noqa: BLE001 — never hang a request
+                            verdict = None
+                        if isinstance(verdict, dict) and verdict.get("evicted"):
+                            statuses = self.statuses()
+                            continue         # re-check the ceiling with the freed room
                     logger.warning(
                         "VRAM ceiling: loading %s would exceed the real-VRAM "
-                        "ceiling and nothing on-demand is evictable — proceeding "
-                        "anyway (autofit will spill/offload; not hanging the "
-                        "request)", model_key)
+                        "ceiling and nothing on-demand is evictable (slot or "
+                        "in-process) — proceeding anyway (autofit will spill/"
+                        "offload; not hanging the request)", model_key)
                     break
                 logger.info(
                     "VRAM ceiling: evicted idle on-demand %s from %s to keep %s "

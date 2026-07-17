@@ -60,7 +60,9 @@ _SENSITIVE = [
     # Worker admission / control — operator actions (register & heartbeat are
     # M2M and deliberately NOT here). Admission is what makes a worker
     # dispatch-eligible, so gating it closes anonymous self-admission → SSRF.
-    ({"POST"},                   re.compile(r"^/llm/workers/[^/]+/(admit|block|admission|assign|unassign|unload|probe|pool|limits)$")),
+    # (alloc-all = bulk GPU-allocation write for a selection of a worker's models
+    #  — worker_routes._apply_alloc_map; same registry-write privilege as assign.)
+    ({"POST"},                   re.compile(r"^/llm/workers/[^/]+/(admit|block|admission|assign|unassign|alloc-all|unload|probe|pool|limits)$")),
     ({"DELETE"},                 re.compile(r"^/llm/workers/[^/]+$")),
     # Serving / slot control (operator) — the GET status reads stay open.
     ({"POST"},                   re.compile(r"^/llm/serving/[^/]+$")),
@@ -106,6 +108,9 @@ _SENSITIVE = [
     # and rewrites its runtime settings — same privilege tier as update.)
     # pin-all/unpin-all relay the SAME /ops/config write in bulk (see
     # worker_routes._relay_pin_all) — same privilege tier as config.
+    # residency-all (todo t12) sets the RESIDENCY tier of a SELECTED set of a
+    # worker's models in one /ops/config write (worker_routes._relay_residency_map)
+    # — the same privilege tier as config/pin-all; residency only, never pin.
     # reap-approve = operator-approved eviction of cold local models (drives the
     # same guarded reaper as /reap, with a central intersection second guard).
     # free-ram = non-destructive host-RAM reclaim (gc + malloc_trim + CUDA
@@ -114,7 +119,7 @@ _SENSITIVE = [
     # evict = targeted per-model RAM+VRAM reclaim (slot child kill / in-process
     # ref-drop / comfy /free) — a privileged destructive executor op on the box,
     # same operator-only tier as unload/free-ram.
-    ({"POST"},                   re.compile(r"^/llm/workers/[^/]+/(restart|update|pip|config|reap|reap-approve|pin-all|unpin-all|free-ram|evict)$")),
+    ({"POST"},                   re.compile(r"^/llm/workers/[^/]+/(restart|update|pip|config|reap|reap-approve|pin-all|unpin-all|residency-all|free-ram|evict)$")),
     # P3.1 agent-node fleet: the operator-facing routes only. GET /agent/nodes
     # (the fleet roster) and POST /agent/<id>/dispatch (queue a task on a node)
     # are operator intent — gated here too, belt-and-suspenders with the

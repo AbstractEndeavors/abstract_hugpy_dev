@@ -460,6 +460,19 @@ class HeartbeatRequest(BaseModel):
     free_ram: int | None = None
     # RAW physical RAM (MemTotal) in bytes — see RegisterRequest.ram_total.
     ram_total: int | None = None
+    # Honest budget-bar inputs (t13/t14). free_ram stays the CLAMPED wire-compat
+    # figure; these carry the spec's raw inputs so central computes the honest
+    # bar (bar_used / encroachment / over-limit) instead of the physical_total −
+    # central_limit artifact. free_ram_raw = reserve-adjusted but UNCLAMPED by the
+    # ceiling; ram_worker/ram_external = the worker's own process-tree RSS vs
+    # everything else; vram_attributed/vram_unattributed = pid_registry model-row
+    # sum vs foreign squatter sum, sampled the same beat as gpus. None on older
+    # agents -> central degrades to legacy bar semantics (bar_semantics="legacy").
+    free_ram_raw: int | None = None
+    ram_worker_bytes: int | None = None
+    ram_external_bytes: int | None = None
+    vram_attributed_bytes: int | None = None
+    vram_unattributed_bytes: int | None = None
     # Free/total bytes of the worker's model-root volume — the assign/load
     # preflight refuses pulls that won't fit (disk-aware allocation).
     disk: dict | None = None
@@ -513,6 +526,10 @@ class HeartbeatRequest(BaseModel):
     # every beat so an /ops/pip that adds a missing dep flips the task within one
     # heartbeat. None on older agents -> field absent (assumed capable).
     task_capabilities: dict | None = None
+    # VRAM eviction churn (slice 10): {count, last:{victim,subject,host_mode,
+    # vram_freed,at}, last_at} — the GPU evict-to-fit churn the operator watches,
+    # surfaced beside the disk reaps. None on a pre-slice-10 worker.
+    vram_evictions: dict | None = None
 
 
 class AssignRequest(BaseModel):
@@ -697,6 +714,11 @@ def workers_heartbeat(worker_id):
         rpc_endpoint=body.rpc_endpoint,
         free_ram=body.free_ram,
         ram_total=body.ram_total,
+        free_ram_raw=body.free_ram_raw,
+        ram_worker_bytes=body.ram_worker_bytes,
+        ram_external_bytes=body.ram_external_bytes,
+        vram_attributed_bytes=body.vram_attributed_bytes,
+        vram_unattributed_bytes=body.vram_unattributed_bytes,
         disk=body.disk,
         engine=body.engine,
         pool=body.pool,
@@ -714,6 +736,7 @@ def workers_heartbeat(worker_id):
         slot_capable=body.slot_capable,
         slot_incapable_reason=body.slot_incapable_reason,
         task_capabilities=body.task_capabilities,
+        vram_evictions=body.vram_evictions,
     )
     if worker is None:
         # The agent thinks it's registered but central forgot it (restart,
@@ -745,6 +768,14 @@ def workers_heartbeat(worker_id):
     # opted in AND is over budget with a proposal AND the cooldown elapsed. Its
     # own try/except means it can never fail a heartbeat.
     _maybe_auto_reap(worker_id, worker)
+    # PENDING-ORPHAN EXPIRY (slice 9, defect 2): also event-driven off the beat
+    # (no timer thread). Retires never-dispatched pending jobs so a stuck row
+    # doesn't wait for someone to open /llm/jobs. Best-effort, never fails a beat.
+    try:
+        from abstract_hugpy_dev.comms import job_store
+        job_store.expire_pending_orphans()
+    except Exception:
+        pass
     # Advertise the target version every beat, so a worker converges within one
     # heartbeat of central's required version changing.
     worker["required_pkg_version"] = required_pkg_version()
@@ -957,6 +988,15 @@ def workers_assign(worker_id):
             return jsonify({"error": f"'{body.model_key}' won't fit on "
                             f"{_w.get('name') or worker_id}: {disk_no} — free "
                             "space or pick another worker"}), 409
+    # Engine gate (operator ruling 2026-07-17), defense-in-depth behind the UI:
+    # a GGUF-only spill (explicit budget / layer offload) must not be written onto
+    # a resolvably non-GGUF model. Autofit ({} / no spill) is engine-agnostic and
+    # always allowed, so ordinary assignment (with or without an autofit spill) is
+    # unaffected — only an explicit GGUF-only contract on a transformers/comfy key
+    # is refused (clear 409), the same class the bulk route skips.
+    ok, reason = _alloc_spill_ok_for_engine(body.spill, body.model_key)
+    if not ok:
+        return jsonify({"error": reason}), 409
     worker = assign_model(worker_id, body.model_key, spill=body.spill)
     if worker is None:
         abort(404, description="Unknown worker id.")
@@ -1223,6 +1263,384 @@ def workers_unpin_all(worker_id):
     worker in one /ops/config write (a `pinned` map of nulls), same relay/code
     path; afterward the models can be unassigned again."""
     return _relay_pin_all(worker_id, pin=False)
+
+
+# ── bulk residency (todo t12) ────────────────────────────────────────────────
+# The console's per-worker Serving table lets the operator multi-SELECT models
+# and change their RESIDENCY tier in ONE action, instead of clicking the per-
+# model residency control N times. N single-model /config POSTs would stack N
+# agent re-execs (each /ops/config schedules a restart) and spuriously fail the
+# later ones during the ~5s blip — the EXACT problem _relay_pin_all already
+# solved for pins: relay ONE /ops/config with the whole map = one atomic
+# settings-write + one re-exec.
+#
+# ⚠ RESIDENCY ONLY — this is NOT pin. Residency is the two-tier serving policy
+#   (on-demand default | 🔒static, the one tier that promises local presence /
+#   blocks eviction); 📌pin is the SEPARATE routing-persistence axis. This route
+#   never touches `pinned`.
+#
+# The worker agent's /ops/config already DEEP-MERGES a `residency` map
+# (agent.py ops_config: {"<model_key>": "static"|null}, one merge + one
+# _schedule_restart) — exactly like `pinned` — so the whole-selection action is
+# that same single relay with every selected key in the dict. No new worker
+# release, no duplicated policy: on-demand is the default and is stored as NO
+# entry, so the normalized wire value for on-demand is ``null`` (the single-
+# model setResidency uses the same null-clears convention).
+def _normalize_residency(mode) -> "str | None":
+    """Map a caller-supplied residency mode onto the wire value the agent stores.
+
+    "static" is the only stored tier; on-demand IS the default and clears the
+    override — so null / "" / "on-demand" and the agent's legacy synonyms
+    ("serving"/"warm") all normalize to None. Anything else is rejected by the
+    route (a bad tier must 400, never silently clear)."""
+    if mode == "static":
+        return "static"
+    if mode in (None, "", "on-demand", "on_demand", "serving", "warm"):
+        return None
+    return "__invalid__"
+
+
+def _relay_residency_map(worker_id, model_keys, mode):
+    """Set the residency tier of MANY designated models to ``mode`` in ONE
+    settings-write, reusing the SAME /ops/config relay the single-model
+    setResidency uses (workers_config).
+
+    ``model_keys`` — the operator's selection (a subset of this worker's
+    designated models; NOT necessarily every model, unlike pin-all). ``mode`` —
+    "static" or on-demand (null/"on-demand"). One /ops/config POST carries
+    ``{"residency": {mk: <wire>, ...}}`` for every selected key, and the agent
+    applies it as one atomic merge + one re-exec — never N restarts.
+
+    Returns a Flask (json, 200) with the SAME shape /pin-all returns so the UI
+    can surface it identically: per-model ``results`` ({model_key: "ok"|error}),
+    summary ``counts``, ``mode``, and the relay's ``restarting`` flag. Resilient:
+    a relay failure marks every selected model errored and STILL returns the full
+    map (never a bare 5xx that would abort the caller before it sees the outcome).
+    """
+    worker = get_worker(worker_id)
+    if worker is None:
+        abort(404, description="Unknown worker id.")
+    wire = _normalize_residency(mode)
+    if wire == "__invalid__":
+        return jsonify({"ok": False, "error": {
+            "code": "BadValue",
+            "message": (f"residency mode {mode!r} must be 'static' or "
+                        "'on-demand' (null/'on-demand' restores the default)")}}), 400
+    # Only act on keys ACTUALLY designated to this worker — a selection can go
+    # stale between render and click (an unassign in another tab). Silently
+    # ignoring off-worker keys keeps the settings-write honest (the agent would
+    # merge a residency entry for a model it isn't assigned otherwise).
+    designated = set(worker.get("models") or [])
+    keys = [mk for mk in (model_keys or []) if mk in designated]
+    skipped = [mk for mk in (model_keys or []) if mk not in designated]
+    label = "static" if wire == "static" else "on-demand"
+    action = f"residency_all:{label}"
+    if not keys:
+        out = {"ok": True, "mode": label, "results": {},
+               "counts": {"ok": 0, "error": 0, "total": 0},
+               "restarting": False,
+               "note": "none of the selected models are designated to this worker"}
+        if skipped:
+            out["skipped"] = skipped
+        return jsonify(out)
+    # Same payload shape as the single residency change (workers_config), just
+    # every selected key at once — the agent deep-merges them in one write.
+    payload = {"residency": {mk: wire for mk in keys}}
+    resp, status = _relay_worker_op(worker_id, "/ops/config", payload,
+                                    timeout=15.0, action=action,
+                                    retry_on_connect=True)
+    data = resp.get_json(silent=True) or {}
+    ok = (200 <= status < 300) and data.get("ok", True) is not False
+    if ok:
+        results = {mk: "ok" for mk in keys}
+        counts = {"ok": len(keys), "error": 0, "total": len(keys)}
+    else:
+        err = data.get("error")
+        msg = ((err.get("message") if isinstance(err, dict) else err)
+               or data.get("reason") or f"config relay failed (HTTP {status})")
+        results = {mk: msg for mk in keys}
+        counts = {"ok": 0, "error": len(keys), "total": len(keys)}
+    out = {"ok": ok, "mode": label, "results": results, "counts": counts,
+           "restarting": bool(data.get("restarting"))}
+    if skipped:
+        out["skipped"] = skipped
+    if not ok and data.get("error"):
+        out["error"] = data["error"]      # let the UI's fetchJson surface it too
+    # Always 200: the structured body (ok + counts) carries success/failure, so
+    # the caller sees the per-model map even when the underlying relay failed.
+    return jsonify(out)
+
+
+@worker_bp.route("/llm/workers/<worker_id>/residency-all", methods=["POST"])
+def workers_residency_all(worker_id):
+    """Bulk-residency (todo t12): set the RESIDENCY tier of a SELECTED set of
+    this worker's designated models in ONE settings-write via the single-model
+    residency relay (see _relay_residency_map). Body:
+    ``{"model_keys": [...], "mode": "static"|"on-demand"}``. One agent re-exec,
+    not one per model. Residency only — never touches 📌pin. Operator-gated +
+    audited like every other /ops/config relay (config/pin-all family)."""
+    body = request.get_json(silent=True) or {}
+    model_keys = body.get("model_keys")
+    if not isinstance(model_keys, list) or not model_keys:
+        return jsonify({"ok": False, "error": {
+            "code": "BadValue",
+            "message": 'model_keys must be a non-empty list of model keys'}}), 400
+    return _relay_residency_map(worker_id, model_keys, body.get("mode"))
+
+
+# ── bulk alloc (todo t15) ────────────────────────────────────────────────────
+# The operator's clarification of what the multi-select was FOR: "i meant ALLOC
+# for the group set, but residency can remain as well." So the same Serving-table
+# selection that drives bulk residency also drives a bulk GPU-ALLOCATION change:
+# set the per-model spill (autofit / max GPU / CPU only / custom budgets) for the
+# whole selection in ONE action.
+#
+# ⚠ ALLOC IS NOT RESIDENCY, AND NOT A RELAY. The single-model alloc editor
+#   applies via POST /llm/workers/<id>/assign {model_key, spill} — a CENTRAL
+#   REGISTRY write to spill_by_model[model_key] (assign_model), NOT the
+#   /ops/config family. So, unlike residency/pin, an alloc change does NOT restart
+#   the agent: the spill is the model's resource CONTRACT, applied by the worker
+#   the next time it loads the model. This route therefore does NOT relay to the
+#   worker and NEVER carries a `restarting` flag — it writes N registry entries in
+#   one request and returns per-model results the same shape residency-all uses.
+#
+# The spill value set MIRRORS the single editor's modeToSpill exactly:
+#   autofit  -> {}                     (clears any override back to autofit)
+#   max GPU  -> {"n_gpu_layers": -1}   (all layers on GPU)
+#   CPU only -> {"n_gpu_layers": "off"}
+#   custom   -> {"gpu_mem_gib"?, "cpu_mem_gib"?, "threads"?}  explicit budgets
+_ALLOC_SPILL_KEYS = {"n_gpu_layers", "gpu_mem_gib", "cpu_mem_gib",
+                     "threads", "tensor_split"}
+
+
+def _validate_alloc_spill(spill):
+    """Validate a bulk-alloc spill dict against the recognized AssignRequest
+    knobs. Returns (clean_dict, None) on success or (None, reason) on a bad shape.
+
+    ``None`` / ``{}`` are BOTH valid and mean autofit (clear the override) — the
+    same convention modeToSpill/assign_model use. Unknown keys are rejected so a
+    typo can't silently write a no-op contract; n_gpu_layers accepts the same
+    int|"auto"|"off" the single path does."""
+    if spill is None:
+        return {}, None
+    if not isinstance(spill, dict):
+        return None, "spill must be an object (or null/{} for autofit)"
+    unknown = sorted(set(spill) - _ALLOC_SPILL_KEYS)
+    if unknown:
+        return None, (f"unsupported spill keys {unknown}; recognized: "
+                      f"{sorted(_ALLOC_SPILL_KEYS)}")
+    ngl = spill.get("n_gpu_layers")
+    if ngl is not None and not (
+            isinstance(ngl, int) or ngl in ("auto", "off")
+            or (isinstance(ngl, str) and ngl.lstrip("-").isdigit())):
+        return None, 'n_gpu_layers must be an int, "auto", or "off"'
+    return dict(spill), None
+
+
+# ── engine gating (operator ruling 2026-07-17, NARROWED by t26) ─────────────
+# Original ruling: "explicit budget … should only be an option if the model is a
+# gguf file." Refined (t26): "the non ggufs should still have options, just not
+# explicit — the autofit, maxgpu and cpu only should still be on the table as its
+# easy to infer what those would indicate for a transformer."
+#
+# So the engine-exclusive set NARROWS to ONLY the EXPLICIT-BUDGET class —
+# gpu_mem_gib / cpu_mem_gib / threads / tensor_split. These are per-model
+# resource-contract numbers with true meaning only in the llama.cpp world.
+#
+# Autofit / Max GPU / CPU only are ENGINE-AGNOSTIC PLACEMENT INTENT that ride the
+# n_gpu_layers wire field (autofit={}, max GPU={n_gpu_layers:-1}, CPU only=
+# {n_gpu_layers:"off"|0}). The GGUF loader reads them as layer counts; the
+# transformers loader now interprets the SAME field as placement (spill.py
+# transformers_max_memory / n_gpu_layers_intent — all-on-GPU / CPU-only /
+# fit-and-spill), so they are NO LONGER dead knobs for transformers and apply to
+# every engine. Only the explicit class skips/409s on non-GGUF.
+_EXPLICIT_BUDGET_KEYS = {"gpu_mem_gib", "cpu_mem_gib", "threads", "tensor_split"}
+
+
+def _alloc_is_gguf_only(spill) -> bool:
+    """True ONLY when this spill carries an EXPLICIT-BUDGET knob (gpu_mem_gib /
+    cpu_mem_gib / threads / tensor_split) — the sole GGUF-exclusive class (t26).
+    Autofit ({}/None) AND the placement-intent modes (Max GPU / CPU only, which
+    carry ONLY n_gpu_layers) are engine-agnostic and apply to every engine."""
+    if not spill:
+        return False
+    return any(k in spill for k in _EXPLICIT_BUDGET_KEYS)
+
+
+def _model_framework(model_key: str) -> "str | None":
+    """The model's engine/framework from central's registry ('gguf'|'llama_cpp'
+    |'transformers'|'comfy'|…), lowercased, or None if it can't be resolved.
+    Central knows this authoritatively (get_model_config), so the engine gate is
+    enforced server-side — the UI gating is a courtesy, not the enforcement."""
+    try:
+        from ....imports.config.main import get_model_config
+        cfg = get_model_config(model_key)
+        fw = getattr(cfg, "framework", None)
+        return str(fw).lower() if fw else None
+    except Exception:  # noqa: BLE001 — unresolvable engine: caller treats as unknown
+        return None
+
+
+def _is_gguf_framework(fw: "str | None") -> bool:
+    """GGUF family: the HF-canonical 'gguf' plus the llama_cpp synonym."""
+    return fw in ("gguf", "llama_cpp")
+
+
+def _alloc_spill_ok_for_engine(spill, model_key) -> "tuple[bool, str | None]":
+    """Single-model engine gate: is this spill allowed for ``model_key``'s engine?
+
+    Returns (True, None) when allowed, (False, reason) when a GGUF-only spill is
+    aimed at a resolvably non-GGUF model. Autofit ({}/None) is always allowed
+    (engine-agnostic), so this only ever refuses an EXPLICIT GGUF-only contract on
+    a transformers/comfy key — the same class the bulk route skips. An
+    unresolvable engine fails SAFE (refuse the GGUF-only write). Pure + directly
+    unit-testable (mirrors _apply_alloc_map's per-key gate for the single path)."""
+    if not _alloc_is_gguf_only(spill):
+        return True, None
+    fw = _model_framework(model_key)
+    if _is_gguf_framework(fw):
+        return True, None
+    shown = fw or "unknown engine"
+    return False, (f"{_alloc_label(spill)} is a GGUF-only allocation "
+                   f"(explicit budget); '{model_key}' is {shown} — use autofit, "
+                   "Max GPU, or CPU only for a non-GGUF model")
+
+
+def _apply_alloc_map(worker_id, model_keys, spill):
+    """Set the GPU-ALLOCATION (spill) of a SELECTED set of a worker's designated
+    models in ONE request, reusing the SAME registry write the single-model alloc
+    uses (assign_model, POST /assign). No relay, no restart — a per-model spill is
+    a central registry contract applied on the model's next load.
+
+    ENGINE GATE (operator ruling): when ``spill`` is a GGUF-only allocation
+    (_alloc_is_gguf_only), non-GGUF members are SKIPPED with an honest per-model
+    reason and counted under ``counts.skipped`` — never written. Autofit applies
+    to every engine. This is defense-in-depth behind the UI gating.
+
+    ``model_keys`` — the operator's selection (a subset). ``spill`` — the alloc
+    contract to write (already validated). Returns a Flask (json, 200) with the
+    SAME shape residency-all/pin-all return so the UI can surface it identically:
+    per-model ``results`` ({model_key: "ok"|"skipped — …"|error}), ``counts``, an
+    ``alloc`` label, and (constant) ``restarting: False`` — alloc never re-execs
+    the agent. Audited like the single assign (operator-gated)."""
+    from .comms_routes import audit
+
+    worker = get_worker(worker_id)
+    if worker is None:
+        abort(404, description="Unknown worker id.")
+    # Only act on keys ACTUALLY designated to this worker — a selection can go
+    # stale between render and click. Off-worker keys are reported as skipped and
+    # never assigned (assign_model would otherwise ADD them, silently designating
+    # a model the operator only meant to re-allocate).
+    designated = set(worker.get("models") or [])
+    keys = [mk for mk in (model_keys or []) if mk in designated]
+    off_worker = [mk for mk in (model_keys or []) if mk not in designated]
+    label = _alloc_label(spill)
+    gguf_only = _alloc_is_gguf_only(spill)
+    audit("worker.alloc_all", {"worker_id": worker_id,
+                               "worker": worker.get("name"),
+                               "model_keys": keys, "spill": spill,
+                               "alloc": label, "gguf_only": gguf_only})
+    if not keys:
+        out = {"ok": True, "alloc": label, "results": {},
+               "counts": {"ok": 0, "error": 0, "skipped": 0, "total": 0},
+               "restarting": False,
+               "note": "none of the selected models are designated to this worker"}
+        if off_worker:
+            out["off_worker"] = off_worker
+        return jsonify(out)
+    results = {}
+    okN = 0
+    skipN = 0
+    for mk in keys:
+        # ENGINE GATE: a GGUF-only spill must not touch a non-GGUF model. Skip it
+        # with an honest reason (registry untouched) instead of writing a knob
+        # the transformers loader ignores. Unknown engine -> treat as non-GGUF
+        # (fail safe: don't write a GGUF-only contract onto an unresolvable model).
+        if gguf_only:
+            fw = _model_framework(mk)
+            if not _is_gguf_framework(fw):
+                shown = fw or "unknown engine"
+                results[mk] = (f"skipped — {label} is a GGUF-only allocation; "
+                               f"this model is {shown}")
+                skipN += 1
+                continue
+        try:
+            # assign_model writes spill_by_model[mk] = spill ({} clears it). The
+            # model is already designated (we filtered to `designated`), so this
+            # only rewrites the contract — it never newly-adds a model.
+            w = assign_model(worker_id, mk, spill=spill)
+            if w is None:
+                results[mk] = "worker vanished mid-apply"
+            else:
+                results[mk] = "ok"
+                okN += 1
+        except Exception as exc:  # noqa: BLE001 — one bad key must not abort the rest
+            results[mk] = f"{type(exc).__name__}: {exc}"
+    # Re-seat the models whose files are already on the box so the new contract
+    # takes effect without waiting for the next organic call — same seat-now
+    # policy the single /assign uses (warm only local files; absent ones wait).
+    try:
+        w2 = get_worker(worker_id) or worker
+        local = set(w2.get("models_local") or [])
+        seat = [mk for mk in keys if mk in local and results.get(mk) == "ok"]
+        if seat:
+            _kick_warm(w2, seat, "alloc_all")
+    except Exception:  # noqa: BLE001 — the warm is best-effort, never fails the write
+        pass
+    errN = len(keys) - okN - skipN
+    # ok=True when nothing HARD-errored: an engine skip is an expected, correct
+    # outcome (not a failure), so an all-transformers gguf-only apply is ok:true
+    # with everything skipped and nothing written.
+    out = {"ok": errN == 0, "alloc": label, "results": results,
+           "counts": {"ok": okN, "error": errN, "skipped": skipN, "total": len(keys)},
+           "restarting": False}
+    if off_worker:
+        # off-worker staleness is surfaced separately from the engine skips (which
+        # live in results with their reason) so the two never conflate.
+        out["off_worker"] = off_worker
+    return jsonify(out)
+
+
+def _alloc_label(spill) -> str:
+    """Human label for a spill contract (mirrors the UI's spillLabel)."""
+    if not spill:
+        return "autofit"
+    ngl = spill.get("n_gpu_layers")
+    if ngl in (-1, "-1"):
+        return "max GPU"
+    if ngl in (0, "0", "off"):
+        return "CPU only"
+    parts = []
+    if spill.get("gpu_mem_gib") is not None:
+        parts.append(f"{spill['gpu_mem_gib']}G VRAM")
+    if spill.get("cpu_mem_gib") is not None:
+        parts.append(f"{spill['cpu_mem_gib']}G RAM")
+    if spill.get("threads") is not None:
+        parts.append(f"{spill['threads']} cores")
+    return " · ".join(parts) or "custom"
+
+
+@worker_bp.route("/llm/workers/<worker_id>/alloc-all", methods=["POST"])
+def workers_alloc_all(worker_id):
+    """Bulk-alloc (todo t15): set the GPU ALLOCATION (spill contract) of a
+    SELECTED set of this worker's designated models in ONE request, via the same
+    registry write the single-model alloc uses (assign_model). Body:
+    ``{"model_keys": [...], "spill": {...}|{}|null}`` where spill mirrors the
+    editor (autofit={} / max GPU={n_gpu_layers:-1} / CPU only={n_gpu_layers:"off"}
+    / custom budgets). NO agent restart — a spill is a registry contract applied
+    on next load. Operator-gated + audited like the single /assign."""
+    body = request.get_json(silent=True) or {}
+    model_keys = body.get("model_keys")
+    if not isinstance(model_keys, list) or not model_keys:
+        return jsonify({"ok": False, "error": {
+            "code": "BadValue",
+            "message": 'model_keys must be a non-empty list of model keys'}}), 400
+    clean, reason = _validate_alloc_spill(body.get("spill"))
+    if reason is not None:
+        return jsonify({"ok": False, "error": {
+            "code": "BadValue", "message": reason}}), 400
+    return _apply_alloc_map(worker_id, model_keys, clean)
 
 
 @worker_bp.route("/llm/workers/<worker_id>/reap", methods=["POST"])
