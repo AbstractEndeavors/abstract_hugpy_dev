@@ -2470,6 +2470,12 @@ def _worker_storage(state: "WorkerState") -> dict:
         # names the ae failure class (not_local / no_config / comfy / …) in one
         # heartbeat instead of leaving considered≫rows unexplained.
         "scan_skip_reasons": scan.get("scan_skip_reasons") or {},
+        # REGISTRY SOURCES (slice 6): per-origin count of the live registry —
+        # {staple, discovered, central, comfy, total}. A dead source is visible
+        # in one beat: the ae 2026-07-17 incident was discovered==0 (stale/absent
+        # report left the registry staples-only). Pairs with scan_skip_reasons —
+        # no_config≫0 WITH discovered==0 points straight at the report/re-walk.
+        "registry_sources": _registry_sources(),
     }
     _STORAGE_CACHE.update(at=now, value=out)
     return out
@@ -2483,6 +2489,42 @@ def _hot_cache_status() -> dict:
         return hot_cache.status()
     except Exception:  # noqa: BLE001
         return {"enabled": False}
+
+
+def _registry_sources() -> dict:
+    """Per-source count of the worker's live model registry (slice 6): how many
+    configs came from each origin — {"staple": N, "discovered": N, "central": N,
+    "comfy": N, "total": N}.
+
+    Same honesty pattern as the scan skip-reason histogram: a DEAD source is
+    visible in one heartbeat. The ae 2026-07-17 incident was 'discovered'==0 (a
+    stale/absent discovery report left the registry staples-only); this names
+    that directly instead of leaving 63 no_config skips unexplained.
+
+    Classification (best-effort, read-only): a row is `comfy` when framework==
+    comfy; `staple` when its key is a curated MODELS entry; `discovered` when it
+    carries a `dir` (the ABSOLUTE on-disk path discover_models stamps — staples
+    carry only a layout `folder`, never a `dir`); else `central` (adopted from
+    central's config row via ensure_model_registered). Never raises."""
+    out = {"staple": 0, "discovered": 0, "central": 0, "comfy": 0, "total": 0}
+    try:
+        from .imports import models_config as mc
+        staples = set(getattr(mc, "MODELS", {}).keys())
+        reg = getattr(mc, "MODEL_REGISTRY_DICT", None) or {}
+        for key, row in reg.items():
+            out["total"] += 1
+            r = row if isinstance(row, dict) else {}
+            if str(r.get("framework") or "") == "comfy":
+                out["comfy"] += 1
+            elif key in staples:
+                out["staple"] += 1
+            elif r.get("dir"):
+                out["discovered"] += 1
+            else:
+                out["central"] += 1
+    except Exception:  # noqa: BLE001 — a heartbeat must never fail on this
+        pass
+    return out
 
 
 def _spill_describe() -> dict:
@@ -5414,6 +5456,31 @@ def main(argv: list[str] | None = None) -> int:
     # profile reads ready in the heartbeat. Boot-driven so the restart-based
     # /ops/config apply re-kicks idempotently (a ready profile is a no-op; a
     # changed manifest re-materializes). Fully additive to the boot path.
+    # BOOT-TIME REGISTRY RE-WALK (slice 6). The registry is built ONCE at module
+    # import from the discovery REPORT FILE (<DEFAULT_ROOT>/projects/
+    # model_discovery.json); nothing on the worker ever re-walks the tree, so an
+    # ABSENT or STALE report leaves the registry as STAPLES ONLY — every on-disk
+    # model then fails get_model_config and dies in the scan's `no_config` bucket
+    # (the ae 2026-07-17 incident: 63 no_config, models_local 65->0). The on-disk
+    # dirs carry per-dir hugpy.json markers — the source of truth discover_models
+    # reads — so a re-walk HERE re-derives their configs regardless of the report
+    # file's state. refresh_registry is idempotent, updates in place, and is what
+    # its own docstring says to call on startup; the worker just never did.
+    # Guarded: a discovery failure must never ground the boot (registry stays
+    # whatever import built). This is the honest presence fix — on-disk models
+    # resolve configs from their markers, not from a possibly-stale report.
+    try:
+        from .imports import models_config as _mc
+        _before = len(_mc.MODEL_REGISTRY)
+        _mc.refresh_registry(run_discovery=True)
+        _after = len(_mc.MODEL_REGISTRY)
+        logger.info("boot registry re-walk: %d -> %d model configs "
+                    "(on-disk markers re-read; report-file staleness bypassed)",
+                    _before, _after)
+    except Exception as _exc:  # noqa: BLE001 — discovery must never break boot
+        logger.warning("boot registry re-walk skipped (%s) — registry stays as "
+                       "import-built; on-disk models may read as no_config", _exc)
+
     try:
         from ..managers.serve import profiles as _profiles
         _profiles.set_model_resolver(_resolve_model_profile)

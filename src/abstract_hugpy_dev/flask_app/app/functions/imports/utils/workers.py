@@ -966,6 +966,10 @@ def storage_proposal(worker: Dict[str, Any]) -> Dict[str, Any]:
         # can name the ae failure class (not_local/no_config/comfy). Absent on a
         # pre-slice-5 worker -> {} (feature off).
         "scan_skip_reasons": (storage.get("scan_skip_reasons") or {}) if reported else {},
+        # REGISTRY SOURCES (slice 6) — per-origin config counts, passed through
+        # VERBATIM so the console shows a dead source (discovered==0) in one beat.
+        # Absent on a pre-slice-6 worker -> {} (feature off).
+        "registry_sources": (storage.get("registry_sources") or {}) if reported else {},
         # EFFECTIVE BUDGET (slice 4, min-wins) — the worker's own resolved
         # min(central disk_cache_gib, worker same-drive declarations) + the source
         # map, passed through VERBATIM so the console can show WHY a number
