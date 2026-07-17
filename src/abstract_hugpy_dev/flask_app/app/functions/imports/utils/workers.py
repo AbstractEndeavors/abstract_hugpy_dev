@@ -646,6 +646,25 @@ def storage_proposal(worker: Dict[str, Any]) -> Dict[str, Any]:
     greedily accumulating bytes until ``need`` is covered — that subset (possibly
     several models) is ``proposed_evictions``. The console renders it; it computes
     nothing.
+
+    📌 PIN + ALLOCATION HAVE NO BEARING ON EVICTION (operator ruling,
+    2026-07-17, verbatim): "the pins only should designate that the model
+    allocation survives restarts. the allocation only stipulates the routing for
+    that model (to that worker). neither of those should have any bearing on the
+    pull or eviction, unless its to do with priority, then a pinned model should
+    take higher precidence than unpinned, but even that is trivial".
+      * 📌 pin = the model's ALLOCATION survives restarts (and unassign — the
+        409). Nothing else. Allocation = ROUTING (which worker answers).
+      * A pinned or assigned model's FILES are a normal LRU eviction candidate
+        here — ``proposed_evictions`` MAY include pinned files. Evicting them
+        leaves pin + allocation untouched; the bytes re-pull on next call.
+      * Pin's only eviction role is the trivial FIFO tiebreak below (unpinned
+        proposed first at an exact last_picked tie).
+      * The ``pinned``/``why`` fields stay HONEST as ATTRIBUTION info (a row can
+        read pinned:true / why:"pinned" while protected:false). 🔒static is the
+        ONLY durable local-presence guard; loaded/loading/provisioning are
+        live-use guards. This removed the day-one tripwire (attribution/routing
+        masquerading as a disk shield). unassign-409 is UNTOUCHED — that IS pin.
     """
     storage = worker.get("storage")
     reported = isinstance(storage, dict)
@@ -665,6 +684,13 @@ def storage_proposal(worker: Dict[str, Any]) -> Dict[str, Any]:
     disk_total = _as_int(disk.get("total_bytes"))
 
     cache_used = _as_int(storage.get("cache_used_bytes")) if reported else None
+    # ORPHANED (unattributed-on-disk) residue reported by the worker (release-
+    # bound field). Passed through verbatim: model dirs / stalled .part sets on
+    # disk that match NO current assignment (computron's 5.7G Qwen2.5-VL-3B
+    # .part junk). Absent on a pre-2026-07-17 agent -> zeros (feature-off).
+    orphaned_bytes = (_as_int(storage.get("orphaned_bytes")) or 0) if reported else 0
+    orphaned_count = (_as_int(storage.get("orphaned_count")) or 0) if reported else 0
+    orphaned_items = (storage.get("orphaned_items") or []) if reported else []
     last_picked_map = worker.get("model_last_picked") or {}
     limits = worker.get("limits") or {}
     cfg = worker.get("config") or {}
@@ -747,27 +773,64 @@ def storage_proposal(worker: Dict[str, Any]) -> Dict[str, Any]:
         #
         # NOTE (Phase 1 item 2, grant markers): a SYSTEM grant is DELIBERATELY
         # ABSENT from this chain — the opposite of an operator "assigned"
-        # designation. A model that is ONLY granted (not assigned/pinned/
-        # static/loaded) gets no protection here and remains a normal LRU
-        # eviction candidate; grants are reclaimable by construction, never a
-        # residency guarantee. If a model happens to be BOTH granted and
-        # pinned/assigned/etc., that other designation still protects it as
-        # before — the grant itself just contributes nothing either way.
+        # designation. A model that is ONLY granted (not assigned/static/loaded)
+        # gets no protection here and remains a normal LRU eviction candidate;
+        # grants are reclaimable by construction, never a residency guarantee.
+        # If a model happens to be BOTH granted and assigned/static/etc., that
+        # FILE-PROTECTING designation still protects it as before — the grant
+        # itself contributes nothing. (📌pin is NOT file-protecting as of
+        # 2026-07-17, so granted+pinned is a candidate — see below.)
         why = m.get("why") or ""
         protected = bool(m.get("protected"))
+        is_pinned = bool(m.get("pinned") or pinned_cfg.get(mk))
+        # Worker-reported protection is trusted ONLY for reasons that are not
+        # pure attribution ("shared/central storage — never reaped", "model
+        # store not marked reapable", live-use guards). A released worker
+        # (<=0.1.183) still stamps protected/why="pinned" or "assigned" from the
+        # old doctrine — strip those two here and let the chain below recompute,
+        # or the fleet's stale flags keep the day-one tripwire alive centrally
+        # until the next release (keeper, 2026-07-17: ae reported 21/21 pinned
+        # rows protected with zero live-use flags — reclaimable pool read as
+        # empty on a 700G/429G box).
+        if protected and why in ("pinned", "assigned"):
+            # Clear the stale label too: if a live-use guard re-protects below,
+            # the chain stamps the HONEST reason (loaded/loading/…) instead of
+            # leaving attribution vocabulary on a protection flag.
+            protected, why = False, ""
+        # 📌 pin does NOT protect files (operator ruling, 2026-07-17): "the pins
+        # only should designate that the model allocation survives restarts. the
+        # allocation only stipulates the routing... neither of those should have
+        # any bearing on the pull or eviction". So pin is DELIBERATELY absent
+        # from this protection chain — a pinned model's files are a normal LRU
+        # candidate; the pin + allocation survive the eviction and the bytes
+        # re-pull on next call. `pinned` is still reported below as ATTRIBUTION
+        # (m['pinned']) but never sets `protected`/`why`. 🔒static is the ONLY
+        # durable local-presence guard; loaded/loading/provisioning are live-use
+        # guards. This removes the day-one tripwire that let attribution/routing
+        # masquerade as a disk shield.
         if not protected:
-            if m.get("pinned") or pinned_cfg.get(mk):
-                protected, why = True, why or "pinned"
-            elif str(residency.get(mk) or "").lower() == "static":
+            if str(residency.get(mk) or "").lower() == "static":
                 protected, why = True, why or "static"
-            elif m.get("assigned"):
-                protected, why = True, why or "assigned"
+            # NO `assigned` branch (operator ruling 2026-07-17): "the allocation
+            # only stipulates the routing for that model... neither of those
+            # should have any bearing on the pull or eviction." Assignment is
+            # attribution, same as pin — worker-side budget._is_protected has
+            # said so since f1894b2; this chain protecting `assigned` was the
+            # central half of the same day-one tripwire (on a box whose on-disk
+            # models are all assigned — ae, op — the reclaimable pool read as
+            # permanently empty).
             elif mk in loaded_now or m.get("loaded"):
                 protected, why = True, why or "loaded"
             elif mk in loading_now or m.get("loading"):
                 protected, why = True, why or "loading"
             elif mk in provisioning_now:
                 protected, why = True, why or "provisioning"
+            elif is_pinned and not why:
+                # ATTRIBUTION-only annotation: honest `why` for a pinned model
+                # that has no other protecting flag, while `protected` stays
+                # False (it remains a candidate). A bare pinned row therefore
+                # shows why="pinned" but IS eligible for the proposal below.
+                why = "pinned"
         models_out.append({
             "model_key": mk,
             "bytes": b,
@@ -775,7 +838,7 @@ def storage_proposal(worker: Dict[str, Any]) -> Dict[str, Any]:
             "protected": protected,
             "why": why,
             "granted": mk in grants_now,   # SYSTEM marker only — confers no protection
-            "pinned": bool(m.get("pinned") or pinned_cfg.get(mk)),
+            "pinned": is_pinned,           # ATTRIBUTION only — confers no eviction protection (2026-07-17)
             "loaded": bool(m.get("loaded") or mk in loaded_now),
             "loading": bool(m.get("loading") or mk in loading_now),
             # LIVE pulls only (not the worker's stale per-row flag) — this is
@@ -785,16 +848,20 @@ def storage_proposal(worker: Dict[str, Any]) -> Dict[str, Any]:
             "assigned": bool(m.get("assigned")),
         })
         if not protected:
-            candidates.append((lp, b, mk))
+            candidates.append((lp, is_pinned, b, mk))
 
     proposed: List[Dict[str, Any]] = []
     proposed_free = 0
     if over_budget and need_bytes > 0 and candidates:
-        # LRU oldest-first (ascending last_picked); among equally-cold entries
-        # (e.g. never-served leftovers, all last_picked=0) evict the LARGEST
-        # first so the budget clears in the fewest deletes; stable key tiebreak.
-        candidates.sort(key=lambda c: (c[0], -c[1], c[2]))
-        for lp, b, mk in candidates:
+        # LRU oldest-first (ascending last_picked). Then a TRIVIAL 📌pin tiebreak
+        # (operator called it "trivial and likely unnecessary", 2026-07-17):
+        # among equally-stale candidates, propose UNPINNED before PINNED (False
+        # sorts first) — a pinned model gets a hair of extra precedence only at
+        # an exact last_picked tie. Then largest-first so the budget clears in
+        # the fewest deletes; stable key tiebreak. IDENTICAL to budget.fit_plan,
+        # so central's preview and the worker's auto-evict agree on what goes.
+        candidates.sort(key=lambda c: (c[0], c[1], -c[2], c[3]))
+        for lp, _pin, b, mk in candidates:
             if proposed_free >= need_bytes:
                 break
             proposed.append({"model_key": mk, "bytes": b,
@@ -813,8 +880,57 @@ def storage_proposal(worker: Dict[str, Any]) -> Dict[str, Any]:
         alloc_over = alloc["allocated_total_bytes"] - budget
     alloc["allocated_over_budget_bytes"] = alloc_over
 
+    # ── ATTRIBUTED vs RESIDENT (2026-07-17) ─────────────────────────────────
+    # The operator scare: assignment/pin ATTRIBUTES a model to a worker without
+    # putting bytes on disk (lazy download, 7f0e6e8/2a3baeb). The fleet gauge
+    # read cache_used/budget, and an over-subscribed ATTRIBUTION set made a box
+    # with nothing transferring look like a runaway download storm. Split the two
+    # so attribution can NEVER masquerade as disk pressure:
+    #   * attributed = the assignment/pin SET's effective size (may exceed disk;
+    #     "assigned but not on disk" is a CORRECT resting state, not pressure).
+    #   * resident   = bytes ACTUALLY on disk. The worker's measured cache_used is
+    #     the authority; the per-model on-disk sum is the fallback/cross-check.
+    # The disk-pressure GAUGE is derived from RESIDENT only.
+    resident_from_models = sum(int(m.get("bytes") or 0) for m in models_out)
+    resident_bytes = cache_used if cache_used is not None else (
+        resident_from_models if reported else None)
+    attributed = {
+        "attributed_total_bytes": alloc["allocated_total_bytes"],
+        "attributed_count": alloc["allocated_count"],
+        "attributed_unknown_count": alloc["allocated_unknown_count"],
+        "attributed_over_budget_bytes": alloc_over,
+    }
+    resident = {
+        # bytes on disk NOW. `resident_bytes` is the number the gauge must use.
+        "resident_bytes": resident_bytes,
+        "resident_model_bytes": resident_from_models,
+        # measured vs summed can disagree (heartbeat lag / non-model files); both
+        # surfaced so the console shows the truth instead of averaging a lie.
+        "resident_source": ("measured" if cache_used is not None
+                            else ("summed" if reported else "unknown")),
+        # ORPHANED = on disk but attributed to NO model (leftover dirs + stalled
+        # .part sets). A THIRD class distinct from attributed and
+        # resident-attributed: junk eating the drive that the allocation ledger
+        # never showed. UI label: "unattributed on disk".
+        "orphaned_bytes": orphaned_bytes,
+        "orphaned_count": orphaned_count,
+        "orphaned_items": orphaned_items,
+    }
+    # The disk-pressure gauge: RESIDENT over budget. Attribution is deliberately
+    # excluded — an over-subscribed assignment set is surfaced via
+    # attributed_over_budget_bytes (structural), never as a full-disk reading.
+    gauge = {
+        "gauge_used_bytes": resident_bytes,   # <-- what the UI bar fills to
+        "gauge_budget_bytes": budget,
+        "gauge_basis": "resident",
+        "gauge_over_budget": over_budget,     # already computed from cache_used/disk_free
+    }
+
     return {
         **alloc,
+        **attributed,
+        **resident,
+        **gauge,
         "reported": reported,
         "cache_used_bytes": cache_used,
         "disk_free": disk_free,

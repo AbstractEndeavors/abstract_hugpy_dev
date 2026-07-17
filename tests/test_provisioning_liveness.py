@@ -180,13 +180,15 @@ def test_worker_row_flag_alone_cannot_resurrect_protection():
 
 
 def test_other_guards_are_untouched():
-    """Only PROVISIONING is liveness-gated. loaded/loading/pinned/assigned keep
-    protecting exactly as before (regression fence)."""
+    """Only PROVISIONING is liveness-gated. loaded/loading keep protecting;
+    pinned/assigned are CANDIDATES (operator 2026-07-17: pin = allocation
+    survives restarts, allocation = routing — "neither of those should have
+    any bearing on the pull or eviction")."""
     w = _worker(last_seen_ago=5.0, provisioning=[],
                 models=[_row("l", loaded=True), _row("h", loading=True),
                         _row("p", pinned=True), _row("a", assigned=True)])
     assert _prot(w, "l")[0] and _prot(w, "h")[0]
-    assert _prot(w, "p")[0] and _prot(w, "a")[0]
+    assert not _prot(w, "p")[0] and not _prot(w, "a")[0]
 
 
 # ── the central progress CLOCK (heartbeat) ────────────────────────────────

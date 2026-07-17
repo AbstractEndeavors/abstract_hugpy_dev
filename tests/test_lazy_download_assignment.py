@@ -230,19 +230,22 @@ def test_reconcile_does_not_rekick_missing_pinned_model(
         "reconcile must NOT re-pull a pinned model nobody called"
 
 
-# ── pin's REAL meaning survives: attribution still protects what's here ─────
-def test_pinned_model_is_still_protected_from_eviction():
-    """Removing pin's PRE-FETCH must not weaken pin's PROTECTION.
-
-    Pin never promises the bytes arrive — but once they have, permanent
-    attribution says they aren't the reaper's to reclaim. (Central-side mirror:
-    storage_proposal's `pinned` guard in
-    flask_app/app/functions/imports/utils/workers.py.)
+# ── pin's REAL meaning: allocation/routing survives, files do NOT ───────────
+def test_pinned_model_is_a_candidate_for_eviction():
+    """📌 pin has NO bearing on eviction (operator ruling, 2026-07-17): "the pins
+    only should designate that the model allocation survives restarts... neither
+    of those should have any bearing on the pull or eviction". So a pinned
+    model's FILES are a normal candidate — _is_protected returns "" for a
+    pin-only row. (Central-side mirror: storage_proposal no longer guards on
+    `pinned` in flask_app/app/functions/imports/utils/workers.py.)
     """
     from abstract_hugpy_dev.worker_agent import budget as B
-    assert B._is_protected({"model_key": "m-pinned", "pinned": True}) == "pinned"
-    # ...while merely-assigned is still reclaimable (attribution != a keep order)
+    # pin-only -> CANDIDATE (was asserted protected before 2026-07-17)
+    assert B._is_protected({"model_key": "m-pinned", "pinned": True}) == ""
+    # ...as is a merely-assigned row (attribution != a keep order)
     assert B._is_protected({"model_key": "m-cold", "assigned": True}) == ""
+    # only 🔒static (and the live-use guards) still protect files
+    assert B._is_protected({"model_key": "m-stat", "static": True}) == "static"
 
 
 def test_reconcile_does_not_rekick_a_model_already_on_disk(

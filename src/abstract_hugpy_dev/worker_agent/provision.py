@@ -39,6 +39,69 @@ _CHUNK = 8 * 1024 * 1024  # 8 MiB streaming chunks
 
 
 # ---------------------------------------------------------------------------
+# Central chain-of-command: refusal is AUTHORITATIVE (operator ruling, ae 1.2TB
+# incident 2026-07-17).
+# ---------------------------------------------------------------------------
+# "unless it is and the worker is resolving to hf download. then that needs to
+# be something that is fixed on the py module level via chain of command."
+#
+# Central OWNS the distribution decision. If central answered AT ALL — any HTTP
+# status, including a deliberate refusal (404/409/"archive refused") or a 5xx —
+# it is ALIVE and its verdict STANDS. The worker must NOT slip out the HF side
+# door and pull weights central just declined to serve (that is how a refusal
+# turned into a silent 55GB/700GB HF pull).
+#
+# HF fallback is a SURVIVAL path, permitted ONLY when central gave NO verdict at
+# all: the box can't reach central (connection refused / timeout / DNS) or no
+# central URL is configured. We distinguish the two by EXCEPTION TYPE at the
+# transfer call sites, never by string-matching a reason (urllib's taxonomy):
+#
+#   * urllib.error.HTTPError  -> central RESPONDED with a status. A VERDICT.
+#                                (HTTPError is a subclass of URLError, so it is
+#                                 caught FIRST everywhere below.)
+#   * urllib.error.URLError (non-HTTPError), socket.timeout, TimeoutError,
+#     ConnectionError, OSError -> no HTTP response reached us. UNREACHABLE.
+#
+# The fetchers RAISE CentralUnreachable for the unreachable class (instead of
+# the old swallow-to-False, which made "central refused" and "central down"
+# indistinguishable at _provision_now). A verdict-shaped failure returns False /
+# raises a non-CentralUnreachable error; _provision_now then refuses HF.
+#
+# Escape hatch: env HUGPY_HF_FALLBACK=always restores the pre-ruling behavior
+# (any central failure falls through to HF) for emergencies.
+import socket as _socket
+
+
+class CentralUnreachable(Exception):
+    """Central gave NO HTTP response — connection refused, timeout, or DNS
+    failure. The ONLY condition (besides no central URL) under which the HF
+    survival fallback is permitted. Carries the originating exception."""
+
+    def __init__(self, cause: BaseException):
+        self.cause = cause
+        super().__init__(f"{type(cause).__name__}: {cause}")
+
+
+def _is_unreachable(exc: BaseException) -> bool:
+    """True when ``exc`` means central never answered (no HTTP verdict).
+
+    HTTPError is a URLError subclass but IS a verdict (central responded), so it
+    is explicitly excluded. Everything else in urllib's connection-failure
+    taxonomy — a bare URLError (its ``.reason`` is the socket error), a raw
+    socket timeout, ConnectionError, OSError — is unreachable."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return False
+    return isinstance(exc, (urllib.error.URLError, _socket.timeout,
+                            TimeoutError, ConnectionError, OSError))
+
+
+def _hf_fallback_always() -> bool:
+    """Emergency escape hatch: HUGPY_HF_FALLBACK=always restores the pre-2026-07-17
+    behavior (ANY central failure — verdict or not — falls through to HF)."""
+    return (os.environ.get("HUGPY_HF_FALLBACK", "").strip().lower() == "always")
+
+
+# ---------------------------------------------------------------------------
 # Central-transfer authentication.
 # ---------------------------------------------------------------------------
 # Central's worker file-transfer endpoints (/manifest, /file, /chunksums,
@@ -74,12 +137,80 @@ def _enroll_token() -> str | None:
     return env or None
 
 
+# ---------------------------------------------------------------------------
+# Transfer self-identification (central budget handshake, ae 1.2TB 2026-07-17).
+# ---------------------------------------------------------------------------
+# Every central-transfer request now says WHO is asking (worker id) and WHY
+# (purpose), so central "abides by the limits set within its own backend": it
+# can 409 a BACKGROUND pull that would push the worker over budget, while never
+# refusing a DEMAND pull (a called model — the worker's own fit_plan evicts to
+# fit it). worker_id is a stable module value (set once at startup). purpose is
+# per-CALL, so it rides a thread-local set by ensure_model_present's ``purpose``
+# arg. Both headers are ADDITIVE: absent -> byte-for-byte the pre-feature
+# requests, and central treats a missing purpose as demand (permissive during
+# fleet convergence).
+_WORKER_ID: str | None = None
+_PURPOSE = threading.local()
+
+# The purposes a transfer can declare. "demand" = a real call (never budget-
+# refused). "probe" = a fit check (non-downloading as of Deliverable A, but
+# labeled for completeness). "reconcile"/"assign" = background pre-fetch (the
+# budget-refusable class).
+_BACKGROUND_PURPOSES = ("reconcile", "assign")
+
+
+def set_worker_id(worker_id: str | None) -> None:
+    """Remember this worker's id so central-transfer requests identify their
+    origin. Called once at agent startup alongside set_enroll_token."""
+    global _WORKER_ID
+    _WORKER_ID = (worker_id or "").strip() or None
+
+
+def _current_purpose() -> str | None:
+    """The purpose of the transfer running on THIS thread, or None. Set for the
+    duration of an ensure_model_present call via _purpose_scope."""
+    return getattr(_PURPOSE, "value", None)
+
+
+class _purpose_scope:
+    """Context manager: stamp the transfer purpose on this thread for the life of
+    a provision call, restoring the prior value on exit (nested calls are safe)."""
+
+    def __init__(self, purpose: str | None):
+        self.purpose = (purpose or "").strip() or None
+        self._prev = None
+
+    def __enter__(self):
+        self._prev = getattr(_PURPOSE, "value", None)
+        _PURPOSE.value = self.purpose
+        return self
+
+    def __exit__(self, *exc):
+        _PURPOSE.value = self._prev
+        return False
+
+
+def _identity_headers() -> dict:
+    """``X-Worker-Id`` + ``X-Transfer-Purpose`` when known, else omitted. Additive
+    on top of the auth header; central reads these to apply its budget gate."""
+    h = {}
+    if _WORKER_ID:
+        h["X-Worker-Id"] = _WORKER_ID
+    purpose = _current_purpose()
+    if purpose:
+        h["X-Transfer-Purpose"] = purpose
+    return h
+
+
 def _auth_headers() -> dict:
     """``{"Authorization": "Bearer <token>"}`` when an enrollment token is
-    available, else ``{}``. The exact header CentralClient._post attaches; an
-    empty dict means no Authorization header (today's tokenless behavior)."""
+    available, else ``{}``, PLUS the worker-identity/purpose headers (also
+    additive). The exact header CentralClient._post attaches; an empty result
+    means no headers added (today's tokenless behavior)."""
     tok = _enroll_token()
-    return {"Authorization": f"Bearer {tok}"} if tok else {}
+    h = {"Authorization": f"Bearer {tok}"} if tok else {}
+    h.update(_identity_headers())
+    return h
 
 
 def _auth_request(url: str, headers: dict | None = None) -> "urllib.request.Request":
@@ -754,10 +885,13 @@ def fetch_from_central(central_url: str, model_key: str, progress=None) -> bool:
         if exc.code in (404, 409):
             logger.info("central has no copy of %s (HTTP %s)", model_key, exc.code)
             return False
-        raise
+        raise                       # other HTTP status = a VERDICT — propagate it
     except urllib.error.URLError as exc:
+        # No HTTP response reached us: central is UNREACHABLE. RAISE (don't
+        # swallow to False) so _provision_now can tell "central down" (HF ok)
+        # from "central refused" (HF forbidden). See CentralUnreachable.
         logger.warning("central unreachable for %s (%s)", model_key, exc)
-        return False
+        raise CentralUnreachable(exc) from exc
 
     dest = _local_destination(manifest)
     files = manifest.get("files") or []
@@ -997,10 +1131,10 @@ def fetch_archive_from_central(central_url: str, model_key: str, progress=None) 
         if exc.code in (404, 409):
             logger.info("central has no copy of %s (HTTP %s)", model_key, exc.code)
             return False
-        raise
+        raise                       # other HTTP status = a VERDICT — propagate it
     except urllib.error.URLError as exc:
         logger.warning("central unreachable for %s (%s)", model_key, exc)
-        return False
+        raise CentralUnreachable(exc) from exc
 
     dest = _local_destination(manifest)
     files = manifest.get("files") or []
@@ -1018,10 +1152,10 @@ def fetch_archive_from_central(central_url: str, model_key: str, progress=None) 
             logger.info("central has no archive endpoint for %s (HTTP %s); "
                         "will use per-file transfer", model_key, exc.code)
             return False
-        raise
+        raise                       # other HTTP status = a VERDICT — propagate it
     except urllib.error.URLError as exc:
         logger.warning("central archive unreachable for %s (%s)", model_key, exc)
-        return False
+        raise CentralUnreachable(exc) from exc
 
     # Wrap the stream so progress reflects BYTES read off the socket — the true
     # download rate — rather than ticking only when a whole file finishes
@@ -1122,7 +1256,7 @@ def central_total_bytes(central_url: str | None, model_key: str) -> int | None:
 
 
 def ensure_model_present(model_key: str, central_url: str | None, progress=None,
-                         state=None) -> bool:
+                         state=None, purpose: str | None = None) -> bool:
     """Make sure model_key is on local disk. Central-first, then HF fallback.
 
     ``progress(done_bytes, total_bytes, filename)`` is forwarded to the central
@@ -1134,10 +1268,23 @@ def ensure_model_present(model_key: str, central_url: str | None, progress=None,
     one, and REFUSES the pull outright (raising ``budget.BudgetRefusal``) if
     even a full eviction can't seat it. Omitted/None -> no budget check, i.e.
     byte-for-byte the pre-feature behavior (standalone/CLI provisions).
+
+    ``purpose`` labels WHY this pull is happening for central's budget handshake
+    (2026-07-17): "demand" (a real call — never budget-refused centrally),
+    "reconcile"/"assign" (background pre-fetch — budget-refusable at 409), or
+    None (old behavior; central treats it as demand during rollout). It rides a
+    thread-local onto the X-Transfer-Purpose header of every transfer request.
     """
     # Teach the worker about the model first (central is the source of truth),
     # then provision against the canonical local key. This is what lets the
     # worker serve a model it wasn't built with.
+    with _purpose_scope(purpose):
+        return _ensure_model_present_inner(model_key, central_url,
+                                           progress=progress, state=state)
+
+
+def _ensure_model_present_inner(model_key: str, central_url: str | None,
+                                progress=None, state=None) -> bool:
     canonical = ensure_model_registered(model_key, central_url) or model_key
 
     if model_is_local(canonical):
@@ -1177,17 +1324,29 @@ def ensure_model_present(model_key: str, central_url: str | None, progress=None,
 
 def _provision_now(canonical: str, central_url: str | None, progress=None) -> bool:
     """Do the actual fetch (central archive -> per-file -> HF). Caller holds the
-    per-model provisioning lock."""
-    # Priority: get the model FILES from CENTRAL first — it's the source of
-    # truth and needs no HF token. Hugging Face is only a fallback, used when
-    # central can't provide the files (no central URL, central unreachable, or
-    # central doesn't have them on disk).
+    per-model provisioning lock.
+
+    CHAIN OF COMMAND (operator ruling, ae 1.2TB incident 2026-07-17): central's
+    verdict is AUTHORITATIVE. If central answered at all — a refusal (404/409/
+    archive-refused) OR any other HTTP status — it is ALIVE and its "no" STANDS:
+    this returns False WITHOUT trying HF. HF is a SURVIVAL fallback, reached ONLY
+    when central was UNREACHABLE (no HTTP response: CentralUnreachable) or no
+    central URL is configured. The distinction is by EXCEPTION TYPE, never by
+    string-matching the reason. Escape hatch: HUGPY_HF_FALLBACK=always restores
+    the old any-failure-falls-through behavior for emergencies.
+    """
     # Daylight item 4: the chosen SOURCE must be loud — logged AND streamed
     # through the progress callback (a "source=…" marker the agent stores on
     # provision_progress), so a silent 55GB HF pull while central held the
     # files can never happen unnoticed again.
+    hf_ok = _hf_fallback_always()            # escape hatch pre-decides HF
     central_reason = "no central URL configured"
-    if central_url:
+    if central_url is None:
+        # No central configured at all: HF is the only source (a worker cut off
+        # from the fleet). This is the survival path, not a side door.
+        hf_ok = True
+    else:
+        central_alive = False                # did central give us an HTTP verdict?
         # 1) parallel + segmented per-file transfer — fastest (saturates the
         #    link; a big weights file is split across many connections).
         if progress:
@@ -1197,8 +1356,14 @@ def _provision_now(canonical: str, central_url: str | None, progress=None) -> bo
                 logger.info("PROVENANCE: %s provisioned from CENTRAL (parallel)",
                             canonical)
                 return True
+            central_alive = True             # returned False = a 409/empty VERDICT
             central_reason = "central does not have the files (per-file 409/empty)"
+        except CentralUnreachable as exc:
+            central_reason = f"central unreachable (parallel): {exc}"
+            logger.warning("central parallel transfer of %s: central UNREACHABLE "
+                           "(%s); trying archive", canonical, exc)
         except Exception as exc:
+            central_alive = True             # any other error = central RESPONDED
             central_reason = f"parallel transfer failed: {type(exc).__name__}: {exc}"
             logger.warning("central parallel transfer of %s failed: %s; "
                            "trying archive", canonical, exc)
@@ -1208,21 +1373,41 @@ def _provision_now(canonical: str, central_url: str | None, progress=None) -> bo
                 logger.info("PROVENANCE: %s provisioned from CENTRAL (archive)",
                             canonical)
                 return True
+            central_alive = True
             central_reason = "central cannot provide the files (archive refused)"
+        except CentralUnreachable as exc:
+            central_reason = f"central unreachable (archive): {exc}"
+            logger.warning("central archive of %s: central UNREACHABLE (%s)",
+                           canonical, exc)
         except Exception as exc:
+            central_alive = True
             central_reason = f"archive transfer failed: {type(exc).__name__}: {exc}"
 
-    logger.warning("PROVENANCE: %s falling back to HUGGING FACE — central "
-                   "rejected: %s", canonical, central_reason)
+        # THE GATE. Central ALIVE (any verdict) => its "no" is authoritative;
+        # NO HF, unless the emergency escape hatch is set. Central UNREACHABLE
+        # on BOTH transports (central_alive stayed False) => HF survival path ok.
+        if not central_alive:
+            hf_ok = True
+        if central_alive and not hf_ok:
+            logger.error("PROVENANCE: %s NOT provisioned — central gave a verdict "
+                         "and HF is forbidden by chain of command (2026-07-17): "
+                         "%s. Set HUGPY_HF_FALLBACK=always to override.",
+                         canonical, central_reason)
+            if progress:
+                progress(0, 0, f"source=refused ({central_reason[:120]})")
+            return False
+
+    logger.warning("PROVENANCE: %s falling back to HUGGING FACE — %s",
+                   canonical, central_reason)
     try:
         if progress:
             progress(0, 0, f"source=hf ({central_reason[:120]})")
         fetch_from_hf(canonical)
-        logger.warning("PROVENANCE: %s provisioned from HUGGING FACE (central "
-                       "rejected: %s)", canonical, central_reason)
+        logger.warning("PROVENANCE: %s provisioned from HUGGING FACE (%s)",
+                       canonical, central_reason)
         return True
     except Exception as exc:
         logger.error("could not provision %s from central or HF: %s "
-                     "(central rejected: %s)", canonical, exc, central_reason)
+                     "(central: %s)", canonical, exc, central_reason)
         return False
 

@@ -33,10 +33,12 @@ def _completion_kwargs(payload: dict) -> dict:
     if isinstance(model, str) and model.strip().lower() in ("", "default"):
         model = None
     kwargs = {
-        "messages": [
-            {"role": m.get("role", "user"), "content": m.get("content", "")}
-            for m in messages
-        ],
+        # Fold the OpenAI tool-calling shapes (assistant `tool_calls`
+        # echo-backs, `{"role":"tool"}` results) down into the plain
+        # role+content wire the frozen ChatRequest / released worker speak —
+        # rendered into the same <tool_call>/<tool_response> text the tools
+        # preamble taught the model. Plain messages pass through untouched.
+        "messages": _render_tool_messages(messages),
         "model_key": model,
         "request_id": f"v1-{uuid.uuid4().hex}",
     }
@@ -64,6 +66,101 @@ def _completion_kwargs(payload: dict) -> dict:
     elif max_tokens:
         kwargs["max_chunks"] = 1
     return kwargs
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# tool-message rendering — the INBOUND half of the tools shim (step 2+).
+#
+# _build_tools_preamble/_parse_tool_calls handle the OUTBOUND half (advertise
+# tools, parse the model's reply). The multi-turn loop also sends messages the
+# other way: the assistant turn echoed back WITH its `tool_calls`, plus one
+# `{"role":"tool","tool_call_id":…,"content":…}` result per call. GGUF models
+# have no native tool-message wire and the released worker's message_to_dict
+# keeps only role+content, so we render those shapes into the SAME dialect the
+# preamble taught the model:
+#   • assistant tool_calls → an assistant turn whose content is the
+#     <tool_call>{"name":…,"arguments":…}</tool_call> block(s) it "said",
+#   • a tool result        → a USER turn carrying <tool_response>…</tool_response>
+#     (Qwen/Hermes convention — llama-server chat templates reject/mangle an
+#     unknown "tool" role, and the preamble already told the model the result
+#     arrives inside <tool_response> tags).
+# The result is a plain role+content message list the frozen schema and every
+# released worker accept, so the model can read the tool output and continue.
+# Plain (no-tools) chat never carries these keys → passed through byte-for-byte.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _render_assistant_tool_calls(tool_calls) -> str:
+    """Assistant `tool_calls` array -> the <tool_call>…</tool_call> text.
+
+    Mirrors _parse_tool_calls' inverse: each call becomes one block holding a
+    {"name","arguments"} JSON object with `arguments` as a parsed object (the
+    OpenAI wire keeps `arguments` as a JSON *string*; unwrap it one level so the
+    rendered block matches what the model itself emits — a JSON object, not a
+    quoted string). A malformed/leftover string is emitted as-is rather than
+    dropped.
+    """
+    blocks = []
+    for tc in tool_calls or []:
+        if not isinstance(tc, dict):
+            continue
+        fn = tc.get("function") or {}
+        name = fn.get("name")
+        if not name:
+            continue
+        raw_args = fn.get("arguments")
+        if isinstance(raw_args, str):
+            try:
+                args = json.loads(raw_args) if raw_args.strip() else {}
+            except (json.JSONDecodeError, ValueError):
+                args = raw_args  # keep the model's own (possibly sloppy) text
+        elif isinstance(raw_args, dict):
+            args = raw_args
+        else:
+            args = {}
+        obj = {"name": str(name), "arguments": args}
+        blocks.append("<tool_call>\n"
+                      + json.dumps(obj, ensure_ascii=False)
+                      + "\n</tool_call>")
+    return "\n".join(blocks)
+
+
+def _render_tool_messages(messages):
+    """Downcast OpenAI messages to the role+content wire, rendering tool turns.
+
+    The single funnel between a /v1 payload's `messages` and the engine kwargs:
+    every message becomes {"role","content"} (str). Assistant `tool_calls` and
+    `{"role":"tool"}` results are rendered into <tool_call>/<tool_response>
+    text; everything else is the same {role, content} downcast as before. Input
+    is never mutated.
+    """
+    out = []
+    for m in messages or []:
+        if not isinstance(m, dict):
+            # bare/odd entry — preserve prior lenient behavior
+            out.append({"role": "user", "content": str(m)})
+            continue
+        role = m.get("role", "user")
+        content = m.get("content")
+        content = content if isinstance(content, str) else ("" if content is None else str(content))
+
+        if role == "tool":
+            # A tool result the model reads as <tool_response>…</tool_response>
+            # on a user turn (unknown "tool" role would break the chat template).
+            out.append({"role": "user",
+                        "content": f"<tool_response>\n{content}\n</tool_response>"})
+            continue
+
+        if role == "assistant" and m.get("tool_calls"):
+            rendered = _render_assistant_tool_calls(m.get("tool_calls"))
+            # Preserve any assistant prose that rode alongside the calls, then
+            # the call block(s) — the order the model would have produced them.
+            merged = "\n".join(p for p in (content, rendered) if p)
+            out.append({"role": "assistant", "content": merged})
+            continue
+
+        out.append({"role": role, "content": content})
+    return out
 
 
 def _usage_block(usage) -> dict:

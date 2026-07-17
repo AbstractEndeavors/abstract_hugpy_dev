@@ -1,12 +1,36 @@
 from .imports import *
 from .task_schemas import *
-from pydantic import model_validator
+from pydantic import model_validator, model_serializer
 ChatInput = Union["ChatRequest", Mapping, str]  # request | dict-ish | bare prompt
 
 class ChatMessage(BaseModel):
     model_config = ConfigDict(extra="forbid")
     role: ROLES = "user"
-    content: str
+    # content is optional on the OpenAI tool-calling shapes: an assistant turn
+    # that ONLY calls a tool carries `tool_calls` and a null `content`. Kept
+    # str|None (default "") so plain chat is byte-for-byte unchanged.
+    content: Optional[str] = ""
+    # OpenAI tool-calling fields (the /v1 loop, step 2+). Added explicitly so
+    # the schema stays extra="forbid": an assistant echo-back carries its
+    # `tool_calls` array, and a `{"role":"tool"}` result carries `tool_call_id`.
+    # The runner never sees these — v1_helpers renders them into `content` text
+    # (the Qwen <tool_call>/<tool_response> convention) before relay, so a
+    # released worker on the frozen role+content wire keeps working.
+    tool_calls: Optional[list] = None
+    tool_call_id: Optional[str] = None
+
+    @model_serializer(mode="wrap")
+    def _omit_null_tool_fields(self, handler):
+        # Workers on the released package re-validate the relayed request with
+        # a ChatMessage that is still role+content only and extra="forbid" —
+        # dumping tool_calls/tool_call_id as None keys breaks EVERY offloaded
+        # chat. Omit them unless actually set so the relay wire stays
+        # byte-identical to the frozen schema for all non-tool traffic.
+        data = handler(self)
+        for key in ("tool_calls", "tool_call_id"):
+            if data.get(key) is None:
+                data.pop(key, None)
+        return data
 
 class ChatRequest(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")

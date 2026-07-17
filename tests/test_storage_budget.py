@@ -5,9 +5,13 @@ Covers the central-only pieces of the storage-budget feature:
     per-worker disk_cache_gib cap — cap WINS), the over_budget flag, and the
     LRU-ordered greedy proposed_evictions[] (least-recently-picked first, cold
     'never served' = last_picked 0 first, greedy until `need` covered).
-  * Guards: pinned / static / assigned / loaded / loading / provisioning are
-    NEVER proposed — worker-reported protected flag OR the central redundant
-    guard (slot-merged loaded_models/loading/provisioning, config residency/pin).
+  * Guards: static / assigned / loaded / loading / provisioning are NEVER
+    proposed — worker-reported protected flag OR the central redundant guard
+    (slot-merged loaded_models/loading/provisioning, config residency).
+    📌pin is DELIBERATELY NOT a guard (operator, 2026-07-17): pin designates only
+    that the allocation/routing survives restarts — it has NO bearing on
+    eviction, so a pinned model is a normal LRU candidate (its `pinned` flag is
+    attribution info only; `protected` stays False).
   * _public_view spreads the derived `storage` sub-object.
   * heartbeat() stores the worker-reported `storage` verbatim.
   * pick_for_model() stamps the per-(worker,model) `model_last_picked` LRU key.
@@ -51,7 +55,11 @@ def _worker(**over):
         # protection. This fixture means "a healthy worker", so say so.
         "last_seen": time.time(),
         "disk": {"free_bytes": 10 * GiB, "total_bytes": 500 * GiB},
-        "model_last_picked": {"warm": 5000.0, "cold": 1000.0},
+        # pinnedm gets the freshest stamp so it sorts LAST — a pinned model is a
+        # candidate now (pin doesn't protect), but keeping it warmest leaves the
+        # LRU-order assertions below (never/cold first) intact.
+        "model_last_picked": {"warm": 5000.0, "cold": 1000.0,
+                              "pinnedm": 9000.0},
         "loaded_models": [], "loading": [], "provisioning": [],
         "config": {}, "limits": {},
         "storage": {
@@ -61,8 +69,10 @@ def _worker(**over):
                 {"model_key": "warm", "bytes": 30 * GiB, "protected": False},
                 {"model_key": "cold", "bytes": 30 * GiB, "protected": False},
                 {"model_key": "never", "bytes": 25 * GiB, "protected": False},
+                # 📌 pin no longer protects files (2026-07-17): the worker
+                # reports it as ATTRIBUTION (pinned:true) but NOT protected.
                 {"model_key": "pinnedm", "bytes": 100 * GiB,
-                 "protected": True, "why": "pinned"},
+                 "protected": False, "pinned": True},
                 {"model_key": "assignedm", "bytes": 20 * GiB, "assigned": True},
             ],
         },
@@ -80,22 +90,31 @@ check("reserve mode: need = reserve - disk_free = 40 GiB",
 prop_keys = [e["model_key"] for e in p["proposed_evictions"]]
 check("LRU order: coldest (never-served last_picked=0) proposed first",
       prop_keys[0] == "never")
-check("LRU order: next-oldest last_picked (cold@1000 before warm@5000) second",
-      prop_keys[1] == "cold")
-check("greedy stops once need is covered (never 25 + cold 30 >= 40 GiB)",
-      prop_keys == ["never", "cold"])
-check("proposed_free_bytes = sum of proposed (55 GiB)",
-      p["proposed_free_bytes"] == 55 * GiB)
+# `assigned` is a CANDIDATE too (operator 2026-07-17: allocation = routing
+# only, no bearing on eviction) — never-picked assignedm ties never@0 and the
+# -bytes tiebreak puts never (25) first, assignedm (20) second; greedy covers
+# need at 45 GiB and cold@1000 survives.
+check("LRU order: never-picked assigned candidate second (allocation = routing only)",
+      prop_keys[1] == "assignedm")
+check("greedy stops once need is covered (never 25 + assignedm 20 >= 40 GiB)",
+      prop_keys == ["never", "assignedm"])
+check("proposed_free_bytes = sum of proposed (45 GiB)",
+      p["proposed_free_bytes"] == 45 * GiB)
 check("warm (most-recently-picked) is NOT proposed", "warm" not in prop_keys)
-check("pinned model is protected, never proposed",
+# pinnedm is a CANDIDATE now (pin doesn't protect), but it has the freshest
+# last_picked so the greedy cut never reaches it — NOT because it is
+# protected. The next check proves it is genuinely unprotected.
+check("pinned model NOT proposed here only because it is warmest, not protected",
       "pinnedm" not in prop_keys)
-check("assigned model is protected, never proposed",
-      "assignedm" not in prop_keys)
+check("cold survives because greedy stopped, not because of protection",
+      "cold" not in prop_keys)
 by = {m["model_key"]: m for m in p["models"]}
-check("pinned model carries protected+why in the per-model view",
-      by["pinnedm"]["protected"] and by["pinnedm"]["why"] == "pinned")
-check("assigned-flag model derived protected+why=assigned",
-      by["assignedm"]["protected"] and by["assignedm"]["why"] == "assigned")
+check("pinned model is UNPROTECTED (pin doesn't shield files) but flagged pinned",
+      by["pinnedm"]["protected"] is False and by["pinnedm"]["pinned"] is True)
+check("pinned model why is attribution-only 'pinned' while protected stays False",
+      by["pinnedm"]["why"] == "pinned")
+check("assigned-flag model is a CANDIDATE (allocation = routing only, 2026-07-17)",
+      by["assignedm"]["protected"] is False)
 check("never-served model last_picked is None (no central stamp)",
       by["never"]["last_picked"] is None)
 
@@ -112,8 +131,9 @@ check("cap mode: budget == cap bytes (150 GiB)", pc["budget"] == 150 * GiB)
 check("cap wins: over budget on cache_used>cap even though disk_free>reserve",
       pc["over_budget"] is True and pc["need_bytes"] == 50 * GiB)
 cap_keys = [e["model_key"] for e in pc["proposed_evictions"]]
-check("cap mode: same LRU greedy (need 50 GiB -> never+cold)",
-      cap_keys == ["never", "cold"])
+check("cap mode: same LRU greedy (need 50 GiB -> never+assignedm+cold: "
+      "assigned is a candidate, 2026-07-17)",
+      cap_keys == ["never", "assignedm", "cold"])
 
 
 # --- central redundant guard: slot-merged loaded/loading/provisioning --------
@@ -124,7 +144,13 @@ check("cap mode: same LRU greedy (need 50 GiB -> never+cold)",
 # "warm" actually live. The old fixture asserted that a bare flag from a worker
 # with no liveness evidence at all protects a model — that was the bug (op sat
 # offline 2h+ with 4 immortal entries).
-guardw = _worker(loaded_models=["never"], loading=["cold"],
+# pinnedm is now an UNPROTECTED candidate (pin doesn't shield files), so for the
+# "all candidates live" scenario to hold, mark it loaded too — otherwise it (the
+# only remaining unprotected model) would be proposed and this test's premise
+# ("nothing left to propose") would no longer be about the live-guard.
+# assignedm too: assigned is a candidate since 2026-07-17 (allocation = routing
+# only), so it must be live-guarded here for the same reason as pinnedm above.
+guardw = _worker(loaded_models=["never", "pinnedm", "assignedm"], loading=["cold"],
                  provisioning=["warm"],
                  provision_progress={"warm": {"done_bytes": 1 << 30,
                                               "total_bytes": 50 << 30,
@@ -158,12 +184,32 @@ check("central guard: provisioning on an OFFLINE worker -> NOT protected",
       not og["warm"]["protected"])
 
 
-# --- central guard: config residency=static / pinned map ---------------------
+# --- central guard: config residency=static (pin is NOT a guard) -------------
 cfgw = _worker(config={"residency": {"never": "static"}, "pinned": {"cold": True}})
 pcfg = W.storage_proposal(cfgw)
 kcfg = [e["model_key"] for e in pcfg["proposed_evictions"]]
+bcfg = {m["model_key"]: m for m in pcfg["models"]}
 check("config static excluded from proposal", "never" not in kcfg)
-check("config pinned excluded from proposal", "cold" not in kcfg)
+# 📌 config pin does NOT protect (2026-07-17): `cold` is config-pinned yet must
+# remain a normal LRU candidate — pin annotates, never shields.
+check("config pinned is a CANDIDATE (proposed), NOT excluded", "cold" in kcfg)
+check("config pinned model is flagged pinned but UNprotected",
+      bcfg["cold"]["pinned"] is True and bcfg["cold"]["protected"] is False)
+
+
+# --- 📌 a pinned model IS proposed when the FIFO reaches it (2026-07-17) ------
+# The direct proof of the ruling: make the ONLY reclaimable candidate a pinned
+# model and force an over-budget state. It must be proposed for eviction.
+pinonly = _worker()
+pinonly["storage"]["models"] = [
+    {"model_key": "pinnedm", "bytes": 100 * GiB, "protected": False,
+     "pinned": True},
+]
+pinonly["model_last_picked"] = {"pinnedm": 1.0}
+pp = W.storage_proposal(pinonly)
+ppk = [e["model_key"] for e in pp["proposed_evictions"]]
+check("pinned model IS proposed for eviction when it's the FIFO candidate",
+      pp["over_budget"] is True and ppk == ["pinnedm"])
 
 
 # --- under budget: no proposal ----------------------------------------------

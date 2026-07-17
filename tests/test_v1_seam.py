@@ -31,6 +31,8 @@ _usage_block = v1_helpers._usage_block
 _build_tools_preamble = v1_helpers._build_tools_preamble
 _inject_tools_preamble = v1_helpers._inject_tools_preamble
 _parse_tool_calls = v1_helpers._parse_tool_calls
+_render_tool_messages = v1_helpers._render_tool_messages
+_render_assistant_tool_calls = v1_helpers._render_assistant_tool_calls
 
 
 def _payload(**over):
@@ -292,6 +294,134 @@ class TestParseToolCalls(unittest.TestCase):
     def test_empty_and_none_inputs(self):
         self.assertEqual(_parse_tool_calls(""), ("", None))
         self.assertEqual(_parse_tool_calls(None), ("", None))
+
+
+class TestRenderToolMessages(unittest.TestCase):
+    """The inbound half of the tools shim: OpenAI tool-message shapes rendered
+    into the <tool_call>/<tool_response> role+content wire the model reads."""
+
+    _ECHO = {
+        "role": "assistant", "content": None,
+        "tool_calls": [{
+            "id": "call_1", "type": "function",
+            "function": {"name": "get_weather",
+                         "arguments": '{"city": "Berlin"}'},
+        }],
+    }
+    _RESULT = {"role": "tool", "tool_call_id": "call_1",
+               "content": '{"temp_c": 21, "sky": "clear"}'}
+
+    def test_plain_chat_is_byte_for_byte_unchanged(self):
+        # THE regression to guard hardest: no tool fields -> same downcast as
+        # the old `{"role": ..., "content": ...}` comprehension produced.
+        msgs = [{"role": "system", "content": "be terse"},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"}]
+        self.assertEqual(_render_tool_messages(msgs), msgs)
+
+    def test_missing_content_becomes_empty_string(self):
+        out = _render_tool_messages([{"role": "user"}])
+        self.assertEqual(out, [{"role": "user", "content": ""}])
+
+    def test_role_defaults_to_user(self):
+        out = _render_tool_messages([{"content": "hi"}])
+        self.assertEqual(out, [{"role": "user", "content": "hi"}])
+
+    def test_tool_result_rendered_as_user_tool_response(self):
+        out = _render_tool_messages([self._RESULT])
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["role"], "user")   # NOT "tool" — template-safe
+        self.assertIn("<tool_response>", out[0]["content"])
+        self.assertIn("</tool_response>", out[0]["content"])
+        self.assertIn('"temp_c": 21', out[0]["content"])
+
+    def test_assistant_tool_calls_rendered_as_tool_call_block(self):
+        out = _render_tool_messages([self._ECHO])
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["role"], "assistant")
+        content = out[0]["content"]
+        self.assertIn("<tool_call>", content)
+        self.assertIn("</tool_call>", content)
+        # arguments unwrapped from the OpenAI JSON *string* back to an object,
+        # matching what the model itself emits (and what _parse_tool_calls reads)
+        self.assertIn('"name": "get_weather"', content)
+        clean, calls = _parse_tool_calls(content)   # round-trips through the parser
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]),
+                         {"city": "Berlin"})
+
+    def test_assistant_prose_preserved_alongside_calls(self):
+        msg = dict(self._ECHO, content="Let me check that.")
+        out = _render_tool_messages([msg])
+        self.assertIn("Let me check that.", out[0]["content"])
+        self.assertIn("<tool_call>", out[0]["content"])
+
+    def test_full_four_message_loop_renders_to_prompt_text(self):
+        # user -> assistant(tool_call) -> tool(result) -> [next assistant turn]
+        loop = [
+            {"role": "user", "content": "weather in Berlin?"},
+            self._ECHO,
+            self._RESULT,
+        ]
+        out = _render_tool_messages(loop)
+        # every message is now a plain role+content str dict (frozen-schema wire)
+        for m in out:
+            self.assertEqual(set(m.keys()), {"role", "content"})
+            self.assertIn(m["role"], ("system", "user", "assistant"))
+            self.assertIsInstance(m["content"], str)
+        self.assertEqual(out[0]["content"], "weather in Berlin?")   # untouched
+        self.assertIn("<tool_call>", out[1]["content"])
+        self.assertIn("<tool_response>", out[2]["content"])
+        self.assertIn("21", out[2]["content"])                     # tool output visible
+
+    def test_dict_arguments_also_accepted(self):
+        # some clients echo `arguments` already as an object, not a JSON string
+        msg = {"role": "assistant", "content": None, "tool_calls": [{
+            "id": "c", "type": "function",
+            "function": {"name": "f", "arguments": {"k": "v"}}}]}
+        out = _render_tool_messages([msg])
+        _clean, calls = _parse_tool_calls(out[0]["content"])
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"k": "v"})
+
+    def test_input_not_mutated(self):
+        loop = [dict(self._ECHO), dict(self._RESULT)]
+        snapshot = json.dumps(loop, sort_keys=True)
+        _render_tool_messages(loop)
+        self.assertEqual(json.dumps(loop, sort_keys=True), snapshot)
+
+    def test_completion_kwargs_routes_through_renderer(self):
+        # the seam wiring: _completion_kwargs must emit the RENDERED messages,
+        # not the raw tool shapes (the old downcast silently dropped them).
+        kw = _completion_kwargs(_payload(messages=[
+            {"role": "user", "content": "weather?"},
+            self._ECHO, self._RESULT,
+        ]))
+        self.assertIn("<tool_call>", kw["messages"][1]["content"])
+        self.assertIn("<tool_response>", kw["messages"][2]["content"])
+
+
+class TestRenderAssistantToolCalls(unittest.TestCase):
+    def test_multiple_calls_each_get_a_block(self):
+        text = _render_assistant_tool_calls([
+            {"function": {"name": "a", "arguments": "{}"}},
+            {"function": {"name": "b", "arguments": '{"x": 1}'}},
+        ])
+        self.assertEqual(text.count("<tool_call>"), 2)
+        self.assertIn('"name": "a"', text)
+        self.assertIn('"name": "b"', text)
+
+    def test_nameless_or_garbage_entries_skipped(self):
+        text = _render_assistant_tool_calls([
+            {"function": {"arguments": "{}"}},   # no name
+            "not a dict",
+            {"function": {"name": "ok", "arguments": "{}"}},
+        ])
+        self.assertEqual(text.count("<tool_call>"), 1)
+        self.assertIn('"name": "ok"', text)
+
+    def test_empty_or_none_is_empty_string(self):
+        self.assertEqual(_render_assistant_tool_calls(None), "")
+        self.assertEqual(_render_assistant_tool_calls([]), "")
 
 
 if __name__ == "__main__":

@@ -215,7 +215,7 @@ DEFAULT_TOP_P = float(get_env_value("DEFAULT_TOP_P") or 1)
 FINISH_REASONS = make_list(get_env_value("FINISH_REASONS") or "stop,max_tokens,cancelled,error")
 FINISH_REASONS =Literal[*FINISH_REASONS]
 
-ROLES = make_list(get_env_value("ROLES") or "system,user,assistant")
+ROLES = make_list(get_env_value("ROLES") or "system,user,assistant,tool")
 ROLES = Literal[*ROLES]
 
 # Stock defaults: one model per task, every one a curated staple in

@@ -230,8 +230,19 @@ def _reconcile_warm_set(worker) -> list:
     ``models`` inventory — everything outside this set lazy-loads on demand.
     The result still passes through ``_warmable_subset`` (fit-cap) before any
     real load, so this only ever *narrows* what reconcile touches.
+
+    ⚠ "on disk" = ``models_local`` (the worker's heartbeat disk-truth,
+    UTIL-08), NEVER ``worker["models"]`` — that is the operator DESIGNATION
+    set (see allocated_totals). Reading designations here made the ∩ a no-op,
+    so every unloaded pin probed "cold", and the worker's /probe downloads
+    absent models (ensure_model_present) — central itself re-created the
+    eager pull storm through the probe side door, 600s at a time, surviving
+    worker restarts (2026-07-17: ae ground toward its full 1.2TB attribution
+    at ~5GB/min until this line). A worker that reports no models_local warms
+    NOTHING — a missed warm costs one first-call load; the designation
+    fallback costs a terabyte.
     """
-    present = set(worker.get("models") or [])
+    present = set(worker.get("models_local") or [])
     if not present:
         return []
     cfg = worker.get("config") or {}
@@ -935,9 +946,12 @@ def workers_assign(worker_id):
     worker = assign_model(worker_id, body.model_key, spill=body.spill)
     if worker is None:
         abort(404, description="Unknown worker id.")
-    # Designated = ready: load it on the worker NOW (background), don't wait
-    # for the first inference to pay the lazy load.
-    _kick_warm(worker, [body.model_key], "assign")
+    # Lazy doctrine (operator 2026-07-16/17): assignment is ATTRIBUTION, never
+    # a transfer order — and the worker's /probe DOWNLOADS an absent model, so
+    # an unconditional assign-warm was a hidden pull. Warm only when the files
+    # are already on the box (seat-now); an absent model waits for first call.
+    if body.model_key in (worker.get("models_local") or []):
+        _kick_warm(worker, [body.model_key], "assign")
     return jsonify(worker)
 
 
@@ -1756,19 +1770,95 @@ def _model_dir_or_404(model_key: str):
     return model, os.path.realpath(dest)
 
 
+# ── central storage-budget gate on BACKGROUND transfers (ae 1.2TB 2026-07-17) ──
+# Operator ruling: "its central that distributed these downloads, it has autonomy
+# over this... it simply needs to abide by the limits set within its own backend."
+# Central refuses a BACKGROUND pull (purpose reconcile/assign) from a worker whose
+# ledger says resident+incoming would exceed its budget. DEMAND pulls (a called
+# model) are NEVER budget-refused here — the worker's own fit_plan evict-to-fit
+# seats them; refusing a called model centrally would break serving. A request
+# with NO purpose header (an old agent mid-convergence) is treated as DEMAND —
+# permissive during rollout; this leniency EXPIRES once the fleet converges on
+# the purpose-aware agent (2026-07-17 release).
+_TRANSFER_PURPOSE_HEADER = "X-Transfer-Purpose"
+_TRANSFER_WORKER_HEADER = "X-Worker-Id"
+# Background purposes = the budget-refusable class. Everything else (demand,
+# probe, or an absent header) is served.
+_BACKGROUND_TRANSFER_PURPOSES = frozenset({"reconcile", "assign"})
+
+
+def _budget_refusal_for_transfer(model, incoming_bytes):
+    """Return a machine-readable 409 reason dict if this transfer REQUEST must be
+    refused for the declaring worker's storage budget, else None.
+
+    Reads the purpose + worker id off the request headers. Only BACKGROUND pulls
+    are candidates for refusal; demand / probe / no-header are always served
+    (None). Uses the SAME budget/resident numbers storage_proposal already
+    computes (via worker_storage_view) — no second accounting path. Refuses only
+    when the worker is KNOWN, has a real budget, and resident+incoming > budget.
+    Any ambiguity (unknown worker, no budget, unknown incoming size) -> serve.
+    """
+    purpose = (request.headers.get(_TRANSFER_PURPOSE_HEADER) or "").strip().lower()
+    if purpose not in _BACKGROUND_TRANSFER_PURPOSES:
+        return None  # demand / probe / absent -> never budget-refused centrally
+    worker_id = (request.headers.get(_TRANSFER_WORKER_HEADER) or "").strip()
+    if not worker_id:
+        return None  # background but anonymous (shouldn't happen) -> serve
+    try:
+        from ..functions.imports.utils.workers import worker_storage_view
+        view = worker_storage_view(worker_id)
+    except Exception:  # noqa: BLE001 — accounting failure must not block serving
+        return None
+    if not isinstance(view, dict):
+        return None  # unknown worker -> serve (don't refuse what we can't size)
+    budget = view.get("budget")
+    resident = view.get("resident_bytes")
+    if budget in (None, "") or resident is None:
+        return None  # no managed budget -> serve (unmanaged = pre-feature behavior)
+    try:
+        budget = int(budget)
+        resident = int(resident)
+        incoming = int(incoming_bytes or 0)
+    except (TypeError, ValueError):
+        return None
+    # If the model is already (partly) resident, its bytes are counted in
+    # `resident`; a background top-up of an already-present model is a no-op the
+    # worker's file-resume handles, so only refuse when the FULL incoming size on
+    # top of current residency would bust the budget. Conservative: this is the
+    # same "resident + need" the worker's own budget check uses.
+    if resident + incoming <= budget:
+        return None
+    return {
+        "code": "storage_budget_exceeded",
+        "purpose": purpose,
+        "worker_id": worker_id,
+        "model_key": (model.get("key") or model.get("name")
+                      if isinstance(model, dict) else None),
+        "budget_bytes": budget,
+        "resident_bytes": resident,
+        "incoming_bytes": incoming,
+        "would_use_bytes": resident + incoming,
+        "reason": (f"background pull ({purpose}) refused: resident {resident} + "
+                   f"incoming {incoming} = {resident + incoming} bytes would "
+                   f"exceed this worker's storage budget of {budget} bytes. "
+                   "Central abides by the limits set within its own backend "
+                   "(2026-07-17). The model pulls on a real call (demand), which "
+                   "the worker's own evict-to-fit seats."),
+    }
+
+
 @worker_bp.route("/llm/models/<path:model_key>/manifest", methods=["GET"])
 def model_file_manifest(model_key):
     if not _transfer_authorized():
         abort(401, description="Worker enrollment or operator token required.")
     model, dest = _model_dir_or_404(model_key)
 
-    files = []
-    total = 0
+    # Walk the whole model dir first (skipping transfer-machinery artifacts:
+    # chunk-hash sidecars + .part/.state staging), then SINGLE-FORMAT filter it.
+    raw = []       # [(rel, size)]
+    raw_total = 0
     for root, _dirs, names in os.walk(dest):
         for name in names:
-            # Transfer machinery artifacts are not model content: chunk-hash
-            # sidecars (server-side cache) and .part/.state staging files
-            # (worker-side, in case a worker dir is ever served back out).
             if ".chunksums-" in name or name.endswith((".part", ".part.state.json")):
                 continue
             full = os.path.join(root, name)
@@ -1777,19 +1867,45 @@ def model_file_manifest(model_key):
             except OSError:
                 continue
             rel = os.path.relpath(full, dest)
-            files.append({"path": rel, "size": size})
-            total += size
+            raw.append((rel, size))
+            raw_total += size
+
+    # Central mirrors WHOLE HF snapshots — the same weights in several formats,
+    # often an fp32 duplicate too. A worker only needs ONE usable weight format +
+    # the sidecars. Offer exactly that (degrade-to-correct: an unrecognized layout
+    # falls back to the whole listing). GGUF is untouched — its effective quant is
+    # resolved elsewhere. The worker's per-file puller drives off this `files`
+    # list, so this is what actually lands on the worker's disk.
+    from ..functions.imports.utils.format_select import select_files
+    framework = model.get("framework")
+    selected = select_files(raw, framework=framework)
+    files = [{"path": r, "size": s} for (r, s) in selected]
+    total = sum(s for (_r, s) in selected)
+
+    # BUDGET GATE (2026-07-17): the manifest is the FIRST thing both the per-file
+    # and the archive transports fetch, so refusing a background-over-budget pull
+    # HERE stops it before a single weight byte moves — on either transport. The
+    # single-format `total` above is exactly the incoming size the worker would
+    # land. Demand/probe/no-purpose pass through untouched (see helper).
+    refusal = _budget_refusal_for_transfer(model, total)
+    if refusal is not None:
+        logger.info("transfer of %s REFUSED (budget): %s", model_key,
+                    refusal.get("reason"))
+        return jsonify({"error": refusal["reason"], **refusal}), 409
 
     return jsonify({
         "model_key": model_key,
         "hub_id": model.get("hub_id"),
         "name": model.get("name"),
-        "framework": model.get("framework"),
+        "framework": framework,
         "task": model.get("task") or model.get("primary_task"),
         "filename": model.get("filename"),
         "include": model.get("include"),
-        "total_bytes": total,
-        "files": files,
+        "total_bytes": total,          # single-format effective size
+        "files": files,                # single usable format + sidecars
+        # Whole-snapshot footprint, for diagnostics only (never the transfer set).
+        "dir_total_bytes": raw_total,
+        "dir_file_count": len(raw),
     })
 
 
@@ -2196,10 +2312,18 @@ def model_archive(model_key):
     # which the worker-side extractor (0.1.129+) rightly refuses. Dereference
     # here — but only links that stay within the model storage root.
     from ....imports.src.constants.constants import DEFAULT_ROOT as _DR
+    from ..functions.imports.utils.format_select import select_files
     _root_real = os.path.realpath(_DR)
-    entries = []
+    # Whole-dir walk (skipping transfer-machinery sidecars, same as /manifest),
+    # then SINGLE-FORMAT filter so the archive tar carries exactly the same file
+    # set the per-file transport does — the fallback must not silently re-ship
+    # every format the /manifest path excludes.
+    walked = []            # [(rel, size)] for the format filter
+    real_by_rel = {}       # rel -> real path to pack
     for root, _dirs, names in os.walk(dest):
         for name in sorted(names):
+            if ".chunksums-" in name or name.endswith((".part", ".part.state.json")):
+                continue
             full = os.path.join(root, name)
             if not os.path.isfile(full):   # follows links: target must exist
                 continue
@@ -2208,7 +2332,16 @@ def model_archive(model_key):
                 logger.warning("archive %s: skipping %s (link escapes storage root)",
                                model_key, name)
                 continue
-            entries.append((real, os.path.relpath(full, dest)))
+            rel = os.path.relpath(full, dest)
+            try:
+                sz = os.path.getsize(full)
+            except OSError:
+                sz = 0
+            walked.append((rel, sz))
+            real_by_rel[rel] = real
+    _model_fw = _model.get("framework") if isinstance(_model, dict) else None
+    entries = [(real_by_rel[rel], rel)
+               for (rel, _sz) in select_files(walked, framework=_model_fw)]
 
     # ── global transfer cap ────────────────────────────────────────────────
     # Acquire AFTER auth + the (cheap-ish) directory walk above, but BEFORE

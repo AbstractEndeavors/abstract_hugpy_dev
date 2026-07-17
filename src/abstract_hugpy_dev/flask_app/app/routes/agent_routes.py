@@ -17,6 +17,8 @@ public-vs-internal curation the /endpoints inspector surfaces:
         GET  /agent/nodes                 list every node + live status  (operator)
         GET  /agent/<id>/tasks/<seq>      one task's full row incl result (operator; P3.1b)
         POST /agent/<id>/dispatch         {task} -> queue it for a node  (operator)
+  * the terminal (operator, human-driven, no browser):
+        GET  /agent/client.sh             serve the bash dispatch client   (open)
 
 Gates, all fail-closed:
   * ``register`` is the unauthenticated bootstrap (a node has no credential
@@ -32,6 +34,10 @@ Gates, all fail-closed:
     — the exact gate the console-management routes use (and additionally listed
     in operator_auth._SENSITIVE so the central before_request gate also covers
     them). It fails closed in external mode / whenever an operator token is set.
+  * ``client.sh`` is unauthenticated, same rationale as the worker/phone-brick
+    bootstrap scripts: it is plain client code with no embedded secret. The
+    dispatch/nodes calls IT makes are still operator-gated as above — the
+    script reads the operator token from the caller's own environment.
 
 All node state lives in comms.agent_nodes (the shared comms SQLite db — cross
 -process, gunicorn 3-worker safe), never per-process memory. Nodes may reach
@@ -280,6 +286,66 @@ def agent_task_result(node_id, seq):
     if outcome.get("reason") == "conflict":
         return jsonify(dict(outcome["task"], already_finalized=True)), 409
     abort(404, description="Unknown task for this node.")
+
+
+# ── public: serve the terminal dispatch client ──────────────────────────────
+def _find_dispatch_client() -> "str | None":
+    """Locate ``hugpy_agent/bin/hugpy-dispatch`` on disk.
+
+    ``HUGPY_AGENT_CLIENT_SH`` overrides the path outright (ops convenience /
+    testing) and is AUTHORITATIVE when set — a misconfigured override (points
+    at nothing) surfaces as 404 rather than silently falling back to
+    auto-discovery, so a bad env var is visible instead of masked. Only when
+    the var is unset do we walk up from THIS file (not cwd — the service runs
+    with ``chdir ~/station/dev/abstract_hugpy_dev``, one level short of the
+    repo root that actually holds ``hugpy_agent/``) until a directory
+    containing ``hugpy_agent/bin/hugpy-dispatch`` is found. Returns None if
+    nothing resolves."""
+    override = os.getenv("HUGPY_AGENT_CLIENT_SH")
+    if override:
+        return override if os.path.isfile(override) else None
+    d = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(20):
+        candidate = os.path.join(d, "hugpy_agent", "bin", "hugpy-dispatch")
+        if os.path.isfile(candidate):
+            return candidate
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return None
+
+
+@agent_bp.route("/agent/client.sh", methods=["GET"])
+def agent_client_sh():
+    """Public: serve the terminal dispatch client so any box can install it
+    with one line::
+
+        curl -fsSL https://dev.hugpy.ai/api/agent/client.sh | bash -s install
+
+    Unauthenticated by design, same rationale as the worker/phone-brick
+    bootstrap scripts (``workers_install_sh`` / ``phone_install_script``):
+    the script is plain client code with no embedded secret — it reads the
+    operator token from the caller's environment or config file at RUN time,
+    never from this response. Piping to ``bash -s install`` means the
+    script's ``install`` subcommand cannot copy itself from ``$0`` (stdin has
+    no file), so it re-downloads its own source from
+    ``$HUGPY_CENTRAL/agent/client.sh`` in that case — see the install
+    subcommand's stdin-fallback branch.
+
+    404s with a one-line explanation if the script cannot be located (e.g. a
+    deployment layout where ``hugpy_agent/`` isn't a sibling of the repo this
+    file ships from) rather than 500ing.
+    """
+    from flask import Response
+    path = _find_dispatch_client()
+    if path is None:
+        abort(404, description=(
+            "Dispatch client script not found on this deployment "
+            "(hugpy_agent/bin/hugpy-dispatch missing)."))
+    with open(path, encoding="utf-8") as fh:
+        script = fh.read()
+    return Response(script, mimetype="text/x-shellscript")
 
 
 # ── console UI: operator lists nodes + dispatches tasks ────────────────────

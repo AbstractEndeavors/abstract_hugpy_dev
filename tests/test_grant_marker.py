@@ -6,7 +6,9 @@ persisted marker + its semantics: no auto-placement, no queue, no scheduling
 logic. Critical semantic difference from an operator assign/pin:
 
   * a grant is RECLAIMABLE — freely LRU-evictable, never protected
-  * a grant is unassignable-with-no-409 (no pin-style protection at all)
+  * a grant is unassignable-with-no-409 (unlike a pin, whose ONE durable claim
+    is that its allocation survives — unassign returns 409; note pin does NOT
+    protect files from eviction, 2026-07-17)
   * a grant must never masquerade as operator intent (assign-memory blind to it)
 
 Runs like the other tests here:
@@ -105,19 +107,21 @@ check("grant-only model IS an eviction candidate",
 check("grant-only model shows up over-budget as a proposed eviction",
       any(e["model_key"] == "modelA" for e in prop["proposed_evictions"]))
 
-# (b) ASSIGNED (worker-reported assigned=True) -> protected, unchanged.
+# (b) ASSIGNED (worker-reported assigned=True) -> a CANDIDATE (operator
+# 2026-07-17: "the allocation only stipulates the routing for that model...
+# neither of those should have any bearing on the pull or eviction").
 w_assigned = _mk_storage_worker(
     "wid-b",
     models_report=[{"model_key": "modelB", "bytes": 500, "assigned": True}],
 )
 prop_b = W.storage_proposal(w_assigned)
 mB = next(m for m in prop_b["models"] if m["model_key"] == "modelB")
-check("assigned model IS protected (unchanged semantics)", mB["protected"] is True)
-check("assigned model's why is 'assigned'", mB["why"] == "assigned")
-check("assigned model is NOT a proposed eviction",
-      not any(e["model_key"] == "modelB" for e in prop_b["proposed_evictions"]))
+check("assigned model is a CANDIDATE (allocation = routing only)",
+      mB["protected"] is False)
 
-# (c) BOTH granted AND pinned -> still protected (pin wins; grant adds nothing).
+# (c) BOTH granted AND pinned -> a CANDIDATE (2026-07-17: pin no longer protects
+# files; neither grant nor pin shields, so the model is reclaimable). The
+# `pinned`/`why` fields stay honest as ATTRIBUTION while `protected` is False.
 w_both = _mk_storage_worker(
     "wid-c", grants={"modelC": {"ts": 1.0, "job_id": None, "origin": "system"}},
     pinned_model="modelC",
@@ -125,9 +129,11 @@ w_both = _mk_storage_worker(
 )
 prop_c = W.storage_proposal(w_both)
 mC = next(m for m in prop_c["models"] if m["model_key"] == "modelC")
-check("granted+pinned model stays protected via the pin", mC["protected"] is True)
-check("granted+pinned model why is 'pinned' (pin wins, grant contributes nothing)",
+check("granted+pinned model is NOT protected (pin no longer shields files)",
+      mC["protected"] is False)
+check("granted+pinned model why is attribution-only 'pinned' (protected False)",
       mC["why"] == "pinned")
+check("granted+pinned model is flagged pinned=True (attribution)", mC["pinned"] is True)
 check("granted+pinned model is marked granted=True regardless", mC["granted"] is True)
 
 

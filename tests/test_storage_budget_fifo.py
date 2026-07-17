@@ -37,6 +37,15 @@ def _model(key, gib, last_picked=None, **flags):
     return row
 
 
+def _static(key, gib, last_picked=None, **flags):
+    """A 🔒static row — the one tier that blocks disk eviction. Used where a test
+    needs an UNRECLAIMABLE model to force a refusal (📌pin no longer protects
+    files as of 2026-07-17, so pinned rows are eviction candidates)."""
+    flags.setdefault("protected", True)
+    flags.setdefault("why", "static")
+    return _model(key, gib, last_picked=last_picked, **flags)
+
+
 def _storage(models):
     return {"cache_used_bytes": sum(m["bytes"] for m in models),
             "models": models, "disk_free": 10 * GIB}
@@ -100,8 +109,12 @@ def test_equally_cold_models_evict_largest_first():
 
 
 # ── 3. never evicts protected models or the keep-target ────────────────────
-@pytest.mark.parametrize("flag", ["loaded", "loading", "provisioning",
-                                  "pinned"])
+# NOTE (operator ruling 2026-07-17): 📌pin is DELIBERATELY absent from this
+# list — pin designates only that the allocation/routing survives restarts and
+# has NO bearing on eviction. A pinned model's files are a normal candidate (see
+# test_pinned_model_is_a_candidate_and_evicts below). Only 🔒static and the
+# live-use guards (loaded/loading/provisioning) protect files here.
+@pytest.mark.parametrize("flag", ["loaded", "loading", "provisioning"])
 def test_protected_models_are_never_evicted(flag):
     storage = _storage([_model("protected_one", 40, **{flag: True}),
                         _model("cold", 20)])
@@ -120,6 +133,37 @@ def test_static_residency_is_never_evicted():
     plan = budget.fit_plan("caller", 10 * GIB, storage,
                            {"disk_cache_gib": 50}, {"stat": 1, "cold": 999})
     assert "stat" not in plan["evict"]
+
+
+def test_pinned_model_is_a_candidate_and_evicts_when_fifo_reaches_it():
+    """📌pin has NO bearing on eviction (operator, 2026-07-17): a pinned model's
+    FILES are a normal FIFO candidate. Here the pinned model is the OLDEST, so it
+    is evicted first — its pin/allocation are runtime state the fit_plan never
+    touches, so nothing in the returned plan disturbs them."""
+    storage = _storage([_model("pinned_old", 40, pinned=True),
+                        _model("warm", 20)])
+    plan = budget.fit_plan("caller", 10 * GIB, storage,
+                           {"disk_cache_gib": 50},
+                           {"pinned_old": 1, "warm": 999})
+    assert plan["action"] == "evict"
+    assert plan["evict"] == ["pinned_old"]   # pinned + oldest -> goes first
+    # fit_plan is PURE — it names files to delete, never mutates pin/allocation.
+    assert plan["reason"] is None
+
+
+def test_pin_is_only_a_trivial_tiebreak_unpinned_evicts_first():
+    """Pin's ONLY eviction role (operator called it "trivial and likely
+    unnecessary"): at an EXACT last_picked tie, the UNPINNED candidate is evicted
+    before the pinned one. Same size + same last_picked isolates the tiebreak."""
+    storage = _storage([_model("pinned", 20, pinned=True),
+                        _model("plain", 20, pinned=False)])
+    # identical last_picked -> only the pin flag breaks the tie.
+    plan = budget.fit_plan("caller", 15 * GIB, storage,
+                           {"disk_cache_gib": 50},
+                           {"pinned": 100, "plain": 100})
+    assert plan["action"] == "evict"
+    assert plan["evict"] == ["plain"]        # unpinned goes first
+    assert "pinned" not in plan["evict"]
 
 
 def test_the_model_being_provisioned_is_never_evicted():
@@ -144,7 +188,9 @@ def test_partial_bytes_of_the_keep_target_count_as_headroom():
 
 # ── 4. can't fit even after a full FIFO -> REFUSE, never download ──────────
 def test_refuses_when_even_a_full_fifo_cannot_free_enough():
-    storage = _storage([_model("pinned_big", 40, pinned=True),
+    # 🔒static (not pin) is the blocker now: pin no longer protects files, so a
+    # pinned big model would simply be evicted and the pull would fit.
+    storage = _storage([_static("static_big", 40),
                         _model("cold", 5)])
     plan = budget.fit_plan("huge", 30 * GIB, storage,
                            {"disk_cache_gib": 50}, {})
@@ -158,20 +204,20 @@ def test_refuses_when_even_a_full_fifo_cannot_free_enough():
     assert reason["needs_bytes"] == 30 * GIB
     assert reason["budget_bytes"] == 50 * GIB
     assert reason["reclaimable_bytes"] == 5 * GIB
-    assert reason["blocked"] == {"pinned": 1}
-    assert "1 pinned" in reason["reason"]
+    assert reason["blocked"] == {"static": 1}
+    assert "1 static" in reason["reason"]
     assert reason["shortfall_bytes"] > 0
 
 
 def test_refusal_reason_is_human_readable_with_real_numbers():
-    storage = _storage([_model("p1", 30, pinned=True),
+    storage = _storage([_static("p1", 30),
                         _model("p2", 20, loaded=True)])
     plan = budget.fit_plan("big", 25 * GIB, storage, {"disk_cache_gib": 50}, {})
     assert plan["action"] == "refuse"
     text = plan["reason"]["reason"]
     assert "25.0 GB" in text and "50.0 GB" in text   # needs + budget
     assert "0 B reclaimable" in text
-    assert "1 pinned" in text and "1 loaded" in text
+    assert "1 static" in text and "1 loaded" in text
 
 
 def test_refused_pull_never_starts_the_download():
@@ -187,7 +233,8 @@ def test_refused_pull_never_starts_the_download():
         central_url = "http://central"
         refused: dict = {}
 
-    storage = _storage([_model("pinned_big", 48, pinned=True)])
+    # 🔒static blocker (pin no longer protects files) so the pull is REFUSED.
+    storage = _storage([_static("static_big", 48)])
 
     orig_fetch = provision.fetch_from_central
     orig_arch = provision.fetch_archive_from_central
@@ -311,7 +358,7 @@ def test_evict_to_fit_raises_and_deletes_nothing_when_it_cannot_fit():
     try:
         agent._worker_storage = lambda s: {
             "cache_used_bytes": 48 * GIB, "disk_free": 0,
-            "models": [_model("big", 48, pinned=True)]}
+            "models": [_static("big", 48)]}   # static blocks; pin would not
         agent._reap_reclaim = lambda s, keys: (reaped.extend(keys), {})[1]
         with pytest.raises(budget.BudgetRefusal):
             budget.evict_to_fit(state, "huge", 30 * GIB)
@@ -353,8 +400,8 @@ def test_refused_survives_centrals_storage_proposal():
               "needs_bytes": 30 * GIB}
     out = storage_proposal({
         "storage": {"cache_used_bytes": 48 * GIB, "disk_free": 2 * GIB,
-                    "models": [_model("big", 48, pinned=True, protected=True,
-                                      why="pinned")],
+                    "models": [_model("big", 48, protected=True,
+                                      why="static")],
                     "refused": {"huge": reason}},
         "disk": {"free_bytes": 2 * GIB, "total_bytes": 100 * GIB},
         "limits": {"disk_cache_gib": 50},
@@ -403,7 +450,7 @@ def _alloc(total_gib, count, unknown=0):
 def test_refusal_reports_the_allocated_set_total_and_overage():
     """1+3: the refusal carries the ASSIGNMENT-set total and how far over the
     budget it is — the operator's "how much is needed" for the WHOLE set."""
-    storage = _storage([_model("p", 48, pinned=True)])
+    storage = _storage([_static("p", 48)])   # static blocks the FIFO -> refusal
     plan = budget.fit_plan("huge", 30 * GIB, storage, {"disk_cache_gib": 50},
                            {}, _alloc(180, 12))
     assert plan["action"] == "refuse"
@@ -478,7 +525,7 @@ def test_unknown_sizes_are_counted_never_silently_zeroed():
 def test_unknown_sizes_are_named_in_the_human_reason_as_a_floor():
     """2: the hover must SAY the total is incomplete — "≥" + an unknown count —
     rather than present a floor as a precise number."""
-    storage = _storage([_model("p", 48, pinned=True)])
+    storage = _storage([_static("p", 48)])   # static blocks the FIFO -> refusal
     plan = budget.fit_plan("huge", 30 * GIB, storage, {"disk_cache_gib": 50},
                            {}, _alloc(180, 12, unknown=3))
     text = plan["reason"]["reason"]
@@ -488,7 +535,7 @@ def test_unknown_sizes_are_named_in_the_human_reason_as_a_floor():
 def test_allocated_over_budget_is_zero_when_the_assigned_set_fits():
     """3: a set that fits reports 0 overage — a refusal is then honestly about
     THIS pull, not a structural over-subscription."""
-    storage = _storage([_model("p", 48, pinned=True)])
+    storage = _storage([_static("p", 48)])   # static blocks the FIFO -> refusal
     plan = budget.fit_plan("huge", 30 * GIB, storage, {"disk_cache_gib": 50},
                            {}, _alloc(30, 2))
     r = plan["reason"]
@@ -498,7 +545,7 @@ def test_allocated_over_budget_is_zero_when_the_assigned_set_fits():
 
 def test_human_reason_states_the_allocation_total_plainly():
     """5: the operator reads the HOVER, not the JSON."""
-    storage = _storage([_model("p", 48, pinned=True)])
+    storage = _storage([_static("p", 48)])   # static blocks the FIFO -> refusal
     plan = budget.fit_plan("huge", 30 * GIB, storage, {"disk_cache_gib": 50},
                            {}, _alloc(180, 12))
     text = plan["reason"]["reason"]
@@ -512,7 +559,7 @@ def test_allocation_clause_is_omitted_when_central_has_not_said():
     """Honesty: before the first heartbeat (or against an older central) there
     are NO totals. Say nothing — never claim a 0 GiB allocation, which would
     read as "nothing is assigned" and is a lie."""
-    storage = _storage([_model("p", 48, pinned=True)])
+    storage = _storage([_static("p", 48)])   # static blocks the FIFO -> refusal
     for allocated in (None, {}, {"allocated_count": None}):
         plan = budget.fit_plan("huge", 30 * GIB, storage,
                                {"disk_cache_gib": 50}, {}, allocated)

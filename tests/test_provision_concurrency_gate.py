@@ -61,7 +61,11 @@ class _FakeProvisioner:
         self.completed = []    # model keys that returned from the fake call
         self.gate = threading.Event()
 
-    def __call__(self, model_key, central_url, progress=None):
+    def __call__(self, model_key, central_url, progress=None, state=None,
+                 purpose=None):
+        # state= (storage budget) and purpose= (central budget handshake,
+        # 2026-07-17) are threaded through _kick_provision's real call; accept
+        # them so this concurrency stub matches the live ensure_model_present.
         with self.lock:
             self.current += 1
             self.max_concurrency = max(self.max_concurrency, self.current)

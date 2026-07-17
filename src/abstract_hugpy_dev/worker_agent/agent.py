@@ -522,7 +522,11 @@ def _ensure_present(payload: dict, central_url: str | None, state=None) -> None:
         canonical = ensure_model_registered(model_key, central_url)
         if canonical and canonical != model_key:
             payload["model_key"] = canonical
-        ensure_model_present(payload.get("model_key"), central_url, state=state)
+        # DEMAND: a real inference call is waiting on this model. Central never
+        # budget-refuses a demand pull (2026-07-17) — the worker's own fit_plan
+        # evicts to fit it; refusing a called model at central would break serving.
+        ensure_model_present(payload.get("model_key"), central_url, state=state,
+                             purpose="demand")
         if state is not None:
             state.refused.pop(payload.get("model_key"), None)
     except BudgetRefusal as exc:
@@ -580,8 +584,10 @@ def _ensure_present_streaming(payload: dict, central_url: str | None, state=None
 
         def _run():
             try:
+                # DEMAND: a live chat is streaming; never budget-refused centrally.
                 result["ok"] = ensure_model_present(model_key, central_url,
-                                                    progress=_progress, state=state)
+                                                    progress=_progress, state=state,
+                                                    purpose="demand")
             except Exception as exc:  # pragma: no cover
                 result["err"] = exc
             finally:
@@ -1690,9 +1696,13 @@ def _path_bytes(path: str) -> int:
 
 def _reap_scan(state: "WorkerState") -> dict:
     """The reaper's read-only survey: which local model files are RECLAIMABLE
-    (on disk, but not assigned / loaded / loading / pinned), and which are
+    (on disk, but not assigned / static / loaded / loading), and which are
     PROTECTED (and why). Never touches comfy rows — those are symlinks into the
     operator's ComfyUI, not this worker's downloads.
+
+    📌 pin is NOT a protection reason here (operator, 2026-07-17): pin designates
+    only that the allocation/routing survives restarts — no bearing on eviction.
+    A pinned model's files are reclaimable; the pin survives the delete.
 
     This is advisory: /reap re-checks every guard at delete time, because state
     (an assign, a load, a pull) can change between preview and reclaim.
@@ -1756,8 +1766,14 @@ def _reap_scan(state: "WorkerState") -> dict:
                    else "model store not marked reapable")
             protected.append({"model_key": mk, "bytes": size, "why": why})
             continue
-        if _pinned(mk):
-            protected.append({"model_key": mk, "bytes": size, "why": "pinned"})
+        # 📌 pin does NOT protect files (operator, 2026-07-17): pin designates
+        # only that the ALLOCATION/routing survives restarts — it has no bearing
+        # on eviction/reaping. A pinned model's files are reclaimable like any
+        # other; the pin survives the delete and the bytes re-pull on next call.
+        # (assigned/static/loaded still guard here — the bulk reaper's own
+        # policy is unchanged; only pin's stale disk-shield is removed.)
+        if _residency(mk) == "static":
+            protected.append({"model_key": mk, "bytes": size, "why": "static"})
         elif mk in assigned:
             protected.append({"model_key": mk, "bytes": size, "why": "assigned"})
         elif mk in loaded or mk in loading:
@@ -1775,8 +1791,12 @@ def _reap_scan(state: "WorkerState") -> dict:
 
 def _reap_reclaim(state: "WorkerState", model_keys: list[str]) -> dict:
     """Delete the local files of the named models — but ONLY after re-proving,
-    per key, that it is still reclaimable (not assigned/loaded/loading/pinned,
-    not comfy). The guard is re-run here, not trusted from a stale preview."""
+    per key, that it is still reclaimable (not assigned/static/loaded/loading,
+    not comfy). The guard is re-run here, not trusted from a stale preview.
+
+    📌 pin is deliberately NOT in that list (operator, 2026-07-17): pin
+    designates only that the allocation/routing survives restarts — no bearing
+    on eviction. A pinned model's files reap freely; the pin survives."""
     from .imports import get_model_config, get_model_path
     from .provision import model_is_local, wipe_model
 
@@ -1809,8 +1829,11 @@ def _reap_reclaim(state: "WorkerState", model_keys: list[str]) -> dict:
         if getattr(cfg, "framework", None) == "comfy":
             results.append({"model_key": mk, "ok": False, "reason": "comfy (symlink/operator files) — never reaped"})
             continue
-        if _pinned(mk):
-            results.append({"model_key": mk, "ok": False, "reason": "pinned"})
+        # 📌 pin is NOT a reap guard (operator, 2026-07-17): pin means only that
+        # the allocation/routing survives restarts — no bearing on eviction. A
+        # pinned model's files are reclaimable; the pin survives the delete.
+        if _residency(mk) == "static":
+            results.append({"model_key": mk, "ok": False, "reason": "static"})
             continue
         if mk in assigned:
             results.append({"model_key": mk, "ok": False, "reason": "assigned"})
@@ -1851,6 +1874,185 @@ def _reap_reclaim(state: "WorkerState", model_keys: list[str]) -> dict:
 # storage view can never disagree with what the reaper would actually delete.
 _STORAGE_CACHE: dict = {"at": 0.0, "value": None}
 
+# RELEASE-BOUND (2026-07-17): measured store-root size, TTL-cached separately so
+# the (cheap) scandir walk of the store root is not tied to the 60s model-scan
+# cache. This is the AUTHORITATIVE cache_used_bytes — a real filesystem
+# measurement of what is on disk under the model store, fixing the 2026-07-16
+# discrepancy where the per-model-dir SUM read 128.8GB while `du` measured 81G
+# (the sum double-counted / carried stale manifest keys).
+_STORE_MEASURE_CACHE: dict = {"at": 0.0, "value": None}
+
+
+def _models_store_root() -> str | None:
+    """The directory the worker's model weights actually live under."""
+    try:
+        from ..imports.src.constants.constants import MODELS_HOME
+        if MODELS_HOME and os.path.isdir(MODELS_HOME):
+            return str(MODELS_HOME)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from ..imports.src.constants.constants import DEFAULT_ROOT
+        cand = os.path.join(str(DEFAULT_ROOT), "models")
+        if os.path.isdir(cand):
+            return cand
+        if os.path.isdir(DEFAULT_ROOT):
+            return str(DEFAULT_ROOT)
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _measured_store_bytes() -> int | None:
+    """Real on-disk bytes under the model store root — a scandir walk, TTL-cached
+    (120s). Non-following of symlinks so shared/comfy links cost 0 here (same rule
+    as _path_bytes). Returns None if the root can't be resolved (caller then falls
+    back to the per-model sum). This is the honest cache_used the heartbeat ships.
+    """
+    now = time.time()
+    cached = _STORE_MEASURE_CACHE["value"]
+    if cached is not None and now - _STORE_MEASURE_CACHE["at"] < 120.0:
+        return cached
+    root = _models_store_root()
+    if not root:
+        return None
+    total = 0
+    stack = [root]
+    while stack:
+        d = stack.pop()
+        try:
+            with os.scandir(d) as it:
+                for entry in it:
+                    try:
+                        if entry.is_symlink():
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                        elif entry.is_file(follow_symlinks=False):
+                            total += entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    _STORE_MEASURE_CACHE.update(at=now, value=total)
+    return total
+
+
+# ── ORPHAN (unattributed-on-disk) scan ──────────────────────────────────────
+# RELEASE-BOUND (2026-07-17 addendum). The reaper survey (_reap_scan) only ever
+# looks at KNOWN/assigned/loaded keys, so on-disk residue that matches NO current
+# model — a stalled *.part set from an old eager-era pull, or a whole model dir
+# for something no longer assigned — is INVISIBLE to central (computron held 5.7G
+# of stalled Qwen2.5-VL-3B .part files that appeared nowhere in the UI). This
+# scan walks the store root for that residue and reports it so the console can
+# surface "unattributed on disk: X GB". Naming (keeper owns nomenclature): the
+# class is "orphaned" in code; the UI labels it "unattributed on disk".
+_ORPHAN_CACHE: dict = {"at": 0.0, "value": None}
+
+
+def _dir_bytes_no_links(path: str) -> int:
+    total = 0
+    stack = [path]
+    while stack:
+        d = stack.pop()
+        try:
+            with os.scandir(d) as it:
+                for e in it:
+                    try:
+                        if e.is_symlink():
+                            continue
+                        if e.is_dir(follow_symlinks=False):
+                            stack.append(e.path)
+                        elif e.is_file(follow_symlinks=False):
+                            total += e.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return total
+
+
+def _orphan_scan(state: "WorkerState", known_keys: set) -> dict:
+    """On-disk residue attributed to NO current model. TTL-cached (120s).
+
+    Two orphan shapes:
+      * a completed model DIR (is_model_dir) whose hub_id/key is in neither the
+        manifest nor the assignment/loaded set — a leftover from a prior
+        assignment that was never reaped;
+      * a STALLED partial: a dir under the store holding *.part staging files
+        (a crash/abandoned pull) — is_model_dir() is False for it (no real
+        weights), so nothing else sees it.
+
+    ``known_keys`` = every name a live model might match (manifest keys + hub_ids
+    + assigned/loaded/loading). Anything on disk NOT matching one of these is
+    orphaned. Conservative: an entry we cannot positively tie to a known model is
+    reported (visible), never auto-deleted — this scan proposes nothing.
+    """
+    now = time.time()
+    cached = _ORPHAN_CACHE["value"]
+    if cached is not None and now - _ORPHAN_CACHE["at"] < 120.0:
+        return cached
+
+    root = _models_store_root()
+    out = {"items": [], "bytes": 0, "count": 0}
+    if not root:
+        _ORPHAN_CACHE.update(at=now, value=out)
+        return out
+
+    try:
+        from ..imports.src.constants.paths import (
+            is_model_dir, is_directory_excluded, get_hub_id_from_directory,
+        )
+    except Exception:  # noqa: BLE001 — never break a heartbeat over this
+        _ORPHAN_CACHE.update(at=now, value=out)
+        return out
+
+    def _norm(s: str) -> str:
+        return str(s or "").strip("/").lower()
+
+    known = {_norm(k) for k in known_keys}
+    # also index by trailing repo name so hub_id 'owner/repo' matches a bare 'repo'
+    known |= {k.rsplit("/", 1)[-1] for k in list(known)}
+
+    items: list[dict] = []
+    seen_dirs: set = set()
+
+    def _is_orphan_dir(dirpath: str) -> bool:
+        hub = get_hub_id_from_directory(dirpath, models_home=root)
+        if not hub:
+            return True
+        h = _norm(hub)
+        return h not in known and h.rsplit("/", 1)[-1] not in known
+
+    # Walk once: catch model dirs (leaves) AND .part-bearing dirs.
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames
+                       if not is_directory_excluded(os.path.join(dirpath, d))]
+        has_part = any(n.endswith((".part", ".part.state.json")) for n in filenames)
+        model_leaf = is_model_dir(dirpath)
+        if not (model_leaf or has_part):
+            continue
+        if dirpath in seen_dirs:
+            continue
+        if _is_orphan_dir(dirpath):
+            b = _dir_bytes_no_links(dirpath)
+            if b > 0:
+                items.append({
+                    "path": os.path.relpath(dirpath, root),
+                    "bytes": b,
+                    "kind": "partial" if (has_part and not model_leaf) else "stale-dir",
+                })
+            seen_dirs.add(dirpath)
+        if model_leaf:
+            dirnames[:] = []   # leaf — don't descend into a model's own files
+
+    items.sort(key=lambda x: x["bytes"], reverse=True)
+    out = {"items": items,
+           "bytes": sum(i["bytes"] for i in items),
+           "count": len(items)}
+    _ORPHAN_CACHE.update(at=now, value=out)
+    return out
+
 
 def _storage_model_row(mk: str, size: int, loaded: set, loading: set,
                        provisioning: set, assigned: set,
@@ -1859,15 +2061,23 @@ def _storage_model_row(mk: str, size: int, loaded: set, loading: set,
     protection flag + a human `why`. loaded is ALREADY answer-inclusive
     (loaded_model_keys() ∪ _slot_occupants()) at the caller."""
     is_pinned = _pinned(mk)
+    is_static = _residency(mk) == "static"
     is_loaded = mk in loaded
     is_loading = mk in loading
     is_provisioning = mk in provisioning
     is_assigned = mk in assigned
-    protected = (is_pinned or is_loaded or is_loading
+    # 📌 pin does NOT protect files (operator, 2026-07-17): pin means only that
+    # the allocation/routing survives restarts — no bearing on eviction. `pinned`
+    # is still reported below as ATTRIBUTION info, but it never sets `protected`.
+    # 🔒static is the durable local-presence guard; loaded/loading/provisioning
+    # are live-use guards. assigned still guards the bulk-reaper preview.
+    protected = (is_static or is_loaded or is_loading
                  or is_provisioning or is_assigned)
-    # Precedence mirrors the reaper's guard order (pinned > assigned > loaded).
-    if is_pinned:
-        why = "pinned"
+    # Precedence for the human `why` (static > assigned > loaded ...). Note pin
+    # is NOT a protection reason, so a pinned-but-otherwise-unprotected model
+    # reads why="pinned" purely as attribution while protected stays False.
+    if is_static:
+        why = "static"
     elif is_assigned:
         why = "assigned"
     elif is_loaded:
@@ -1876,6 +2086,8 @@ def _storage_model_row(mk: str, size: int, loaded: set, loading: set,
         why = "loading"
     elif is_provisioning:
         why = "provisioning"
+    elif is_pinned:
+        why = "pinned"          # attribution only — protected stays False
     else:
         why = why_hint or ""
     return {
@@ -1964,8 +2176,38 @@ def _worker_storage(state: "WorkerState") -> dict:
     models.sort(key=lambda m: m["bytes"], reverse=True)
 
     disk = _disk_status()
+    # AUTHORITATIVE cache_used = MEASURED store-root bytes (release-bound). The
+    # per-model dir SUM (`cache_used` here) over-counted in the field (op:
+    # 128.8GB summed vs 81G measured), so a real filesystem measurement of the
+    # store root is the honest number the gauge should read. Keep the sum as a
+    # cross-check diagnostic; fall back to it only if the root can't be measured.
+    measured = _measured_store_bytes()
+    # ORPHANED (unattributed-on-disk) residue — model dirs / stalled .part sets
+    # that match NO current model. Every name a live model might be known by, so
+    # the diff doesn't false-flag a resident model as orphaned.
+    try:
+        known_keys = (set(get_models_dict().keys()) | set(models and [m["model_key"] for m in models] or [])
+                      | set(state.assigned_models or []) | loaded | loading | provisioning)
+        # fold in each known model's hub_id so a dir named by hub_id matches.
+        for _mk in list(known_keys):
+            try:
+                _c = get_model_config(_mk)
+                _h = getattr(_c, "hub_id", None) if _c is not None else None
+                if _h:
+                    known_keys.add(_h)
+            except Exception:  # noqa: BLE001
+                continue
+        orphans = _orphan_scan(state, known_keys)
+    except Exception:  # noqa: BLE001 — a heartbeat must never fail on this
+        orphans = {"items": [], "bytes": 0, "count": 0}
     out = {
-        "cache_used_bytes": cache_used,
+        "cache_used_bytes": measured if measured is not None else cache_used,
+        "cache_used_measured_bytes": measured,      # None if root unresolved
+        "cache_used_model_sum_bytes": cache_used,   # legacy per-model-dir sum
+        # Orphaned residue (release-bound). UI labels it "unattributed on disk".
+        "orphaned_bytes": orphans["bytes"],
+        "orphaned_count": orphans["count"],
+        "orphaned_items": orphans["items"],
         "disk_free": int(disk.get("free_bytes", 0) or 0),
         "models": models,
         # Models REFUSED for storage: the pull never started because even a full
@@ -2627,13 +2869,45 @@ def _probe_model(model_key: str, state: "WorkerState") -> dict:
     before = _free_vram_bytes()
     result: dict = {"model_key": model_key, "vram_free_before": before}
     try:
-        # Learn the model from central (if needed), make sure its files are
-        # present, then build the runner, which loads the model. A tiny run
-        # confirms it can actually generate.
-        from .provision import ensure_model_present, ensure_model_registered
+        # PROBE DOES NOT DOWNLOAD (operator ruling, ae 1.2TB incident 2026-07-17:
+        # "its central that distributed these downloads... it simply needs to
+        # abide by the limits set within its own backend"). A probe used to call
+        # ensure_model_present() — so probing an ABSENT model WAS a transfer
+        # order, and central's warm sweep rode /probe to pull ~700GB onto ae.
+        # A probe answers a question ("does this model FIT on my GPU?"); it never
+        # provisions. If the files aren't already on THIS box's disk, return an
+        # honest non-downloading verdict and let the model arrive on the first
+        # REAL call (lazy-download doctrine, 7f0e6e8/2a3baeb).
+        #
+        # ensure_model_registered is METADATA-only (a small config row from
+        # central, no weight bytes) — kept so the locality check + the honest
+        # error can name/resolve the model even if this worker wasn't built with
+        # it. NO byte transfer happens on ANY path through here.
+        from .provision import (
+            ensure_model_present, ensure_model_registered, model_is_local,
+        )
         canonical = ensure_model_registered(model_key, state.central_url) or model_key
-        ensure_model_present(canonical, state.central_url)
 
+        # Locality gate: the SAME predicate the agent uses everywhere else
+        # (model_is_local / _models_local). If the weights aren't already on
+        # disk, do not build the runner (which would trigger a load/pull) — the
+        # probe reports "not local" and stops here. This is what makes the warm
+        # sweep's probe a no-op instead of a distributed 700GB pull order.
+        try:
+            _local = model_is_local(canonical)
+        except Exception:  # noqa: BLE001 — a bad row reads as "not local", never a crash
+            _local = False
+        if not _local:
+            result.update(
+                ok=False, fit=False,
+                vram_free_after=before, vram_used=0, path="none", local=False,
+                error=("not local — probe does not download (lazy doctrine "
+                       "2026-07-17); files arrive on first real call"))
+            return result
+        result["local"] = True
+
+        # Local: safe to build the runner and measure a real fit — no transfer
+        # can be triggered because the files are already present.
         #from abstract_hugpy_dev.managers.dispatch import runner_for
         runner = runner_for(model_key=canonical)  # builds the runner WRAPPER
         # runner_for only BUILDS the (lazy) wrapper; for GGUF/in-process runners
@@ -2853,7 +3127,7 @@ def _sync_assignment(state: "WorkerState", worker: dict) -> None:
     for model_key in models:
         if _eager_pull(model_key):
             logger.info("pre-provisioning %s (static — eager tier)", model_key)
-            _kick_provision(state, model_key)
+            _kick_provision(state, model_key, purpose="assign")
     # Slice 9: already-local models can be seated right now — don't wait for
     # the maintenance tick. Background thread: fills block on slot loads.
     # NOT a download: this seats models whose files are ALREADY on disk, so it
@@ -2862,11 +3136,18 @@ def _sync_assignment(state: "WorkerState", worker: dict) -> None:
     threading.Thread(target=_fill_empty_slots, args=(state,), daemon=True).start()
 
 
-def _kick_provision(state: "WorkerState", model_key: str) -> None:
+def _kick_provision(state: "WorkerState", model_key: str,
+                    purpose: str = "reconcile") -> None:
     """Provision (and per-policy preload) ONE assigned model in the background.
 
     Shared by assignment adoption and the UTIL-08 reconcile loop; the
-    _provisioning guard makes concurrent kicks a no-op."""
+    _provisioning guard makes concurrent kicks a no-op.
+
+    ``purpose`` ("assign" from adoption, "reconcile" from the loop) is a
+    BACKGROUND purpose (2026-07-17): central MAY 409 this pull if it would push
+    the worker over its storage budget ("central abides by the limits set within
+    its own backend"). Contrast the demand path (_ensure_present), which is never
+    budget-refused centrally."""
     if restart_requested():
         # A restart is underway — don't spin up a NEW transfer pool into a process
         # about to exit (it would only be torn down by _shutdown_executors).
@@ -2918,7 +3199,7 @@ def _kick_provision(state: "WorkerState", model_key: str) -> None:
                 if not _has_files:
                     logger.info("pre-provisioning assigned model %s…", mk)
                     ensure_model_present(mk, state.central_url, progress=_prog,
-                                         state=state)
+                                         state=state, purpose=purpose)
                     logger.info("pre-provisioned %s", mk)
                     state.refused.pop(mk, None)   # it fit after all
                 # Warm-up policy (v3 final semantics):
@@ -3189,25 +3470,36 @@ def _residency(model_key: str) -> str:
 
 
 def _pinned(model_key: str) -> bool:
-    """📌 pin: PERMANENT ATTRIBUTION of the model to this worker — and NOTHING
-    else. Operator, 2026-07-16, asked what pinned means: "pinned doesnt mean
-    anything aside from: 1) is the model attributed to a worker; if yes, then
-    it always will be".
+    """📌 pin: the model's ALLOCATION survives restarts — and NOTHING else.
 
-    So pin answers exactly one question — "does this model belong to this
-    worker?" — with "yes, durably". It says NOTHING about when the bytes
-    arrive. Concretely, pin DOES:
+    CANONICAL STATEMENT (operator ruling, 2026-07-17): "the pins only should
+    designate that the model allocation survives restarts. the allocation only
+    stipulates the routing for that model (to that worker). neither of those
+    should have any bearing on the pull or eviction". (Consistent with the
+    2026-07-16 answer: "pinned doesnt mean anything aside from: 1) is the model
+    attributed to a worker; if yes, then it always will be".)
+
+    So pin answers exactly one question — "does this worker's ALLOCATION
+    (routing) for this model survive restarts and unassign attempts?" — with
+    "yes, durably". It says NOTHING about when the bytes arrive or whether they
+    stay. Concretely, pin DOES:
       * make central refuse unassign while pinned (409),
-      * protect the files from eviction/reaping (budget._is_protected,
-        workers.storage_proposal),
-      * keep residency overrides alive across the unassign-prune
-        (_prune_stale_residency) and restarts.
+      * keep residency overrides + the allocation alive across the
+        unassign-prune (_prune_stale_residency) and restarts.
 
-    Pin does NOT: pre-fetch, eager-warm, guarantee residency, or promise the
-    files are on this disk. A pinned model is a LAZY download like any other —
-    it arrives on first CALL (_ensure_present). Do not re-add pin to
-    _eager_pull: that conflation filled the operator's workstation to 0 bytes
-    free on 2026-07-16 (ae: 65/65 assigned models pinned = every model eager).
+    Pin does NOT: pre-fetch, eager-warm, guarantee residency, promise the files
+    are on this disk, OR protect the files from eviction/reaping. A pinned model
+    is a LAZY download like any other — it arrives on first CALL
+    (_ensure_present) — and its files are a normal eviction/reap CANDIDATE
+    (budget._is_protected, _reap_scan, workers.storage_proposal all treat pin as
+    NON-protecting as of 2026-07-17). Evicting a pinned model's files leaves the
+    pin + allocation untouched: routing survives, bytes re-pull on next call.
+    Pin's only eviction role is a trivial FIFO tiebreak (unpinned evict first at
+    an exact last_picked tie). Do not re-add pin to _eager_pull OR to any disk
+    guard: those conflations are the day-one tripwire — the eager one filled the
+    operator's workstation to 0 bytes free on 2026-07-16 (ae: 65/65 assigned
+    models pinned = every model eager). 🔒static is the ONLY tier that promises
+    local presence and protects files.
     """
     return bool((_RUNTIME_SETTINGS.get("pinned") or {}).get(model_key))
 
@@ -4881,7 +5173,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # Contention-based residency (doctrine 2026-07-11): an on-demand model stays
     # resident until a NEW load needs its memory — then the LRU on-demand
-    # resident yields (never static / pinned / gate-busy / slot-backed). dispatch
+    # resident yields (never static / gate-busy / slot-backed; 📌pinned DOES
+    # yield per 2026-07-15 — pin is designation, not a resource lock). dispatch
     # owns the LRU mechanism; the worker registers the box-specific fit-guard +
     # yield predicate + a post-evict trim so each headroom re-check sees the
     # freed memory. See dispatch.ensure_headroom_for_load; the old idle clock
@@ -4923,8 +5216,11 @@ def main(argv: list[str] | None = None) -> int:
     # in provision.py, so provisioning keeps working once central turns on
     # HUGPY_WORKER_ENROLL_REQUIRED. No-op (tokenless, exactly today's behavior)
     # when args.token is None.
-    from .provision import set_enroll_token
+    from .provision import set_enroll_token, set_worker_id
     set_enroll_token(args.token)
+    # Identify this worker on central-transfer requests so central can apply its
+    # per-worker storage budget to BACKGROUND pulls (2026-07-17 handshake).
+    set_worker_id(state.worker_id)
 
     try:
         _register(client, state, args)

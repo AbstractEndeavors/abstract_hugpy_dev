@@ -64,6 +64,22 @@ the assignment payload; a model central has never served has no entry and sorts
 as 0 = coldest = evicted first (exactly right for never-served test leftovers).
 When central hasn't shipped the map at all, we fall back to on-disk mtime so the
 order is still oldest-first rather than arbitrary.
+
+── 📌 PIN + ALLOCATION HAVE NO BEARING ON EVICTION (operator, 2026-07-17) ───────
+The canonical statement (verbatim): "the pins only should designate that the
+model allocation survives restarts. the allocation only stipulates the routing
+for that model (to that worker). neither of those should have any bearing on the
+pull or eviction, unless its to do with priority, then a pinned model should
+take higher precidence than unpinned, but even that is trivial".
+
+So in THIS module: a pinned or assigned model is a normal eviction CANDIDATE
+(see _is_protected). Evicting its files leaves the pin + allocation untouched —
+routing survives and the bytes re-pull on the next call. Pin's ONLY eviction
+role is the trivial FIFO tiebreak in fit_plan: among equally-stale candidates,
+unpinned evict first. Only 🔒static promises local presence and is protected;
+loaded/loading/provisioning are protected as live-use guards. This is the
+day-one tripwire the operator called out — conflating attribution/routing with a
+disk shield filled his workstation to 0 bytes free on 2026-07-16.
 """
 from __future__ import annotations
 
@@ -73,9 +89,17 @@ import logging
 logger = logging.getLogger("abstract_hugpy_dev.worker_agent.budget")
 
 # Protection reasons that make a model INELIGIBLE for auto-eviction. Mirrors
-# storage_proposal's chain (utils/workers.py) minus `assigned` — see
-# _is_protected for why `assigned` is deliberately NOT here.
-_PROTECTED_REASONS = ("pinned", "static", "loaded", "loading", "provisioning")
+# storage_proposal's chain (utils/workers.py) minus `assigned` AND `pinned` —
+# see _is_protected for why NEITHER protects here.
+#   * `assigned` = attribution/routing only (lazy-download doctrine).
+#   * `pinned`   = the ALLOCATION survives restarts, nothing else (operator,
+#     2026-07-17). Pin has NO bearing on eviction — a pinned model's files are a
+#     normal LRU candidate; evicting them leaves pin + routing untouched and the
+#     bytes re-pull on next call.
+# Only 🔒static (durable local-presence promise) and the live-use guards
+# (loaded/loading/provisioning — deleting under a live pull corrupts the fetch)
+# stay protected.
+_PROTECTED_REASONS = ("static", "loaded", "loading", "provisioning")
 
 
 class BudgetRefusal(Exception):
@@ -135,32 +159,32 @@ def cap_bytes(limits: dict | None) -> int | None:
 def _is_protected(row: dict) -> str:
     """The reason ``row`` may NOT be auto-evicted, or "" if it is a candidate.
 
-    Domain mirrors storage_proposal's guard chain with ONE deliberate
-    difference: ``assigned`` does NOT protect here.
+    Domain mirrors storage_proposal's guard chain with TWO deliberate
+    differences: NEITHER ``assigned`` NOR ``pinned`` protects here.
 
-    WHY: central ASSIGNS a model to a worker as ATTRIBUTION, not as a transfer
-    order or a residency guarantee — the lazy-download doctrine (operator,
-    2026-07-16; see agent._eager_pull): "models are attributed to be routed to a
-    worker though not immediately downloaded... they should be lazy download
-    instead downloading to the drive only when called". A model that is merely
-    assigned but cold has files on disk that nobody is calling; that is exactly
-    what the operator means by "remove an existing model and install the one
-    that is being called". If `assigned` protected, then on a box whose models
-    are all assigned (the normal case, and op's actual case) NOTHING would ever
-    be reclaimable and this feature would be dead on arrival — the incident
-    would simply repeat.
+    CANONICAL STATEMENT (operator ruling, 2026-07-17): "the pins only should
+    designate that the model allocation survives restarts. the allocation only
+    stipulates the routing for that model (to that worker). neither of those
+    should have any bearing on the pull or eviction".
+      * 📌 pin = the model's ALLOCATION survives restarts (and unassign
+        attempts). Nothing else.
+      * Allocation = ROUTING: which worker answers for that model.
+      * NEITHER has any bearing on the pull (already true — lazy download,
+        7f0e6e8/2a3baeb) NOR on eviction (this rule). Evicting a pinned or
+        assigned model's FILES never touches its pin or allocation — routing
+        survives, bytes re-pull on next call. A row whose ONLY claim is pinned
+        (or assigned) is a CANDIDATE.
 
-    The DURABLE designations still protect: 📌pinned and 🔒static, plus
-    loaded/loading/provisioning as live-use guards (deleting under a live pull
-    corrupts the fetch). An assigned model that is also pinned/static/loaded
-    keeps that protection through those flags.
+    This closes the day-one tripwire the operator called out: assignment and pin
+    are attribution/routing, not a disk shield. On a box whose models are all
+    assigned (the normal case, and op's actual case) they must all be reclaimable
+    or the disk fills — exactly the 2026-07-16 incident.
 
-    Note the asymmetry for 📌pin, which is deliberate: pin does NOT pre-fetch
-    (it is attribution only — see agent._pinned), but it DOES protect what is
-    already here. Those are consistent: pin never promises the bytes arrive,
-    yet once they have, the operator's permanent attribution says they are not
-    ours to reclaim. Absent-because-uncalled is pin's resting state; deleted-
-    out-from-under is not.
+    Only the DURABLE local-presence promise and the live-use guards protect:
+    🔒static (the ONE tier that promises the files stay local), plus
+    loaded/loading/provisioning (deleting under a live pull corrupts the fetch;
+    deleting a loaded model breaks serving). A pinned/assigned model that is ALSO
+    static/loaded keeps protection through THAT flag — never through pin.
     """
     if row.get("protected") and (row.get("why") or "") not in ("assigned", ""):
         # Worker-side flag already decided (e.g. "shared/central storage —
@@ -304,20 +328,24 @@ def fit_plan(model_key: str, need_bytes: int, storage: dict,
         if why:
             blocked[why] = blocked.get(why, 0) + 1
             continue
-        candidates.append((_lp(mk, r), int(r.get("bytes") or 0), mk))
+        candidates.append((_lp(mk, r), bool(r.get("pinned")),
+                           int(r.get("bytes") or 0), mk))
 
-    # Oldest-first. Among equally-cold entries (all last_picked=0, e.g. never
-    # -served leftovers) take the LARGEST first so the budget clears in the
-    # fewest deletes; stable key tiebreak. IDENTICAL to storage_proposal's sort,
-    # so central's preview and this auto path agree on what goes.
-    candidates.sort(key=lambda c: (c[0], -c[1], c[2]))
+    # Oldest-first (primary key = central last_picked). Then a TRIVIAL pin
+    # tiebreak: among equally-stale candidates, evict UNPINNED before PINNED
+    # (False sorts before True). The operator called this "trivial and likely
+    # unnecessary" (2026-07-17) — implemented only because it costs nothing and
+    # gives a pinned model a hair of extra precedence at an exact last_picked
+    # tie. Then largest-first among the rest so the budget clears in the fewest
+    # deletes; stable key tiebreak. IDENTICAL primary order to storage_proposal.
+    candidates.sort(key=lambda c: (c[0], c[1], -c[2], c[3]))
 
     must_free = used + delta - cap
-    reclaimable_total = sum(b for _lp_, b, _mk in candidates)
+    reclaimable_total = sum(b for _lp_, _pin_, b, _mk in candidates)
 
     evict: list[str] = []
     freed = 0
-    for _lp_, b, mk in candidates:
+    for _lp_, _pin_, b, mk in candidates:
         if freed >= must_free:
             break
         evict.append(mk)

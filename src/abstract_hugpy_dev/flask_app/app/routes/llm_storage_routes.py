@@ -68,17 +68,37 @@ def _annotate_size(model: dict, mk: str) -> None:
     residency shows what it costs BEFORE you commit it. GGUF: the effective quant
     that actually serves (already resolved into ``effective_bytes`` by
     _annotate_gguf_size), never the all-quants dir sum. Everything else
-    (transformers / comfy): the on-disk directory footprint, mtime-cached so
-    /models stays cheap. ``None`` when the model isn't on disk."""
+    (transformers / comfy): the SINGLE-FORMAT effective footprint — the one usable
+    weight format + sidecars a worker actually holds, NOT the whole-snapshot sum
+    (a mirrored HF repo carries the same weights in 3-5 formats + an fp32 dupe;
+    ledgering the dir sum made an ~11GB model read as 45GB — the 2026-07-16 scare).
+    ``dir_bytes`` keeps the whole-dir footprint for diagnostics. ``None`` when the
+    model isn't on disk."""
     eff = model.get("effective_bytes")
     if eff:
         model["size_bytes"] = eff
+        model.setdefault("dir_bytes", eff)
         return
     try:
         from ....imports.config.models.model_meta import dir_size_bytes
         from ....imports.config.main import get_model_path
+        from ..functions.imports.utils.format_select import (
+            walk_listing, effective_bytes as _eff_bytes,
+        )
         model_dir = model.get("destination") or get_model_path(mk)
-        model["size_bytes"] = dir_size_bytes(model_dir)
+        dir_bytes = dir_size_bytes(model_dir)          # whole snapshot (all formats)
+        model["dir_bytes"] = dir_bytes
+        if model_dir:
+            listing = walk_listing(model_dir)
+            if listing:
+                # Same single-format selection the transfer manifest applies, so
+                # the ledger equals what a worker would actually hold post-pull.
+                model["size_bytes"] = _eff_bytes(
+                    listing, framework=model.get("framework"))
+            else:
+                model["size_bytes"] = dir_bytes
+        else:
+            model["size_bytes"] = dir_bytes
     except Exception:  # noqa: BLE001 — never break the models list over sizing
         model["size_bytes"] = None
 

@@ -15,7 +15,8 @@ Covered here:
   (1) model_key -> handle resolution picks the right host_mode per mode;
   (2) recycled-PID guard: if the slot handle changed before we act (swapped model
       or respawned child under a new pid), we do NOT evict — no slot /unload fires;
-  (3) the static/pinned/in-flight gate is honored UNLESS force=true;
+  (3) the static / in-flight gate is honored UNLESS force=true (📌pin does NOT
+      gate the evict verb — pin is designation, not a VRAM lock; 2026-07-15);
   (4) the comfy path calls comfy's /free with the documented body (mocked httpx);
   (5) a foreign/non-owned model_key resolves to "not resident" and is REFUSED,
       never killed (no in-process drop, no slot unload);
