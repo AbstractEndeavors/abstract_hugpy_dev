@@ -19,7 +19,13 @@ from .enums import (
     PRECISION_QUALITY,
 )
 from .errors import Err, ErrorCode, Ok, Result, StageError
-from .registry import CAPABILITY_TASKS, MODEL_REGISTRY, runner_for
+from .registry import (
+    CAPABILITY_TASKS,
+    MODEL_REGISTRY,
+    runner_available,
+    runner_for,
+    runner_gate_reason,
+)
 from .schemas import CapabilityRequest, ModelBinding, ModelConfig
 
 
@@ -38,11 +44,27 @@ def _pick_precision(
 
 
 def _pick_task(cfg: ModelConfig, capability: Capability):
-    """First task that both satisfies the capability and has a runner."""
+    """First task that both satisfies the capability and has a SERVABLE runner
+    (k1: gated on import-resolvability, not just registry membership — a seed
+    entry whose runner module hasn't landed yet must never look routable here;
+    see ``registry.runner_available``)."""
     for task in CAPABILITY_TASKS.get(capability, ()):  # ordered by preference
-        if task in cfg.tasks and runner_for(cfg.family, task) is not None:
+        if task in cfg.tasks and runner_available(cfg.family, task) is not None:
             return task
     return None
+
+
+def _no_task_reason(cfg: ModelConfig, capability: Capability) -> str:
+    """Why ``_pick_task`` found nothing for ``cfg``/``capability`` — an honest
+    rejection reason, not a generic dead end. Distinguishes "this model declares
+    a satisfying task but its runner is GATED (module missing)" from "this model
+    declares no satisfying task at all" (a genuine capability mismatch)."""
+    for task in CAPABILITY_TASKS.get(capability, ()):
+        if task in cfg.tasks:
+            reason = runner_gate_reason(cfg.family, task)
+            if reason is not None:
+                return f"{task.value} runner gated ({reason})"
+    return "no runnable task for capability"
 
 
 class CapabilityRouter:
@@ -141,10 +163,13 @@ class CapabilityRouter:
                     f"{cfg.model_id}: max_frames {cfg.max_frames} < {req.min_frames}")
                 continue
 
-            # capability -> task -> runner
+            # capability -> task -> runner (k1: honest reason when the model
+            # declares a satisfying task but its runner is gated, not a generic
+            # dead end — so a direct/pinned dispatch attempt at a dead engine
+            # names the missing runner instead of surfacing an ImportError).
             task = _pick_task(cfg, req.capability)
             if task is None:
-                rejected.append(f"{cfg.model_id}: no runnable task for capability")
+                rejected.append(f"{cfg.model_id}: {_no_task_reason(cfg, req.capability)}")
                 continue
 
             # precision / VRAM fit — bounded below by the chosen runner's floor (FIX-4)

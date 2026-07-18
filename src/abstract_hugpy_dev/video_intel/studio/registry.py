@@ -11,10 +11,26 @@ practice after import:
 every capability a model claims is routable, every task has a runner, every
 declared Capability is either served or explicitly PLANNED. It collects EVERY
 problem and raises once - you see the whole failure set, not just the first.
-"""
+
+RUNNER GATE (k1): a seed entry (e.g. a video-engine bet like Hunyuan/CogVideoX/
+Mochi/Open-Sora/SkyReels/AnimateDiff/FramePack/CodeFormer/LTX-2) may declare a
+``RunnerSpec`` whose ``entrypoint`` dotted path does not resolve to a real module
+in this tree yet — the bet hasn't landed, only the zoo row has. That is DATA, not
+a bug: ``register_runner``/``runner_for`` stay a raw structural lookup (so
+``validate_registry()``'s "every task has a runner" totality proof is unaffected
+and the seed entry is never pruned), but a SEPARATE servability gate
+(``runner_available`` / ``runner_gate_reason`` / ``gated_runners``) is layered on
+top for anything that actually DISPATCHES (the router's task-picker, a direct
+dispatch attempt): it checks import-resolvability via ``importlib.util.find_spec``
+(cheap — locates the module, never executes it) and returns an honest
+``"runner_missing: <module path>"`` reason instead of letting the router bind a
+model that would only fail one layer down (or, worse, silently outrank a model
+that could actually render). Dropping the runner module into the tree re-enables
+the engine with ZERO seed edits — that's the point of gating instead of pruning."""
 
 from __future__ import annotations
 
+import importlib.util
 import os
 from dataclasses import dataclass
 
@@ -63,7 +79,105 @@ def set_capability_tasks(mapping: dict[Capability, tuple[Task, ...]]) -> None:
 
 
 def runner_for(framework: Framework, task: Task) -> RunnerSpec | None:
+    """Raw structural lookup: a RunnerSpec is DECLARED for (framework, task), full
+    stop — it says nothing about whether the entrypoint module actually exists on
+    this tree. This is what ``validate_registry()``'s totality proof and any
+    reporting on the DECLARED zoo shape must keep using, so a runner module that
+    hasn't landed yet never turns into an import-time crash. For a servability
+    decision (routing / dispatch), use ``runner_available`` instead."""
     return RUNNER_REGISTRY.get((framework, task))
+
+
+# --------------------------------------------------------------------------
+# Runner GATE (k1): import-resolvability, layered on top of the raw registry.
+# --------------------------------------------------------------------------
+_ENTRYPOINT_IMPORTABLE_CACHE: dict[str, bool] = {}
+
+
+def _entrypoint_module(entrypoint: str) -> str:
+    """The dotted MODULE path of a ``RunnerSpec.entrypoint`` ("mod.path:callable"
+    -> "mod.path"; a bare "mod.path" with no ":" is returned unchanged)."""
+    return entrypoint.split(":", 1)[0]
+
+
+def _is_entrypoint_importable(entrypoint: str) -> bool:
+    """True iff ``entrypoint``'s module can be LOCATED on this tree.
+
+    Uses ``importlib.util.find_spec``, which resolves the module's location
+    without executing its body — so this stays cheap and side-effect-free even
+    for a runner module that (once it exists) pulls torch/diffusers at import.
+    Cached per module path (the zoo is static after import). Any resolution
+    failure (module genuinely absent, a malformed dotted path, a broken parent
+    package) is treated as "not importable" rather than raised — this gate must
+    never be the thing that crashes the process."""
+    module = _entrypoint_module(entrypoint)
+    cached = _ENTRYPOINT_IMPORTABLE_CACHE.get(module)
+    if cached is not None:
+        return cached
+    try:
+        found = importlib.util.find_spec(module) is not None
+    except (ImportError, ModuleNotFoundError, ValueError, AttributeError, TypeError):
+        found = False
+    _ENTRYPOINT_IMPORTABLE_CACHE[module] = found
+    return found
+
+
+def runner_available(framework: Framework, task: Task) -> RunnerSpec | None:
+    """SERVABLE lookup: the registered ``RunnerSpec`` for (framework, task) IFF its
+    entrypoint module resolves on this tree, else ``None`` — a GATED runner (the
+    seed declared it; the module hasn't landed) is indistinguishable here from an
+    unregistered one, which is exactly what the router's task-picker wants: skip
+    it and fall through to a candidate that can actually render. Use
+    ``runner_gate_reason`` to recover WHY a gated (framework, task) returned None."""
+    spec = RUNNER_REGISTRY.get((framework, task))
+    if spec is None:
+        return None
+    return spec if _is_entrypoint_importable(spec.entrypoint) else None
+
+
+def runner_gate_reason(framework: Framework, task: Task) -> str | None:
+    """None when (framework, task) is servable (``runner_available`` would return
+    the spec); otherwise an honest, queryable reason string:
+      * "not_registered"           — no RunnerSpec declared at all for this pair.
+      * "runner_missing: <module>" — a RunnerSpec IS declared (the seed's stated
+        intent) but its entrypoint module is not present in this tree yet.
+    """
+    spec = RUNNER_REGISTRY.get((framework, task))
+    if spec is None:
+        return "not_registered"
+    if _is_entrypoint_importable(spec.entrypoint):
+        return None
+    return f"runner_missing: {_entrypoint_module(spec.entrypoint)}"
+
+
+def gated_runners() -> tuple[tuple[str, str, str], ...]:
+    """Reporting hook (mirrors ``unpinned_models()``): every REGISTERED
+    (framework, task) whose entrypoint module cannot be found on this tree, as
+    sorted ``(framework, task, reason)`` string triples. Empty when every
+    declared runner is servable. This is the "servable catalog" queryable surface
+    a picker/console can use to explain (or filter out) a dead engine without the
+    seed entry ever being deleted."""
+    out: list[tuple[str, str, str]] = []
+    for (fw, task) in RUNNER_REGISTRY:
+        reason = runner_gate_reason(fw, task)
+        if reason is not None:
+            out.append((fw.value, task.value, reason))
+    return tuple(sorted(out))
+
+
+def model_gate_reasons(model_id: str) -> dict[str, str]:
+    """``{task_value: reason}`` for every task ``model_id`` declares whose runner
+    is gated (empty dict when every declared task is servable, or the model_id is
+    unknown). The per-model "why can't I run this" surface."""
+    cfg = MODEL_REGISTRY.get(model_id)
+    if cfg is None:
+        return {}
+    out: dict[str, str] = {}
+    for task in cfg.tasks:
+        reason = runner_gate_reason(cfg.family, task)
+        if reason is not None:
+            out[task.value] = reason
+    return out
 
 
 def _allow_unpinned() -> bool:

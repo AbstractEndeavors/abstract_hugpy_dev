@@ -1,4 +1,4 @@
-"""POST /llm/workers/<id>/alloc-all — bulk-alloc route (todo t15).
+"""POST /llm/workers/<id>/alloc-all — bulk-alloc route (todo t15; per-model % t48).
 
 The operator clarified the multi-select was for ALLOC (GPU allocation), residency
 kept too. The single-model alloc editor applies via POST /assign {model_key,
@@ -8,14 +8,28 @@ agent. The bulk action must match that EXACTLY: N registry writes in one request
 per-model results like residency-all, and a constant restarting:False.
 
 This regresses the route WITHOUT a live worker:
-  * one assign_model call per selected key carrying the SAME spill contract;
+  * one assign_model call per selected key carrying the SAME spill contract
+    (body: {"spill": {...}}) — for autofit / max GPU / CPU only / an operator-
+    typed absolute GiB budget, every selected model IS meant to get the same
+    contract;
+  * OR one assign_model call per key with its OWN spill (body:
+    {"spills": {model_key: {...}}}) — t48: a PERCENT VRAM/RAM budget must
+    resolve against each model's OWN size, so two differently-sized models in
+    the same bulk selection land two DIFFERENT absolute GiB numbers instead of
+    one flat number (resolved once against the worker's capacity) stamped on
+    both — that was the bug ("...not the total for the particular model that
+    happened to be the first in the list's actual ram alloc");
   * the spill value set mirrors the editor (autofit {} / max GPU {n_gpu_layers:-1}
     / CPU only {n_gpu_layers:"off"} / custom budgets);
   * NEVER a relay / restart (restarting is always False, no /ops/config touched);
   * off-worker keys dropped (render->click staleness) → skipped, never assigned;
   * per-model results / counts / alloc label surfaced like residency-all;
   * one bad key errors that key only, the rest still apply;
-  * bad body -> 400; bad spill shape -> 400; unknown worker -> 404.
+  * the engine gate is evaluated per-key against THAT key's own spill in the
+    `spills` path (a per-model map can carry different explicit-budget keys per
+    member, unlike the single shared `spill`);
+  * bad body -> 400; bad spill shape -> 400; bad spills shape -> 400; unknown
+    worker -> 404.
 
 Runs like the other tests here: venv/bin/python tests/test_bulk_alloc_route.py
 """
@@ -368,6 +382,88 @@ try:
     check("resolved %→GiB budget validates as a normal custom spill",
           reason is None and clean == {"gpu_mem_gib": 6.0, "cpu_mem_gib": 12.0})
     check("resolved budget is gguf-only", wr._alloc_is_gguf_only(clean) is True)
+
+    # ── PER-MODEL alloc (t48): `spills: {model_key: spill}` instead of one
+    # `spill` broadcast to every key. This is how a bulk PERCENT VRAM/RAM budget
+    # rides the wire now: the UI resolves the percent against EACH model's own
+    # size client-side (still no percent concept on the wire) and sends the
+    # resulting per-model absolutes here in one request, so a 40% budget on a
+    # big model and a 40% budget on a small model land as two DIFFERENT GiB
+    # numbers instead of one flat number stamped on both. ───────────────────
+    wr.get_worker = lambda wid: dict(WORKER) if wid == "wid" else None
+    wr._model_framework = lambda mk: FRAMEWORKS.get(mk)
+
+    # (h1) two gguf models, two DIFFERENT resolved budgets in one request.
+    assign_calls.clear(); warm_calls.clear()
+    r = client.post("/llm/workers/wid/alloc-all",
+                    json={"model_keys": ["a", "b"],
+                          "spills": {"a": {"gpu_mem_gib": 9.6, "cpu_mem_gib": 4.0},
+                                     "b": {"gpu_mem_gib": 2.4, "cpu_mem_gib": 1.0}}})
+    body = r.get_json()
+    check("per-model: 200", r.status_code == 200)
+    check("per-model: one assign_model per key, EACH its OWN spill",
+          {c[1]: c[2] for c in assign_calls} ==
+          {"a": {"gpu_mem_gib": 9.6, "cpu_mem_gib": 4.0},
+           "b": {"gpu_mem_gib": 2.4, "cpu_mem_gib": 1.0}})
+    a_spill = next(c[2] for c in assign_calls if c[1] == "a")
+    b_spill = next(c[2] for c in assign_calls if c[1] == "b")
+    check("per-model: distinct per-model values actually landed", a_spill != b_spill)
+    check("per-model: NEVER relayed (no restart)", relay_seen["n"] == 0)
+    check("per-model: restarting is always False", body["restarting"] is False)
+    check("per-model: alloc label", body["alloc"] == "per-model")
+    check("per-model: per-model results all ok",
+          body["results"] == {"a": "ok", "b": "ok"})
+    check("per-model: counts", body["counts"] == {"ok": 2, "error": 0, "skipped": 0, "total": 2})
+    check("per-model: only LOCAL models re-seated (a,b local; warm once)",
+          warm_calls == [("a", "b")])
+
+    # (h2) a key missing from `spills` (caller only sent a subset) -> autofit
+    # for that key (same {}-is-autofit convention as the broadcast path).
+    assign_calls.clear()
+    r = client.post("/llm/workers/wid/alloc-all",
+                    json={"model_keys": ["a", "b"],
+                          "spills": {"a": {"n_gpu_layers": -1}}})
+    body = r.get_json()
+    check("per-model: key absent from spills resolves to autofit",
+          dict((c[1], c[2]) for c in assign_calls) == {"a": {"n_gpu_layers": -1}, "b": {}})
+
+    # (h3) engine gate is evaluated PER KEY's OWN spill (mixed selection: g1
+    # gets an explicit gguf-only budget, t1 gets autofit — only g1 should be
+    # gated on, and it should NOT be skipped since it IS gguf).
+    wr.get_worker = lambda wid: dict(MIXED) if wid == "wid" else None
+    wr._model_framework = lambda mk: MIXED_FW.get(mk)
+    assign_calls.clear()
+    r = client.post("/llm/workers/wid/alloc-all",
+                    json={"model_keys": ["g1", "t1"],
+                          "spills": {"g1": {"gpu_mem_gib": 8}, "t1": {"gpu_mem_gib": 4}}})
+    body = r.get_json()
+    check("per-model engine gate: gguf member applies",
+          body["results"]["g1"] == "ok")
+    check("per-model engine gate: transformers member skipped (its OWN spill is gguf-only)",
+          "skipped" in body["results"]["t1"] and "GGUF-only" in body["results"]["t1"])
+    check("per-model engine gate: counts 1 ok / 1 skipped",
+          body["counts"] == {"ok": 1, "error": 0, "skipped": 1, "total": 2})
+    check("per-model engine gate: only g1 actually written",
+          [c[1] for c in assign_calls] == ["g1"])
+
+    # (h4) off-worker key + stale note behave the same as the broadcast path.
+    assign_calls.clear()
+    r = client.post("/llm/workers/wid/alloc-all",
+                    json={"model_keys": ["g1", "zz"], "spills": {"g1": {}}})
+    body = r.get_json()
+    check("per-model: off-worker key dropped, reported separately",
+          body["off_worker"] == ["zz"] and body["results"] == {"g1": "ok"})
+
+    # (h5) bad shapes -> 400.
+    check("spills: non-dict -> 400",
+          client.post("/llm/workers/wid/alloc-all",
+                      json={"model_keys": ["g1"], "spills": "nope"}).status_code == 400)
+    check("spills: bad per-key spill -> 400",
+          client.post("/llm/workers/wid/alloc-all",
+                      json={"model_keys": ["g1"], "spills": {"g1": {"bogus": 1}}}).status_code == 400)
+
+    wr.get_worker = lambda wid: dict(WORKER) if wid == "wid" else None
+    wr._model_framework = lambda mk: FRAMEWORKS.get(mk)
 finally:
     (wr.get_worker, wr.assign_model, wr._kick_warm, cr.audit,
      wr._relay_worker_op, wr._model_framework) = _orig

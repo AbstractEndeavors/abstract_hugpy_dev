@@ -175,12 +175,26 @@ class VisionCoder:
         }
 
         if cfg.device_map == "auto" and cfg.device == "cuda":
-            model_kwargs.update({
-                "device_map": "auto",
-                "max_memory": {
+            # GPU/CPU spill: honor the SAME placement seam every other
+            # transformers loader uses (t26/t27 — spill.transformers_max_memory)
+            # so explicit HUGPY_GPU_MEM_GIB/HUGPY_CPU_MEM_GIB budgets and the
+            # HUGPY_N_GPU_LAYERS placement intent (Max GPU / CPU only / auto)
+            # apply to vision loads too, not just text (t31). Falls back to
+            # this loader's own gpu_max_memory/cpu_max_memory (5GiB/24GiB by
+            # default) ONLY when the seam has no better answer (e.g. VRAM is
+            # unreadable) — no-operator-config behavior is unchanged.
+            from ..spill import transformers_max_memory
+
+            max_memory = transformers_max_memory()
+            if not max_memory:
+                max_memory = {
                     0: cfg.gpu_max_memory,
                     "cpu": cfg.cpu_max_memory,
-                },
+                }
+
+            model_kwargs.update({
+                "device_map": "auto",
+                "max_memory": max_memory,
             })
 
             self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(

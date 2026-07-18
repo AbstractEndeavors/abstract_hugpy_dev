@@ -56,6 +56,14 @@ from .blocklist import (
     is_blocked,
     unblock as unblock_model,
 )
+from .calibration import (
+    CalibrationStore,
+    calibration_store,
+    calibration_table,
+    clamp_correction,
+    corrections_for,
+    record_samples,
+)
 
 __all__ = [
     "CANONICAL_STATUSES",
@@ -90,4 +98,10 @@ __all__ = [
     "blocked_keys",
     "is_blocked",
     "unblock_model",
+    "CalibrationStore",
+    "calibration_store",
+    "calibration_table",
+    "clamp_correction",
+    "corrections_for",
+    "record_samples",
 ]

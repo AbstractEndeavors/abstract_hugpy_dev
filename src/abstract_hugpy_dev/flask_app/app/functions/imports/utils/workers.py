@@ -2382,6 +2382,17 @@ def explain_no_worker(model_key: str, pool: Optional[str] = None,
         return ""
 
 
+def _reserved_vram_bytes(worker_id: str) -> int:
+    """VRAM bytes CURRENTLY reserved on a worker by in-flight heavy video runs
+    (p6). Lazily imported + fully guarded so placement never depends on the
+    reservation layer being importable/healthy — 0 means 'nothing reserved'."""
+    try:
+        from ......video_intel.reservation.registry import reserved_bytes
+        return int(reserved_bytes(worker_id) or 0)
+    except Exception:  # noqa: BLE001 — admission-respect must never break placement
+        return 0
+
+
 def fleet_snapshot() -> list:
     """The deterministic allocator's view of the fleet, from the live registry.
 
@@ -2394,6 +2405,12 @@ def fleet_snapshot() -> list:
     for w in worker_store.all():
         gpus = w.get("gpus") or []
         free_vram = sum(int(g.get("memory_free") or 0) for g in gpus)
+        # p6 admission-respect: a card reserved by an in-flight heavy video run is
+        # NOT free for another placement. Subtract the run's claimed peak so the
+        # allocator never shards/places a model onto VRAM a Wan/Hunyuan render is
+        # about to occupy. Best-effort (0 on any error) — a reservation-store
+        # hiccup must never wrongly starve LLM placement.
+        free_vram = max(0, free_vram - _reserved_vram_bytes(w["id"]))
         nodes.append(Node(
             id=w["id"],
             free_vram=free_vram,

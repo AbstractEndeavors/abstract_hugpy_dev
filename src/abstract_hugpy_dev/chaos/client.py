@@ -1,0 +1,221 @@
+"""Thin, dependency-free HTTP seam onto the hugpy central (dev.hugpy.ai API).
+
+Stdlib only (urllib) — the runner must not add a dependency (sklearn etc. is the
+learner's concern). This is the single object the runner/alloc/observe modules
+talk to, and the single object tests substitute with an in-memory fake, so all
+the network lives here and nowhere else.
+
+Only ONE method mutates fleet state: ``assign`` (operator-gated). Every other
+call is a read. ``chat_stream`` fires the keyless ``web`` transport — the same
+public path the console uses — and returns a terminal record (never raises for
+an in-band model error; it captures it verbatim)."""
+from __future__ import annotations
+
+import json
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+DEFAULT_BASE = "http://127.0.0.1:7002"
+
+
+class CentralClient:
+    def __init__(self, base_url: str = DEFAULT_BASE,
+                 operator_token: str | None = None, timeout: float = 12.0):
+        self.base = base_url.rstrip("/")
+        self.operator_token = (operator_token or "").strip() or None
+        self.timeout = timeout
+
+    # ── low-level ────────────────────────────────────────────────────────────
+    def _get(self, path: str, params: dict | None = None,
+             timeout: float | None = None):
+        url = self.base + path
+        if params:
+            clean = {k: v for k, v in params.items() if v is not None}
+            if clean:
+                url += "?" + urllib.parse.urlencode(clean)
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout or self.timeout) as r:
+            return r.status, json.loads(r.read().decode("utf-8", "replace"))
+
+    def _post(self, path: str, body: dict, operator: bool = False,
+              timeout: float | None = None):
+        data = json.dumps(body).encode()
+        headers = {"Content-Type": "application/json"}
+        if operator:
+            if not self.operator_token:
+                raise RuntimeError(
+                    "operator token required for %s but none configured" % path)
+            headers["X-Operator-Token"] = self.operator_token
+        req = urllib.request.Request(self.base + path, data=data,
+                                     headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as r:
+                raw = r.read().decode("utf-8", "replace")
+                try:
+                    return r.status, json.loads(raw)
+                except Exception:
+                    return r.status, {"_raw": raw}
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode("utf-8", "replace")
+            try:
+                return e.code, json.loads(raw)
+            except Exception:
+                return e.code, {"_raw": raw}
+
+    # ── reads ────────────────────────────────────────────────────────────────
+    def health(self) -> int:
+        try:
+            code, _ = self._get("/health", timeout=6)
+            return code
+        except urllib.error.HTTPError as e:
+            return e.code
+        except Exception:
+            return 0
+
+    def models(self) -> list[dict]:
+        _, d = self._get("/models")
+        return d if isinstance(d, list) else (d.get("models") or [])
+
+    def workers(self) -> list[dict]:
+        _, d = self._get("/llm/workers")
+        return d if isinstance(d, list) else []
+
+    def jobs(self) -> dict:
+        _, d = self._get("/llm/jobs")
+        return d if isinstance(d, dict) else {"jobs": d, "counts": {}}
+
+    def model_meta(self, model_key: str, vram_gib: float | None = None,
+                   ctx_pct: int | None = None) -> dict:
+        try:
+            _, d = self._get(f"/models/{urllib.parse.quote(model_key, safe='~')}/meta",
+                             {"vram_gib": vram_gib, "ctx_pct": ctx_pct})
+            return d if isinstance(d, dict) else {}
+        except Exception:
+            return {}
+
+    # ── the ONLY mutation ────────────────────────────────────────────────────
+    def assign(self, worker_id: str, model_key: str, spill: dict) -> tuple[int, dict]:
+        """POST /assign — operator-gated central registry write to
+        spill_by_model[model_key]. Returns (status_code, body). A non-200 (e.g.
+        409 engine-gate refusal) is returned, never raised."""
+        return self._post(f"/llm/workers/{worker_id}/assign",
+                          {"model_key": model_key, "spill": spill},
+                          operator=True)
+
+    def cancel(self, request_id: str) -> None:
+        """Best-effort cancel a chat (polite-guest on a timeout / stop)."""
+        try:
+            self._post(f"/llm/chat/cancel/{urllib.parse.quote(request_id)}", {},
+                       timeout=6)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ── the generation fire (keyless web transport) ──────────────────────────
+    def chat_stream(self, model_key: str, prompt: str, request_id: str,
+                    max_new_tokens: int, ceiling_s: float,
+                    read_timeout_s: float | None = None) -> dict:
+        """Fire one /chat/stream and drain the SSE. Returns a terminal record:
+        {outcome, served_worker, error, finish_reason, ttft_s, load_duration_s,
+         wall_s, tokens, stages}. Captures an in-band model error verbatim
+         rather than raising.
+
+        Bounds TOTAL wall time by ``ceiling_s`` (a broken model that streams
+        'awaiting-load' progress forever would otherwise keep the SSE open
+        indefinitely — the per-socket-read timeout never fires while data flows).
+        A single silent read is bounded by ``read_timeout_s``. On a wall-clock
+        timeout the job is cancelled."""
+        read_timeout = read_timeout_s or min(45.0, ceiling_s)
+        body = json.dumps({
+            "model_key": model_key, "prompt": prompt, "request_id": request_id,
+            "transport": "web", "max_new_tokens": max_new_tokens,
+        }).encode()
+        req = urllib.request.Request(self.base + "/chat/stream", data=body,
+                                     headers={"Content-Type": "application/json"},
+                                     method="POST")
+        worker = None
+        outcome = None
+        error = None
+        finish_reason = None
+        first_token_t = None
+        first_load_t = None
+        tokens = 0
+        stages: list[list] = []
+        timed_out = False
+        t0 = time.time()
+        try:
+            with urllib.request.urlopen(req, timeout=read_timeout) as r:
+                for raw in r:
+                    # HARD wall-clock ceiling — bounds a never-ending load stream.
+                    if time.time() - t0 > ceiling_s:
+                        timed_out = True
+                        break
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    try:
+                        ev = json.loads(line[5:].strip())
+                    except Exception:
+                        continue
+                    et = ev.get("type")
+                    if et == "status":
+                        wn = ev.get("worker_name") or ev.get("worker_id")
+                        if wn:
+                            worker = wn
+                        stage = ev.get("stage")
+                        stages.append([stage, wn, ev.get("progress")])
+                        if stage and first_load_t is None and "load" in str(stage).lower():
+                            first_load_t = time.time()
+                    elif et == "token":
+                        tokens += 1
+                        if first_token_t is None:
+                            first_token_t = time.time()
+                    elif et == "error":
+                        error = ev.get("message")
+                        outcome = "error"
+                    elif et == "done":
+                        finish_reason = ev.get("finish_reason")
+                        outcome = outcome or "done"
+                    elif et in ("end", "final"):
+                        outcome = outcome or "done"
+        except urllib.error.HTTPError as e:
+            body_txt = ""
+            try:
+                body_txt = e.read().decode("utf-8", "replace")
+            except Exception:
+                pass
+            error = f"HTTP {e.code}: {body_txt[:400]}"
+            outcome = "error"
+        except (TimeoutError, OSError) as e:  # socket read timed out / dropped
+            timed_out = True
+            error = error or f"{type(e).__name__}: {e}"
+        except Exception as e:  # noqa: BLE001 — a client fault is data, not a crash
+            error = f"{type(e).__name__}: {e}"
+            outcome = outcome or "client_exception"
+        wall = time.time() - t0
+        if timed_out and outcome is None:
+            outcome = "done" if first_token_t else "load-timeout"
+            error = error or (f"chat exceeded {ceiling_s}s wall ceiling in stage "
+                              f"'{stages[-1][0] if stages else 'connect'}'")
+            self.cancel(request_id)  # don't leave it churning on the worker
+        if outcome is None:
+            outcome = "done" if first_token_t else "closed_no_token"
+        # Classify a refusal from the verbatim error text (structured detail is
+        # captured later from the worker row; this is the coarse label).
+        if outcome == "error" and error and (
+                "won't fit" in error or "refus" in error.lower()
+                or '"refused"' in error):
+            outcome = "refused"
+        ttft = (first_token_t - t0) if first_token_t else None
+        load_ref = first_load_t or t0
+        load_dur = None
+        if first_token_t:
+            load_dur = first_token_t - load_ref
+        return {
+            "outcome": outcome, "served_worker": worker, "error": error,
+            "finish_reason": finish_reason,
+            "ttft_s": round(ttft, 3) if ttft is not None else None,
+            "load_duration_s": round(load_dur, 3) if load_dur is not None else None,
+            "wall_s": round(wall, 3), "tokens": tokens, "stages": stages,
+        }

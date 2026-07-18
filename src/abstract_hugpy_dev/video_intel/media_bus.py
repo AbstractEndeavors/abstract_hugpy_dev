@@ -17,6 +17,7 @@ at app init.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -44,6 +45,8 @@ from .identity_reconstruction_schema import (
 from .identity_video_extract_schema import identity_video_extract_from_dict
 from .result_schema import JobResult
 from .runners import DISPATCH
+
+logger = logging.getLogger(__name__)
 
 DB_PATH = os.path.join(DEFAULT_ROOT, "video_intel", "media_jobs.db")
 
@@ -306,6 +309,45 @@ def _bridge(fn_name: str, *args, **kwargs) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# p6 GPU RESERVATION seam — heavy video tasks pre-claim the (single) video GPU
+# BEFORE dispatch so a Wan/Hunyuan render doesn't collide mid-run with the LLM
+# agent-brain squatting the card. Lazily imported + fully guarded so the media
+# bus keeps ZERO import-time coupling to the reservation engine and a reservation
+# failure can NEVER break a media job. Policy lives in video_intel/reservation/.
+# --------------------------------------------------------------------------- #
+def _acquire_reservation(name: str, spec, job_id: str):
+    """Returns (handle, refusal_result). ``handle`` None ⇒ proceed unreserved
+    (a light task, the layer off, or an infra hiccup — fail open). ``refusal_result``
+    is a terminal JobResult when the engine HONESTLY refused (a measured shortfall it
+    could not clear) so the run terminals as gpu_unavailable instead of OOM'ing."""
+    try:
+        from .reservation import acquire, ReservationRefused
+    except Exception:  # noqa: BLE001 — no engine present ⇒ unreserved, exactly as before
+        return None, None
+    try:
+        return acquire(name, spec, job_id), None
+    except ReservationRefused as rr:
+        from .result_schema import JobError
+        return None, JobResult(
+            job_id=job_id, ok=False,
+            error=JobError(code="gpu_unavailable", message=str(rr), retryable=True))
+    except Exception:  # noqa: BLE001 — an engine bug proceeds unreserved, never wedges dispatch
+        logger.debug("reservation acquire failed — proceeding unreserved",
+                     exc_info=True)
+        return None, None
+
+
+def _release_reservation(job_id: str) -> None:
+    """Release a run's GPU claim on ANY terminal path (done/failed/cancelled/abort).
+    Idempotent + best-effort — a lease TTL is the backstop for a crash."""
+    try:
+        from .reservation import release
+        release(job_id, reason="run terminal")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# --------------------------------------------------------------------------- #
 # API
 # --------------------------------------------------------------------------- #
 def enqueue(name: str, spec) -> str:
@@ -398,16 +440,28 @@ def run_claimed(job_id: str, worker_token: str) -> Optional[JobResult]:
     _bridge("on_running", job_id, name, worker=worker_token)
 
     # ---- run outside the DB connection; the runner is pure & may block ----
+    # p6: a heavy GPU video task pre-claims the card here (make-room via the
+    # eviction verbs) BEFORE its runner touches the GPU. A non-heavy task / infra
+    # hiccup proceeds unreserved; a measured, unclearable shortfall short-circuits
+    # to a gpu_unavailable terminal instead of dispatching a render that would OOM.
+    # The claim is released on EVERY terminal path in the finally below (incl.
+    # abort/cancel + the exception path); a crashed run's claim self-expires.
+    reservation_handle = None
     try:
         spec = deserialize_spec(name, json.loads(spec_json))
         job_spec = JOB_REGISTRY[name]
         runner = DISPATCH[job_spec.runner_key]
-        result = runner(spec, job_id)
-        if not isinstance(result, JobResult):
-            raise TypeError(
-                f"runner {job_spec.runner_key} returned {type(result).__name__}, "
-                "expected JobResult"
-            )
+        reservation_handle, reservation_refusal = _acquire_reservation(
+            name, spec, job_id)
+        if reservation_refusal is not None:
+            result = reservation_refusal
+        else:
+            result = runner(spec, job_id)
+            if not isinstance(result, JobResult):
+                raise TypeError(
+                    f"runner {job_spec.runner_key} returned {type(result).__name__}, "
+                    "expected JobResult"
+                )
     except Exception as exc:  # the one sanctioned catch/convert point
         from .result_schema import JobError
         result = JobResult(
@@ -419,6 +473,11 @@ def run_claimed(job_id: str, worker_token: str) -> Optional[JobResult]:
                 retryable=False,
             ),
         )
+    finally:
+        # Release the GPU claim on ANY terminal path — success, failure, cancel,
+        # or an internal raise. No-op when nothing was claimed.
+        if reservation_handle is not None:
+            _release_reservation(job_id)
 
     # ---- write the terminal state ONCE (single writer via claim_token) ----
     # A runner that honored a cancel returns error.code='cancelled' — record

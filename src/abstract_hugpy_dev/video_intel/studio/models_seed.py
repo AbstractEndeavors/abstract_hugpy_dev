@@ -82,6 +82,16 @@ PLACEHOLDER_SAMPLER_DEFAULTS: dict = {
 
 # --------------------------------------------------------------------------
 # Runners: (framework, task) -> how to execute it. Entrypoints wired explicitly.
+#
+# k1 GATE NOTE: several rows below name a runner module that has not been built
+# yet (a video-engine bet, not a bug) — hunyuan/cog/mochi/opensora/skyreels/
+# animatediff/framepack/codeformer, and LTX's t2v/i2v/av (only ltx_upscale is
+# wired). Declaring the RunnerSpec here is intentional and stays — it is the
+# zoo's honest statement of intent, and `registry.runner_available` /
+# `runner_gate_reason` gate them out of actual routing/dispatch until their
+# runner module lands (see `video_intel/studio/registry.py`'s "RUNNER GATE"
+# docstring). Do NOT delete a row just because its runner isn't wired yet —
+# dropping the module into `runners/` re-enables it with ZERO edits here.
 # --------------------------------------------------------------------------
 _RUNNERS = (
     # Task 3b: WAN T2V is now WIRED to the real runner — run_wan_t2v is a thin DRY

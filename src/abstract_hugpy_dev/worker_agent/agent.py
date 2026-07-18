@@ -3614,6 +3614,15 @@ def _kick_provision(state: "WorkerState", model_key: str,
         # A restart is underway — don't spin up a NEW transfer pool into a process
         # about to exit (it would only be torn down by _shutdown_executors).
         return
+    # k2: single choke for BOTH callers (assignment adoption's eager pre-pull
+    # and the UTIL-08 reconcile loop's re-kick). An operator BLOCK does not
+    # auto-unassign, so a blocked static model can still be sitting in
+    # state.assigned_models and NOT local — without this, the reconcile loop
+    # would re-kick a doomed pull of it every reconcile_interval_s forever.
+    # Log once, not every pass; never a request refusal (background-only).
+    if _is_blocked_locally(model_key):
+        _log_blocked_skip_once(model_key, f"provisioning ({purpose})")
+        return
     with state._provision_lock:
         if model_key in state._provisioning:
             return
@@ -3908,6 +3917,80 @@ _FLEX_CTX_FLOOR: dict = {}               # model_key -> committed compressed ctx
 # shard-blind autofit. Cleared when the model is re-admitted (re-decides) or fits
 # fully. Empty == no active partial-offload commitment.
 _PARTIAL_NGL: dict = {}                   # model_key -> {"path", "n"}
+# t28 load-and-learn: the worker's half of the calibration loop.
+#   _CALIB_BUFFER      pending calibration_sample dicts, drained into each
+#                      heartbeat (worker->central, additive/optional).
+#   _CALIB_SAMPLED     model_keys already sampled for their CURRENT residency
+#                      episode (dedup — one measured sample per load, re-armed
+#                      when the model leaves residency).
+#   _CALIB_CORRECTIONS model_key -> clamped learned correction, ADOPTED from the
+#                      heartbeat reply (central aggregates + gates + clamps; the
+#                      worker just applies it, with a defensive re-clamp). Empty
+#                      == no learned number -> the static x1.15 stands.
+# All best-effort telemetry: a calibration failure must NEVER break a beat or an
+# admission. The whole layer is inert when HUGPY_CALIBRATION=off.
+_CALIB_MAXLEN = 64
+_CALIB_BUFFER: list = []
+_CALIB_SAMPLED: set = set()
+_CALIB_CORRECTIONS: dict = {}
+_CALIB_LOCK = threading.Lock()
+# k2: the worker's adopted view of the operator's model BLOCK set (aa4aea3),
+# learned off the heartbeat reply (worker['blocked_models'] = [model_key, ...]),
+# the exact same additive/omit-when-empty wire idiom as calibration. Closes the
+# gap the 2026-07-18 ae incident exposed: the block primitive covers every
+# CENTRAL path already, but a worker's OWN background reconciler loops (slot
+# fill, provisioning re-kick) had no way to learn a model was blocked out from
+# under an assignment that is still on record (block does not auto-unassign) —
+# so they kept retrying a doomed load every ~60s indefinitely.
+#   _BLOCKED_MODELS   model_keys blocked as of the last heartbeat. Empty ==
+#                     nothing blocked (or an older/central without the
+#                     feature; the reply just omits the key).
+#   _BLOCKED_LOGGED   model_keys a background loop has already logged a skip
+#                     for, so the skip logs ONCE per block episode, not every
+#                     tick. Re-armed on unblock so a future re-block logs again.
+# ONLY gates the worker's own background warm/load-ahead loops — never an
+# explicit relay request (that stays central's honest-refusal job).
+_BLOCKED_MODELS: set = set()
+_BLOCKED_LOGGED: set = set()
+_BLOCKED_LOCK = threading.Lock()
+
+
+def _adopt_blocked_models(worker: "dict | None") -> None:
+    """Adopt central's published model BLOCK set from the heartbeat reply.
+    Central only sends the key when the set is non-empty; an older/unblocked
+    central omits it -> the local set clears -> nothing reads as blocked.
+    Mirrors _adopt_calibration."""
+    raw = (worker or {}).get("blocked_models") or []
+    parsed = ({str(mk) for mk in raw if mk}
+              if isinstance(raw, (list, tuple, set)) else set())
+    with _BLOCKED_LOCK:
+        _BLOCKED_MODELS.clear()
+        _BLOCKED_MODELS.update(parsed)
+        _BLOCKED_LOGGED.intersection_update(parsed)  # re-arm anything unblocked
+
+
+def _is_blocked_locally(model_key: "str | None") -> bool:
+    """True iff ``model_key`` is in this worker's adopted BLOCK set. For gating
+    the worker's OWN background loops only — see the module note above."""
+    if not model_key:
+        return False
+    with _BLOCKED_LOCK:
+        return model_key in _BLOCKED_MODELS
+
+
+def _log_blocked_skip_once(model_key: str, where: str) -> None:
+    """Log a background loop's skip of a blocked model exactly ONCE per block
+    episode, not every ~60s tick — the direct fix for the 2026-07-18 ae
+    incident (slot-fill reconciler retried a blocked model every beat for
+    ~4.75 hours, each attempt failing a full-GPU fit)."""
+    with _BLOCKED_LOCK:
+        if model_key in _BLOCKED_LOGGED:
+            return
+        _BLOCKED_LOGGED.add(model_key)
+    logger.info("%s: skipping %s — blocked from the serving pool by the "
+                "operator (won't retry until unblocked)", where, model_key)
+
+
 _COMFY_URL_BASE_ENV = "_HUGPY_COMFY_URL_BASE"  # sentinel: the pre-projection
 # COMFY_URL (systemd drop-in / env / none), captured once and carried across
 # os.execv so clearing the setting reverts to the real base, never the last
@@ -4341,7 +4424,8 @@ def _incoming_need_detail(model_key: str) -> dict:
     byte-identical to today."""
     weights = _incoming_need_bytes(model_key)
     if not weights:
-        return {"total": None, "weights": weights, "kv": 0,
+        return {"total": None, "base_total": None, "calibration_correction": 1.0,
+                "weights": weights, "kv": 0,
                 "ctx_pct": None, "ctx_resolved": None, "ctx_max": None,
                 "geometry_source": None}
     try:
@@ -4349,8 +4433,190 @@ def _incoming_need_detail(model_key: str) -> dict:
     except Exception:  # noqa: BLE001 — KV is additive; never break a working fit
         kv, det = 0, {"ctx_pct": None, "ctx_resolved": None, "ctx_max": None,
                       "geometry_source": None}
-    return {"total": int(weights) + int(kv or 0), "weights": int(weights),
-            "kv": int(kv or 0), **det}
+    base_total = int(weights) + int(kv or 0)
+    # t28 load-and-learn: consult the learned per-model correction (median
+    # measured/predicted from real loads, adopted from central, clamped + gated).
+    # `total` — what every fit path prices against — becomes the corrected figure;
+    # `base_total` (the UNcorrected prediction, incl. the static x1.15) is carried
+    # for honest reporting AND is what a calibration_sample records, so the ratio
+    # tracks the true base fudge instead of collapsing to a fixpoint at the
+    # current correction. None correction -> total == base_total (byte-identical).
+    corr = _calib_correction(model_key)
+    total = int(base_total * corr) if corr else base_total
+    return {"total": total, "base_total": base_total,
+            "calibration_correction": (corr or 1.0),
+            "weights": int(weights), "kv": int(kv or 0), **det}
+
+
+# ── t28 load-and-learn — worker capture + learned-correction application ─────
+def _calibration_enabled() -> bool:
+    """Master switch (mirrors central's). Default ON; ``off``/``0``/``false``/
+    ``no`` makes the whole worker-side layer inert — no capture, no correction."""
+    return (os.environ.get("HUGPY_CALIBRATION") or "on").strip().lower() not in (
+        "0", "off", "false", "no", "")
+
+
+def _calib_correction(model_key: str) -> "float | None":
+    """The clamped learned correction for a model, or None (the static x1.15
+    stands). Read from the map adopted off the heartbeat reply. Central already
+    clamps + gates; the [0.8, 1.5] re-clamp here is a defensive safety net so a
+    malformed reply can never move need-pricing outside the doctrine band."""
+    if not _calibration_enabled():
+        return None
+    with _CALIB_LOCK:
+        c = _CALIB_CORRECTIONS.get(model_key)
+    if c is None:
+        return None
+    try:
+        return max(0.8, min(1.5, float(c)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _calib_verdict(device: "str | None", ngl, total_layers) -> str:
+    """Classify a residency into the placement verdict a calibration sample
+    carries: ``full`` (weights+kv fully GPU-resident — the ONLY class that feeds
+    the ratio), ``partial`` (some layers on CPU), ``cpu``, or ``unknown``."""
+    dev = (device or "").lower() if device else None
+    try:
+        ngl = int(ngl) if ngl is not None else None
+    except (TypeError, ValueError):
+        ngl = None
+    try:
+        tl = int(total_layers) if total_layers is not None else None
+    except (TypeError, ValueError):
+        tl = None
+    if ngl == 0 or dev == "cpu":
+        return "cpu"
+    if ngl is not None and ngl > 0 and tl and ngl < tl:
+        return "partial"
+    if dev == "cuda" or (ngl is not None and (ngl == -1 or ngl > 0)):
+        return "full"
+    return "unknown"
+
+
+def _build_calibration_success(mk: str, row: dict) -> "dict | None":
+    """A measured calibration_sample from an allocation row (post-load): the
+    BASE (uncorrected) prediction split paired with the measured VRAM/RSS. None
+    when the prediction can't be sized. Omits None fields (additive wire)."""
+    try:
+        det = _incoming_need_detail(mk)
+    except Exception:  # noqa: BLE001 — capture must never raise on the beat
+        return None
+    base_total = det.get("base_total")
+    if not base_total:
+        return None
+    sample = {
+        "model_key": mk,
+        "engine": _model_framework(mk),
+        "needs_weights_bytes": det.get("weights"),
+        "needs_kv_bytes": det.get("kv"),
+        "ctx_pct": det.get("ctx_pct"),
+        "need_total_bytes": base_total,
+        "verdict": _calib_verdict(row.get("device"), row.get("n_gpu_layers"),
+                                  row.get("total_layers")),
+        "n_gpu_layers": row.get("n_gpu_layers"),
+        "total_layers": row.get("total_layers"),
+        "vram_bytes": row.get("vram_bytes"),
+        "rss_bytes": row.get("rss_bytes"),
+        "device": row.get("device"),
+        "ok": True,
+        "ts": time.time(),
+    }
+    return {k: v for k, v in sample.items() if v is not None}
+
+
+def _collect_calibration_from_allocations(allocs: "list | None") -> None:
+    """Emit ONE measured sample per residency episode. Keys off the SAME
+    allocations view the heartbeat already computes (per-process nvidia-smi
+    VRAM), so it captures EVERY load path — on-demand, slot, warm/probe, reconcile
+    — uniformly, and dedups via _CALIB_SAMPLED. Samples only once a footprint is
+    actually measured (vram_bytes present); departed residents are re-armed so a
+    reload re-samples."""
+    if not _calibration_enabled():
+        return
+    resident_now: set = set()
+    new_samples: list = []
+    for row in (allocs or []):
+        mk = (row or {}).get("model_key")
+        if not mk:
+            continue
+        resident_now.add(mk)
+        if row.get("vram_bytes") is None:
+            continue                        # not measured yet — wait for a beat that does
+        with _CALIB_LOCK:
+            if mk in _CALIB_SAMPLED:
+                continue
+        s = _build_calibration_success(mk, row)
+        if s:
+            new_samples.append(s)
+            with _CALIB_LOCK:
+                _CALIB_SAMPLED.add(mk)
+    with _CALIB_LOCK:
+        _CALIB_SAMPLED.intersection_update(resident_now)
+        _CALIB_BUFFER.extend(new_samples)
+        if len(_CALIB_BUFFER) > _CALIB_MAXLEN:
+            del _CALIB_BUFFER[:-_CALIB_MAXLEN]
+
+
+def _record_calibration_refuse(model_key: str, det: "dict | None") -> None:
+    """A load-FAIL sample from the VRAM admission refusal: the prediction with no
+    successful measurement (verdict=refuse, ok=False). Stored for telemetry /
+    future regression; EXCLUDED from the ratio (it never loaded)."""
+    if not _calibration_enabled():
+        return
+    try:
+        det = det or {}
+        sample = {
+            "model_key": model_key,
+            "engine": _model_framework(model_key),
+            "needs_weights_bytes": det.get("weights"),
+            "needs_kv_bytes": det.get("kv"),
+            "ctx_pct": det.get("ctx_pct"),
+            "need_total_bytes": det.get("base_total") or det.get("total"),
+            "verdict": "refuse",
+            "ok": False,
+            "ts": time.time(),
+        }
+        sample = {k: v for k, v in sample.items() if v is not None}
+        with _CALIB_LOCK:
+            _CALIB_BUFFER.append(sample)
+            if len(_CALIB_BUFFER) > _CALIB_MAXLEN:
+                del _CALIB_BUFFER[:-_CALIB_MAXLEN]
+    except Exception:  # noqa: BLE001 — telemetry must never break admission
+        pass
+
+
+def _drain_calibration_samples() -> list:
+    """Snapshot + clear the pending sample buffer for the heartbeat payload.
+    Best-effort telemetry: a rare loss on a failed beat is acceptable (the next
+    residency re-samples)."""
+    with _CALIB_LOCK:
+        if not _CALIB_BUFFER:
+            return []
+        out = list(_CALIB_BUFFER)
+        _CALIB_BUFFER.clear()
+    return out
+
+
+def _adopt_calibration(worker: "dict | None") -> None:
+    """Adopt central's published per-model corrections from the heartbeat reply
+    (``worker['calibration'] = {mk: {"correction", ...}}``). Central only sends
+    gate-passing, clamped values; an older/off central simply omits the key ->
+    the map clears -> the static x1.15 stands. Mirrors _apply_central_limits."""
+    corr = (worker or {}).get("calibration") or {}
+    parsed: dict = {}
+    if isinstance(corr, dict):
+        for mk, info in corr.items():
+            try:
+                val = info.get("correction") if isinstance(info, dict) else info
+                if val is not None:
+                    parsed[str(mk)] = float(val)
+            except (TypeError, ValueError):
+                continue
+    with _CALIB_LOCK:
+        _CALIB_CORRECTIONS.clear()
+        _CALIB_CORRECTIONS.update(parsed)
 
 
 def _worker_fit_check(model_key: str) -> bool:
@@ -5107,6 +5373,8 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
     # why, what we evicted, the numbers, and — when a partial offload was
     # CONSIDERED and rejected — what it would have been and why (degenerate offload
     # or CPU remainder OOM), in the C4 vision-fit style.
+    # t28: a load-FAIL calibration sample (prediction with no successful load).
+    _record_calibration_refuse(model_key, _det)
     reason = {
         "state": "refused",
         "model_key": model_key,
@@ -5656,9 +5924,18 @@ def _fill_empty_slots(state: "WorkerState") -> None:
             except Exception:  # noqa: BLE001 — unknown row: not seatable
                 return None
 
-        candidates = [mk for mk in state.assigned_models
-                      if mk not in occupied and mk in local
-                      and _framework(mk) == "gguf"]
+        candidates = []
+        for mk in state.assigned_models:
+            if mk in occupied or mk not in local or _framework(mk) != "gguf":
+                continue
+            # k2: an operator BLOCK (aa4aea3) does not auto-unassign — the model
+            # can still be sitting in state.assigned_models. Skip it here so this
+            # loop stops retrying a doomed seat every ~60s (the 2026-07-18 ae
+            # incident); log once, not every tick.
+            if _is_blocked_locally(mk):
+                _log_blocked_skip_once(mk, "slot fill")
+                continue
+            candidates.append(mk)
         if not candidates:
             return
         from ..managers.dispatch.dispatch import last_used_snapshot
@@ -6104,6 +6381,16 @@ def _heartbeat_loop(client: CentralClient, state: WorkerState, args) -> None:
             # attributed (worker) vs unattributed (foreign) — sampled this beat,
             # alongside detect_gpus() below, so the two are one snapshot.
             _vram_split = _vram_split_from_pidlog(_pid_log)
+            # t28: compute the allocations view ONCE, harvest calibration samples
+            # off it (measured per-process VRAM per resident), then reuse it for
+            # the payload. Fully guarded — capture must never skip a beat.
+            _allocs = _allocations(_slots)
+            try:
+                _collect_calibration_from_allocations(_allocs)
+                _calib_samples = _drain_calibration_samples()
+            except Exception as _ce:  # noqa: BLE001 — telemetry never breaks a beat
+                logger.debug("calibration capture failed: %s", _ce)
+                _calib_samples = []
             worker = client.heartbeat(
                 state.worker_id,
                 {
@@ -6141,7 +6428,12 @@ def _heartbeat_loop(client: CentralClient, state: WorkerState, args) -> None:
                     "comfy": _comfy_status(),
                     "loaded_detail": _loaded_detail(),
                     "slots": _slots,
-                    "allocations": _allocations(_slots),
+                    "allocations": _allocs,
+                    # t28 load-and-learn: prediction-vs-measured observations
+                    # captured this beat (measured successes off `allocations` +
+                    # any admission refusals). Additive/optional — None when empty,
+                    # omitted for a worker with HUGPY_CALIBRATION=off.
+                    "calibration_samples": _calib_samples or None,
                     # Precision model->PID log (2026-07-14): {"models":[{model_key,
                     # pid,host_mode,vram_bytes,alive}], "unattributed":[{pid,name,
                     # mib}]}. None on older/no-GPU boxes -> central just omits it.
@@ -6170,6 +6462,12 @@ def _heartbeat_loop(client: CentralClient, state: WorkerState, args) -> None:
             _sync_assignment(state, worker)
             # Adopt central's resource limits (min of central + local config).
             _apply_central_limits(worker)
+            # t28: adopt central's learned per-model need corrections (if any).
+            _adopt_calibration(worker)
+            # k2: adopt central's model BLOCK set (if any) — see
+            # _adopt_blocked_models. Gates only this worker's own background
+            # warm/load-ahead loops (slot fill, provisioning re-kick).
+            _adopt_blocked_models(worker)
             # Keep the STORAGE budget's two central-owned inputs on state: the
             # disk allocation and the LRU clock the FIFO orders by. Both are
             # facts only central holds; the pull path reads them off state.

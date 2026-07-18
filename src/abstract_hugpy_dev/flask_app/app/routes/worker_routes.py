@@ -561,6 +561,14 @@ class HeartbeatRequest(BaseModel):
     # vram_freed,at}, last_at} — the GPU evict-to-fit churn the operator watches,
     # surfaced beside the disk reaps. None on a pre-slice-10 worker.
     vram_evictions: dict | None = None
+    # t28 load-and-learn: compact prediction-vs-measured observations the worker
+    # emits on load-success (measured VRAM/RSS) and load-fail (refusal). Central
+    # persists + aggregates them into per-model correction factors. Additive +
+    # optional (extra='ignore' drops it for older workers); worker->central is
+    # the safe direction. Each row: {model_key, engine, needs_weights_bytes,
+    # needs_kv_bytes, ctx_pct, need_total_bytes, verdict, n_gpu_layers,
+    # total_layers, vram_bytes, rss_bytes, load_seconds, device, ok, ts}.
+    calibration_samples: list | None = None
 
 
 class AssignRequest(BaseModel):
@@ -608,6 +616,67 @@ def workers_required_version():
     priority over ``/llm/workers/<worker_id>``.
     """
     return jsonify({"required_pkg_version": required_pkg_version()})
+
+
+@worker_bp.route("/llm/calibration", methods=["GET"])
+def llm_calibration():
+    """t28 load-and-learn: the per-model calibration table — for each model with
+    observations, the sample counts, the median measured/predicted VRAM ratio,
+    the spread, and the gate-passing clamped correction (null until enough sane
+    samples). ``?model=<key>`` narrows to one model. Read-only JSON; degrades to
+    an empty table when the store is unavailable (never 5xxes).
+
+    ``enabled`` reflects the ``HUGPY_CALIBRATION`` master switch — when off the
+    table still shows what WOULD be learned, but no correction is published to a
+    worker reply or consulted by the preflight."""
+    from abstract_hugpy_dev.comms import calibration as _calib
+    model = (request.args.get("model") or "").strip()
+    try:
+        if model:
+            agg = _calib.calibration_store.aggregate(model)
+            rows = [agg] if agg else []
+        else:
+            rows = _calib.calibration_table()
+    except Exception:  # noqa: BLE001 — introspection never 5xxes
+        logger.debug("calibration table failed", exc_info=True)
+        rows = []
+    return jsonify({"enabled": _calib._enabled(),
+                    "min_samples": _calib._min_samples(),
+                    "max_spread": _calib._max_spread(),
+                    "clamp": list(_calib._clamp_band()),
+                    "models": rows})
+
+
+@worker_bp.route("/llm/reservations", methods=["GET"])
+def llm_reservations():
+    """p6: the GPU-reservation listing — the heavy video runs that have PRE-CLAIMED
+    a card (with the peak bytes reserved, the lease countdown, and what make-room
+    yielded). Read-only; the operator's console SEES claims here but this slice
+    exposes no create route (claims are minted only by the video dispatch path).
+
+    Active claims by default; ``?all=1`` also lists recent released/expired rows
+    (so the console can show what just finished / self-expired). ``?templates=1``
+    adds the loaded per-task templates (measured overlay applied) for introspection.
+    Never 5xxes — a store hiccup degrades to an empty list."""
+    include_terminal = (request.args.get("all") or "").strip().lower() in (
+        "1", "true", "yes", "on")
+    out: dict = {"reservations": []}
+    try:
+        from abstract_hugpy_dev.video_intel.reservation.registry import (
+            reservation_registry as _rr)
+        out["reservations"] = _rr.listing(include_terminal=include_terminal)
+    except Exception:  # noqa: BLE001 — introspection never 5xxes
+        logger.debug("reservation listing failed", exc_info=True)
+    if (request.args.get("templates") or "").strip().lower() in (
+            "1", "true", "yes", "on"):
+        try:
+            from abstract_hugpy_dev.video_intel.reservation.templates import (
+                reservable_tasks, load_template)
+            out["templates"] = {t: load_template(t).as_dict()
+                                 for t in reservable_tasks()}
+        except Exception:  # noqa: BLE001
+            logger.debug("reservation templates view failed", exc_info=True)
+    return jsonify(out)
 
 
 @worker_bp.route("/llm/workers/install.sh", methods=["GET"])
@@ -810,6 +879,64 @@ def workers_heartbeat(worker_id):
     # Advertise the target version every beat, so a worker converges within one
     # heartbeat of central's required version changing.
     worker["required_pkg_version"] = required_pkg_version()
+    # t28 load-and-learn: persist any calibration observations the worker shipped
+    # this beat, then publish the gate-passing per-model corrections back in the
+    # reply (a plain dict the worker reads with .get() — additive, an older
+    # worker just ignores it). Fully guarded: the learned loop must NEVER fail a
+    # heartbeat (a missed beat drops the worker off the fleet). Sent on a COPY so
+    # the ephemeral corrections never persist onto the stored worker record (they
+    # must not ride the relay wire built from it).
+    reply_extra: dict = {}
+    try:
+        from abstract_hugpy_dev.comms import calibration as _calib
+        if body.calibration_samples:
+            _calib.record_samples(worker_id, body.calibration_samples)
+        relevant = sorted(set(worker.get("loaded_models") or [])
+                          | set(worker.get("models") or []))
+        corr = _calib.corrections_for(relevant or None)
+        if corr:
+            reply_extra["calibration"] = corr
+    except Exception:  # noqa: BLE001 — calibration is best-effort; never 5xx a beat
+        logger.debug("calibration heartbeat hook failed", exc_info=True)
+    # p6: publish this worker's ACTIVE GPU reservations back on the reply (additive,
+    # omit-when-unset — same wire idiom as calibration: a plain list the worker reads
+    # with .get(), an older worker just ignores it). The WORKER-side hard admission
+    # gate (release-bound; see report) consumes this to hold the reserved bytes out
+    # of its OWN evict-to-fit headroom, so the LLM plane never reclaims VRAM a heavy
+    # video render is about to occupy. Fully guarded — never fails a beat.
+    try:
+        from abstract_hugpy_dev.video_intel.reservation.registry import (
+            reservation_registry as _rr)
+        resv = _rr.active(worker_id)
+        if resv:
+            reply_extra["reservations"] = [
+                {"run_id": r.get("run_id"), "task": r.get("task"),
+                 "gpu": r.get("gpu"), "peak_bytes": r.get("peak_bytes")}
+                for r in resv]
+    except Exception:  # noqa: BLE001 — reservation hook is best-effort; never 5xx a beat
+        logger.debug("reservation heartbeat hook failed", exc_info=True)
+    # k2: publish the operator's model BLOCK set on the reply (additive,
+    # omit-when-empty — same wire idiom as calibration/reservations: a plain
+    # list the worker reads with .get(), an older worker just ignores it). The
+    # block primitive (aa4aea3) already covers every CENTRAL path — routing,
+    # assign-409, warm sweeps, provisioning kick, the agent-brain ladder — but
+    # the worker's OWN background reconciler loops (slot fill, etc.) have no
+    # other way to learn a model was blocked out from under an assignment that
+    # is still on record (block deliberately does not auto-unassign). This
+    # closes that gap. Fully guarded — never fails a beat.
+    try:
+        blocked = sorted(_blocked_keys())
+        if blocked:
+            reply_extra["blocked_models"] = blocked
+    except Exception:  # noqa: BLE001 — block propagation is best-effort; never 5xx a beat
+        logger.debug("blocklist heartbeat hook failed", exc_info=True)
+    # Sent on a COPY so the ephemeral corrections/reservations/blocked set never
+    # persist onto the stored worker record (they must not ride the relay wire
+    # built from it).
+    if reply_extra:
+        reply = dict(worker)
+        reply.update(reply_extra)
+        return jsonify(reply)
     return jsonify(worker)
 
 
@@ -1459,6 +1586,17 @@ def workers_residency_all(worker_id):
 # the gpu_mem_gib/cpu_mem_gib targets; ctx_pct is the CTX target (percent of the
 # model's max context) and ctx_deviation_pct its band; priority (int >=0, 0=normal)
 # lets a higher-priority allocation compress lower ones within their bands first.
+#
+# t48 addendum: the ONE-spill-broadcast shape above is correct when the operator
+# picks an absolute (or autofit/max-GPU/CPU-only) — every member is meant to get
+# the SAME contract. It is WRONG for a PERCENT VRAM/RAM budget: "40%" must mean
+# 40% of each model's OWN size, not one absolute GiB number (resolved once
+# against the worker's capacity) stamped identically on every member regardless
+# of that member's actual size. `workers_alloc_all` therefore also accepts
+# `spills: {model_key: spill}` — a per-model contract map, applied by
+# `_apply_alloc_map_multi` — for exactly this case; the UI picks whichever shape
+# fits (`spill` when every member truly wants the same contract, `spills` when a
+# percent budget was resolved per model).
 _BAND_SPILL_KEYS = {"gpu_mem_gib_deviation_pct", "cpu_mem_gib_deviation_pct",
                     "ctx_pct", "ctx_deviation_pct", "priority"}
 _ALLOC_SPILL_KEYS = {"n_gpu_layers", "gpu_mem_gib", "cpu_mem_gib",
@@ -1696,6 +1834,94 @@ def _apply_alloc_map(worker_id, model_keys, spill):
     return jsonify(out)
 
 
+def _apply_alloc_map_multi(worker_id, model_keys, spills_by_key):
+    """Per-model variant of _apply_alloc_map (t48): each selected model gets its
+    OWN spill contract in the SAME one-request bulk write, instead of one shared
+    dict stamped on every key.
+
+    Root cause this exists to fix: the bulk editor's PERCENT budgets (VRAM/RAM)
+    used to resolve once client-side against the WORKER's capacity into a single
+    absolute GiB number, then that one number rode as `spill` and was applied
+    identically to every selected model — correct (at best) for whichever model
+    that absolute actually matched, wrong for every other member of a
+    differently-sized group (operator, t48: "...not the total for the
+    particular model that happened to be the first in the list's actual ram
+    alloc"). The fix resolves the percent PER MODEL (against that model's own
+    effective size) client-side, then sends the resulting per-model absolutes
+    here in one request via `spills: {model_key: spill}` instead of one shared
+    `spill` — still no percent concept on the wire, just fanned per key.
+
+    Same registry write, same engine gate (computed per key off that key's OWN
+    spill, since different members can carry different explicit-budget keys),
+    same warm-reseat, same response shape as _apply_alloc_map."""
+    from .comms_routes import audit
+
+    worker = get_worker(worker_id)
+    if worker is None:
+        abort(404, description="Unknown worker id.")
+    # Only act on keys ACTUALLY designated to this worker — same staleness guard
+    # as _apply_alloc_map.
+    designated = set(worker.get("models") or [])
+    keys = [mk for mk in (model_keys or []) if mk in designated]
+    off_worker = [mk for mk in (model_keys or []) if mk not in designated]
+    audit("worker.alloc_all", {"worker_id": worker_id,
+                               "worker": worker.get("name"),
+                               "model_keys": keys,
+                               "spills": {mk: (spills_by_key.get(mk) or {}) for mk in keys},
+                               "alloc": "per-model", "per_model": True})
+    if not keys:
+        out = {"ok": True, "alloc": "per-model", "results": {},
+               "counts": {"ok": 0, "error": 0, "skipped": 0, "total": 0},
+               "restarting": False,
+               "note": "none of the selected models are designated to this worker"}
+        if off_worker:
+            out["off_worker"] = off_worker
+        return jsonify(out)
+    results = {}
+    okN = 0
+    skipN = 0
+    for mk in keys:
+        spill = spills_by_key.get(mk) or {}
+        # ENGINE GATE: same rule as the broadcast path, evaluated against THIS
+        # key's own spill (a per-model map can carry different explicit-budget
+        # keys per member, unlike the single shared `spill`).
+        if _alloc_is_gguf_only(spill):
+            fw = _model_framework(mk)
+            if not _is_gguf_framework(fw):
+                shown = fw or "unknown engine"
+                results[mk] = (f"skipped — {_alloc_label(spill)} is a GGUF-only "
+                               f"allocation; this model is {shown}")
+                skipN += 1
+                continue
+        try:
+            # assign_model writes spill_by_model[mk] = spill ({} clears it).
+            w = assign_model(worker_id, mk, spill=spill)
+            if w is None:
+                results[mk] = "worker vanished mid-apply"
+            else:
+                results[mk] = "ok"
+                okN += 1
+        except Exception as exc:  # noqa: BLE001 — one bad key must not abort the rest
+            results[mk] = f"{type(exc).__name__}: {exc}"
+    # Re-seat the models whose files are already on the box, same seat-now
+    # policy _apply_alloc_map uses.
+    try:
+        w2 = get_worker(worker_id) or worker
+        local = set(w2.get("models_local") or [])
+        seat = [mk for mk in keys if mk in local and results.get(mk) == "ok"]
+        if seat:
+            _kick_warm(w2, seat, "alloc_all")
+    except Exception:  # noqa: BLE001 — the warm is best-effort, never fails the write
+        pass
+    errN = len(keys) - okN - skipN
+    out = {"ok": errN == 0, "alloc": "per-model", "results": results,
+           "counts": {"ok": okN, "error": errN, "skipped": skipN, "total": len(keys)},
+           "restarting": False}
+    if off_worker:
+        out["off_worker"] = off_worker
+    return jsonify(out)
+
+
 def _alloc_label(spill) -> str:
     """Human label for a spill contract (mirrors the UI's spillLabel)."""
     if not spill:
@@ -1717,19 +1943,44 @@ def _alloc_label(spill) -> str:
 
 @worker_bp.route("/llm/workers/<worker_id>/alloc-all", methods=["POST"])
 def workers_alloc_all(worker_id):
-    """Bulk-alloc (todo t15): set the GPU ALLOCATION (spill contract) of a
-    SELECTED set of this worker's designated models in ONE request, via the same
-    registry write the single-model alloc uses (assign_model). Body:
-    ``{"model_keys": [...], "spill": {...}|{}|null}`` where spill mirrors the
-    editor (autofit={} / max GPU={n_gpu_layers:-1} / CPU only={n_gpu_layers:"off"}
-    / custom budgets). NO agent restart — a spill is a registry contract applied
-    on next load. Operator-gated + audited like the single /assign."""
+    """Bulk-alloc (todo t15; per-model % t48): set the GPU ALLOCATION (spill
+    contract) of a SELECTED set of this worker's designated models in ONE
+    request, via the same registry write the single-model alloc uses
+    (assign_model). Body is EITHER:
+      ``{"model_keys": [...], "spill": {...}|{}|null}`` — ONE contract
+        BROADCAST to every selected key (autofit={} / max GPU={n_gpu_layers:-1}
+        / CPU only={n_gpu_layers:"off"} / custom budgets) — unchanged since
+        t15; OR
+      ``{"model_keys": [...], "spills": {model_key: {...}|{}|null, ...}}`` —
+        (t48) a PER-MODEL contract, one entry per selected key. This is how the
+        bulk editor's PERCENT VRAM/RAM budgets ride the wire: the UI resolves
+        each model's percent against ITS OWN effective size client-side (no
+        percent concept lands here either — same "no schema change for the
+        percent itself" posture as t15, the wire still only ever sees resolved
+        GiB) and sends the resulting per-model absolutes in one request instead
+        of one flat number broadcast to every member regardless of its size.
+    NO agent restart — a spill is a registry contract applied on next load.
+    Operator-gated + audited like the single /assign."""
     body = request.get_json(silent=True) or {}
     model_keys = body.get("model_keys")
     if not isinstance(model_keys, list) or not model_keys:
         return jsonify({"ok": False, "error": {
             "code": "BadValue",
             "message": 'model_keys must be a non-empty list of model keys'}}), 400
+    spills_in = body.get("spills")
+    if spills_in is not None:
+        if not isinstance(spills_in, dict):
+            return jsonify({"ok": False, "error": {
+                "code": "BadValue",
+                "message": "spills must be an object of {model_key: spill}"}}), 400
+        per_key = {}
+        for mk in model_keys:
+            clean, reason = _validate_alloc_spill(spills_in.get(mk))
+            if reason is not None:
+                return jsonify({"ok": False, "error": {
+                    "code": "BadValue", "message": f"spills[{mk}]: {reason}"}}), 400
+            per_key[mk] = clean
+        return _apply_alloc_map_multi(worker_id, model_keys, per_key)
     clean, reason = _validate_alloc_spill(body.get("spill"))
     if reason is not None:
         return jsonify({"ok": False, "error": {
@@ -2033,6 +2284,21 @@ def _worker_fit(model_key, worker):
         return {"fit": None, "gpu_resident": None, "need": None, "need_raw": None,
                 "vram_free": vram, "ram_free": ram, "reason": "model size unknown — not preflighted"}
     need = int(need_raw * VRAM_HEADROOM)
+    # t28 load-and-learn: refine the VRAM-residency estimate with the learned,
+    # per-model correction (median measured/predicted from real loads), clamped +
+    # gated central-side. Applied to `need` (drives gpu_resident + the human hint)
+    # so the preflight agrees with the worker's own corrected admission; the hard
+    # combined-capacity block below stays on the raw size, so calibration can
+    # only make the residency hint MORE accurate, never invent a new refusal.
+    calibration_correction = None
+    try:
+        from abstract_hugpy_dev.comms.calibration import calibration_store as _cal
+        _c = _cal.correction_for(model_key)
+        if _c:
+            need = int(need * float(_c))
+            calibration_correction = float(_c)
+    except Exception:  # noqa: BLE001 — learned pricing is additive; never break fit
+        calibration_correction = None
     capacity = (vram or 0) + (ram or 0)
     fit = (need_raw <= capacity) if capacity else None
     gpu_resident = (vram is not None) and (need <= vram)
@@ -2082,6 +2348,7 @@ def _worker_fit(model_key, worker):
     return {"fit": fit, "gpu_resident": gpu_resident, "need": need, "need_raw": need_raw,
             "vram_free": vram, "ram_free": ram, "capacity": capacity,
             "headroom": VRAM_HEADROOM, "reason": reason,
+            "calibration_correction": calibration_correction,
             "band_floor_bytes": band_floor_bytes,
             "band_floor_admissible": band_floor_admissible,
             "partial_offload_admissible": partial_offload_admissible}
