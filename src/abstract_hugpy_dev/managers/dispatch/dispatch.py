@@ -242,6 +242,11 @@ def ensure_headroom_for_load(model_key: str) -> List[str]:
         if isinstance(verdict, dict):
             evicted.extend(v for v in (verdict.get("evicted") or [])
                            if v not in evicted)
+            # action == "partial": the full weights don't fit, but the worker
+            # admitted an honest GGUF PARTIAL offload (autofit's hybrid). It is an
+            # ADMIT, not a refusal — the in-process llama_cpp load then reads the
+            # pinned n_gpu_layers via spill.gguf_gpu_layers (set on the served
+            # path by the same admission), so we neither raise nor re-price.
             if verdict.get("action") == "refuse":
                 raise LoadRefusal(verdict.get("reason") or
                                   {"reason": "won't fit on GPU", "model_key": model_key})

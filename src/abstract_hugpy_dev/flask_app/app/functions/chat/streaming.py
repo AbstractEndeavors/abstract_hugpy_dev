@@ -16,6 +16,47 @@ def sse_event(payload: dict) -> bytes:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
 
 
+# Stages a status event may carry that mean "the model is being made ready"
+# (the cold-load HOLD, t36, and the worker's own provisioning). Any of them
+# moves the job to `processing`/`awaiting-load` so it reads honestly and its
+# progressed_at is fed (never orphan-expired mid-load).
+_LOADING_STAGES = ("awaiting-load", "loading", "provision")
+
+
+def _feed_job_from_status(rid, event) -> None:
+    """Reflect a chat status event into the shared job (F5). Best-effort — job
+    bookkeeping must never break a chat.
+
+    * dispatch banner (``served_by``): stamp the SELECTED worker onto the job.
+      The pending-orphan sweep only expires WORKER-LESS pending rows, so a call
+      that IS placed on a worker and loading can no longer be auto-expired.
+    * awaiting-load / provisioning progress: move the job to ``processing`` +
+      stage ``awaiting-load`` and mirror progress; ``update`` bumps
+      ``progressed_at`` on a status/stage/progress advance, feeding the honest
+      stall clock while the load churns."""
+    from abstract_hugpy_dev.comms import job_store
+    try:
+        if getattr(event, "served_by", None) is not None:
+            if getattr(event, "served_by", None) == "worker":
+                wname = (getattr(event, "worker_name", None)
+                         or getattr(event, "worker_id", None))
+                if wname:
+                    job_store.update(rid, worker=str(wname))
+            return
+        stage = getattr(event, "stage", None)
+        if stage in _LOADING_STAGES:
+            changes = {"status": "processing", "stage": stage}
+            prog = getattr(event, "progress", None)
+            if isinstance(prog, (int, float)):
+                changes["progress"] = float(prog)
+            msg = getattr(event, "message", None)
+            if msg:
+                changes["message"] = str(msg)
+            job_store.update(rid, **changes)
+    except Exception:
+        pass
+
+
 def event_to_sse(ev) -> bytes:
     """Serialize a dispatch StreamEvent to the browser's SSE wire shape.
 
@@ -201,8 +242,24 @@ async def stream_events(body: ChatBody):
     try:
         async for event in execute_chat_stream(cancel_event=cancel_event,
                                                **prompt_kwargs):
-            if getattr(event, "type", None) == "token":
+            etype = getattr(event, "type", None)
+            if etype == "token":
                 job_store.on_output(rid)
+            elif etype == "status":
+                # A HELD cold call (t36) surfaces its dispatch worker + load
+                # progress as status events. Reflect them into the job so the row
+                # reads honestly (stage `awaiting-load`, progress) AND its
+                # progressed_at stays fed — a placed, loading call must never be
+                # retired by the pending-orphan sweep while its load churns.
+                _feed_job_from_status(rid, event)
+            elif etype == "error":
+                # Surface an honest failure ON the job (first-terminal-wins; the
+                # finally's finish() then no-ops). Covers the held-load-gave-up
+                # and honest-refusal cases so /llm/jobs shows failed, not done.
+                try:
+                    job_store.finish(rid, error=getattr(event, "message", "error"))
+                except Exception:
+                    pass
             yield event_to_sse(event)
     except Exception as exc:
         logger.exception("stream_events failed")

@@ -53,11 +53,35 @@ def _reconcile_default(configured: str, registry: Dict[str, ModelConfig],
     prefer_task, then key order for determinism). Never picks a model that
     would need a download — when nothing usable is installed, the configured
     name is returned unchanged so resolve_model_key's 'not in MODEL_REGISTRY'
-    error stays accurate instead of surprise-downloading a stand-in."""
-    if not registry or configured in registry:
+    error stays accurate instead of surprise-downloading a stand-in.
+
+    Operator BLOCK (central pool primitive): a blocked model is never resolved by
+    this fallback ladder — the configured default/agent-brain is SKIPPED when
+    blocked (with an honest log line) and a stand-in installed, non-blocked model
+    is chosen instead. Blocked candidates are excluded from the stand-in set too.
+    Guarded: any blocklist failure degrades to "nothing blocked" (fail-open)."""
+    if not registry:
         return configured
 
-    installed = {k: cfg for k, cfg in registry.items() if _on_disk(cfg)}
+    # Guarded read of the operator block set (blocklist lives in stdlib-only
+    # comms; a failure here must never break config import).
+    try:
+        from abstract_hugpy_dev.comms.blocklist import blocked_keys as _blocked_keys
+        blocked = _blocked_keys()
+    except Exception:  # noqa: BLE001
+        blocked = set()
+
+    if configured in registry and configured not in blocked:
+        return configured
+    if configured in blocked:
+        import logging as _logging
+        _logging.getLogger(__name__).info(
+            "default/agent-brain candidate %s is BLOCKED from the serving pool "
+            "by the operator — skipping it and standing in an installed model",
+            configured)
+
+    installed = {k: cfg for k, cfg in registry.items()
+                 if k not in blocked and _on_disk(cfg)}
     if prefer_task:
         preferred = {k: cfg for k, cfg in installed.items() if prefer_task in cfg.tasks}
         installed = preferred or installed

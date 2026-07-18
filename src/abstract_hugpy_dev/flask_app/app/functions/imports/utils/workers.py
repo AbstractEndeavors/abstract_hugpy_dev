@@ -252,6 +252,28 @@ def _now() -> float:
     return time.time()
 
 
+# ── operator model BLOCK (central serving-pool primitive) ────────────────────
+# A blocked model is removed from the pool: never a routing candidate, never a
+# warm/provision target, never a fallback default. The registry lives in the F4
+# settings store (comms.blocklist); these are guarded thin wrappers so a
+# blocklist read can NEVER raise into routing (fail-open = not blocked, because
+# a routing gate that 500s is worse than a momentarily-unblocked model).
+def _model_blocked(model_key: str) -> bool:
+    try:
+        from abstract_hugpy_dev.comms.blocklist import is_blocked
+        return is_blocked(model_key)
+    except Exception:  # noqa: BLE001 — never let the block gate break selection
+        return False
+
+
+def _blocked_keys() -> set:
+    try:
+        from abstract_hugpy_dev.comms.blocklist import blocked_keys
+        return blocked_keys()
+    except Exception:  # noqa: BLE001
+        return set()
+
+
 def _is_online(worker: Dict[str, Any]) -> bool:
     last = worker.get("last_seen") or 0
     return (_now() - last) <= HEARTBEAT_TIMEOUT_SECONDS
@@ -1833,6 +1855,20 @@ class WorkerStore:
                           pool: Optional[str] = None,
                           task: Optional[str] = None,
                           require_comfy_id_lock: bool = False) -> List[Dict[str, Any]]:
+        # Operator BLOCK gate (central pool primitive): a blocked model is
+        # removed from the pool entirely — no worker is EVER a candidate for it,
+        # regardless of assignment/pin. Block outranks pin (pin is routing
+        # persistence; block is an operator override), so a pinned+blocked model
+        # simply yields no candidates here while its designation row stays
+        # recorded (inert). One honest log line, same say-why spirit as the gates
+        # below; returns before any per-worker work.
+        if _model_blocked(model_key):
+            import logging as _logging
+            _logging.getLogger(__name__).info(
+                "model %s is BLOCKED from the serving pool by the operator — "
+                "no worker is a routing candidate (unblock to route again)",
+                model_key)
+            return []
         wanted = _match_keys(model_key)
         want_pool = (pool or "").strip()
         need_tier = env_tier_for_model(model_key)
@@ -2198,6 +2234,77 @@ def candidates_for_model(model_key: str, pool: Optional[str] = None,
     return worker_store.candidates_for_model(model_key, pool=pool, task=task)
 
 
+def load_state_for_model(model_key: str, worker_id: str,
+                         since_ts: float = 0.0) -> Optional[Dict[str, Any]]:
+    """The cold-load HOLD's view (t36) of ``model_key`` on ``worker_id``.
+
+    Reads the worker's LIVE heartbeat state — no worker-side change — and returns
+    a compact status the core hold loop (resolvers.remote) consults:
+
+      {"healthy": bool,       # resident/loaded now (ready to serve)
+       "in_progress": bool,    # weights loading OR still downloading now
+       "progress": float|None, # download fraction when provisioning
+       "message": str|None,    # human progress line (from provision_progress)
+       "error": str|None}      # a FRESH (ts>=since_ts) honest load failure
+
+    ``error`` is only the worker's own last_load_error (load_reports, ok False)
+    that is NEWER than ``since_ts`` — a stale error from a prior request never
+    fails a fresh hold. It is returned VERBATIM; the core classifies transient vs
+    honest so this stays a dumb reader. Returns None on any failure / unknown
+    worker (the hold then degrades to a blind bounded retry)."""
+    try:
+        w = worker_store.get(worker_id)
+        if not w:
+            return None
+        wanted = _match_keys(model_key)
+
+        def _member(coll) -> Optional[str]:
+            for m in (coll or []):
+                if m == model_key or (_match_keys(m) & wanted):
+                    return m
+            return None
+
+        loaded = _member(w.get("loaded_models"))
+        in_prog = bool(_member(w.get("loading")) or _member(w.get("provisioning")))
+
+        progress = None
+        message = None
+        pp = w.get("provision_progress") or {}
+        if isinstance(pp, dict):
+            for k, v in pp.items():
+                if (k == model_key or (_match_keys(k) & wanted)) and isinstance(v, dict):
+                    progress = v.get("progress")
+                    message = v.get("message")
+                    in_prog = True
+                    break
+
+        error = None
+        reports = w.get("load_reports") or {}
+        if isinstance(reports, dict):
+            for k, v in reports.items():
+                if not isinstance(v, dict):
+                    continue
+                if not (k == model_key or (_match_keys(k) & wanted)):
+                    continue
+                try:
+                    fresh = float(v.get("ts") or 0) >= float(since_ts or 0)
+                except (TypeError, ValueError):
+                    fresh = False
+                if v.get("ok") is False and fresh:
+                    error = str(v.get("error") or "load failed")
+                break
+
+        return {
+            "healthy": bool(loaded),
+            "in_progress": in_prog,
+            "progress": progress,
+            "message": message,
+            "error": error,
+        }
+    except Exception:  # noqa: BLE001 — advisory only, never break the hold
+        return None
+
+
 def explain_no_worker(model_key: str, pool: Optional[str] = None,
                       task: Optional[str] = None) -> str:
     """Human reason no worker took a request for ``model_key`` — the ``detail`` the
@@ -2214,6 +2321,18 @@ def explain_no_worker(model_key: str, pool: Optional[str] = None,
     ANY error: this is advisory and must never raise into a request.
     """
     try:
+        # Operator BLOCK is the FIRST, most-specific reason — surfaced even when
+        # the model has no assigned worker (unlike the static-gate walk below,
+        # which only names DESIGNATED-but-excluded boxes). This is what turns the
+        # refused-local error into a distinct "blocked from the serving pool by
+        # the operator" line instead of a generic "no worker available".
+        try:
+            from abstract_hugpy_dev.comms.blocklist import block_reason as _br
+            _blk = _br(model_key)
+        except Exception:  # noqa: BLE001 — advisory; never raise into a request
+            _blk = None
+        if _blk:
+            return _blk
         wanted = _match_keys(model_key)
         want_pool = (pool or "").strip()
         need_tier = env_tier_for_model(model_key)
@@ -2395,6 +2514,17 @@ try:
         import logging as _logging
         _logging.getLogger(__name__).info(
             "no-worker diagnostic not registered (older core): %s", _exc3)
+    # Cold-load HOLD load-state (t36): lets the core hold a FEASIBLE-but-COLD
+    # call as a presumed success, surfacing the worker's live load progress and
+    # honest last_load_error. Central-only (reads the heartbeat); optional in
+    # older cores — guarded; unset ⇒ the hold degrades to a blind bounded retry.
+    try:
+        from ......managers.resolvers.remote import set_load_state_provider
+        set_load_state_provider(load_state_for_model)
+    except Exception as _exc4:  # older core without the seam — hold degrades
+        import logging as _logging
+        _logging.getLogger(__name__).info(
+            "load-state provider not registered (older core): %s", _exc4)
 except Exception as _exc:  # never let registration break importing the pool
     import logging as _logging
     _logging.getLogger(__name__).warning("worker provider registration failed: %s", _exc)

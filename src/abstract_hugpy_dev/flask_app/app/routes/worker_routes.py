@@ -70,6 +70,24 @@ _warm_busy: set = set()        # worker_ids with a warm thread in flight
 _warm_lock = _threading.Lock()
 
 
+def _model_blocked(model_key: str) -> bool:
+    """Operator BLOCK check — guarded (fail-open = not blocked). See
+    comms.blocklist. A blocked model is never warmed/probed/provisioned."""
+    try:
+        from abstract_hugpy_dev.comms.blocklist import is_blocked
+        return is_blocked(model_key)
+    except Exception:  # noqa: BLE001 — never let the block gate break a sweep
+        return False
+
+
+def _blocked_keys() -> set:
+    try:
+        from abstract_hugpy_dev.comms.blocklist import blocked_keys
+        return blocked_keys()
+    except Exception:  # noqa: BLE001
+        return set()
+
+
 def _kick_warm(worker, model_keys, source: str) -> list:
     """Probe the given models on the worker in ONE background thread.
 
@@ -79,6 +97,15 @@ def _kick_warm(worker, model_keys, source: str) -> list:
     wid = (worker or {}).get("id") or ""
     base = ((worker or {}).get("url") or "").rstrip("/")
     if not wid or not base:
+        return []
+    # Operator BLOCK is the single choke on central-initiated PROVISIONING: a
+    # warm probe DOWNLOADS an absent model onto the worker (ensure_model_present),
+    # so filtering here stops every central pull path (reconcile-warm AND
+    # assign-warm AND any future caller) for a blocked model — never a routing
+    # candidate, never a transfer target.
+    blocked = _blocked_keys()
+    model_keys = [mk for mk in (model_keys or []) if mk not in blocked]
+    if not model_keys:
         return []
     now = _time.monotonic()
     with _warm_lock:
@@ -261,6 +288,10 @@ def _reconcile_warm_set(worker) -> list:
     static = {k for k, v in (cfg.get("residency") or {}).items() if v == "static"}
     whitelist = set(cfg.get("warm_whitelist") or [])
     curated = (_immutable_warm_defaults() | static | whitelist) & present
+    # Operator BLOCK outranks warm: a blocked model is never kept warm, even if
+    # it is an immutable task-default / static / whitelisted. Intersect the
+    # curated set with not-blocked (the ∩ enforcement #3 asks for).
+    curated -= _blocked_keys()
     return sorted(curated)
 
 
@@ -978,6 +1009,14 @@ def workers_assign(worker_id):
         # slip (e.g. "Wan2.1-VACE-1.3B" the display name vs the "Wan-AI~..." key).
         return jsonify({"error": f"unknown model key '{body.model_key}' — it is "
                         "not in central's manifest"}), 404
+    # Operator BLOCK gate: a blocked model may not be (re)designated to any
+    # worker. Clear 409 with the fix, same shape as the disk/engine refusals
+    # below. Existing designations are left recorded (inert) — block does not
+    # auto-unassign — so this only stops NEW assignments while blocked.
+    if _model_blocked(body.model_key):
+        return jsonify({"error": f"'{body.model_key}' is blocked from the serving "
+                        "pool by the operator — unblock it (Models tab) before "
+                        "assigning it to a worker"}), 409
     # Item 4 guard: a model can't be designated unless central itself holds the
     # files — otherwise the worker silently pulls ~50GB from HF at internet
     # speed (the 2026-07-03 sdxl-turbo saga). Clear 409 with the fix.
@@ -2019,6 +2058,14 @@ def _worker_fit(model_key, worker):
                 band_floor_admissible = band_floor_bytes <= vram
         except Exception:  # noqa: BLE001 — band math is additive; never break fit
             band_floor_bytes = None
+    # ── partial-offload mirror (t21 stage 2.5): the worker now DEGRADES an
+    # oversize GGUF to an honest hybrid (offload the layers that fit, stream the
+    # rest to CPU RAM) instead of hard-refusing. Central's feasibility must AGREE:
+    # a model that fits combined VRAM+RAM but not VRAM outright is admissible as a
+    # partial offload. Additive boolean; never changes the base fit/gpu_resident
+    # verdict (the human `reason` for this case already reads "would partially
+    # offload to CPU"). The worker makes the real, geometry-aware call at load.
+    partial_offload_admissible = bool(fit and not gpu_resident)
     if fit is False:
         reason = (f"won't fit {where}: model is {need_raw/gib:.1f} GiB but only "
                   f"{(vram or 0)/gib:.1f} GiB VRAM + {(ram or 0)/gib:.1f} GiB RAM free "
@@ -2036,7 +2083,8 @@ def _worker_fit(model_key, worker):
             "vram_free": vram, "ram_free": ram, "capacity": capacity,
             "headroom": VRAM_HEADROOM, "reason": reason,
             "band_floor_bytes": band_floor_bytes,
-            "band_floor_admissible": band_floor_admissible}
+            "band_floor_admissible": band_floor_admissible,
+            "partial_offload_admissible": partial_offload_admissible}
 
 
 def _worker_already_has(worker: dict, model_key: str) -> bool:
@@ -2053,6 +2101,54 @@ def _worker_already_has(worker: dict, model_key: str) -> bool:
     if model_key in (worker.get("grants") or {}):
         return True
     return False
+
+
+@worker_bp.route("/llm/models/<path:model_key>/block", methods=["POST"])
+def model_block(model_key):
+    """Operator BLOCK a model from the SERVING POOL (global).
+
+    A blocked model is never routed to, never (re)designated/assigned, never
+    warmed/provisioned by a sweep, and never resolved by a fallback ladder — its
+    files stay on disk and its existing designation rows stay recorded (inert).
+    Block is a ROUTING override that outranks pin (pin is routing persistence;
+    block is an operator override) — this does NOT auto-unassign and does NOT
+    fight the pin's unassign-409. Reversible via /unblock.
+
+    Operator-gated in operator_auth._SENSITIVE (same tier as assign). Body
+    (optional): {"note": str}. Idempotent; returns the block record + the
+    manifest membership so the console can reflect state immediately."""
+    if model_key not in get_models_dict(dict_return=True):
+        return jsonify({"error": f"unknown model key '{model_key}' — it is not in "
+                        "central's manifest"}), 404
+    body = request.get_json(silent=True) or {}
+    from abstract_hugpy_dev.comms.blocklist import block as _block
+    rec = _block(model_key, by="operator", note=body.get("note"))
+    try:
+        from .comms_routes import audit
+        audit("model.block", {"model_key": model_key, "note": body.get("note")})
+    except Exception:  # noqa: BLE001 — audit is best-effort, never fatal
+        pass
+    return jsonify({"ok": True, "model_key": model_key, "blocked": True,
+                    "block": rec})
+
+
+@worker_bp.route("/llm/models/<path:model_key>/unblock", methods=["POST"])
+def model_unblock(model_key):
+    """Operator UNBLOCK a model — return it to the serving pool. The undo for
+    /block. Idempotent (unblocking a non-blocked model is a no-op that reports
+    ``was_blocked: false``). Operator-gated like /block."""
+    if model_key not in get_models_dict(dict_return=True):
+        return jsonify({"error": f"unknown model key '{model_key}' — it is not in "
+                        "central's manifest"}), 404
+    from abstract_hugpy_dev.comms.blocklist import unblock as _unblock
+    was = _unblock(model_key)
+    try:
+        from .comms_routes import audit
+        audit("model.unblock", {"model_key": model_key, "was_blocked": was})
+    except Exception:  # noqa: BLE001
+        pass
+    return jsonify({"ok": True, "model_key": model_key, "blocked": False,
+                    "was_blocked": was})
 
 
 @worker_bp.route("/llm/models/<path:model_key>/placement", methods=["GET"])
@@ -2073,6 +2169,18 @@ def model_placement_preview(model_key):
     """
     if not _transfer_authorized():
         abort(401, description="Worker enrollment or operator token required.")
+
+    # Operator BLOCK: report "blocked" as the honest winner_reason rather than
+    # walking the fleet and claiming fake-infeasibility. Additive `blocked:true`
+    # so the console can render the distinct state; no worker is a candidate.
+    if _model_blocked(model_key):
+        return jsonify({
+            "model_key": model_key, "size_bytes": None, "workers": [],
+            "feasible_workers": [], "winner": None,
+            "winner_reason": (f"'{model_key}' is blocked from the serving pool by "
+                              "the operator — unblock it to place it"),
+            "blocked": True,
+        })
 
     size_bytes = None
     try:

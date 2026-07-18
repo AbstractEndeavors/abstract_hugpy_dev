@@ -219,6 +219,11 @@ class SlotPool:
         Returns the slot's inference endpoint, or None when every slot is busy
         with a different model (caller should fall back to swap).
         """
+        # The opts actually applied to the /load. The cross-tier make-room hook
+        # (below) may hand back a PARTIAL-offload plan for an oversize GGUF — the
+        # honest layers-that-fit count — which we thread in here so the slot child
+        # launches with --n-gpu-layers N (not the shard-blind autofit -1).
+        eff_opts = dict(opts or {})
         statuses = self.statuses()
 
         # 1. already serving OR currently loading it — reuse, never load a 2nd
@@ -274,6 +279,23 @@ class SlotPool:
                             verdict = _MAKE_ROOM(model_key)
                         except Exception:  # noqa: BLE001 — never hang a request
                             verdict = None
+                        # PARTIAL-offload admission (autofit's hybrid contract): the
+                        # full weights don't fit even after eviction, but the honest
+                        # layers-that-fit plan admits. Launch the child with that
+                        # exact n_gpu_layers and stop looping the (full-need) ceiling
+                        # check — it can never pass, and re-looping would spin.
+                        if (isinstance(verdict, dict)
+                                and verdict.get("action") == "partial"
+                                and verdict.get("n_gpu_layers") is not None):
+                            eff_opts["n_gpu_layers"] = verdict["n_gpu_layers"]
+                            logger.info(
+                                "VRAM ceiling: %s admitted as a PARTIAL offload — "
+                                "%s/%s layers on GPU (%s%%); launching child with "
+                                "--n-gpu-layers %s", model_key,
+                                verdict["n_gpu_layers"],
+                                (verdict.get("partial") or {}).get("total_layers"),
+                                verdict.get("gpu_pct"), verdict["n_gpu_layers"])
+                            break
                         if isinstance(verdict, dict) and verdict.get("evicted"):
                             statuses = self.statuses()
                             continue         # re-check the ceiling with the freed room
@@ -294,7 +316,7 @@ class SlotPool:
             if "error" in s:
                 continue
             if not s.get("model_key"):
-                body = {"model_key": model_key, **(opts or {})}
+                body = {"model_key": model_key, **eff_opts}
                 resp = _post(s["_control"] + "/load", body, load_timeout)
                 if isinstance(resp, dict) and resp.get("error"):
                     raise RuntimeError(f"slot load failed: {resp['error']}")
@@ -327,7 +349,7 @@ class SlotPool:
                     logger.warning("promotion evict failed on %s: %s",
                                    victim["_control"], exc)
                     continue
-                body = {"model_key": model_key, **(opts or {})}
+                body = {"model_key": model_key, **eff_opts}
                 resp = _post(victim["_control"] + "/load", body, load_timeout)
                 if isinstance(resp, dict) and resp.get("error"):
                     raise RuntimeError(f"slot load failed: {resp['error']}")

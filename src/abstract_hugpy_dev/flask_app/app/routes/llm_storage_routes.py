@@ -107,10 +107,28 @@ def _annotate_size(model: dict, mk: str) -> None:
 def list_models():
     manifest = get_models_dict(dict_return=True)
     media_default = media_default_state()
+    # Operator BLOCK set (guarded — a listing must never 500 over the blocklist).
+    try:
+        from abstract_hugpy_dev.comms.blocklist import blocked_keys, block_info
+        _blocked = blocked_keys()
+    except Exception:  # noqa: BLE001
+        _blocked, block_info = set(), (lambda _k: None)
     output = []
     for key, model in manifest.items():
         model = update_model_status(model)
         mk = model.get("model_key") or key
+        # Operator BLOCK state (additive): ⛔ blocked from the serving pool. The
+        # console renders the chip + block/unblock control off this flag; the
+        # full record (by/ts/note) rides `block` for the tooltip.
+        model["blocked"] = (mk in _blocked) or (key in _blocked)
+        if model["blocked"]:
+            model["block"] = block_info(mk) or block_info(key)
+        else:
+            # get_models_dict returns the cached manifest dicts (mutated in place
+            # like model["media"] below), so a stale `block` record from a prior
+            # blocked read must be cleared on unblock — the `blocked` bool alone
+            # is not enough.
+            model.pop("block", None)
         # Whether this model is offered in the media-intelligence chat dropdown.
         model["media"] = media_state(mk)
         # Whether this model is THE preselected default for the media chat.

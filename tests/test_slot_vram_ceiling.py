@@ -227,4 +227,50 @@ finally:
     (slots._EVICTION_POLICY, slots._FIT_CHECK, slots._RESIDENCY_LOOKUP,
      slots._post, slots._get) = _ep_saved
 
+
+# ===========================================================================
+# Part 3 — PARTIAL offload (t21 stage 2.5): the cross-tier make-room hook hands
+# back an honest layers-that-fit plan for an oversize GGUF; endpoint_for must
+# launch the child with --n-gpu-layers N (not the shard-blind autofit) and stop
+# spinning the (full-need) ceiling loop.
+# ===========================================================================
+def _body_recorder(pool):
+    def fake_post(url, body, timeout):
+        pool.loaded.append((url, body))          # capture the WHOLE body
+        return {"endpoint": url.replace("/load", "") + "/infer"}
+    return fake_post
+
+
+_p3_saved = (slots._EVICTION_POLICY, slots._FIT_CHECK, slots._RESIDENCY_LOOKUP,
+             slots._MAKE_ROOM, slots._post, slots._get)
+try:
+    slots._get = lambda url, timeout=3.0: {}
+    slots.set_eviction_policy(lambda mk: False)   # nothing slot-side is evictable
+    slots.set_residency_lookup(lambda mk: "on-demand")
+    slots.set_fit_check(lambda mk: False)         # ALWAYS over ceiling (full need)
+    # make-room admits an honest partial offload of 17/48 layers.
+    slots.set_make_room(lambda mk: {
+        "action": "partial", "evicted": [], "n_gpu_layers": 17, "gpu_pct": 35,
+        "partial": {"total_layers": 48}, "reason": None})
+
+    st = [                                        # a single idle slot, nothing to evict
+        {"_control": "http://s0", "model_key": None, "healthy": True,
+         "busy": False, "last_used": 0.0, "endpoint": "http://s0"},
+    ]
+    pool = FakePool(st)
+    slots._post = _body_recorder(pool)
+    ep = pool.endpoint_for("Qwen~Qwen3-Coder-Next-GGUF", load_timeout=1.0)
+    check("(v) partial: nothing slot-side evicted (hybrid, not eviction)",
+          pool.unloaded == [])
+    check("(v) partial: loaded the model into the idle slot",
+          pool.loaded and pool.loaded[0][1].get("model_key")
+          == "Qwen~Qwen3-Coder-Next-GGUF")
+    check("(v) partial: launched the child with the honest --n-gpu-layers N",
+          pool.loaded[0][1].get("n_gpu_layers") == 17)
+    check("(v) partial: returned a usable endpoint (no hang on the ceiling loop)",
+          isinstance(ep, str) and ep)
+finally:
+    (slots._EVICTION_POLICY, slots._FIT_CHECK, slots._RESIDENCY_LOOKUP,
+     slots._MAKE_ROOM, slots._post, slots._get) = _p3_saved
+
 print(f"\nall {ok} checks passed")

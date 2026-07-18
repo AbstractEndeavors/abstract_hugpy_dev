@@ -3900,6 +3900,14 @@ _RUNTIME_SETTINGS: dict = {}             # the loaded settings, for live readers
 # reserve-small-then-serve-large (that OOMs). Cleared when the model is evicted
 # or when it later fits at target (uncontended). Empty == no active flex.
 _FLEX_CTX_FLOOR: dict = {}               # model_key -> committed compressed ctx%
+# t21 stage (2.5): the honest GGUF PARTIAL-offload the VRAM admission COMMITTED a
+# model to when its full weights don't fit the GPU even after flex+evict. Value:
+# {"path": served_quant_path, "n": n_gpu_layers}. The n rides the slot child
+# cmdline (via the verdict -> slot opts) AND pins the in-process llama_cpp load
+# (spill.set_ngl_override on the path) so a sharded model never re-OOMs on the
+# shard-blind autofit. Cleared when the model is re-admitted (re-decides) or fits
+# fully. Empty == no active partial-offload commitment.
+_PARTIAL_NGL: dict = {}                   # model_key -> {"path", "n"}
 _COMFY_URL_BASE_ENV = "_HUGPY_COMFY_URL_BASE"  # sentinel: the pre-projection
 # COMFY_URL (systemd drop-in / env / none), captured once and carried across
 # os.execv so clearing the setting reverts to the real base, never the last
@@ -4134,6 +4142,102 @@ def _flex_alloc(model_key: str) -> dict:
     directly. Kept tiny + pure-ish so building subject/resident rows is cheap."""
     return {"priority": (_RUNTIME_SETTINGS.get("priority") or {}).get(model_key),
             "ctx_deviation_pct": _ctx_deviation_pct(model_key)}
+
+
+def _vram_deviation_pct(model_key: str) -> "float | None":
+    """Per-model VRAM tolerance band (percent points, 0..100) from settings, or
+    None when unset. Symmetric with _ctx_deviation_pct; the stretch input to
+    flex.band_ceiling when the partial-offload budget may reach a model's VRAM
+    band CEILING (above its gpu_mem_gib target) under its own need. None (today,
+    until central projects gpu_mem_gib_deviation_pct into the worker settings)
+    collapses band_ceiling to the gpu_mem_gib target — the offload budget is then
+    capped at exactly the explicit gpu_mem_gib, byte-identical to autofit's cap.
+    Reads the SAME registry key central's _worker_fit mirror uses for the band
+    floor, so worker and central agree the moment central populates it."""
+    val = (_RUNTIME_SETTINGS.get("gpu_mem_gib_deviation_pct") or {}).get(model_key)
+    try:
+        d = float(val)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, min(100.0, d))
+
+
+def _gguf_ngl_intent(model_key: str) -> "tuple[str, int | None]":
+    """Decode the effective GGUF placement intent (t26) from HUGPY_N_GPU_LAYERS —
+    the SAME wire the console's Autofit / Max GPU / CPU only controls ride, set
+    per-model by _apply_spill before the load. Returns ``(intent, requested)``:
+
+      * ``"-1"``            -> ("gpu",  None)  — Max GPU (as many as fit; for an
+                                                oversize model == autofit, and it
+                                                deliberately does NOT squeeze the
+                                                ceiling reserve — see flex.plan_
+                                                partial_offload).
+      * ``0``/off/cpu/none  -> ("cpu",  None)  — CPU only (n_gpu_layers 0).
+      * positive int ``N``  -> ("auto", N)     — honor the explicit layer count,
+                                                capped to what fits.
+      * unset / ``"auto"``  -> ("auto", None)  — autofit layers-that-fit.
+
+    GGUF-only: for a GGUF a positive int IS a real layer count (unlike the
+    transformers reading in spill.n_gpu_layers_intent, which collapses it to
+    'auto'), so we decode it here rather than reuse that transformers-shaped
+    helper."""
+    raw = (os.environ.get("HUGPY_N_GPU_LAYERS") or "").strip().lower()
+    if raw in ("", "auto"):
+        return "auto", None
+    if raw in ("off", "cpu", "none"):
+        return "cpu", None
+    try:
+        n = int(raw)
+    except ValueError:
+        return "auto", None
+    if n < 0:
+        return "gpu", None
+    if n == 0:
+        return "cpu", None
+    return "auto", n
+
+
+def _served_gguf_geometry(model_key: str) -> "tuple[str | None, int | None]":
+    """``(served_quant_path, total_layers)`` for a GGUF model — the SERVED quant's
+    path and its ``.block_count``, resolved exactly as _model_kv_geometry does (no
+    parallel reader). ``(None, None)`` for non-GGUF or on any resolution miss.
+
+    Reused for BOTH the partial-offload layer math and the in-process
+    n_gpu_layers override (the same path the in-process runner will load), so the
+    plan and the load can never key off different files."""
+    try:
+        from ..imports import route_destination
+        from ..imports.config.main import get_model_config
+        cfg = get_model_config(model_key, dict_return=True)
+        if str((cfg or {}).get("framework") or "").lower() not in ("gguf", "llama_cpp"):
+            return None, None
+        path = route_destination(cfg)
+        if not path:
+            return None, None
+        try:
+            from ..managers.serve.serve import _model_file_for
+            picked = _model_file_for(model_key, get_model_config(model_key))
+            if picked:
+                path = picked
+        except Exception:  # noqa: BLE001 — fall back to the route path
+            pass
+        from ..managers import spill
+        return path, spill._gguf_layer_count(path)
+    except Exception:  # noqa: BLE001 — unresolvable geometry -> caller keeps refusal
+        return None, None
+
+
+def _clear_partial_ngl(model_key: str) -> None:
+    """Drop any committed partial-offload for ``model_key`` (this admission
+    re-decides) and clear the in-process spill override for its path, so a model
+    that now fits fully is never forced back onto a stale partial plan."""
+    prev = _PARTIAL_NGL.pop(model_key, None)
+    if prev and prev.get("path"):
+        try:
+            from ..managers import spill as _spill
+            _spill.clear_ngl_override(prev["path"])
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _resolved_ctx(model_key: str, cfg: dict | None = None) -> "tuple[int | None, int | None, int | None]":
@@ -4789,7 +4893,10 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
     # t21: every admission re-decides from TARGET — drop any stale ctx flex
     # commitment for this subject so the fit check below is against the
     # operator's target ctx, not a prior compression (uncontended == target).
+    # Same for any prior PARTIAL-offload commitment: a model that now fits fully
+    # must serve fully (-1), never stay pinned to a stale layer count.
     _FLEX_CTX_FLOOR.pop(model_key, None)
+    _clear_partial_ngl(model_key)
     total = _total_vram_bytes()
     if not total:
         return {"action": "proceed", "evicted": [], "freed_bytes": 0,
@@ -4933,10 +5040,73 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
         return {"action": "evicted", "evicted": evicted,
                 "freed_bytes": freed, "reason": None}
 
-    # Still short after a full permissible eviction -> HONEST refusal (never
-    # admit-then-OOM). Carry what's resident, what's protected + why, what we
-    # evicted, and the numbers, in the C4 vision-fit style.
     fv = _free_vram_bytes()
+
+    # ── stage (2.5): honest GGUF PARTIAL offload — autofit's hybrid contract ──
+    # Full GPU offload still doesn't fit after flex + evict. For a GGUF this is
+    # NOT a dead end: autofit's PROMISE (empty spill = the default alloc mode) is
+    # a hybrid — offload as many layers as safely fit under the ceiling reserve,
+    # stream the rest from disk to CPU RAM. This is the regression this restores:
+    # a served-many-times brain must not hard-refuse on a card that plainly holds
+    # part of it. Priced from the honest, SHARD-AWARE need split (not the shard-
+    # blind on-disk autofit), floored against a degenerate offload and against a
+    # CPU remainder that would OOM host RAM (never admit-then-OOM). GGUF/slot path
+    # only; transformers placement modes are t26 (out of scope).
+    partial = None
+    ppath, total_layers = _served_gguf_geometry(model_key)
+    if fv is not None and total_layers:
+        weights = int(_det.get("weights") or 0)
+        kv_eff = max(0, int(need) - weights)     # honors any committed ctx flex
+        budget = max(0, fv - ceiling_reserve)    # VRAM the offloaded layers may use
+        # Cap by the model's explicit VRAM band CEILING when a gpu_mem_gib budget
+        # is set (t21) — stretchable to the band ceiling under this model's own
+        # need. band_ceiling collapses to the gpu_mem_gib target when no deviation
+        # is projected (today), i.e. the same cap autofit already applies.
+        gpu_mem_gib = os.environ.get("HUGPY_GPU_MEM_GIB")
+        if gpu_mem_gib:
+            try:
+                from .flex import band_ceiling
+                cap = int(band_ceiling(float(gpu_mem_gib) * (2 ** 30),
+                                       _vram_deviation_pct(model_key), total))
+                budget = min(budget, cap)
+            except (TypeError, ValueError):
+                pass
+        intent, requested = _gguf_ngl_intent(model_key)
+        from .flex import plan_partial_offload
+        partial = plan_partial_offload(
+            weights_bytes=weights, kv_bytes=kv_eff, total_layers=total_layers,
+            vram_budget_bytes=budget, ram_free_bytes=_free_ram_bytes(),
+            intent=intent, requested_layers=requested)
+
+    if partial is not None and partial.admit:
+        # Admit the hybrid. Pin the honest layer count for the in-process
+        # llama_cpp load (overriding the shard-blind autofit that re-OOMs a
+        # sharded model) AND carry it in the verdict so the slot path launches
+        # the child with --n-gpu-layers N instead of -1. Residency is MEASURED
+        # post-load (pid-registry) and the slot status reports the real ngl, so
+        # the console/bars read the true split with no declared number to drift.
+        try:
+            from ..managers import spill as _spill
+            _spill.set_ngl_override(ppath, partial.n_gpu_layers)
+        except Exception:  # noqa: BLE001 — slot opts still carry N; override is a bonus
+            pass
+        _PARTIAL_NGL[model_key] = {"path": ppath, "n": partial.n_gpu_layers}
+        logger.info(
+            "partial offload: %s -> %d/%d layers on GPU (%d%%), ~%s VRAM + ~%s RAM "
+            "— admitting hybrid instead of refusing (budget %s, ram_free %s)",
+            model_key, partial.n_gpu_layers, partial.total_layers, partial.gpu_pct,
+            _human_bytes(partial.vram_need_bytes), _human_bytes(partial.ram_need_bytes),
+            _human_bytes(partial.vram_budget_bytes), _human_bytes(partial.ram_free_bytes))
+        return {"action": "partial", "evicted": evicted, "freed_bytes": freed,
+                "reason": None, "n_gpu_layers": partial.n_gpu_layers,
+                "gpu_pct": partial.gpu_pct, "partial": partial.as_dict(),
+                "note": f"partial GPU offload: {partial.note}"}
+
+    # Still short after eviction AND no admissible partial offload -> HONEST
+    # refusal (never admit-then-OOM). Carry what's resident, what's protected +
+    # why, what we evicted, the numbers, and — when a partial offload was
+    # CONSIDERED and rejected — what it would have been and why (degenerate offload
+    # or CPU remainder OOM), in the C4 vision-fit style.
     reason = {
         "state": "refused",
         "model_key": model_key,
@@ -4969,9 +5139,16 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
     }
     if flex_note:
         reason["flex_note"] = flex_note      # what the band flex tried, for hover
-    # The load is refused — void any ctx compression we committed for it so a
-    # future admission of this model re-decides from its target ctx.
+    if partial is not None and not partial.admit:
+        # A partial offload WAS considered and rejected — say what it would have
+        # been and why, so the refusal is honest about the hybrid it declined.
+        reason["partial_offload_considered"] = partial.as_dict()
+        reason["reason"] = reason["reason"] + "; " + (
+            partial.reject_reason or "partial GPU offload not admissible")
+    # The load is refused — void any ctx compression / partial-offload commitment
+    # we made for it so a future admission of this model re-decides from target.
     _FLEX_CTX_FLOOR.pop(model_key, None)
+    _clear_partial_ngl(model_key)
     return {"action": "refuse", "evicted": evicted, "freed_bytes": freed,
             "reason": reason}
 

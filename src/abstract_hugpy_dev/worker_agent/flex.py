@@ -170,6 +170,191 @@ def kv_at_ctx_pct(kv_at_target: Optional[int], target_pct: Optional[int],
         return int(kv_at_target or 0)
 
 
+# ── stage (2.5): honest GGUF partial-offload (autofit's contract) ────────────
+# When the FULL GGUF does not fit the GPU even after flex + evict, autofit's
+# PROMISE is a hybrid: offload as many layers as safely fit and stream the rest
+# from disk to CPU RAM — NOT a hard refusal. This is the layers-that-fit math,
+# kept PURE so the tests can assert the split, the KV proportionality, the RAM
+# guard, the degenerate floor, and the intent modes without a GPU. The agent
+# calls it AFTER its eviction loop, BEFORE building the honest refusal.
+#
+# WHY per-layer VRAM folds KV in: llama.cpp allocates the KV cache per layer, so
+# a layer offloaded to the GPU also holds its KV slice on the GPU. Pricing each
+# offloaded layer at (weights_share + kv_share) means the plan NEVER over-admits
+# the VRAM budget — the incident we're fixing was an admit-then-OOM, so the
+# budget must hold weights AND their KV, not weights alone.
+class PartialPlan:
+    """The result of :func:`plan_partial_offload`.
+
+    ``admit`` True  -> serve as a hybrid: ``n_gpu_layers`` offloaded to the GPU
+                       (holding ``vram_need_bytes``), the remainder streamed to
+                       host RAM (``ram_need_bytes``). ``gpu_pct`` is the offloaded
+                       fraction as whole percent.
+    ``admit`` False -> the hybrid was rejected (``reject_reason`` says why: a
+                       degenerate offload below the floor, or a CPU remainder that
+                       would OOM host RAM). The caller REFUSES honestly, extended
+                       with this plan so the operator sees what was considered."""
+
+    __slots__ = ("admit", "n_gpu_layers", "gpu_pct", "total_layers",
+                 "vram_need_bytes", "ram_need_bytes",
+                 "weights_gpu_bytes", "weights_cpu_bytes",
+                 "kv_gpu_bytes", "kv_cpu_bytes",
+                 "vram_budget_bytes", "ram_free_bytes",
+                 "floor_layers", "reject_reason", "note")
+
+    def __init__(self, admit, n_gpu_layers=0, gpu_pct=0, total_layers=0,
+                 vram_need_bytes=0, ram_need_bytes=0, weights_gpu_bytes=0,
+                 weights_cpu_bytes=0, kv_gpu_bytes=0, kv_cpu_bytes=0,
+                 vram_budget_bytes=0, ram_free_bytes=0, floor_layers=0,
+                 reject_reason=None, note=""):
+        self.admit = bool(admit)
+        self.n_gpu_layers = int(n_gpu_layers)
+        self.gpu_pct = int(gpu_pct)
+        self.total_layers = int(total_layers)
+        self.vram_need_bytes = int(vram_need_bytes)
+        self.ram_need_bytes = int(ram_need_bytes)
+        self.weights_gpu_bytes = int(weights_gpu_bytes)
+        self.weights_cpu_bytes = int(weights_cpu_bytes)
+        self.kv_gpu_bytes = int(kv_gpu_bytes)
+        self.kv_cpu_bytes = int(kv_cpu_bytes)
+        self.vram_budget_bytes = int(vram_budget_bytes)
+        self.ram_free_bytes = int(ram_free_bytes or 0)
+        self.floor_layers = int(floor_layers)
+        self.reject_reason = reject_reason
+        self.note = note
+
+    def as_dict(self) -> dict:
+        return {"admit": self.admit, "n_gpu_layers": self.n_gpu_layers,
+                "gpu_pct": self.gpu_pct, "total_layers": self.total_layers,
+                "vram_need_bytes": self.vram_need_bytes,
+                "ram_need_bytes": self.ram_need_bytes,
+                "weights_gpu_bytes": self.weights_gpu_bytes,
+                "weights_cpu_bytes": self.weights_cpu_bytes,
+                "kv_gpu_bytes": self.kv_gpu_bytes,
+                "kv_cpu_bytes": self.kv_cpu_bytes,
+                "vram_budget_bytes": self.vram_budget_bytes,
+                "ram_free_bytes": self.ram_free_bytes,
+                "floor_layers": self.floor_layers,
+                "reject_reason": self.reject_reason, "note": self.note}
+
+
+def plan_partial_offload(*, weights_bytes: Optional[int], kv_bytes: Optional[int],
+                         total_layers: Optional[int], vram_budget_bytes: Optional[int],
+                         ram_free_bytes: Optional[int], intent: str = "auto",
+                         requested_layers: Optional[int] = None,
+                         min_offload_frac: float = 0.05,
+                         ram_safety_frac: float = 0.95) -> Optional["PartialPlan"]:
+    """Layers-that-fit plan for an oversize GGUF — autofit's hybrid contract. PURE.
+
+    Inputs (all VRAM/RAM figures in bytes, from the caller's honest, shard-aware
+    need pricing — NOT the shard-blind on-disk file size):
+      * ``weights_bytes``    honest effective weights of the WHOLE model.
+      * ``kv_bytes``         KV-cache bytes at the resolved (possibly ctx-flexed)
+                             context — 0 when no ctx allocation is set.
+      * ``total_layers``     the GGUF's ``.block_count`` (transformer blocks).
+      * ``vram_budget_bytes``the VRAM the offloaded layers may consume = free
+                             VRAM after the ceiling reserve AND after flex+evict,
+                             already capped by any explicit VRAM band ceiling.
+      * ``ram_free_bytes``   budgetable free host RAM for the CPU remainder.
+      * ``intent``           placement intent (t26): ``"auto"``/``"gpu"`` fit as
+                             many layers as safely fit (identical for an oversize
+                             model — see below); ``"cpu"`` forces 0 GPU layers.
+      * ``requested_layers`` an explicit positive n_gpu_layers count (GGUF layer
+                             count) to honor, capped to what fits.
+
+    Returns a :class:`PartialPlan`, or ``None`` when the plan is NOT computable
+    (missing/degenerate geometry or weight size) so the caller keeps its existing
+    honest refusal unchanged.
+
+    ── "Max GPU" vs autofit (documented choice) ──────────────────────────────
+    For an OVERSIZE model both converge on the same answer: as many layers as fit
+    UNDER the ceiling reserve. "Max GPU" deliberately does NOT squeeze the ceiling
+    reserve here — doing so reintroduces the exact admit-then-OOM this fix closes.
+    The only place the two ever differ (a model that FULLY fits) never reaches
+    this function; it is admitted whole (-1) upstream.
+
+    ── The math ──────────────────────────────────────────────────────────────
+      per_layer_vram = (weights + kv) / total_layers   (KV rides its GPU layer)
+      n_gpu          = floor(budget / per_layer_vram)   (0..total_layers)
+      vram_need      = n_gpu · per_layer_vram
+      ram_need       = (total_layers − n_gpu)/total_layers · (weights + kv)
+
+    ── Floors (never admit dross, never admit-then-OOM) ──────────────────────
+      * degenerate: a NON-cpu plan whose ``n_gpu`` is below
+        ``ceil(min_offload_frac · total_layers)`` (min 1) buys negligible speed
+        for real VRAM — reject (serve CPU-only or a smaller quant instead).
+      * RAM: a CPU remainder above ``ram_free · ram_safety_frac`` would OOM host
+        RAM — reject. (``cpu`` intent is still subject to this — a CPU-only model
+        that can't fit RAM must refuse, not OOM.)
+    """
+    # Geometry / weight guards — not computable -> caller keeps its refusal.
+    try:
+        total_layers = int(total_layers)
+        weights = int(weights_bytes)
+    except (TypeError, ValueError):
+        return None
+    if total_layers <= 0 or weights <= 0:
+        return None
+    kv = max(0, int(kv_bytes or 0))
+    budget = max(0, int(vram_budget_bytes or 0))
+    ram_free = max(0, int(ram_free_bytes or 0))
+    whole = weights + kv
+    per_layer_vram = whole / float(total_layers)          # weights + KV per layer
+
+    mode = (intent or "auto").strip().lower()
+    if mode == "cpu":
+        n_gpu = 0
+    elif per_layer_vram <= 0:
+        n_gpu = 0
+    else:
+        fit = int(budget // per_layer_vram)
+        if requested_layers is not None:                  # explicit count, capped
+            try:
+                fit = min(fit, max(0, int(requested_layers)))
+            except (TypeError, ValueError):
+                pass
+        n_gpu = max(0, min(fit, total_layers))
+
+    frac = n_gpu / float(total_layers)
+    weights_gpu = int(round(weights * frac))
+    weights_cpu = max(0, weights - weights_gpu)
+    kv_gpu = int(round(kv * frac))
+    kv_cpu = max(0, kv - kv_gpu)
+    vram_need = weights_gpu + kv_gpu
+    ram_need = weights_cpu + kv_cpu
+    gpu_pct = int(round(100 * frac))
+    floor_layers = max(1, int(-(-min_offload_frac * total_layers // 1)))  # ceil
+
+    plan = PartialPlan(
+        admit=True, n_gpu_layers=n_gpu, gpu_pct=gpu_pct, total_layers=total_layers,
+        vram_need_bytes=vram_need, ram_need_bytes=ram_need,
+        weights_gpu_bytes=weights_gpu, weights_cpu_bytes=weights_cpu,
+        kv_gpu_bytes=kv_gpu, kv_cpu_bytes=kv_cpu,
+        vram_budget_bytes=budget, ram_free_bytes=ram_free, floor_layers=floor_layers,
+        note=f"{n_gpu}/{total_layers} layers on GPU ({gpu_pct}%)")
+
+    # Degenerate floor — a non-cpu hybrid that offloads almost nothing.
+    if mode != "cpu" and n_gpu < floor_layers:
+        plan.admit = False
+        plan.reject_reason = (
+            f"partial GPU offload degenerate: only {n_gpu}/{total_layers} layers "
+            f"({gpu_pct}%) fit the {budget / 2**30:.1f} GiB VRAM budget — below the "
+            f"{floor_layers}-layer floor ({int(min_offload_frac*100)}% of layers); "
+            f"serve CPU-only or pick a smaller quant")
+        return plan
+
+    # RAM guard — never admit a hybrid whose CPU remainder OOMs host RAM.
+    if ram_need > ram_free * ram_safety_frac:
+        plan.admit = False
+        plan.reject_reason = (
+            f"partial GPU offload would need ~{ram_need / 2**30:.1f} GiB host RAM "
+            f"for the {total_layers - n_gpu} CPU-resident layer(s) but only "
+            f"~{ram_free / 2**30:.1f} GiB is budgetable — would OOM system RAM")
+        return plan
+
+    return plan
+
+
 # ── the flex-before-evict decision ───────────────────────────────────────────
 class FlexPlan:
     """The result of :func:`plan_flex`.

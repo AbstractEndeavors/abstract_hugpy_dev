@@ -46,6 +46,16 @@ from .settings import (
     settings_store,
     wire_settings_events,
 )
+from .blocklist import (
+    BLOCKED_MARKER,
+    NS as BLOCKED_NS,
+    block as block_model,
+    block_info,
+    block_reason,
+    blocked_keys,
+    is_blocked,
+    unblock as unblock_model,
+)
 
 __all__ = [
     "CANONICAL_STATUSES",
@@ -72,4 +82,12 @@ __all__ = [
     "SettingsStore",
     "settings_store",
     "wire_settings_events",
+    "BLOCKED_MARKER",
+    "BLOCKED_NS",
+    "block_model",
+    "block_info",
+    "block_reason",
+    "blocked_keys",
+    "is_blocked",
+    "unblock_model",
 ]

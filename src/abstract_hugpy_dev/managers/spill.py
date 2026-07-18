@@ -650,8 +650,42 @@ def autofit_gpu_layers(model_path: str,
     return fit
 
 
+# The worker's honest partial-offload admission (agent._vram_evict_to_fit) pins an
+# EXPLICIT n_gpu_layers per SERVED-quant path here, so the in-process llama_cpp
+# load offloads exactly the admitted layer count. Without it the in-process path
+# would fall to autofit_gpu_layers, which sizes off the on-disk file (shard-1
+# only) and UNDER-counts a sharded model -> over-offloads -> the very OOM this
+# fixes. Path-keyed (not model_key) because gguf_gpu_layers only sees a path;
+# absent/None -> historical env+autofit behaviour, byte-identical.
+_NGL_OVERRIDE: dict[str, int] = {}
+
+
+def set_ngl_override(model_path, n_gpu_layers) -> None:
+    """Pin an explicit n_gpu_layers for a resolved GGUF path (the worker's honest
+    partial-offload plan). Consulted by gguf_gpu_layers BEFORE env/autofit."""
+    try:
+        _NGL_OVERRIDE[os.path.abspath(str(model_path))] = int(n_gpu_layers)
+    except (TypeError, ValueError, OSError):
+        pass
+
+
+def clear_ngl_override(model_path) -> None:
+    """Drop the partial-offload pin for a path (re-admission / full-fit re-decide)."""
+    try:
+        _NGL_OVERRIDE.pop(os.path.abspath(str(model_path)), None)
+    except (TypeError, ValueError, OSError):
+        pass
+
+
 def gguf_gpu_layers(model_path: str) -> int:
-    """Resolve n_gpu_layers for a GGUF model from env (+autofit)."""
+    """Resolve n_gpu_layers for a GGUF model: the worker's partial-offload pin
+    first (honest layers-that-fit), else env (+autofit)."""
+    try:
+        pinned = _NGL_OVERRIDE.get(os.path.abspath(model_path))
+    except (TypeError, OSError):
+        pinned = None
+    if pinned is not None:
+        return int(pinned)
     raw = _env("HUGPY_N_GPU_LAYERS")
     if raw is None or raw.lower() == "auto":
         return autofit_gpu_layers(model_path)

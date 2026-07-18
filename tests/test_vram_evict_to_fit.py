@@ -271,10 +271,108 @@ def test_ensure_headroom_raises_loadrefusal_on_make_room_refuse(monkeypatch):
 
 
 def test_ensure_headroom_returns_evicted_from_make_room(monkeypatch):
-    
+
     monkeypatch.setattr(D, "_FIT_CHECK", None)
     monkeypatch.setattr(D, "_MAKE_ROOM",
                         lambda mk: {"action": "evicted", "evicted": ["idle_slot"],
                                     "reason": None})
     out = D.ensure_headroom_for_load("subject")
     assert out == ["idle_slot"]
+
+
+def test_ensure_headroom_does_not_raise_on_partial_admit(monkeypatch):
+    # A PARTIAL verdict is an ADMIT (honest hybrid), never a refusal — the
+    # in-process load proceeds and reads the pinned n_gpu_layers via spill.
+    monkeypatch.setattr(D, "_FIT_CHECK", None)
+    monkeypatch.setattr(D, "_MAKE_ROOM",
+                        lambda mk: {"action": "partial", "evicted": [],
+                                    "n_gpu_layers": 17, "gpu_pct": 35,
+                                    "reason": None})
+    out = D.ensure_headroom_for_load("subject")   # must NOT raise LoadRefusal
+    assert out == []
+
+
+# ═══════════ stage (2.5): honest GGUF partial offload at admission ══════════
+# The oversize agent-brain incident: a GGUF whose FULL weights exceed the card
+# even on an EMPTY card was hard-refused. Autofit's promise is a hybrid — offload
+# the layers that fit, stream the rest to CPU RAM — so admission now DEGRADES to
+# a partial offload instead of refusing (GGUF/slot path only).
+@pytest.fixture
+def gguf_rig(rig, monkeypatch):
+    """Extend the base rig for the GGUF partial path: a served-quant geometry and
+    a controllable host-RAM reading."""
+    geo = {"path": "/models/coder-next/q4.gguf", "layers": 48}
+    ram = {"free": 200 * GIB}
+    monkeypatch.setattr(A, "_served_gguf_geometry",
+                        lambda mk: (geo["path"], geo["layers"]))
+    monkeypatch.setattr(A, "_free_ram_bytes", lambda: ram["free"])
+    # Clear any leftover ngl pin (module globals) so each test starts clean.
+    A._PARTIAL_NGL.clear()
+    from abstract_hugpy_dev.managers import spill as _spill
+    _spill._NGL_OVERRIDE.clear()
+    return type("GgufRig", (), {"geo": geo, "ram": ram})()
+
+
+def test_oversize_gguf_admits_as_partial_offload(rig, gguf_rig):
+    # coder-next shape: 24 GiB card, ~21 GiB free (empty-ish), 52 GiB need.
+    rig.card["free"] = 21 * GIB
+    rig.card["need"] = 52 * GIB
+    plan = A._vram_evict_to_fit(_State(), "Qwen~Qwen3-Coder-Next-GGUF")
+    assert plan["action"] == "partial"
+    assert plan["n_gpu_layers"] > 0
+    assert 0 < plan["gpu_pct"] < 100
+    # budget = 21 - 2.4 = 18.6 GiB; per-layer = 52/48 GiB -> 17 layers fit.
+    assert plan["n_gpu_layers"] == 17
+    # The in-process load is pinned to the honest count (overrides shard-blind
+    # autofit) on the served path.
+    from abstract_hugpy_dev.managers import spill
+    assert spill._NGL_OVERRIDE.get(gguf_rig.geo["path"]) == 17
+    assert A._PARTIAL_NGL["Qwen~Qwen3-Coder-Next-GGUF"]["n"] == 17
+
+
+def test_partial_refused_when_ram_cannot_hold_remainder(rig, gguf_rig):
+    rig.card["free"] = 21 * GIB
+    rig.card["need"] = 52 * GIB
+    gguf_rig.ram["free"] = 4 * GIB                 # can't hold the ~33 GiB CPU share
+    plan = A._vram_evict_to_fit(_State(), "coder")
+    assert plan["action"] == "refuse"
+    considered = plan["reason"]["partial_offload_considered"]
+    assert considered["admit"] is False
+    assert "host RAM" in considered["reject_reason"]
+    assert "host RAM" in plan["reason"]["reason"]  # extended honest message
+    # A refused hybrid pins nothing.
+    from abstract_hugpy_dev.managers import spill
+    assert gguf_rig.geo["path"] not in spill._NGL_OVERRIDE
+
+
+def test_partial_refused_when_offload_is_degenerate(rig, gguf_rig):
+    # Barely over the ceiling: tiny budget -> ~0 layers -> below the floor.
+    rig.card["free"] = 3 * GIB                      # 3 - 2.4 = 0.6 GiB budget
+    rig.card["need"] = 52 * GIB
+    plan = A._vram_evict_to_fit(_State(), "coder")
+    assert plan["action"] == "refuse"
+    assert plan["reason"]["partial_offload_considered"]["admit"] is False
+    assert "degenerate" in plan["reason"]["reason"]
+
+
+def test_non_gguf_oversize_still_refuses_unchanged(rig, monkeypatch):
+    # No GGUF geometry -> no partial attempted -> the honest refusal, unchanged.
+    monkeypatch.setattr(A, "_served_gguf_geometry", lambda mk: (None, None))
+    rig.card["free"] = 1 * GIB
+    rig.card["need"] = 30 * GIB
+    plan = A._vram_evict_to_fit(_State(), "some-transformers-model")
+    assert plan["action"] == "refuse"
+    assert "partial_offload_considered" not in plan["reason"]
+
+
+def test_full_fit_never_reaches_partial_and_pin_is_cleared(rig, gguf_rig):
+    # Fits outright -> proceed, no partial, and any stale pin is cleared at entry.
+    from abstract_hugpy_dev.managers import spill
+    spill.set_ngl_override(gguf_rig.geo["path"], 5)          # stale from a prior load
+    A._PARTIAL_NGL["subject"] = {"path": gguf_rig.geo["path"], "n": 5}
+    rig.card["free"] = 30 * GIB
+    rig.card["need"] = 2 * GIB
+    plan = A._vram_evict_to_fit(_State(), "subject")
+    assert plan["action"] == "proceed"
+    assert spill._NGL_OVERRIDE.get(gguf_rig.geo["path"]) is None   # re-decided full
+    assert "subject" not in A._PARTIAL_NGL

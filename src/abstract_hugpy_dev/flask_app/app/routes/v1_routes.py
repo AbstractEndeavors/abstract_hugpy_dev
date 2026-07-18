@@ -77,6 +77,12 @@ def v1_auth(fn):
 def v1_models():
     manifest = get_models_dict(dict_return=True)
     media_default = media_default_state()
+    # Operator BLOCK set (guarded — a listing must never 500 over the blocklist).
+    try:
+        from abstract_hugpy_dev.comms.blocklist import blocked_keys
+        _blocked = blocked_keys()
+    except Exception:  # noqa: BLE001
+        _blocked = set()
     data = []
     for key, model in manifest.items():
         model = update_model_status(model)
@@ -95,6 +101,9 @@ def v1_models():
             "tasks": model.get("tasks") or ([model.get("primary_task")] if model.get("primary_task") else []),
             "context_length": model.get("model_max_length"),
             "media_default": (key == media_default),
+            # Additive: ⛔ blocked from the serving pool by the operator. A call
+            # naming a blocked model fails fast with the distinct blocked reason.
+            "blocked": (key in _blocked),
         })
     return jsonify({"object": "list", "data": data})
 

@@ -64,6 +64,12 @@ _SENSITIVE = [
     #  — worker_routes._apply_alloc_map; same registry-write privilege as assign.)
     ({"POST"},                   re.compile(r"^/llm/workers/[^/]+/(admit|block|admission|assign|unassign|alloc-all|unload|probe|pool|limits)$")),
     ({"DELETE"},                 re.compile(r"^/llm/workers/[^/]+$")),
+    # Model-level BLOCK from the serving pool (operator pool primitive — the
+    # global sibling of the per-worker block verb above). Same operator-only tier
+    # as assign: block/unblock are routing-registry writes. model_key can contain
+    # slashes (`<path:...>`), so `.+` spans it; the GET placement/meta reads stay
+    # open. Matched after the /api strip, bare and dual-mounted.
+    ({"POST"},                   re.compile(r"^/llm/models/.+/(un)?block$")),
     # Serving / slot control (operator) — the GET status reads stay open.
     ({"POST"},                   re.compile(r"^/llm/serving/[^/]+$")),
     ({"POST"},                   re.compile(r"^/llm/slots/(load|unload)$")),
