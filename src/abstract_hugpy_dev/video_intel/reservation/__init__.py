@@ -46,6 +46,9 @@ from .engine import (
     ReservationRefused,
     acquire,
     release,
+    can_admit,
+    force_admit_safe,
+    admission_enabled,
 )
 
 __all__ = [
@@ -58,4 +61,7 @@ __all__ = [
     "ReservationRefused",
     "acquire",
     "release",
+    "can_admit",
+    "force_admit_safe",
+    "admission_enabled",
 ]

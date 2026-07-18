@@ -68,6 +68,19 @@ _STATUS_MAP = {
 _TRANSPORT = "media"
 
 
+def _placement(job_id: str, name: str):
+    """WHERE this media job executes (video_intel.placement) — a
+    {source,host,worker_id,gpu,process,reserved_bytes} object, or None. Lazily
+    imported + fully guarded (bridge discipline: zero import-time coupling, and a
+    placement hiccup can never affect the mirror or the job). Set-only-when-present
+    at the call sites so a None never blanks a placement a prior write set."""
+    try:
+        from .placement import job_placement
+        return job_placement(job_id, name)
+    except Exception:
+        return None
+
+
 def _store():
     """The comms JobStore singleton. Imported lazily (never at media_bus import
     time) so media_bus stays importable even if comms is unhappy, and so there
@@ -118,11 +131,13 @@ def _error_dict(result):
         return None
 
 
-def on_enqueue(job_id: str, name: str) -> None:
+def on_enqueue(job_id: str, name: str, principal: str | None = None) -> None:
     """queued -> pending. Mirror-ONLY (no local anchor): every gunicorn process
     then shows the job as queued via the shared mirror, and the enqueue process
     does not pin a record it will never advance. No-op when the mirror is off
-    (single-process installs still get running/terminal from the local store)."""
+    (single-process installs still get running/terminal from the local store).
+    ``principal`` (k9) rides onto the mirrored row so a queued media job is
+    attributed in /llm/jobs from the moment it lands."""
     try:
         store = _store()
         mirror = getattr(store, "mirror", None)
@@ -132,27 +147,48 @@ def on_enqueue(job_id: str, name: str) -> None:
         # snapshot()/live_rows(); building the Job locally does NOT insert it
         # into the store (no stale local shadow) — we only upsert its dict.
         from abstract_hugpy_dev.comms.jobs import Job
+        # Placement (WHERE it will run) rides onto the queued row so a held/queued
+        # heavy render shows its locus in /llm/jobs from the moment it lands. At
+        # enqueue there is no active reservation yet -> this is the TEMPLATE hint;
+        # on_running upgrades it once a claim is held. Set-only-when-present.
+        placement = _placement(job_id, name)
         row = Job(id=job_id, kind=name, status="pending",
-                  transport=_TRANSPORT, model_name=name).to_dict()
+                  transport=_TRANSPORT, model_name=name,
+                  principal=principal,
+                  **({"placement": placement} if placement else {})).to_dict()
         mirror.upsert(row)
     except Exception:
         logger.warning("job_bridge.on_enqueue failed for %s (%s)",
                        job_id, name, exc_info=True)
 
 
-def on_running(job_id: str, name: str, worker: str | None = None) -> None:
+def on_running(job_id: str, name: str, worker: str | None = None,
+               principal: str | None = None) -> None:
     """claimed/running -> processing, in the process that actually runs the job.
     Anchors a LOCAL JobStore record (create-if-missing, else advance) so this
     process owns the row for its visible life and mirrors the live status to
-    siblings."""
+    siblings. ``principal`` (k9) is carried onto that local record so the
+    attribution survives once this process's record wins over the mirror row
+    (snapshot: local records win on id)."""
     try:
         store = _store()
+        # Only carry principal when we actually have one, so a None (unattributed
+        # job) never blanks an attribution a prior write already set.
+        attrib = {"principal": principal} if principal else {}
+        # Placement — WHERE the run executes. on_running fires BEFORE the
+        # reservation acquire in run_claimed, so at first this is the TEMPLATE hint
+        # (host/gpu/process); it is refreshed to the reservation truth on the next
+        # progress push. Set-only-when-present (a None never blanks it).
+        placement = _placement(job_id, name)
+        if placement:
+            attrib["placement"] = placement
         if store.get(job_id) is None:
             store.create(id=job_id, kind=name, status="processing",
-                         worker=worker, transport=_TRANSPORT, model_name=name)
+                         worker=worker, transport=_TRANSPORT, model_name=name,
+                         **attrib)
         else:
             store.update(job_id, status="processing", worker=worker,
-                         transport=_TRANSPORT, model_name=name)
+                         transport=_TRANSPORT, model_name=name, **attrib)
     except Exception:
         logger.warning("job_bridge.on_running failed for %s (%s)",
                        job_id, name, exc_info=True)
@@ -210,6 +246,13 @@ def on_progress(job_id: str, progress: dict) -> None:
         # write a private progress shape we don't surface). No-op, no message.
         if not changes:
             return
+        # On a real progress tick, refresh placement so the row upgrades from the
+        # enqueue/on_running TEMPLATE hint to the live RESERVATION truth (real
+        # worker_id + reserved bytes) once the run's claim is held. Set-only-when-
+        # present: a None (no active claim) never blanks the template placement.
+        placement = _placement(job_id, None)
+        if placement:
+            changes["placement"] = placement
         msg = _summary(changes.get("stage", ""), changes.get("progress"))
         if msg:
             changes["message"] = msg
@@ -220,20 +263,23 @@ def on_progress(job_id: str, progress: dict) -> None:
 
 
 def on_terminal(job_id: str, name: str, status: str, result=None,
-                worker: str | None = None) -> None:
+                worker: str | None = None, principal: str | None = None) -> None:
     """done|failed|cancelled -> terminal, in the process that ran the job. Marks
     the local record terminal (retained ~600s) so GET /llm/jobs?live=0 shows the
     completed job — the JobStore's own terminal representation, NOT the mirror's
     live_rows() (which excludes terminal). On success the produced clip uri rides
-    along as the job message (back-reference to the artifact)."""
+    along as the job message (back-reference to the artifact). ``principal`` (k9)
+    is carried onto the record so a finished media job stays attributed."""
     try:
         store = _store()
         comms_status = _STATUS_MAP.get(status, "failed")
+        attrib = {"principal": principal} if principal else {}
         # Ensure a local record exists to mark terminal (defensive: normally
         # on_running already anchored it in this same process).
         if store.get(job_id) is None:
             store.create(id=job_id, kind=name, status="processing",
-                         worker=worker, transport=_TRANSPORT, model_name=name)
+                         worker=worker, transport=_TRANSPORT, model_name=name,
+                         **attrib)
         error = _error_dict(result) if comms_status == "failed" else None
         store.finish(job_id, status=comms_status, error=error)
         if comms_status == "done":

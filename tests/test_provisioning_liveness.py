@@ -192,9 +192,16 @@ def test_other_guards_are_untouched():
 
 
 # ── the central progress CLOCK (heartbeat) ────────────────────────────────
-def test_heartbeat_only_bumps_the_clock_when_bytes_actually_advance(tmp_path):
+def test_heartbeat_only_bumps_the_clock_when_bytes_actually_advance(tmp_path, monkeypatch):
     """The orphan-job lesson in one test: the worker re-sends its whole progress
     map every heartbeat, so ARRIVAL of the field must not count as progress."""
+    # k3 isolation: WorkerStore(path=tmp_path/...) isolates the worker rows,
+    # but register(worker_id=...) ALSO reads the assignment-memory sidecar,
+    # which independently derives its directory from settings.manifest_path
+    # (a frozen, .env-file-resolved singleton — see
+    # tests/worker_store_isolation.py). Redirect it into tmp_path too so this
+    # test never touches the live /mnt/llm_storage/projects/ registry.
+    monkeypatch.setattr(W.settings, "manifest_path", str(tmp_path / "model_manifest.json"))
     reg = W.WorkerStore(path=str(tmp_path / "workers.json"))
     reg.register(worker_id="w", name="w", url="http://w")
 
@@ -226,6 +233,9 @@ def test_a_wedged_pull_turns_stale_without_any_writer_noticing(tmp_path,
     stays ONLINE) but its pull stops advancing. It must age out of in-flight on
     its own, with no daemon and no 'finished/failed' message ever arriving."""
     monkeypatch.setenv("HUGPY_PROVISION_STALL_SECONDS", "1")
+    # k3 isolation: see the note in the previous test — redirect the
+    # assignment-memory sidecar too, not just WorkerStore's own path.
+    monkeypatch.setattr(W.settings, "manifest_path", str(tmp_path / "model_manifest.json"))
     reg = W.WorkerStore(path=str(tmp_path / "workers.json"))
     reg.register(worker_id="w", name="w", url="http://w")
 

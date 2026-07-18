@@ -30,6 +30,7 @@ task_deps = importlib.import_module("abstract_hugpy_dev.managers.task_deps")
 agent = importlib.import_module("abstract_hugpy_dev.worker_agent.agent")
 W = importlib.import_module(
     "abstract_hugpy_dev.flask_app.app.functions.imports.utils.workers")
+from worker_store_isolation import isolated_worker_store  # noqa: E402
 
 ok = 0
 def check(name, cond):
@@ -131,8 +132,9 @@ finally:
 
 
 # --- registry round-trip ---------------------------------------------------
-tmp = tempfile.mkdtemp(prefix="hugpy-task-caps-")
-store = W.WorkerStore(path=os.path.join(tmp, "workers.json"))
+# k3 isolation: isolated_worker_store() also redirects the assignment-memory
+# sidecar (settings.manifest_path) — see tests/worker_store_isolation.py.
+store, tmp = isolated_worker_store(prefix="hugpy-task-caps-")
 
 CAPS = {"feature-extraction": True, "automatic-speech-recognition": False,
         "keyword-extraction": True}

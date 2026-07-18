@@ -47,6 +47,7 @@ schemas = importlib.import_module("abstract_hugpy_dev.managers.imagegen.schemas"
 W = importlib.import_module(
     "abstract_hugpy_dev.flask_app.app.functions.imports.utils.workers")
 from abstract_hugpy_dev.imports.src.constants.constants import UPLOADS_HOME  # noqa: E402
+from worker_store_isolation import isolated_worker_store  # noqa: E402
 
 ImageGenRequest = schemas.ImageGenRequest
 
@@ -238,8 +239,11 @@ finally:
 
 print("ROUTING (id_lock lands only on a comfy-with-nodes worker)")
 def _fresh_store():
-    tmp = tempfile.mkdtemp(prefix="hugpy-idlock-")
-    return W.WorkerStore(path=os.path.join(tmp, "workers.json"))
+    # k3 isolation: isolated_worker_store() also redirects the assignment-
+    # memory sidecar (settings.manifest_path) — see
+    # tests/worker_store_isolation.py.
+    store, _tmp = isolated_worker_store(prefix="hugpy-idlock-")
+    return store
 
 MODEL = "org/Comfy-Ckpt"
 store = _fresh_store()

@@ -31,6 +31,18 @@ os.environ["PROJECTS_HOME"] = tempfile.mkdtemp(prefix="hugpy-model-block-test-")
 import importlib
 from flask import Flask
 
+# ⚠ ISOLATION LANDMINE (k2 incident, 2026-07-18): the PROJECTS_HOME env var set
+# above does NOT isolate the worker registry — WorkerStore's default path
+# resolves through schemas.settings.manifest_path, a module-level singleton
+# read from a .env FILE at import time (abstract_essentials.get_env_value),
+# never from os.environ. Section 6 below drives real Flask routes, including
+# an /assign call that (once the model is unblocked) reaches the real,
+# UNSTUBBED module-level assign_model() — which writes through the module
+# singleton W.worker_store straight to the LIVE /mnt/llm_storage/projects/
+# registry (proven: it opens/locks/rewrites that file even for an unknown
+# worker id). See tests/worker_store_isolation.py for the full writeup.
+from worker_store_isolation import swap_worker_store
+
 ok = 0
 def check(name, cond):
     global ok
@@ -165,33 +177,41 @@ try:
     wr._disk_preflight_reason = lambda w, mk: None
     wr.get_worker = lambda wid: {"id": wid, "name": "box", "models_local": []}
 
-    _reset()
-    # /block sets state; unknown key 404s; /unblock reverts
-    r = client.post("/llm/models/M/block", json={"note": "op says"})
-    check("route /block: 200 + blocked:true", r.status_code == 200 and r.get_json()["blocked"] is True)
-    check("route /block: model is actually blocked now", bl.is_blocked("M") is True)
-    check("route /block: unknown key → 404",
-          client.post("/llm/models/Nope~Key/block", json={}).status_code == 404)
+    # The /assign route below calls the REAL, unstubbed module-level
+    # assign_model() once "M" is unblocked (nothing else in this section
+    # stubs it) — swap the module singleton for an isolated store so that
+    # write lands on a tmpdir, never the live registry.
+    with swap_worker_store():
+        _reset()
+        # /block sets state; unknown key 404s; /unblock reverts
+        r = client.post("/llm/models/M/block", json={"note": "op says"})
+        check("route /block: 200 + blocked:true", r.status_code == 200 and r.get_json()["blocked"] is True)
+        check("route /block: model is actually blocked now", bl.is_blocked("M") is True)
+        check("route /block: unknown key → 404",
+              client.post("/llm/models/Nope~Key/block", json={}).status_code == 404)
 
-    # assign of a blocked model → 409 with a clear blocked reason
-    ra = client.post("/llm/workers/w1/assign", json={"model_key": "M"})
-    check("route /assign: blocked model → 409",
-          ra.status_code == 409 and "blocked from the serving pool" in (ra.get_json() or {}).get("error", ""))
+        # assign of a blocked model → 409 with a clear blocked reason
+        ra = client.post("/llm/workers/w1/assign", json={"model_key": "M"})
+        check("route /assign: blocked model → 409",
+              ra.status_code == 409 and "blocked from the serving pool" in (ra.get_json() or {}).get("error", ""))
 
-    # placement/feasibility preview reports blocked (not fake-infeasible)
-    rp = client.get("/llm/models/M/placement")
-    pj = rp.get_json()
-    check("route /placement: blocked:true + blocked winner_reason (not fake-infeasible)",
-          rp.status_code == 200 and pj.get("blocked") is True
-          and "blocked from the serving pool" in (pj.get("winner_reason") or "")
-          and pj.get("workers") == [])
+        # placement/feasibility preview reports blocked (not fake-infeasible)
+        rp = client.get("/llm/models/M/placement")
+        pj = rp.get_json()
+        check("route /placement: blocked:true + blocked winner_reason (not fake-infeasible)",
+              rp.status_code == 200 and pj.get("blocked") is True
+              and "blocked from the serving pool" in (pj.get("winner_reason") or "")
+              and pj.get("workers") == [])
 
-    # /unblock reverts everything
-    ru = client.post("/llm/models/M/unblock", json={})
-    check("route /unblock: 200 + was_blocked:true", ru.status_code == 200 and ru.get_json()["was_blocked"] is True)
-    check("route /unblock: model no longer blocked", bl.is_blocked("M") is False)
-    check("route /assign: unblocked model no longer 409 on the block gate",
-          client.post("/llm/workers/w1/assign", json={"model_key": "M"}).status_code != 409)
+        # /unblock reverts everything
+        ru = client.post("/llm/models/M/unblock", json={})
+        check("route /unblock: 200 + was_blocked:true", ru.status_code == 200 and ru.get_json()["was_blocked"] is True)
+        check("route /unblock: model no longer blocked", bl.is_blocked("M") is False)
+        # This is the confirmed live-write path (k3): once unblocked, the route
+        # falls through to the REAL assign_model() — now safely inside the
+        # swapped, tmpdir-backed W.worker_store.
+        check("route /assign: unblocked model no longer 409 on the block gate",
+              client.post("/llm/workers/w1/assign", json={"model_key": "M"}).status_code != 409)
 finally:
     (wr.get_models_dict, wr._transfer_authorized, cr.audit,
      wr._central_missing_reason, wr._disk_preflight_reason, wr.get_worker) = _orig

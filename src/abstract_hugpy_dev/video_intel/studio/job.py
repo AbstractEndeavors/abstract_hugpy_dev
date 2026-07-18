@@ -29,6 +29,7 @@ from typing import Optional
 
 from abstract_hugpy_dev.imports.src.constants.constants import DEFAULT_ROOT
 
+from ..._platform import env_value
 from .enums import Capability
 from .env import StudioEnv
 
@@ -37,6 +38,14 @@ from .env import StudioEnv
 # jail (DEFAULT_ROOT) and can be cataloged like any other media output.
 STUDIO_ROOT = os.path.join(DEFAULT_ROOT, "video_intel", "studio")
 DEFAULT_CLIPS_ROOT = os.path.join(STUDIO_ROOT, "clips")
+
+# Studio "Send to Editor" (k12) INBOX — a STABLE first-class sibling of clips/,
+# weights/ and manifests/ under STUDIO_ROOT. The one-click handoff writes a
+# Filmora-native MP4 here; the operator's LAN Windows workstation (Filmora
+# desktop) picks the folder up over a host-side Samba export. Defined ONCE here
+# (not recomputed as os.path.join(STUDIO_ROOT, "editor-inbox") at each call site)
+# so the route and its tests import the single canonical constant.
+EDITOR_INBOX_ROOT = os.path.join(STUDIO_ROOT, "editor-inbox")
 
 # This slice wires exactly one studio runner path (SYNTHETIC i2v — the no-model
 # spine prover). A budget below the smallest real i2v footprint (8GB) makes the
@@ -321,10 +330,27 @@ def resolve_studio_env(out_root: str, *, master_fps: int, max_vram_gb: float = 2
     is threaded from the job's target so the recorded env matches the render intent.
     ``allow_unpinned=True`` (dev posture); the synthetic runner is pinned regardless,
     and ``produce_clip`` never calls ``validate_registry``, so this only affects the
-    recorded env snapshot, never routing."""
+    recorded env snapshot, never routing.
+
+    WEIGHTS ROOT — the SHARED-store seam (k4 fix, 2026-07-18). The studio weights are a
+    SHARED asset (373GB Wan/Lightricks), NOT a per-box copy: on a split central+worker
+    fleet the render runs on the GPU worker (ae), whose media-store root ``DEFAULT_ROOT``
+    is its LOCAL hot drive (``/mnt/hot990/hugpy-worker``) — so deriving the weights root
+    from ``DEFAULT_ROOT`` (the old behavior) pointed the manifest's captured
+    ``STUDIO_WEIGHTS_ROOT`` at a hot path that never held the weights, and every Wan render
+    failed ``weights_missing`` naming ``<DEFAULT_ROOT>/video_intel/studio/weights``. The
+    fix: honor an EXPLICIT ``STUDIO_WEIGHTS_ROOT`` (the shared mount, e.g.
+    ``/mnt/llm_storage/video_intel/studio/weights``, resolved via ``env_value`` — the .env
+    file OR the process env) when the operator sets one, falling back to the
+    ``DEFAULT_ROOT``-derived default for the self-hosted SINGLE-box case (where the media
+    store IS where the weights live, so the default is correct). This is NOT a smart default
+    on the strict ``env.py`` loader (INV-5 untouched); it is honoring an explicit operator
+    override on the worker-defaults path, and the resulting value is what ``to_snapshot()``
+    records — so the manifest snapshot still matches what actually resolved."""
+    weights_root = env_value("STUDIO_WEIGHTS_ROOT") or os.path.join(STUDIO_ROOT, "weights")
     return StudioEnv(
         output_root=os.path.abspath(out_root),
-        weights_root=os.path.join(STUDIO_ROOT, "weights"),
+        weights_root=weights_root,
         manifest_root=os.path.join(STUDIO_ROOT, "manifests"),
         master_colorspace="rec709",
         master_fps=int(master_fps),

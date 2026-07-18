@@ -227,19 +227,6 @@ def get_hugpy_flask(name=None,allowed_origins=None,debug=False):
         import logging as _logging
         _logging.getLogger(__name__).error("operator gate install failed: %s", _exc)
 
-    # Video surface gate: the /video arm (SPA shell + /video/* and /movie/* API
-    # and media routes) sits behind the SAME auth boundary as the console — a
-    # valid console session (mode-aware; permissive in `open`, enforced in
-    # `external`) OR a video-scoped share credential (a stubbed seam today).
-    # DELIBERATELY separate from the operator gate so the share credential can
-    # NEVER authorize a console/operator route. Never break boot.
-    try:
-        from .app.video_auth import install_video_gate
-        install_video_gate(app)
-    except Exception as _exc:
-        import logging as _logging
-        _logging.getLogger(__name__).error("video gate install failed: %s", _exc)
-
     # Human-friendly /endpoints: content-negotiate the abstract_flask endpoint
     # inspector so a browser hitting dev.hugpy.ai/endpoints gets a rendered,
     # searchable page while curl / programmatic clients still get the exact JSON

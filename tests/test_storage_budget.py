@@ -30,6 +30,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import importlib
 
+from worker_store_isolation import isolated_worker_store
+
 W = importlib.import_module(
     "abstract_hugpy_dev.flask_app.app.functions.imports.utils.workers")
 
@@ -232,8 +234,12 @@ check("no storage field -> disk_free still read from worker['disk']",
 
 
 # --- store integration: heartbeat stores storage, _public_view derives -------
-tmp = tempfile.mkdtemp(prefix="hugpy-storage-test-")
-store = W.WorkerStore(path=os.path.join(tmp, "workers.json"))
+# k3 isolation: isolated_worker_store() ALSO redirects the assignment-memory
+# sidecar (settings.manifest_path) — a bare WorkerStore(path=tmp) below would
+# isolate the worker rows but the later unassign_model() call still writes
+# worker_assignments.json beside the real live manifest. See
+# tests/worker_store_isolation.py.
+store, tmp = isolated_worker_store(prefix="hugpy-storage-test-")
 store.register(name="box", url="http://box", worker_id="wid1", models=["m1"])
 store.set_admission("wid1", "approved")
 view = store.heartbeat(

@@ -250,6 +250,29 @@ def _evict(worker: Dict[str, Any], model_key: str, force: bool = False) -> Dict[
         return {"evicted": False, "reason": f"{type(exc).__name__}: {exc}"}
 
 
+def _evictable_bytes(worker: Optional[Dict[str, Any]]) -> int:
+    """VRAM (bytes) that safe make-room COULD reclaim on this card — the comfy +
+    on-demand residents the engine would ask the worker to evict (force=false).
+
+    Deliberately OPTIMISTIC: it counts every keyed resident's VRAM, even ones the
+    worker's gate may ultimately protect (static / replying / queued-ahead). That
+    bias is on purpose — an admission PROBE over-estimating headroom only ever
+    ADMITS a run that then falls to acquire()'s best-effort + the worker gate (no
+    worse than today), whereas under-estimating would HOLD a render that would
+    have succeeded. Reservation-caused shortfall is accounted separately (via
+    ``reserved_bytes``), so this figure is purely the physical make-room ceiling."""
+    if not worker:
+        return 0
+    total = 0
+    for m in _pid_models(worker):
+        if not m.get("model_key"):
+            continue
+        vb = int(m.get("vram_bytes") or 0)
+        if vb > 0:
+            total += vb
+    return total
+
+
 def _refusal_reason(worker: Optional[Dict[str, Any]], peak: int,
                     free: Optional[int], evicted: List[str]) -> Dict[str, Any]:
     remaining = []
@@ -378,6 +401,105 @@ class _Claim:
 # the handle in hand (belt-and-suspenders against a lost handle).
 _ACTIVE: Dict[str, _Claim] = {}
 _ACTIVE_LOCK = threading.Lock()
+
+
+# ── admission probe (advisory — the SCHEDULER's gate, not an authority) ───────
+def admission_enabled() -> bool:
+    """Public alias of the enable gate so the media-bus scheduler can take a pure
+    FIFO fast-path (a transparent no-op) when the reservation layer is OFF."""
+    return _enabled()
+
+
+def can_admit(job_name: str, spec: Any = None,
+              run_id: Optional[str] = None) -> Tuple[bool, Optional[Dict[str, Any]]]:
+    """Non-destructive fit PROBE: "would ``job_name``'s reservation fit on its
+    target card NOW — counting active reserved bytes, after the make-room the
+    engine could safely do — WITHOUT evicting anything and WITHOUT creating a
+    claim?" Returns ``(admit, reason)``.
+
+    admit=True  → safe for the scheduler to START this job now.
+    admit=False → HOLD: the headroom this run needs is currently committed to
+                  ANOTHER active reservation (a heavy run in flight); starting it
+                  now would collide. ``reason`` carries the accounting.
+
+    Fail-OPEN (admit=True, reason=None), same philosophy as ``acquire``: a light
+    task (no template), the layer disabled, an unresolvable fleet, an unmeasured
+    peak, or an unreadable free-VRAM all ADMIT — the probe never blocks a job it
+    cannot honestly size, and acquire() + the worker gate remain the authority.
+
+    The accounting is: ``prospective = free - reserved + evictable`` vs ``peak``.
+      * ``free``      physical free VRAM on the target card (reflects real usage);
+      * ``reserved``  bytes already claimed by OTHER active reservations — the
+                      capacity an in-flight heavy run intends to occupy (its
+                      allocation may not yet show in ``free``), so we subtract it
+                      to serialize heavy runs behind one another;
+      * ``evictable`` what safe make-room could physically reclaim (comfy +
+                      on-demand residents) — added back optimistically.
+    Note this is deliberately conservative for a SECOND heavy run (its peak is
+    ~20 GB and ``reserved`` already carries the first run's ~20 GB on a 24 GB
+    card, so ``prospective`` goes negative and it HOLDS) and generous for the
+    first / a lone run (nothing reserved → make-room headroom carries it)."""
+    if not _enabled():
+        return True, None
+    template = load_template(job_name)
+    if template is None:
+        return True, None                      # light task — never gated
+    worker_id, worker = _resolve_target(template)
+    if worker_id is None or worker is None:
+        return True, None                      # can't see the fleet — fail open
+    peak = template.peak_bytes()
+    if peak is None:
+        return True, None                      # unmeasured — best-effort, don't gate
+    free = _free_vram(worker)
+    if free is None:
+        return True, None                      # unmeasurable — fail open
+    try:
+        reserved = int(reservation_registry.reserved_bytes(worker_id))
+    except Exception:  # noqa: BLE001 — a store hiccup must never wrongly HOLD a render
+        reserved = 0
+    evictable = _evictable_bytes(worker)
+    prospective = free - reserved + evictable
+    admit = prospective >= peak
+    reason: Optional[Dict[str, Any]] = None
+    if not admit:
+        reason = {
+            "reason": "GPU capacity for this run is currently committed to an "
+                      "active reservation (a heavy run in flight) — holding until "
+                      "it releases",
+            "worker_id": worker_id,
+            "peak_bytes": int(peak),
+            "free_bytes": int(free),
+            "reserved_bytes": int(reserved),
+            "evictable_bytes": int(evictable),
+            "short_by_bytes": int(peak - prospective),
+        }
+    logger.info("admission %s for %s (run %s) on %s: peak=%s free=%s reserved=%s "
+                "evictable=%s -> prospective=%s",
+                "ADMIT" if admit else "HOLD", job_name, run_id or "-", worker_id,
+                peak, free, reserved, evictable, prospective)
+    return admit, reason
+
+
+def force_admit_safe(job_name: str) -> bool:
+    """True when best-effort force-admitting ``job_name`` (the scheduler's
+    starvation/deadlock guard for a held HEAD) CANNOT collide with an active
+    reservation: a light task always; a heavy task only when NO reservation
+    currently occupies its target card (``reserved_bytes == 0``). This lets the
+    scheduler unblock a lone held head that only fails the envelope check (it will
+    OFFLOAD — §7.4) while still refusing to run a SECOND heavy run concurrently
+    with one already in flight. Fail-OPEN True on any infra problem."""
+    if not _enabled():
+        return True
+    template = load_template(job_name)
+    if template is None:
+        return True
+    worker_id, _worker = _resolve_target(template)
+    if worker_id is None:
+        return True
+    try:
+        return int(reservation_registry.reserved_bytes(worker_id)) <= 0
+    except Exception:  # noqa: BLE001
+        return True
 
 
 # ── public API (dispatch path only) ──────────────────────────────────────────

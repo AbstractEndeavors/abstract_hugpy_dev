@@ -2823,22 +2823,14 @@ def model_file_manifest(model_key):
         abort(401, description="Worker enrollment or operator token required.")
     model, dest = _model_dir_or_404(model_key)
 
-    # Walk the whole model dir first (skipping transfer-machinery artifacts:
-    # chunk-hash sidecars + .part/.state staging), then SINGLE-FORMAT filter it.
-    raw = []       # [(rel, size)]
-    raw_total = 0
-    for root, _dirs, names in os.walk(dest):
-        for name in names:
-            if ".chunksums-" in name or name.endswith((".part", ".part.state.json")):
-                continue
-            full = os.path.join(root, name)
-            try:
-                size = os.path.getsize(full)
-            except OSError:
-                continue
-            rel = os.path.relpath(full, dest)
-            raw.append((rel, size))
-            raw_total += size
+    # Walk the whole model dir first (skipping transfer-machinery artifacts —
+    # chunk-hash sidecars, .part/.state staging, and dot-directories like
+    # .cache/.git, see walk_listing's docstring), then SINGLE-FORMAT filter it.
+    # Shared with /archive via format_select.walk_listing — one walk, one skip
+    # list, not a hand-copied mirror.
+    from ..functions.imports.utils.format_select import select_files, walk_listing
+    raw = walk_listing(dest)       # [(rel, size)]
+    raw_total = sum(s for (_r, s) in raw)
 
     # Central mirrors WHOLE HF snapshots — the same weights in several formats,
     # often an fp32 duplicate too. A worker only needs ONE usable weight format +
@@ -2846,7 +2838,6 @@ def model_file_manifest(model_key):
     # falls back to the whole listing). GGUF is untouched — its effective quant is
     # resolved elsewhere. The worker's per-file puller drives off this `files`
     # list, so this is what actually lands on the worker's disk.
-    from ..functions.imports.utils.format_select import select_files
     framework = model.get("framework")
     selected = select_files(raw, framework=framework)
     files = [{"path": r, "size": s} for (r, s) in selected]
@@ -3106,6 +3097,23 @@ def model_file(model_key):
     target = real
     if not os.path.isfile(target):
         abort(404, description="No such file.")
+    if not os.access(target, os.R_OK):
+        # Exists on disk but the API process can't read it (permission-
+        # restricted — e.g. an HF cache metadata file dropped 0600 by a
+        # different uid; live 2026-07-18 on a comfy checkpoint's .cache/
+        # tree json). Degrade to a clean 404 BEFORE any response headers
+        # commit, instead of a raw PermissionError 500 from inside
+        # send_file()'s open() — matches the house degrade-not-500 pattern.
+        # Belt-and-suspenders: the real fix is the manifest/archive walkers
+        # no longer OFFERING dot-directory files at all (see
+        # format_select.walk_listing) — this guards any other path to an
+        # unreadable file too (a direct ?path= guess, a legit weight with
+        # bad perms, …).
+        logger.warning("model_file: %s exists but is not readable by the API "
+                       "process; refusing (permission denied on central).",
+                       target)
+        abort(404, description="File exists on central but is not readable "
+                               "(permission denied); treat as unavailable.")
 
     # ── serve the bytes ───────────────────────────────────────────────────
     # KEEPER FOLLOW-UP (X-Accel-Redirect): everything above RESOLVES the target;
@@ -3290,7 +3298,11 @@ def model_archive(model_key):
     # every format the /manifest path excludes.
     walked = []            # [(rel, size)] for the format filter
     real_by_rel = {}       # rel -> real path to pack
-    for root, _dirs, names in os.walk(dest):
+    for root, dirs, names in os.walk(dest):
+        # Same dot-directory prune as format_select.walk_listing (.cache/.git/…
+        # are never servable weights — and HF cache metadata can be
+        # permission-restricted, see that helper's docstring).
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
         for name in sorted(names):
             if ".chunksums-" in name or name.endswith((".part", ".part.state.json")):
                 continue
@@ -3306,7 +3318,10 @@ def model_archive(model_key):
             try:
                 sz = os.path.getsize(full)
             except OSError:
-                sz = 0
+                # Unreadable entry: degrade by skipping, never let one bad
+                # entry break the whole archive walk.
+                logger.warning("archive %s: skipping unreadable %s", model_key, name)
+                continue
             walked.append((rel, sz))
             real_by_rel[rel] = real
     _model_fw = _model.get("framework") if isinstance(_model, dict) else None
@@ -3339,6 +3354,14 @@ def model_archive(model_key):
                                 tar.add(full, arcname=rel, recursive=False)
                             except FileNotFoundError:
                                 continue  # file vanished mid-stream; skip it
+                            except OSError as exc:
+                                # Unreadable entry (permission-restricted, …):
+                                # degrade by skipping — never let one bad
+                                # member abort an otherwise-good tar stream.
+                                logger.warning(
+                                    "archive %s: skipping unreadable member %s (%s)",
+                                    model_key, rel, exc)
+                                continue
             except Exception:
                 logger.exception("archive writer failed for %s", model_key)
 

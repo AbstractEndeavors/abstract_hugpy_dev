@@ -27,6 +27,12 @@ from flask import Response, jsonify, request, stream_with_context
 from ..functions import *  # get_bp, api-key store, chat_iter_sync, get_models_dict, update_model_status, …
 # Default media-chat model_key (single global value); explicit import — not in the functions star-export.
 from ....imports.config.models.models_config import media_default_state
+# k9 video-share key store (its OWN category/store — never the /v1 api_keys store).
+from ..functions.imports.utils.video_share_keys import (
+    create_share_key,
+    list_share_keys,
+    revoke_share_key,
+)
 # Pure request/response plumbing lives in v1_helpers (stdlib-only, no Flask)
 # so it unit-tests offline; see that module's docstring.
 from .v1_helpers import (
@@ -406,3 +412,50 @@ def keys_revoke(key_id):
 def keys_require():
     body = request.get_json(silent=True) or {}
     return jsonify({"require_key": set_api_key_required(bool(body.get("require")))})
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# k9 — VIDEO-SHARE links. Mint a video-scoped share credential (a NEW key
+# category, its own store — see functions/.../video_share_keys.py) and hand its
+# link to an outside party so they can drive the /video features WITHOUT a
+# console login. These routes are OPERATOR-ONLY (operator_auth._SENSITIVE gates
+# ^/keys/video-share) and are deliberately NOT on the /video surface, so a
+# share principal (which can pass the /video gate) can never reach them —
+# structurally "no key-minting-by-key". The GET doubles as the SPA's auth probe.
+# ──────────────────────────────────────────────────────────────────────────
+def _public_base() -> str:
+    """Best-effort public origin for building a share URL. Prefers an explicit
+    HUGPY_PUBLIC_BASE; else reconstructs from the forwarded host/proto (the SPA
+    also rebuilds the link from window.location.origin, so this is the
+    curl/programmatic path)."""
+    import os as _os
+    base = (_os.environ.get("HUGPY_PUBLIC_BASE") or "").strip()
+    if base:
+        return base.rstrip("/")
+    proto = (request.headers.get("X-Forwarded-Proto") or request.scheme or "https").split(",")[0].strip()
+    host = (request.headers.get("X-Forwarded-Host") or request.host or "").split(",")[0].strip()
+    return f"{proto}://{host}".rstrip("/") if host else ""
+
+
+@v1_bp.route("/keys/video-share", methods=["GET"])
+def video_share_list():
+    return jsonify({"keys": list_share_keys()})
+
+
+@v1_bp.route("/keys/video-share", methods=["POST"])
+def video_share_create():
+    body = request.get_json(silent=True) or {}
+    ttl = body.get("ttl_days", None)
+    minted = create_share_key(label=body.get("label", ""),
+                              ttl_days=(ttl if ttl is not None else 30))
+    base = _public_base()
+    minted["url"] = f"{base}/video/?share={minted['key']}" if base else \
+        f"/video/?share={minted['key']}"
+    return jsonify(minted)
+
+
+@v1_bp.route("/keys/video-share/<key_id>", methods=["DELETE"])
+def video_share_revoke(key_id):
+    if not revoke_share_key(key_id):
+        return jsonify({"ok": False, "error": "unknown key id"}), 404
+    return jsonify({"ok": True})

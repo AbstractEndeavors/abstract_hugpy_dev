@@ -118,6 +118,25 @@ ALLOC_MODES = ("autofit", "max-gpu", "cpu-only", "budget", "bands")
 # The ctx% dimension of the assortment cube (percent of a model's max context).
 CTX_PCTS = (25, 50, 75, 100)
 
+# ── sweep mode (k7 offload speed-cliff) ──────────────────────────────────────
+# The DETERMINISTIC VRAM-share sweep grid: each point is a % of a model's TOTAL
+# resident requirement (weights + KV @ the sweep ctx) that the gpu_mem_gib budget
+# caps to VRAM — the rest spills to host RAM. 100% first (== "as full as the card
+# allows"), stepping down to find where tok/s collapses.
+SWEEP_VRAM_PCTS = (100, 85, 70, 55, 40, 25)
+# Coarser grid for big models (each point is a cold reload of many GB) — the
+# runner picks this when a model's requirement exceeds SWEEP_BIG_MODEL_GIB.
+SWEEP_VRAM_PCTS_COARSE = (100, 70, 40)
+SWEEP_BIG_MODEL_GIB = 20.0
+
+# The sweep block appended to each point's chaos-obs/1 observation (additive; a
+# non-sweep chaos trial carries sweep=None). vram_share_pct is the REQUESTED %;
+# actual_gpu_pct / actual_n_gpu_layers are what the serving contract MEASURED.
+REQUIRED_SWEEP_KEYS = (
+    "vram_share_pct", "requested_gib", "actual_n_gpu_layers", "actual_gpu_pct",
+    "ttft_s", "tokens_per_s", "load_s",
+)
+
 # Recognised /assign spill keys (mirror worker_routes._ALLOC_SPILL_KEYS). The
 # runner never sends a key outside this set, so a typo can't write a no-op
 # contract that the route would 400.
@@ -131,6 +150,9 @@ SPILL_KEYS = frozenset({
 SKIP_REASONS = frozenset({
     "predicted-infeasible", "back-off-foreign-jobs", "health-degraded",
     "alloc-refused", "no-servable-worker", "assortment-empty", "stopped",
+    # sweep-mode (k7) skips — the point was NOT fired; recorded for honesty.
+    "back-off-reservation", "back-off-headroom", "serving-busy",
+    "budget-exhausted", "meta-unavailable", "unload-failed",
 })
 
 # Every observation MUST carry these top-level keys (completeness invariant the
@@ -195,6 +217,37 @@ def blank_observation() -> dict:
             "worker_state": {},
         },
         "restore": {"ok": None, "per_worker": {}},
+        # Optional sweep block (k7). None for a chaos trial; blank_sweep() for a
+        # sweep point. Additive to chaos-obs/1 — not a REQUIRED_TOP_KEY.
+        "sweep": None,
+    }
+
+
+def blank_sweep() -> dict:
+    """A fully-formed sweep block (every REQUIRED_SWEEP_KEY present, null-ish).
+
+    ``vram_share_pct`` is the REQUESTED share of the model's total requirement;
+    ``requested_gib`` is the gpu_mem_gib budget that encodes it (clamped to a safe
+    fraction of the card's live free VRAM); the ``actual_*`` fields are read back
+    from the serving contract; ``tokens_per_s`` is the median of the timed runs."""
+    return {
+        "vram_share_pct": None,     # requested % of total requirement (the grid)
+        "requested_gib": None,      # gpu_mem_gib budget applied (clamped)
+        "clamped": False,           # true if requested_gib was capped to safe VRAM
+        "denom_need_bytes": None,   # weights+KV @ sweep ctx (the 100% denominator)
+        "ctx_pct": None,            # fixed sweep context %
+        "card_vram_bytes": None,    # the worker's vram_total
+        "actual_n_gpu_layers": None,
+        "actual_total_layers": None,
+        "actual_gpu_pct": None,     # n_gpu_layers / total_layers * 100 (measured)
+        "actual_vram_bytes": None,  # measured serving-contract VRAM footprint
+        "actual_vram_share_pct": None,  # actual_vram_bytes / denom_need_bytes * 100
+        "load_s": None,             # cold-load duration (warm-up fire)
+        "ttft_s": None,             # median time-to-first-token over timed runs
+        "tokens_per_s": None,       # median decode rate over timed runs
+        "runs": [],                 # per-timed-run [{ttft_s, tokens_per_s, tokens}]
+        "warmup_outcome": None,     # outcome of the excluded warm-up fire
+        "floor_rejected": None,     # true if partial plan hit min_offload_frac floor
     }
 
 
@@ -227,4 +280,14 @@ def validate_observation(obs: dict) -> list[str]:
         problems.append("kind=skip but skip_reason is empty")
     if obs.get("skip_reason") and obs["skip_reason"] not in SKIP_REASONS:
         problems.append(f"unknown skip_reason: {obs['skip_reason']}")
+    # The sweep block is optional (None on a chaos trial); when present it must be
+    # complete so the cliff analyser never trips over a missing key.
+    sweep = obs.get("sweep")
+    if sweep is not None:
+        if not isinstance(sweep, dict):
+            problems.append("sweep present but not a dict")
+        else:
+            for k in REQUIRED_SWEEP_KEYS:
+                if k not in sweep:
+                    problems.append(f"missing sweep key: {k}")
     return problems

@@ -189,6 +189,11 @@ class Job:
     model_name: Optional[str] = None      # display name (model_key is the key)
     message: str = ""
     error: Optional[JobError] = None
+    # WHERE a media/video job physically executes — {source, host, worker_id, gpu,
+    # process, reserved_bytes} (omit-when-unset). Stamped by the media-bus job
+    # bridge (video_intel.placement); None for every non-media job, and omitted
+    # from to_dict() when None so no chat/download row's wire shape changes.
+    placement: Optional[dict] = None
     # Live-stream telemetry (was activity.py).
     tokens: int = 0
     started_ts: float = field(default_factory=time.time)
@@ -232,7 +237,7 @@ class Job:
         """JSON-safe snapshot — superset of both predecessors' shapes."""
         now = time.time()
         ended = self.ended_ts or now
-        return {
+        d = {
             "id": self.id,
             "model_key": self.model_key,
             "status": normalize_status(self.status),
@@ -271,6 +276,11 @@ class Job:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
+        # Omit-when-unset: only media/video jobs carry a placement — every other
+        # row's shape is byte-identical to before this field existed.
+        if self.placement is not None:
+            d["placement"] = self.placement
+        return d
 
     def to_legacy_dict(self) -> dict[str, Any]:
         """The pre-comms /jobs wire shape: legacy status names, error as a

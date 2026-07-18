@@ -72,8 +72,18 @@ _SLOT_REASON = ("no native llama-server binary resolvable (run "
 
 
 def _fresh_store(W):
-    tmp = tempfile.mkdtemp(prefix="hugpy-no-worker-diag-")
-    return W.WorkerStore(path=os.path.join(tmp, "workers.json"))
+    # k3 isolation: function-local import (not module scope) — this file
+    # deliberately keeps collection a no-op (see the note above), and
+    # worker_store_isolation itself imports workers.py, so importing it here
+    # is only safe because W is already imported by the caller at this point.
+    # isolated_worker_store() ALSO redirects the assignment-memory sidecar
+    # (settings.manifest_path) — a bare WorkerStore(path=tmp) isolates the
+    # worker rows but a later register()/assign_model() call on the SAME id
+    # would still write worker_assignments.json beside the real live
+    # manifest. See tests/worker_store_isolation.py.
+    from worker_store_isolation import isolated_worker_store
+    store, _tmp = isolated_worker_store(prefix="hugpy-no-worker-diag-")
+    return store
 
 
 def _add(store, wid, *, engine=None, models=(MODEL,), caps=None,

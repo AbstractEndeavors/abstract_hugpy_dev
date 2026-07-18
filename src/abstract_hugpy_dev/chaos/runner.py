@@ -289,11 +289,19 @@ class ChaosRunner:
 
 
 def main(argv=None) -> int:
+    # Subcommand dispatch: `hugpy-chaos sweep ...` -> the deterministic k7 offload
+    # speed-cliff sweep (chaos/sweep.py); anything else -> the random exerciser.
+    args_in = list(sys.argv[1:] if argv is None else argv)
+    if args_in and args_in[0] == "sweep":
+        from . import sweep as _sweep
+        return _sweep.main(args_in[1:])
+
     ap = argparse.ArgumentParser(
         prog="hugpy-chaos",
         description="Chaos-and-learn exerciser: randomly exercise the model x "
                     "card x alloc-mode x ctx%% assortment, recording predicted-"
-                    "vs-measured observations for the learner.")
+                    "vs-measured observations for the learner. Subcommand "
+                    "`sweep` runs the deterministic k7 offload speed-cliff sweep.")
     ap.add_argument("--base-url", default=os.environ.get("HUGPY_BASE_URL", DEFAULT_BASE))
     ap.add_argument("--rounds", type=int, default=30)
     ap.add_argument("--seed", type=int, default=None,

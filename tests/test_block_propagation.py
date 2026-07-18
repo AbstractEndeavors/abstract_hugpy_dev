@@ -55,6 +55,8 @@ import importlib
 
 from flask import Flask
 
+from worker_store_isolation import swap_worker_store
+
 ok = 0
 fail = 0
 
@@ -107,18 +109,16 @@ print("\n[1] central propagation (workers_heartbeat reply)")
 # read PROJECTS_HOME from real os.environ, so blocklist tests ARE isolated;
 # only the worker registry has this gap.) Registering a real worker here for
 # real would leak a ghost row into the LIVE fleet the operator's console
-# shows — so we inject an explicit tempfile-backed WorkerStore instead of
-# touching the module singleton.
-_wk_tmp_store = W.WorkerStore(path=os.path.join(
-    tempfile.mkdtemp(prefix="hugpy-block-prop-workers-"), "workers.json"))
-_worker_store_orig = W.worker_store
-W.worker_store = _wk_tmp_store
-
+# shows — so we swap the module singleton for an isolated store via
+# swap_worker_store() (tests/worker_store_isolation.py), which ALSO redirects
+# the assignment-memory sidecar (settings.manifest_path) — a bare injected
+# WorkerStore(path=tmp), as this section used before k3, isolates the worker
+# rows but NOT that second, independently-resolved sidecar path.
 app = Flask(__name__)
 app.register_blueprint(wr.worker_bp)
 client = app.test_client()
 
-try:
+with swap_worker_store(prefix="hugpy-block-prop-workers-"):
     _reset_blocklist()
     W.worker_store.register(name="box", url="http://192.0.2.9:9100", worker_id="wk-prop")
 
@@ -157,8 +157,6 @@ try:
               r.status_code == 200)
     finally:
         wr._blocked_keys = _bk_orig
-finally:
-    W.worker_store = _worker_store_orig
 
 
 # ── [2] worker: _adopt_blocked_models ────────────────────────────────────────
@@ -377,4 +375,11 @@ _reset_blocklist()
 _reset_worker_block_state()
 
 print(f"\n{ok} passed, {fail} failed")
-sys.exit(1 if fail else 0)
+assert fail == 0, f"{fail} check(s) failed — see FAIL lines above"
+if __name__ == "__main__":
+    # k3: an unconditional sys.exit() at module scope aborts pytest's
+    # collector with an INTERNALERROR instead of a normal per-file failure
+    # (confirmed pre-existing, not introduced here) — guard it so `pytest
+    # tests/` can traverse this file without crashing the whole run. The
+    # assert above already fails collection on a real check failure.
+    sys.exit(1 if fail else 0)

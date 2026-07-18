@@ -19,6 +19,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from worker_store_isolation import isolated_worker_store
+
 W = importlib.import_module(
     "abstract_hugpy_dev.flask_app.app.functions.imports.utils.workers")
 
@@ -51,8 +53,11 @@ EMBED = "feature-extraction"
 
 
 def _fresh_store():
-    tmp = tempfile.mkdtemp(prefix="hugpy-task-gate-")
-    return W.WorkerStore(path=os.path.join(tmp, "workers.json"))
+    # k3 isolation: isolated_worker_store() also redirects the assignment-
+    # memory sidecar (settings.manifest_path), which a bare
+    # WorkerStore(path=tmp) does NOT — see tests/worker_store_isolation.py.
+    store, _tmp = isolated_worker_store(prefix="hugpy-task-gate-")
+    return store
 
 
 def _add(store, wid, caps, name=None):

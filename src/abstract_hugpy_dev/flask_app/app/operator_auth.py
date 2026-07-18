@@ -54,6 +54,15 @@ _SENSITIVE = [
     ({"GET", "POST"},            re.compile(r"^/keys$")),
     ({"DELETE"},                 re.compile(r"^/keys/[^/]+$")),
     ({"PUT"},                    re.compile(r"^/keys/require$")),
+    # k9 VIDEO-SHARE key management: mint/list/revoke the video-scoped share
+    # links. Operator-only, and deliberately NOT on the /video surface — so a
+    # video-share principal (which CAN pass the /video gate) can never reach the
+    # mint route to bootstrap another key ("no key-minting-by-key"). The list GET
+    # doubles as the SPA's operator-auth probe (200 => show the Share button).
+    # (The generic DELETE /keys/<id> rule above matches DELETE /keys/video-share
+    # too, but never the 2-segment /keys/video-share/<id> revoke — hence its own.)
+    ({"GET", "POST"},            re.compile(r"^/keys/video-share$")),
+    ({"DELETE"},                 re.compile(r"^/keys/video-share/[^/]+$")),
     # Worker enrollment tokens (minting/revoking enrollment — CRITICAL)
     ({"GET", "POST"},            re.compile(r"^/llm/enroll-tokens$")),
     ({"DELETE"},                 re.compile(r"^/llm/enroll-tokens/[^/]+$")),

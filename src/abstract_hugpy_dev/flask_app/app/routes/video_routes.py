@@ -46,6 +46,7 @@ from abstract_hugpy_dev.imports.src.constants.constants import (
     DEFAULT_ROOT,
 )
 from abstract_hugpy_dev.video_intel import media_store, media_bus, identity_profiles, shot_intent
+from abstract_hugpy_dev.video_intel.placement import job_placement
 from abstract_hugpy_dev.video_intel.media_schema import make_media_ref
 from abstract_hugpy_dev.video_intel.crop_schema import (
     SpatialRegion,
@@ -82,6 +83,39 @@ from abstract_hugpy_dev.video_intel.chains import (
 )
 
 video_bp, logger = get_bp("video_bp", __name__)
+
+
+# --------------------------------------------------------------------------- #
+# k9 attribution — WHO is enqueueing this video job. Resolved HERE, in the Flask
+# request context (media_bus is Flask-free), and threaded onto the job so it
+# surfaces in /llm/jobs. Mirrors chat's streaming._resolve_request_principal:
+# operator session first (the stronger, first-party identity), then a video-share
+# principal (share:<key_id>) for an outside party on a share link, else None
+# (unattributed — every self-hosted/open-mode call). Best-effort: attribution
+# must never fail an enqueue.
+# --------------------------------------------------------------------------- #
+def _request_principal():
+    try:
+        from ..operator_auth import operator_authenticated
+        if operator_authenticated():
+            return "operator"
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from ..video_auth import _video_share_principal
+        p = _video_share_principal(request)
+        if p:
+            return p
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _video_enqueue(name, spec):
+    """media_bus.enqueue with the request principal stamped for attribution (k9).
+    Every /video enqueue route funnels through this so a job's origin (operator
+    vs a share link) rides onto /llm/jobs uniformly."""
+    return media_bus.enqueue(name, spec, principal=_request_principal())
 
 
 # --------------------------------------------------------------------------- #
@@ -231,7 +265,7 @@ def video_crop():
         spec = make_crop(source=source, spatial=spatial, temporal=temporal)
     except (ValueError, TypeError) as exc:  # invalid axis combo / bad fields = 400
         return jsonify({"error": str(exc)}), 400
-    job_id = media_bus.enqueue("crop", spec)
+    job_id = _video_enqueue("crop", spec)
     return jsonify({"job_id": job_id}), 200
 
 
@@ -258,7 +292,7 @@ def video_frame_extract():
         )
     except (ValueError, TypeError) as exc:  # bad fields / axis combo = 400
         return jsonify({"error": str(exc)}), 400
-    job_id = media_bus.enqueue("frame_extract", spec)
+    job_id = _video_enqueue("frame_extract", spec)
     return jsonify({"job_id": job_id}), 200
 
 
@@ -279,7 +313,7 @@ def video_audio_extract():
         )
     except (ValueError, TypeError) as exc:  # bad fields / non-video source = 400
         return jsonify({"error": str(exc)}), 400
-    job_id = media_bus.enqueue("audio_extract", spec)
+    job_id = _video_enqueue("audio_extract", spec)
     return jsonify({"job_id": job_id}), 200
 
 
@@ -326,7 +360,7 @@ def video_generate_image():
     except (ValueError, TypeError) as exc:
         return jsonify({"error": str(exc)}), 400
 
-    job_id = media_bus.enqueue("generate_image", resolved)
+    job_id = _video_enqueue("generate_image", resolved)
     return jsonify({"job_id": job_id}), 200
 
 
@@ -380,7 +414,7 @@ def video_generate_scene():
     except (ValueError, TypeError) as exc:
         return jsonify({"error": str(exc)}), 400
 
-    job_id = media_bus.enqueue("generate_scene", resolved)
+    job_id = _video_enqueue("generate_scene", resolved)
     return jsonify({"job_id": job_id}), 200
 
 
@@ -442,7 +476,7 @@ def video_generate_movie():
     except (ValueError, TypeError) as exc:
         return jsonify({"error": str(exc)}), 400
 
-    job_id = media_bus.enqueue("generate_movie", resolved)
+    job_id = _video_enqueue("generate_movie", resolved)
     return jsonify({"job_id": job_id}), 200
 
 
@@ -644,7 +678,7 @@ def video_studio_i2v():
         )
     except (ValueError, TypeError) as exc:  # bad geometry / capability / overrides = 400
         return jsonify({"error": str(exc)}), 400
-    job_id = media_bus.enqueue("studio_i2v", spec)
+    job_id = _video_enqueue("studio_i2v", spec)
     return jsonify({"job_id": job_id}), 200
 
 
@@ -867,7 +901,7 @@ def video_studio_movie():
         )
     except (ValueError, TypeError) as exc:  # bad node / geometry / chain = 400
         return jsonify({"error": str(exc)}), 400
-    job_id = media_bus.enqueue("generate_studio_movie", spec)
+    job_id = _video_enqueue("generate_studio_movie", spec)
     return jsonify({"job_id": job_id}), 200
 
 
@@ -1249,13 +1283,64 @@ def studio_preset_apply(preset_id):
 
 
 # --------------------------------------------------------------------------- #
+# 2z) GET /video/jobs — bus-wide LISTING for the console-wide "Active Processes"
+#     view. In-flight media-bus jobs by default (queued/claimed/running/
+#     cancelling); ?all=1 appends recent terminal rows (bounded). Each row carries
+#     its parsed `progress` (incl. the awaiting_capacity HOLD marker) and a
+#     `placement` object — {source:"reservation"|"template", host, worker_id, gpu,
+#     process, reserved_bytes} (omit-when-unset) — so the console can show WHERE a
+#     run physically executes (e.g. "ae · cuda:0 · P-studio"). Read-only; never
+#     5xxes (a bus/placement hiccup degrades to fewer rows / no placement).
+#
+#     NOTE: this bare-path route MUST be registered on the blueprint so it wins
+#     over the SPA catch-all (`@app.route("/<path:asset>")`): Werkzeug ranks a
+#     static rule above a <path:> converter regardless of registration order, so
+#     GET /video/jobs resolves here, not to index.html. (The per-id sibling
+#     /video/jobs/<job_id> below is a distinct, more-specific rule.)
+# --------------------------------------------------------------------------- #
+@video_bp.route("/video/jobs", methods=["GET"])
+def video_jobs_list():
+    include_terminal = (request.args.get("all") or "").strip().lower() in (
+        "1", "true", "yes", "on")
+    try:
+        limit = int(request.args.get("limit", 50))
+    except (TypeError, ValueError):
+        limit = 50
+    jobs = []
+    try:
+        rows = media_bus.list_jobs(include_terminal=include_terminal, limit=limit)
+    except Exception:  # noqa: BLE001 — the listing never 5xxes
+        logger.debug("video jobs listing failed", exc_info=True)
+        rows = []
+    for row in rows:
+        try:
+            pl = job_placement(row.get("job_id"), row.get("name"))
+            if pl:
+                row["placement"] = pl
+        except Exception:  # noqa: BLE001 — placement is best-effort per row
+            pass
+        jobs.append(row)
+    return jsonify({"jobs": jobs}), 200
+
+
+# --------------------------------------------------------------------------- #
 # 3) GET /video/jobs/<job_id> — read-only job view (unknown id -> null view)
 # --------------------------------------------------------------------------- #
 @video_bp.route("/video/jobs/<job_id>", methods=["GET"])
 def video_job_status(job_id):
-    # media_bus.get returns {"job_id","status":null,"result":null} for an unknown
-    # id, so the poller can distinguish "not yet / unknown" from a real status.
-    return jsonify(media_bus.get(job_id)), 200
+    # media_bus.get returns {"job_id","name":null,"status":null,"result":null,
+    # "progress":null} for an unknown id, so the poller can distinguish
+    # "not yet / unknown" from a real status. Enriched with a `placement` object
+    # (same helper as GET /video/jobs / /video/studio/clips) when known — WHERE the
+    # run executes — set only when present, so a light/unknown job is unaffected.
+    view = media_bus.get(job_id)
+    try:
+        pl = job_placement(job_id, view.get("name") if isinstance(view, dict) else None)
+        if pl and isinstance(view, dict):
+            view["placement"] = pl
+    except Exception:  # noqa: BLE001 — enrichment never breaks the status read
+        pass
+    return jsonify(view), 200
 
 
 # --------------------------------------------------------------------------- #
@@ -1336,7 +1421,7 @@ def video_studio_clips():
         conn.execute("PRAGMA busy_timeout=5000")
         try:
             rows = conn.execute(
-                "SELECT job_id, status, result_json, created, updated "
+                "SELECT job_id, status, result_json, created, updated, progress_json "
                 "FROM media_jobs WHERE name='studio_i2v' AND archived_at IS NULL "
                 "ORDER BY updated DESC LIMIT ?",
                 (limit,),
@@ -1349,7 +1434,7 @@ def video_studio_clips():
         # honest answer, same posture as before this feature.
         rows = []
 
-    for job_id, status, result_json, created, updated in rows:
+    for job_id, status, result_json, created, updated, progress_json in rows:
         out = None
         if result_json:
             try:
@@ -1372,14 +1457,32 @@ def video_studio_clips():
                     }
             except (ValueError, TypeError):
                 out = None
-        clips.append({
+        # Additive honesty (Active Processes): the live progress blob (incl. the
+        # awaiting_capacity HOLD marker) + a placement object (WHERE the render
+        # executes). Existing fields are untouched. `progress` is null unless the
+        # runner has written one; `placement` is omitted unless known.
+        progress = None
+        if progress_json:
+            try:
+                progress = _json.loads(progress_json)
+            except (ValueError, TypeError):
+                progress = None
+        clip = {
             "job_id": job_id,
             "status": status,
             "playable": bool(status == "done" and out),
             "created": created,
             "updated": updated,
             "output": out,
-        })
+            "progress": progress,
+        }
+        try:
+            pl = job_placement(job_id, "studio_i2v")
+            if pl:
+                clip["placement"] = pl
+        except Exception:  # noqa: BLE001 — placement is best-effort per clip
+            pass
+        clips.append(clip)
 
     return jsonify({"clips": clips}), 200
 
@@ -1592,6 +1695,112 @@ def video_studio_clip_unarchive(job_id):
         "job_id": job_id,
         "archived": False,
         "already": result["already"],
+    }), 200
+
+
+# --------------------------------------------------------------------------- #
+# 5d) POST /video/studio/clip/<job_id>/to-editor — Studio "Send to Editor" (k12).
+#     A ONE-CLICK handoff of a produced clip, in a Filmora-native MP4, into a
+#     stable inbox (studio.job.EDITOR_INBOX_ROOT) the operator's LAN Windows
+#     workstation (Filmora desktop) picks up over a host-side Samba export.
+#
+#     CONSOLE-OPERATOR ONLY. The blanket /video gate (video_auth.install_video_gate)
+#     already admitted EITHER an operator session OR a video-share credential by the
+#     time this body runs — but this action WRITES INTO THE OPERATOR'S REAL EDITING
+#     FOLDER, so a share-link guest (who CAN pass that gate) must not reach it. The
+#     body re-checks operator_authenticated() and 403s otherwise: defense in depth,
+#     independent of the blanket gate (mirrors _request_principal's lazy import).
+#
+#     The clip is resolved BY JOB ID exactly like GET /video/studio/clip/<id>
+#     (archived -> 410, no completed clip -> 404, jail on the realpath under the
+#     studio clips tree). The FORMAT GUARANTEE (ffprobe -> remux-or-transcode) lives
+#     in the backbone (studio.editor_handoff), never inline here, per this module's
+#     house rule. RE-SEND is NON-DESTRUCTIVE: unique_path appends _1, _2 … rather
+#     than clobbering a prior copy the operator may have open in Filmora mid-edit.
+# --------------------------------------------------------------------------- #
+@video_bp.route("/video/studio/clip/<job_id>/to-editor", methods=["POST"])
+def video_studio_clip_to_editor(job_id):
+    # Cheapest check first: CONSOLE OPERATOR ONLY (a share guest is refused here
+    # even though it passed the blanket /video gate). Same lazy import idiom as
+    # _request_principal() at the top of this module.
+    from ..operator_auth import operator_authenticated
+    if not operator_authenticated():
+        return jsonify({"error": "operator session required"}), 403
+
+    import json as _json
+    import sqlite3
+    from abstract_hugpy_dev.video_intel.studio.job import (
+        DEFAULT_CLIPS_ROOT,
+        EDITOR_INBOX_ROOT,
+    )
+    from abstract_hugpy_dev.video_intel.studio.editor_handoff import (
+        editor_filename,
+        send_to_editor,
+    )
+    from abstract_hugpy_dev.imports.src.utils import unique_path
+
+    # Resolve the clip exactly like GET /video/studio/clip/<job_id>: an archived
+    # clip's bytes still exist (never-delete) -> honest 410, not a bare 404; any
+    # non-done/failed job -> no playable clip; the jail on the realpath keeps a
+    # crafted/rehomed uri from becoming an arbitrary file read.
+    if media_bus.is_archived(job_id):
+        return jsonify({"error": "clip archived", "archived": True}), 410
+
+    view = media_bus.get(job_id)
+    result = view.get("result") if isinstance(view, dict) else None
+    if not (isinstance(result, dict) and result.get("ok")):
+        return jsonify({"error": "no completed studio clip for that job"}), 404
+
+    outputs = result.get("outputs") or []
+    first = outputs[0] if (outputs and isinstance(outputs[0], dict)) else {}
+    uri = first.get("uri")
+    if not uri or not isinstance(uri, str):
+        return jsonify({"error": "job result carries no clip uri"}), 404
+
+    resolved = os.path.realpath(uri)
+    if not _is_within(resolved, DEFAULT_CLIPS_ROOT) or not os.path.isfile(resolved):
+        return jsonify({"error": "clip not found"}), 404
+
+    # Filename slug from the render's prompt/project. spec_json carries them; there
+    # is no dedicated media_bus getter, so read the bus row read-only, exactly like
+    # GET /video/studio/clip/<id>/detail. Best-effort — a slug of "clip" is a fine
+    # fallback if the row/spec can't be read.
+    title = None
+    try:
+        conn = sqlite3.connect(
+            f"file:{media_bus.DB_PATH}?mode=ro", uri=True, timeout=5.0)
+        conn.execute("PRAGMA busy_timeout=5000")
+        try:
+            row = conn.execute(
+                "SELECT spec_json FROM media_jobs WHERE job_id=? AND name='studio_i2v'",
+                (job_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row and row[0]:
+            s = _json.loads(row[0])
+            title = s.get("prompt") or s.get("project")
+    except (sqlite3.Error, ValueError, TypeError):
+        title = None
+
+    filename = editor_filename(title, job_id)
+    os.makedirs(EDITOR_INBOX_ROOT, exist_ok=True)
+    dest = unique_path(os.path.join(EDITOR_INBOX_ROOT, filename))
+
+    outcome = send_to_editor(resolved, dest)
+    if not outcome.ok:
+        return jsonify({
+            "error": "could not prepare the clip for the editor",
+            "code": outcome.code,
+            "message": outcome.message,
+        }), 500
+
+    return jsonify({
+        "ok": True,
+        "filename": os.path.basename(outcome.dest),
+        "path": outcome.dest,
+        # "copy" (remux) vs "transcode" — surfaced so the console can say which ran.
+        "mode": outcome.mode,
     }), 200
 
 
@@ -2089,7 +2298,7 @@ def _retired_video_identity_profile_reconstructions(slug):
         )
     except (ValueError, TypeError) as exc:  # bad fields = 400
         return jsonify({"error": str(exc)}), 400
-    job_id = media_bus.enqueue("identity_reconstruction", spec)
+    job_id = _video_enqueue("identity_reconstruction", spec)
     return jsonify({"job_id": job_id, "recon_id": recon_id}), 200
 
 
@@ -2220,7 +2429,7 @@ def video_identity_profile_reconstruction(slug):
     except (ValueError, TypeError) as exc:
         return jsonify({"error": str(exc)}), 400
         
-    job_id = media_bus.enqueue("identity_reconstruction", spec)
+    job_id = _video_enqueue("identity_reconstruction", spec)
     return jsonify({"job_id": job_id, "recon_id": recon_id}), 200
 
 
@@ -2280,7 +2489,7 @@ def video_identity_profile_view_regenerate(slug, recon_id, view_id):
     except identity_profiles.ProfileError as exc:
         return jsonify({"error": str(exc), "code": exc.code}), 400
 
-    job_id = media_bus.enqueue("identity_view_regenerate", spec)
+    job_id = _video_enqueue("identity_view_regenerate", spec)
     return jsonify({"job_id": job_id, "recon_id": recon_id}), 200
 
 
@@ -2448,7 +2657,7 @@ def video_identity_profile_build_mesh(slug, recon_id):
     except identity_profiles.ProfileError:
         pass
 
-    job_id = media_bus.enqueue("identity_mesh_build", spec)
+    job_id = _video_enqueue("identity_mesh_build", spec)
     return jsonify({"job_id": job_id, "recon_id": recon_id}), 200
 
 
@@ -2540,7 +2749,7 @@ def video_identity_profile_video_extract():
     except (ValueError, TypeError) as exc:  # bad fields = 400
         return jsonify({"error": str(exc)}), 400
 
-    job_id = media_bus.enqueue("identity_video_extract", spec)
+    job_id = _video_enqueue("identity_video_extract", spec)
     return jsonify({"job_id": job_id, "target": target}), 200
 
 
@@ -2768,7 +2977,7 @@ def video_identity_profile_generate(slug):
     except identity_profiles.ProfileError:
         pass
 
-    job_id = media_bus.enqueue("identity_mesh_build", spec)
+    job_id = _video_enqueue("identity_mesh_build", spec)
     resp = {"job_id": job_id, "recon_id": recon_id}
     # Only surface a ``pose`` block when t-pose was explicitly requested — a bare click
     # (pose="none") keeps the exact {job_id, recon_id} shape it has today.

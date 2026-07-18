@@ -29,9 +29,12 @@ unit tests all share one implementation with no filesystem coupling.
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 from typing import Iterable, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 # ── weight-format classification ────────────────────────────────────────────
 # Redundant framework formats a Linux GPU worker never loads when a torch-usable
@@ -209,14 +212,24 @@ def effective_bytes(
 def walk_listing(root: str) -> List[Tuple[str, int]]:
     """Directory -> ``[(relpath, size)]``, skipping transfer-machinery sidecars.
 
-    Mirrors the walk the /manifest and /archive routes already do (chunk-hash
-    caches + .part/.state staging are not model content) so select_files sees the
-    same file universe those routes filter.
+    This is THE shared walk for /manifest and /archive (both call it directly;
+    no more hand-copied mirrors) so select_files always sees the same file
+    universe those routes filter.
+
+    Never descends into a dot-directory (``.cache/``, ``.git/``, …). Those are
+    HF/git bookkeeping, never servable weights — and critically, HF's own local
+    cache scheme drops metadata files (``.cache/huggingface/trees/*.json``) that
+    can be mode 0600 owned by whatever uid ran the download, which a
+    differently-provisioned central process can enumerate but not read (live
+    2026-07-18: PermissionError serving a comfy checkpoint's manifest-offered
+    ``.cache`` file — see worker_routes.py's ``model_file``). Pruning the
+    directory here means the file is never offered, not just tolerated.
     """
     out: List[Tuple[str, int]] = []
     if not root or not os.path.isdir(root):
         return out
-    for r, _dirs, names in os.walk(root):
+    for r, dirs, names in os.walk(root):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
         for name in names:
             if ".chunksums-" in name or name.endswith((".part", ".part.state.json")):
                 continue
@@ -224,6 +237,10 @@ def walk_listing(root: str) -> List[Tuple[str, int]]:
             try:
                 size = os.path.getsize(full)
             except OSError:
+                # Unreadable entry (permission-restricted, vanished mid-walk, …):
+                # degrade by skipping it, never let a single bad entry 500 the
+                # whole listing.
+                logger.warning("walk_listing: skipping unreadable entry %s", full)
                 continue
             out.append((os.path.relpath(full, root), size))
     return out

@@ -23,7 +23,7 @@ import sqlite3
 import threading
 import time
 from dataclasses import asdict
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 from abstract_hugpy_dev.imports.src.constants.constants import DEFAULT_ROOT
@@ -288,6 +288,16 @@ def _ensure_db() -> None:
                 conn.execute("ALTER TABLE media_jobs ADD COLUMN archived_at REAL")
             except sqlite3.OperationalError:
                 pass  # column already present (fresh CREATE or prior migration)
+            # k9 attribution: who enqueued this job (a comms principal string —
+            # "operator", "apikey:<id>", "share:<id>", …). NULL = unattributed
+            # (every pre-k9 job). Resolved in the REQUEST context at enqueue and
+            # persisted here so the bus->JobStore bridge can carry it to /llm/jobs
+            # even though the process that RUNS the job (and fires on_running/
+            # on_terminal) is frequently a different one than enqueued it.
+            try:
+                conn.execute("ALTER TABLE media_jobs ADD COLUMN principal TEXT")
+            except sqlite3.OperationalError:
+                pass  # column already present (fresh CREATE or prior migration)
         finally:
             conn.close()
         _initialized = True
@@ -348,10 +358,221 @@ def _release_reservation(job_id: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# RESERVATION-GATED ADMISSION seam — the claim path probes the reservation
+# engine's non-destructive fit PROBE before flipping a queued row to 'claimed'.
+# A head that can't fit HOLDS (stays queued, marked awaiting_capacity) and the
+# claimer may look PAST it to a later job that fits (bounded overtake). Like the
+# reservation acquire/release seam above, this is lazily imported + fully guarded
+# so the bus keeps ZERO import-time coupling to the reservation engine and any
+# probe failure FAILS OPEN (admit) — an admission bug can never wedge dispatch.
+# When the reservation layer is OFF the whole gate is a transparent no-op (pure
+# FIFO — see claim_admissible's fast-path).
+# --------------------------------------------------------------------------- #
+def _admission_enabled() -> bool:
+    """True when the reservation layer is on (so the admission gate is active).
+    Fail-CLOSED to False (pure FIFO) on any import/infra problem — the gate is
+    never allowed to be the thing that breaks claiming."""
+    try:
+        from .reservation import admission_enabled
+        return bool(admission_enabled())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _probe_admission(name: str, job_id: str) -> Tuple[bool, Optional[dict]]:
+    """(admit, reason) from the engine's non-destructive probe. Fail-OPEN
+    (True, None) on any error — a probe hiccup must never HOLD a render."""
+    try:
+        from .reservation import can_admit
+        return can_admit(name, None, run_id=job_id)
+    except Exception:  # noqa: BLE001
+        return True, None
+
+
+def _force_admit_safe(name: str) -> bool:
+    """Whether the scheduler's starvation/deadlock guard may force-admit a held
+    head best-effort without colliding with an active reservation. Fail-OPEN
+    True."""
+    try:
+        from .reservation import force_admit_safe
+        return bool(force_admit_safe(name))
+    except Exception:  # noqa: BLE001
+        return True
+
+
+# ── admission knobs (env-overridable; defaults are today's-fleet success paths) ─
+def _runner_count() -> int:
+    """Concurrent claim->run threads in the pool (HUGPY_MEDIA_BUS_RUNNERS, def 2).
+    Heavy GPU tasks still serialize naturally via exclusive reservations; the win
+    is light/CPU tasks + multi-worker fleets no longer queuing behind a render."""
+    try:
+        return max(1, int(os.environ.get("HUGPY_MEDIA_BUS_RUNNERS", "2")))
+    except (TypeError, ValueError):
+        return 2
+
+
+def _lookahead() -> int:
+    """How many oldest queued rows the claimer may consider — the head plus the
+    overtake window (HUGPY_MEDIA_BUS_LOOKAHEAD, def 5)."""
+    try:
+        return max(1, int(os.environ.get("HUGPY_MEDIA_BUS_LOOKAHEAD", "5")))
+    except (TypeError, ValueError):
+        return 5
+
+
+def _max_overtake() -> int:
+    """Max times a held HEAD may be overtaken by later jobs before the claimer
+    STOPS overtaking and idles until the head's capacity frees — the anti-
+    starvation bound (HUGPY_MEDIA_BUS_MAX_OVERTAKE, def 8). The head still runs the
+    instant its reservation fits; this only caps how long throughput may jump it."""
+    try:
+        return max(0, int(os.environ.get("HUGPY_MEDIA_BUS_MAX_OVERTAKE", "8")))
+    except (TypeError, ValueError):
+        return 8
+
+
+def _load_progress(progress_json: Optional[str]) -> Optional[dict]:
+    if not progress_json:
+        return None
+    try:
+        return json.loads(progress_json)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _mark_awaiting_capacity(job_id: str, reason: Optional[dict],
+                            prev: Optional[dict], overtaken: int) -> None:
+    """Set (or refresh) a held job's ``awaiting_capacity`` progress marker so the
+    hold + reason are VISIBLE via GET /video/jobs/<id> and (through the bridge)
+    /llm/jobs — mirroring the cold-hold/awaiting-load pattern. The job stays
+    status='queued' (so cancel() still cancels it exactly as any queued job). To
+    avoid spamming set_progress (and its bridge) every idle tick, we only write
+    when the marker actually CHANGES (first hold, or the overtaken count ticks)."""
+    already = bool(prev) and prev.get("phase") == "awaiting_capacity"
+    if already and int(prev.get("overtaken", 0)) == int(overtaken):
+        return  # unchanged — don't re-emit
+    held_since = prev.get("held_since") if already else time.time()
+    marker = {
+        "phase": "awaiting_capacity",
+        "reason": reason or {},
+        "held_since": held_since,
+        "overtaken": int(overtaken),
+    }
+    try:
+        set_progress(job_id, marker)
+    except Exception:  # noqa: BLE001 — the hold marker is best-effort observability
+        pass
+
+
+def _candidate_queued(limit: int):
+    """The oldest ``limit`` queued rows (job_id, name, progress_json), FIFO order.
+    A plain read (no write lock) so probing — which may hit the fleet read — never
+    holds the sqlite write lock across network I/O."""
+    conn = _connect()
+    try:
+        return conn.execute(
+            "SELECT job_id, name, progress_json FROM media_jobs "
+            "WHERE status='queued' ORDER BY created LIMIT ?", (int(limit),)
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def _try_claim_specific(job_id: str, worker_token: str) -> bool:
+    """Atomically claim ONE specific queued job (the admission-chosen row). Same
+    cross-process guarantee as claim(): BEGIN IMMEDIATE + a conditional UPDATE
+    gated on status='queued', so exactly one claimer wins. Clears progress_json
+    so a stale awaiting_capacity marker doesn't linger once the job starts. Returns
+    True iff we won the row."""
+    conn = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.execute(
+            "UPDATE media_jobs SET status='claimed', claim_token=?, updated=?, "
+            "progress_json=NULL WHERE job_id=? AND status='queued'",
+            (worker_token, time.time(), job_id),
+        )
+        conn.execute("COMMIT")
+        return cur.rowcount == 1
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
+def claim_admissible(worker_token: str) -> Optional[str]:
+    """Reservation-GATED claim. Probes the reservation engine's non-destructive
+    fit PROBE before flipping a queued row to 'claimed':
+
+      * layer OFF  → transparent no-op: pure FIFO claim() (current behavior).
+      * head fits  → claim the head (FIFO).
+      * head can't → HOLD it (mark awaiting_capacity) and look PAST it, within a
+                     bounded window, for a later job that fits (overtake). The
+                     overtake count is capped (anti-starvation): once exhausted
+                     the claimer idles until the head's capacity frees.
+      * no later job fits AND force-admitting the head can't collide with an
+                     active reservation → force-admit the head best-effort (its
+                     envelope only fails because the render will OFFLOAD — §7.4),
+                     exactly today's FIFO behavior. Otherwise return None (idle).
+
+    Returns the claimed job_id, or None (queue empty / everything held). The
+    reservation acquire() in run_claimed remains the AUTHORITY; this is advisory
+    admission (handle the probe→acquire race via acquire's best-effort path)."""
+    _ensure_db()
+    if not _admission_enabled():
+        return claim(worker_token)            # transparent FIFO — no fleet reads
+
+    cands = _candidate_queued(_lookahead())
+    if not cands:
+        return None
+    head_id, head_name, head_pj = cands[0]
+    admit, reason = _probe_admission(head_name, head_id)
+    if admit:
+        if _try_claim_specific(head_id, worker_token):
+            return head_id
+        return None                           # lost the race — rescan next tick
+
+    # Head can't be admitted now — HOLD it and account the overtake.
+    head_prev = _load_progress(head_pj)
+    overtaken = (int(head_prev.get("overtaken", 0))
+                 if head_prev and head_prev.get("phase") == "awaiting_capacity"
+                 else 0)
+    _mark_awaiting_capacity(head_id, reason, head_prev, overtaken)
+
+    # Overtake with a later admissible job (bounded by the anti-starvation cap).
+    if overtaken < _max_overtake():
+        for cid, cname, _cpj in cands[1:]:
+            adc, _r = _probe_admission(cname, cid)
+            if adc and _try_claim_specific(cid, worker_token):
+                _mark_awaiting_capacity(head_id, reason, head_prev, overtaken + 1)
+                logger.info("media_bus: %s (%s) overtook held head %s (%s) "
+                            "[overtaken=%d/%d]", cid, cname, head_id, head_name,
+                            overtaken + 1, _max_overtake())
+                return cid
+
+    # No later job fit (or the overtake budget is spent). Starvation/deadlock
+    # guard: force-admit the head best-effort ONLY when that can't collide with an
+    # active reservation (a lone head whose only failing is the offload envelope);
+    # otherwise idle and wait for the in-flight reservation to release.
+    if _force_admit_safe(head_name) and _try_claim_specific(head_id, worker_token):
+        logger.info("media_bus: force-admitting held head %s (%s) best-effort — "
+                    "no active-reservation collision (render offloads / worker gate "
+                    "is the fit authority)", head_id, head_name)
+        return head_id
+    return None
+
+
+# --------------------------------------------------------------------------- #
 # API
 # --------------------------------------------------------------------------- #
-def enqueue(name: str, spec) -> str:
-    """Mint a job_id, serialize the spec, insert status='queued'. Returns job_id."""
+def enqueue(name: str, spec, principal: Optional[str] = None) -> str:
+    """Mint a job_id, serialize the spec, insert status='queued'. Returns job_id.
+
+    ``principal`` (k9) is the comms attribution string for whoever enqueued this
+    job — resolved by the caller in the REQUEST context (this module has no Flask
+    coupling). It is persisted on the row so the bus->JobStore bridge can stamp it
+    onto /llm/jobs from the (possibly different) process that runs the job."""
     if name not in JOB_REGISTRY:
         raise KeyError(f"unknown job name {name!r}; registered: {sorted(JOB_REGISTRY)}")
     _ensure_db()
@@ -362,15 +583,15 @@ def enqueue(name: str, spec) -> str:
     try:
         conn.execute(
             "INSERT INTO media_jobs "
-            "(job_id, name, status, spec_json, result_json, claim_token, created, updated) "
-            "VALUES (?, ?, 'queued', ?, NULL, NULL, ?, ?)",
-            (job_id, name, spec_json, now, now),
+            "(job_id, name, status, spec_json, result_json, claim_token, created, updated, principal) "
+            "VALUES (?, ?, 'queued', ?, NULL, NULL, ?, ?, ?)",
+            (job_id, name, spec_json, now, now, principal),
         )
     finally:
         conn.close()
     # One-directional bridge (A/P0-2): surface this queued job in comms.JobStore
-    # (GET /llm/jobs). Best-effort — never fails the enqueue.
-    _bridge("on_enqueue", job_id, name)
+    # (GET /llm/jobs), carrying its attribution. Best-effort — never fails enqueue.
+    _bridge("on_enqueue", job_id, name, principal=principal)
     return job_id
 
 
@@ -413,12 +634,12 @@ def run_claimed(job_id: str, worker_token: str) -> Optional[JobResult]:
     conn = _connect()
     try:
         row = conn.execute(
-            "SELECT name, spec_json, claim_token FROM media_jobs WHERE job_id=?",
+            "SELECT name, spec_json, claim_token, principal FROM media_jobs WHERE job_id=?",
             (job_id,),
         ).fetchone()
         if row is None:
             return None
-        name, spec_json, claim_token = row
+        name, spec_json, claim_token, principal = row
         if claim_token != worker_token:
             # not our claim — refuse to write (single writer invariant)
             return None
@@ -436,8 +657,10 @@ def run_claimed(job_id: str, worker_token: str) -> Optional[JobResult]:
         conn.close()
 
     # One-directional bridge (A/P0-2): mark this job running in comms.JobStore
-    # (GET /llm/jobs), in the process that actually owns the run. Best-effort.
-    _bridge("on_running", job_id, name, worker=worker_token)
+    # (GET /llm/jobs), in the process that actually owns the run — carrying the
+    # attribution read from the row so it survives across the enqueue/run process
+    # split (k9). Best-effort.
+    _bridge("on_running", job_id, name, worker=worker_token, principal=principal)
 
     # ---- run outside the DB connection; the runner is pure & may block ----
     # p6: a heavy GPU video task pre-claims the card here (make-room via the
@@ -500,9 +723,10 @@ def run_claimed(job_id: str, worker_token: str) -> Optional[JobResult]:
     finally:
         conn.close()
     # One-directional bridge (A/P0-2): mark the terminal state in comms.JobStore
-    # (done | failed | cancelled), carrying the clip uri on success. Best-effort.
+    # (done | failed | cancelled), carrying the clip uri on success + the
+    # attribution (k9). Best-effort.
     _bridge("on_terminal", job_id, name, status, result=result,
-            worker=worker_token)
+            worker=worker_token, principal=principal)
     return result
 
 
@@ -694,45 +918,141 @@ def work_once(worker_token: Optional[str] = None) -> Optional[str]:
 
 
 def get(job_id: str) -> dict:
-    """Read-only view: {"job_id", "status", "result": <JobResult dict|None>,
+    """Read-only view: {"job_id", "name", "status", "result": <JobResult dict|None>,
     "progress": <blob dict|None>}. `progress` is an object WHILE running (the
     live per-frame blob) and null at a terminal state (run_claimed nulls it on
-    the terminal write). Unknown id -> all-null view."""
+    the terminal write). `name` (the bus job kind) is additive — callers that
+    ignore it are unaffected, and the placement projection reads it. Unknown id ->
+    all-null view."""
     _ensure_db()
     conn = _connect()
     try:
         row = conn.execute(
-            "SELECT status, result_json, progress_json FROM media_jobs WHERE job_id=?",
+            "SELECT name, status, result_json, progress_json FROM media_jobs WHERE job_id=?",
             (job_id,),
         ).fetchone()
     finally:
         conn.close()
     if row is None:
-        return {"job_id": job_id, "status": None, "result": None, "progress": None}
-    status, result_json, progress_json = row
+        return {"job_id": job_id, "name": None, "status": None,
+                "result": None, "progress": None}
+    name, status, result_json, progress_json = row
     result = json.loads(result_json) if result_json else None
     progress = json.loads(progress_json) if progress_json else None
-    return {"job_id": job_id, "status": status, "result": result, "progress": progress}
+    return {"job_id": job_id, "name": name, "status": status,
+            "result": result, "progress": progress}
+
+
+# --------------------------------------------------------------------------- #
+# Bus-wide LISTING — feeds GET /video/jobs (the console-wide "Active Processes"
+# view). Read-only projection over the media_jobs catalog (like
+# /video/studio/clips), NOT the comms /llm/jobs view (which drops terminal rows
+# after ~600s). In-flight rows by default; ``include_terminal`` appends recent
+# terminal rows (bounded). The route enriches each row with a placement object.
+# --------------------------------------------------------------------------- #
+_INFLIGHT_STATES = ("queued", "claimed", "running", "cancelling")
+_TERMINAL_STATES = ("done", "failed", "cancelled")
+
+
+def _project_job_row(r) -> dict:
+    job_id, name, status, created, updated, principal, progress_json = r
+    return {
+        "job_id": job_id,
+        "name": name,
+        "status": status,
+        "created": created,
+        "updated": updated,
+        "principal": principal,
+        "progress": _load_progress(progress_json),
+    }
+
+
+def list_jobs(include_terminal: bool = False, limit: int = 50) -> List[dict]:
+    """Bus-wide job listing for GET /video/jobs.
+
+    In-flight rows (queued/claimed/running/cancelling) in FIFO order by ``created``
+    by default; ``include_terminal`` appends up to ``limit`` recent terminal rows
+    (done/failed/cancelled), newest-updated first. Each row is a dict:
+    {job_id, name, status, created, updated, principal, progress(parsed|None)} —
+    ``progress`` carries the live per-frame blob AND the ``awaiting_capacity`` hold
+    marker (phase/reason/held_since/overtaken) verbatim. Read-only; ``limit`` is
+    clamped to 1..200. The caller enriches each row with a placement object."""
+    _ensure_db()
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 50
+    limit = max(1, min(limit, 200))
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT job_id, name, status, created, updated, principal, progress_json "
+            "FROM media_jobs WHERE status IN (?,?,?,?) ORDER BY created ASC LIMIT ?",
+            (*_INFLIGHT_STATES, limit),
+        ).fetchall()
+        out = [_project_job_row(r) for r in rows]
+        if include_terminal:
+            trows = conn.execute(
+                "SELECT job_id, name, status, created, updated, principal, progress_json "
+                "FROM media_jobs WHERE status IN (?,?,?) ORDER BY updated DESC LIMIT ?",
+                (*_TERMINAL_STATES, limit),
+            ).fetchall()
+            out.extend(_project_job_row(r) for r in trows)
+        return out
+    finally:
+        conn.close()
+
+
+def _runner_loop(worker_token: str, idle_sleep_s: float,
+                 stop_event: Optional[threading.Event] = None) -> None:
+    """One pool thread: reservation-gated claim -> run, forever. Each pass claims
+    at most one job (heavy runs serialize naturally via exclusive reservations;
+    light/CPU jobs run concurrently across the pool). Never dies on a transient
+    error — a bad tick just idles. ``stop_event`` (optional) lets a caller stop the
+    loop gracefully (used by tests; production runs it forever as a daemon)."""
+    while not (stop_event is not None and stop_event.is_set()):
+        try:
+            job_id = claim_admissible(worker_token)
+        except Exception:  # noqa: BLE001 — never let a runner die on a transient error
+            logger.debug("media_bus runner: claim_admissible raised", exc_info=True)
+            job_id = None
+        if job_id is None:
+            if stop_event is not None and stop_event.wait(idle_sleep_s):
+                return
+            elif stop_event is None:
+                time.sleep(idle_sleep_s)
+            continue
+        try:
+            run_claimed(job_id, worker_token)
+        except Exception:  # noqa: BLE001 — run_claimed already converts runner raises;
+            # this guards ONLY an unexpected bus-level error so the pool survives.
+            logger.warning("media_bus runner: run_claimed raised for %s",
+                           job_id, exc_info=True)
 
 
 def start_worker_daemon(worker_token: Optional[str] = None,
-                        idle_sleep_s: float = 0.25) -> threading.Thread:
-    """Background thread looping work_once() with a short sleep when idle.
+                        idle_sleep_s: float = 0.25,
+                        stop_event: Optional[threading.Event] = None
+                        ) -> List[threading.Thread]:
+    """Start the media-bus RUNNER POOL — ``HUGPY_MEDIA_BUS_RUNNERS`` (default 2)
+    threads, each doing reservation-gated claim -> run. Replaces the old single
+    serial daemon so light/CPU tasks and multi-worker fleets no longer queue
+    behind a heavy render; heavy GPU tasks still serialize via exclusive
+    reservations (the admission gate + the worker gate keep the single-3090 fleet
+    a success path — nothing OOMs that wouldn't today). Returns the thread list.
 
-    DEFINED but NOT called at import — Phase 3 wires it at app init.
-    """
-    token = worker_token or f"daemon-{os.getpid()}-{uuid4().hex[:8]}"
-
-    def _loop() -> None:
-        while True:
-            try:
-                processed = work_once(token)
-            except Exception:
-                # never let the daemon thread die on a transient DB error
-                processed = None
-            if processed is None:
-                time.sleep(idle_sleep_s)
-
-    thread = threading.Thread(target=_loop, name="media_bus_worker", daemon=True)
-    thread.start()
-    return thread
+    DEFINED but NOT called at import — wsgi wires it once per process at app init.
+    The bus's atomic cross-process claim still guarantees exactly one runner (of
+    the N*processes total) transitions any given job."""
+    base = worker_token or f"daemon-{os.getpid()}"
+    n = _runner_count()
+    threads: List[threading.Thread] = []
+    for i in range(n):
+        token = f"{base}-r{i}-{uuid4().hex[:6]}"
+        t = threading.Thread(target=_runner_loop,
+                             args=(token, idle_sleep_s, stop_event),
+                             name=f"media_bus_worker_{i}", daemon=True)
+        t.start()
+        threads.append(t)
+    logger.info("media_bus: started %d runner thread(s)", n)
+    return threads
