@@ -507,6 +507,92 @@ def test_write_back_mode_and_face_centroid_persist():
     assert sh["mode"] == "sheet", sh
 
 
+# --------------------------------------------------------------------------- #
+# [10] REVIEW path (CHARACTER-GROUPS-PLAN S1) — target="review" runs char360, downloads
+#      the per-character crops into the storage jail, and returns the grouped views on
+#      JobResult.groups WITHOUT writing ANY identity profile. Retrieved via the same
+#      GET /video/jobs plumbing (media_bus.get -> result.groups).
+# --------------------------------------------------------------------------- #
+def test_review_returns_groups_and_writes_no_profile():
+    man = _manifest([_char("char_00", 4, [0.1, 0.2, 0.3]),
+                     _char("char_01", 3, [0.4, 0.5, 0.6])])
+    _reset_service(manifest=man)
+
+    before = {p["slug"] for p in identity_profiles.list_profiles()}
+
+    spec = make_identity_video_extract(source=_video_ref(), target="review")
+    job_id = media_bus.enqueue("identity_video_extract", spec)
+    view = _drain_bus(job_id)
+    assert view["status"] == "done", view
+    assert view["result"]["ok"] is True, view["result"]
+
+    # The grouped manifest rides the terminal result.
+    grouped = view["result"]["groups"]
+    assert grouped is not None, view["result"]
+    assert grouped["n_characters"] == 2, grouped
+    gs = grouped["groups"]
+    assert [g["char"] for g in gs] == ["char_00", "char_01"], gs
+    assert gs[0]["face_centroid"] == [0.1, 0.2, 0.3], gs[0]
+    # per-view shape: url (a persisted jailed handle that EXISTS) + yaw/bin/score.
+    v0 = gs[0]["views"]
+    assert len(v0) == 4, v0
+    assert len(gs[1]["views"]) == 3, gs[1]
+    for i, vv in enumerate(v0):
+        assert set(vv) == {"url", "yaw", "bin", "score"}, vv
+        assert isinstance(vv["url"], str) and os.path.isabs(vv["url"]), vv
+        assert os.path.isfile(vv["url"]), vv          # the crop was really persisted
+        assert vv["url"].startswith(_TMP_IDENTITIES), vv  # under the storage jail
+        assert vv["bin"] == i and vv["yaw"] == float(i * 30), vv
+        assert vv["score"] == 0.9, vv
+
+    # NO profile was created or appended — review is non-committing.
+    after = {p["slug"] for p in identity_profiles.list_profiles()}
+    assert after == before, sorted(after - before)
+
+
+# --------------------------------------------------------------------------- #
+# [11] REVIEW via the ROUTE — POST target="review" enqueues (no profile lookup), runs to
+#      done, and the grouped manifest is retrievable through GET /video/jobs plumbing.
+# --------------------------------------------------------------------------- #
+def test_review_route_enqueues_and_returns_groups():
+    man = _manifest([_char("char_00", 2, [1.0, 0.0, 0.0])])
+    _reset_service(manifest=man)
+
+    before = {p["slug"] for p in identity_profiles.list_profiles()}
+
+    import dataclasses
+    src = dataclasses.asdict(_video_ref())
+    r = client.post("/video/identity-profiles/video-extract",
+                    json={"source": src, "target": "review"})
+    assert r.status_code == 200, (r.status_code, r.get_json())
+    body = r.get_json()
+    assert body["target"] == "review" and isinstance(body["job_id"], str), body
+
+    view = _drain_bus(body["job_id"])
+    assert view["status"] == "done" and view["result"]["ok"] is True, view
+    grouped = view["result"]["groups"]
+    assert grouped["n_characters"] == 1, grouped
+    assert grouped["groups"][0]["char"] == "char_00", grouped
+
+    # Route review path mints NO profile (it never resolves target as a slug).
+    after = {p["slug"] for p in identity_profiles.list_profiles()}
+    assert after == before, sorted(after - before)
+
+
+# --------------------------------------------------------------------------- #
+# [12] REVIEW with no characters is still a clean no_characters error-as-data (the shared
+#      early guard), and nothing is written.
+# --------------------------------------------------------------------------- #
+def test_review_no_characters_is_error_as_data():
+    before = len(identity_profiles.list_profiles())
+    _reset_service(manifest=_manifest([], n=0))
+    spec = make_identity_video_extract(source=_video_ref(), target="review")
+    res = identity_video_extract_relay.run_identity_video_extract(spec, "job-review-empty")
+    assert res.ok is False and res.error.code == "no_characters", res.error
+    assert res.groups is None, res
+    assert len(identity_profiles.list_profiles()) == before, "review must write nothing"
+
+
 CHECKS = [
     ("create: a 2-char clip mints a profile per character (video_extract recon)",
      test_create_mints_profile_per_character),
@@ -521,6 +607,12 @@ CHECKS = [
     ("no characters found -> no_characters error-as-data; nothing written", test_no_characters_is_error_as_data),
     ("write-back: video_extract mode + char + face_centroid persist; angle-ring round-trips",
      test_write_back_mode_and_face_centroid_persist),
+    ("review: 2-char clip returns grouped views (url/yaw/bin/score) + writes NO profile",
+     test_review_returns_groups_and_writes_no_profile),
+    ("review route: POST target=review enqueues + returns groups; mints no profile",
+     test_review_route_enqueues_and_returns_groups),
+    ("review: no characters -> no_characters error-as-data; nothing written",
+     test_review_no_characters_is_error_as_data),
 ]
 
 

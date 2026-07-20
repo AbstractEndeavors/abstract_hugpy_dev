@@ -51,3 +51,12 @@ class JobResult:
     # generate_movie manifest: {"goals":[...], "segments":[...], ...} — the goal
     # timeline + per-segment director record. Plain dict; absent for non-movie jobs.
     movie: Optional[Dict[str, Any]] = None
+    # char360 REVIEW-mode grouped manifest (CHARACTER-GROUPS-PLAN S1): the per-character
+    # grouped views an ``identity_video_extract`` job with target="review" returns to the
+    # UI to curate BEFORE any identity profile is written. Shape:
+    #   {"n_characters": int, "groups": [{"char": str, "face_centroid": [float]|null,
+    #                                     "views": [{"url","yaw","bin","score"}]}]}.
+    # A plain dict (mirrors project/movie) so it serializes transparently via asdict and
+    # reaches the client through GET /video/jobs/<id> -> result.groups. Absent (None) for
+    # every non-review job — additive, backward-compatible.
+    groups: Optional[Dict[str, Any]] = None

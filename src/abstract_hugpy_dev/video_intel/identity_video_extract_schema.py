@@ -38,6 +38,15 @@ from .media_schema import MediaRef
 # and is deliberately OUT of scope here — a matched slug simply arrives as ``target``.)
 CREATE_TARGET = "create"
 
+# The REVIEW sentinel (CHARACTER-GROUPS-PLAN S1): a THIRD, non-committing target. Unlike
+# ``create`` / a slug, ``review`` runs char360 and RETURNS the per-character grouped views
+# to the caller WITHOUT writing ANY identity profile — the curation step the edit/move/merge
+# UI needs before anything is committed. Structurally it is just another non-empty target
+# string (the factory needs no special case); the RUNNER and the route branch on it. Kept a
+# reserved word (not a legal slug — ``slugify`` would collapse it, but no profile is ever
+# created named "review" through the review path, so it can never collide with a real slug).
+REVIEW_TARGET = "review"
+
 # The knobs the service's ``Char360Params`` accepts (mirrors
 # identity_render_service/identity_render/api_models.py:Char360Params + char360's
 # Char360Spec / CLI defaults). Kept as a bare allow-list so the central side forwards ONLY
@@ -61,8 +70,10 @@ class IdentityVideoExtractSpec:
                          forwards it to the service as ``video_path`` (ae + central share
                          the ``/mnt/llm_storage`` mount, so a hundreds-of-MB clip need not
                          be base64-inflated through the request body).
-        target           ``"create"`` (mint a NEW profile per detected character) or an
-                         EXISTING profile SLUG (append each character's view-set to it).
+        target           ``"create"`` (mint a NEW profile per detected character),
+                         ``"review"`` (CHARACTER-GROUPS-PLAN S1 — run char360 and RETURN the
+                         grouped views WITHOUT writing any profile), or an EXISTING profile
+                         SLUG (append each character's view-set to it).
         char360_params   OPTIONAL passthrough knobs for the service's ``Char360Params``
                          (stride / yolo_model / min_h_frac / cluster_dist / min_faces). Kept
                          a PLAIN dict on the central side (never a typed sub-spec) — the

@@ -56,6 +56,7 @@ dependencies = [
     # remaining abstract_* below are the slimmed, phone-clean ones.
     "abstract_apis",
     "abstract_flask",
+    "abstract_queries",
 ]
 
 [project.optional-dependencies]

@@ -29,6 +29,7 @@ if _SRC not in sys.path:
 
 from abstract_hugpy_dev.video_intel.identity_video_extract_schema import (  # noqa: E402
     CHAR360_PARAM_KEYS,
+    REVIEW_TARGET,
     IdentityVideoExtractSpec,
     identity_video_extract_from_dict,
     make_identity_video_extract,
@@ -155,9 +156,23 @@ def test_from_dict_rejects_missing_source():
         raise AssertionError("expected from_dict to reject a payload with no source")
 
 
+# --------------------------------------------------------------------------- #
+# [7] factory: the REVIEW target sentinel (CHARACTER-GROUPS-PLAN S1) builds like any
+#     non-empty target and round-trips; blank identity_id stays None (the runner
+#     synthesizes a correlation id for review, exactly as for create).
+# --------------------------------------------------------------------------- #
+def test_factory_review_target():
+    spec = make_identity_video_extract(source=_video(), target=REVIEW_TARGET)
+    assert spec.target == "review" and spec.identity_id is None, spec
+    spec2 = identity_video_extract_from_dict(dataclasses.asdict(spec))
+    assert spec2.target == "review" and spec2.source.kind == "video", spec2
+
+
 CHECKS = [
     ("factory: create target + char360_params filtered + blank id -> None",
      test_factory_create_target_and_param_filter),
+    ("factory: review target builds + round-trips (S1 curation sentinel)",
+     test_factory_review_target),
     ("factory: slug target keeps identity_id; blank params default {}", test_factory_slug_target),
     ("factory: rejects a non-video source (and a raw-dict source)", test_factory_rejects_non_video_source),
     ("factory: rejects a blank target + a non-dict char360_params",

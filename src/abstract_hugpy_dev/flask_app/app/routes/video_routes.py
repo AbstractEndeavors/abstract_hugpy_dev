@@ -2692,13 +2692,25 @@ def video_identity_profile_mesh_status(slug, recon_id):
 #                       Its uri must be an absolute path inside the storage jail; the runner
 #                       forwards it to the service as video_path (ae + central share the
 #                       mount, so a large clip is never base64-inflated through the body).
-#       target          "create" (mint a NEW profile per detected character) or an EXISTING
-#                       profile slug (append each character's view-set to it). Required.
+#       target          "create" (mint a NEW profile per detected character), "review"
+#                       (CHARACTER-GROUPS-PLAN S1 — run char360 and RETURN the grouped views
+#                       for curation, writing NO profile), or an EXISTING profile slug
+#                       (append each character's view-set to it). Required.
 #       char360_params? optional passthrough knobs for the service's Char360Params
 #                       (stride / yolo_model / min_h_frac / cluster_dist / min_faces);
 #                       unknown keys are dropped by the spec factory.
 #     Returns {job_id, target} 200; a bad source/target is a clean 400; an unknown target
 #     slug is a 404 (checked up front, mirroring the mesh route's profile guard).
+#
+#     REVIEW-mode RESULT CONTRACT (S1): the terminal result carries the grouped manifest —
+#     GET /video/jobs/<job_id> -> result.groups =
+#       {"n_characters": int,
+#        "groups": [{"char": str, "face_centroid": [float]|null,
+#                    "views": [{"url": <abs jailed path handle>, "yaw": float|null,
+#                               "bin": int|null, "score": float|null}]}]}
+#     Each view "url" is the persisted crop's media HANDLE (an absolute path under the
+#     storage jail); the UI renders it via mediaBytesUrl(url) — the SAME GET /video/media
+#     ?handle= route the profile canonical views use. No profile is created or appended.
 # --------------------------------------------------------------------------- #
 @video_bp.route("/video/identity-profiles/video-extract", methods=["POST"])
 def video_identity_profile_video_extract():
@@ -2726,9 +2738,14 @@ def video_identity_profile_video_extract():
 
     # An ADD target must name a LIVE profile — a clean 404 up front (rather than after a
     # full extract), mirroring the mesh route's get_profile guard. The correlation id handed
-    # to the service is the slug (add) or a synthesized id (create — the runner synthesizes
-    # one when identity_id is blank, but pass an explicit honest one here too).
-    if target == "create":
+    # to the service is the slug (add) or a synthesized id (create/review — the runner
+    # synthesizes one when identity_id is blank, but pass an explicit honest one here too).
+    #
+    # "review" (CHARACTER-GROUPS-PLAN S1) is NON-COMMITTING: like "create" it names no
+    # existing profile, so it is NOT profile-checked here — it runs char360 and returns the
+    # grouped views for curation WITHOUT writing anything. The grouped manifest rides the
+    # job's terminal result and is read via GET /video/jobs/<job_id> -> result.groups.
+    if target in ("create", "review"):
         identity_id = None  # the runner synthesizes videoextract-<job_id>
     else:
         if identity_profiles.get_profile(target) is None:
@@ -2751,6 +2768,62 @@ def video_identity_profile_video_extract():
 
     job_id = _video_enqueue("identity_video_extract", spec)
     return jsonify({"job_id": job_id, "target": target}), 200
+
+
+# --------------------------------------------------------------------------- #
+# 5h) POST /video/identity-profiles/from-groups
+#     CHARACTER-GROUPS-PLAN S3 — commit the curated char360 groups (S1's REVIEW
+#     manifest, edited client-side by S2) into identity profiles. ONE profile is
+#     created per submitted group, through the EXACT SAME validation + copy path
+#     as the single-profile create route above
+#     (_validate_profile_reference_images -> identity_profiles.create_profile):
+#     no re-invented staging, no new jail rule. The reference-image entries are
+#     the jailed crop handles S1 persisted under
+#     <IDENTITIES_HOME>/_char360_extracts/<job_id>/char_NN/<file> (servable via
+#     GET /video/media?handle=), but any jail-valid image path is accepted —
+#     this route does not care how a handle was produced.
+#
+#     Body: {"groups": [{"name"?: str, "reference_images": [<handle>, ...]}]}
+#     A missing/blank name is derived as "Character N" (1-based index over the
+#     submitted list) so every group still gets a stable, url-safe default slug.
+#
+#     Returns 200 ALWAYS (a bad group is errors-as-data, never a batch failure) —
+#       {"results": [{"name": str, "ok": bool, "slug"?: str, "error"?: str}]}
+#     — one result per input group, ORDER-PRESERVING. A validation failure (bad/
+#     missing/non-image reference, jail escape, dup slug, ...) records
+#     ok:false + error for THAT group only; the rest of the batch still commits.
+# --------------------------------------------------------------------------- #
+@video_bp.route("/video/identity-profiles/from-groups", methods=["POST"])
+def video_identity_profiles_from_groups():
+    body = request.get_json(silent=True) or {}
+    groups = body.get("groups")
+    if not isinstance(groups, list) or not groups:
+        return jsonify({"error": "groups must be a non-empty list"}), 400
+
+    results = []
+    for idx, group in enumerate(groups):
+        default_name = f"Character {idx + 1}"
+        if not isinstance(group, dict):
+            results.append({"name": default_name, "ok": False, "error": "group must be an object"})
+            continue
+        raw_name = group.get("name")
+        name = raw_name.strip() if isinstance(raw_name, str) and raw_name.strip() else default_name
+
+        resolved, err = _validate_profile_reference_images(group.get("reference_images"))
+        if err is not None:
+            payload, _status = err
+            results.append({"name": name, "ok": False, "error": payload.get("error", "invalid reference_images")})
+            continue
+
+        try:
+            profile = identity_profiles.create_profile(name, resolved)
+        except identity_profiles.ProfileError as exc:  # dup slug / bad shape = errors-as-data
+            results.append({"name": name, "ok": False, "error": str(exc)})
+            continue
+
+        results.append({"name": name, "ok": True, "slug": profile["slug"]})
+
+    return jsonify({"results": results}), 200
 
 
 # --------------------------------------------------------------------------- #

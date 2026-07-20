@@ -22,6 +22,26 @@ the patterns apply. It:
      slug. The per-character ``face_centroid`` is carried into the recon spec so S3b's
      face-descriptor match path can read it.
 
+REVIEW MODE (``spec.target == "review"`` — CHARACTER-GROUPS-PLAN S1): a THIRD, NON-COMMITTING
+branch. Steps 1-3 are IDENTICAL (POST, poll, download the manifest AND every per-character
+crop into the storage jail), but step 4 is REPLACED: NO identity profile is created or
+appended. Instead the runner returns the per-character grouped views to the caller so the
+edit/move/merge UI can curate the partition before anything is committed. The grouped
+manifest rides the terminal ``JobResult.groups`` (a plain dict, like ``project``/``movie``),
+retrievable via GET /video/jobs/<id> -> ``result.groups``:
+
+    {"n_characters": int,
+     "groups": [{"char": str, "face_centroid": [float]|null,
+                 "views": [{"url": <abs jailed path handle>, "yaw": float|null,
+                            "bin": int|null, "score": float|null}]}]}
+
+Each view ``url`` is the persisted crop's media HANDLE — an absolute path under the storage
+jail (the crops land under ``IDENTITIES_HOME/_char360_extracts/<job_id>/``, itself under
+DEFAULT_ROOT, so the ``GET /video/media?handle=`` route serves them). The UI renders it via
+``mediaBytesUrl(url)`` — the SAME media-byte route the profile canonical views use (the
+canonical wire likewise carries bare jailed PATHS, wrapped client-side; central holds no URL
+literal). Groups + views are emitted in the manifest's order (bin-ascending per character).
+
 Pure ``(IdentityVideoExtractSpec, job_id) -> JobResult`` (map §6): EVERY expected failure —
 an unconfigured service, an unreachable host, a 401, a render error, a timeout, a missing
 target profile — is DATA (``JobResult(ok=False, JobError(...))``), never a raise. Only a
@@ -146,12 +166,16 @@ def run_identity_video_extract(spec, job_id: str) -> JobResult:
 
     target = spec.target
     is_create = (target == "create")
+    # REVIEW (CHARACTER-GROUPS-PLAN S1): run char360 + download crops, then RETURN the grouped
+    # views WITHOUT writing any profile. Like "create" it names no existing slug, so it skips
+    # the ADD profile-existence guard below and synthesizes a correlation id.
+    is_review = (target == "review")
 
     # If this is an ADD to an existing slug, verify the profile EXISTS up front so we fail
     # fast + cleanly (rather than after a full extract) — mirrors the mesh relay's early
     # guard style. A create target is validated per-character at write-back (create_profile
-    # raises on a dup slug, which we catch).
-    if not is_create:
+    # raises on a dup slug, which we catch). Review writes nothing, so it too is skipped.
+    if not is_create and not is_review:
         try:
             if identity_profiles.get_profile(target) is None:
                 return _fail(
@@ -169,7 +193,10 @@ def run_identity_video_extract(spec, job_id: str) -> JobResult:
     # safe-id charset (letters/digits/_-.) — a slug already is, and the fallback is hex.
     identity_id = (getattr(spec, "identity_id", None) or "").strip()
     if not identity_id:
-        identity_id = target if (not is_create and target) else f"videoextract-{job_id}"
+        # Only an ADD (a real slug target) reuses the target as the correlation id; create
+        # AND review synthesize a fresh one (review names no profile, create mints its own).
+        identity_id = (target if (not is_create and not is_review and target)
+                       else f"videoextract-{job_id}")
 
     char360_params = dict(getattr(spec, "char360_params", {}) or {})
 
@@ -316,11 +343,14 @@ def run_identity_video_extract(spec, job_id: str) -> JobResult:
     stage_root = os.path.join(
         identity_profiles.IDENTITIES_HOME, "_char360_extracts", job_id)
 
-    # ---- per-character: download views + write back (create | add) ----
+    # ---- per-character: download views + write back (create | add) OR group (review) ----
     created_slugs: list[str] = []
     updated_slugs: list[str] = []
     attached: list[dict] = []
     per_char_errors: list[dict] = []
+    # REVIEW accumulator (CHARACTER-GROUPS-PLAN S1): one grouped entry per detected character,
+    # emitted in manifest order; unused (stays empty) for create/add.
+    groups: list[dict] = []
 
     for idx, ch in enumerate(characters):
         if is_cancelling(job_id):  # cooperative cancel between characters
@@ -343,7 +373,9 @@ def run_identity_video_extract(spec, job_id: str) -> JobResult:
         # Download each view file into the staging root, preserving the service's job-relative
         # subpath (char_NN/<file>) so distinct characters never collide. Keep angular order:
         # the manifest's per-character views are already emitted bin-ascending by the service.
-        view_paths: list[str] = []
+        # ``view_records`` carries the persisted dest path PLUS each view's yaw/bin/score (the
+        # review contract needs them; create/add reads only the paths via ``view_paths``).
+        view_records: list[dict] = []
         for v in views:
             if not isinstance(v, dict):
                 continue
@@ -366,10 +398,27 @@ def run_identity_video_extract(spec, job_id: str) -> JobResult:
             except OSError:
                 logger.warning("identity video-extract: could not persist %r -> %s", rel, dest)
                 continue
-            view_paths.append(dest)
+            view_records.append({
+                "url": dest,               # the media HANDLE (abs jailed path); UI wraps it
+                "yaw": v.get("yaw"),       # the view's yaw in degrees (float) or null
+                "bin": v.get("bin"),       # the yaw-bin index (int) or null
+                "score": v.get("score"),   # the detection/pose score (float) or null
+            })
 
+        view_paths = [r["url"] for r in view_records]
         if not view_paths:
             per_char_errors.append({"char": char_id, "error": "no downloadable views"})
+            continue
+
+        # REVIEW (CHARACTER-GROUPS-PLAN S1): DO NOT write a profile — accumulate the grouped
+        # views for the curation UI and move on. face_centroid rides through so the UI (and a
+        # later commit) can key on it. Nothing about the store is touched in this branch.
+        if is_review:
+            groups.append({
+                "char": char_id,
+                "face_centroid": ch.get("face_centroid"),
+                "views": view_records,
+            })
             continue
 
         n = len(view_paths)
@@ -443,6 +492,26 @@ def run_identity_video_extract(spec, job_id: str) -> JobResult:
             continue
 
     _delete_remote()  # best-effort remote cleanup after a successful download
+
+    # ---- REVIEW terminal (CHARACTER-GROUPS-PLAN S1) ----
+    # Return the grouped views WITHOUT having written any profile. If not a single character
+    # yielded a downloadable view, that is an honest failure (nothing to curate) — errors-as-
+    # data, mirroring the write-back guard below. Otherwise ok=True with the grouped manifest
+    # on JobResult.groups (GET /video/jobs/<id> -> result.groups). n_characters is the count
+    # of GROUPS actually built (characters with >=1 downloaded crop), not the raw manifest
+    # count, so the UI never renders an empty partition.
+    if is_review:
+        if not groups:
+            detail = "; ".join(f"{e.get('char', '?')}: {e.get('error')}"
+                               for e in per_char_errors)
+            return _fail("no_review_groups",
+                         "identity video-extract review produced no groups"
+                         + (f" ({detail})" if detail else ""),
+                         retryable=False)
+        logger.info("identity video-extract REVIEW done: %d group(s), %d char error(s)",
+                    len(groups), len(per_char_errors))
+        return JobResult(job_id=job_id, ok=True,
+                         groups={"n_characters": len(groups), "groups": groups})
 
     # If NOT a single character wrote back, that is a genuine failure (nothing landed) — an
     # honest error-as-data rather than a hollow ok. Otherwise the job succeeds even if some
