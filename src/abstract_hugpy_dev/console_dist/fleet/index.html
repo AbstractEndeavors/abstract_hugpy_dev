@@ -26,16 +26,22 @@
       body {
         margin: 0;
         background: #050505;
-        overflow-x: hidden;
       }
       #root {
-        min-height: 100dvh;
-        background: #050505;
+        /* #root is the bounded scroll container (fixed viewport height, scrolls
+           internally) so the sticky nav inside it pins to #root's top and rides
+           along as content scrolls — a min-height box would instead grow and
+           carry the "sticky" nav off with the window (operator directive
+           2026-07-21). overflow-x clip lives here too, on the same scroll box, so
+           it can't create a SEPARATE containing block that breaks the sticky. */
+        height: 100dvh;
+        overflow-y: auto;
         overflow-x: hidden;
+        background: #050505;
       }
     </style>
-    <script type="module" crossorigin src="/fleet/assets/index-D0ZuXGKP.js"></script>
-    <link rel="stylesheet" crossorigin href="/fleet/assets/index-CmDTmKJq.css">
+    <script type="module" crossorigin src="/fleet/assets/index-Bcg0MVMU.js"></script>
+    <link rel="stylesheet" crossorigin href="/fleet/assets/index-B7-z7tdI.css">
   </head>
   <body>
     <div id="root"></div>

@@ -1595,7 +1595,36 @@ def _restart(state, *, reason: str, reexec_fn, kill_slots: bool = False) -> None
             pass
         os._exit(plan["exit_code"])
     logger.info("restart(%s): standalone re-exec in place %s", reason, plan["steps"])
-    reexec_fn()
+    # Log the EXACT exec target before the handoff, and survive a raising re-exec.
+    # os.execv replaces the image and never returns on success; if control comes
+    # back here or it raises, the swap did NOT happen. Left unguarded, that
+    # exception bubbles into the heartbeat loop's generic "heartbeat failed"
+    # swallow, where a still-OLD image keeps beating — the silent half of the
+    # 2026-07-20 ae cosmetic-update path. Log LOUDLY and return instead: the
+    # heartbeat now reports the honest (stale) running version, so central's
+    # version_ok stays FALSE — a visible, diagnosable skew, not a green lie.
+    # (SystemExit from the Windows spawn+exit path is BaseException, so it is not
+    # caught here and still propagates.)
+    try:
+        from .._platform.procutil import _module_argv
+        _target_argv = _module_argv() or [sys.executable, *sys.argv]
+    except Exception:  # noqa: BLE001 — argv preview is best-effort logging only
+        _target_argv = [sys.executable, *sys.argv]
+    logger.info("restart(%s): exec target argv=%r (running image %s)",
+                reason, _target_argv, _RUNNING_IMAGE_VERSION)
+    try:
+        reexec_fn()
+    except Exception as exc:  # noqa: BLE001 — must not bubble into a silent swallow
+        logger.error(
+            "restart(%s): RE-EXEC FAILED (%s: %s) — image NOT replaced; staying on "
+            "the OLD running version %s. Heartbeat reports the honest (stale) "
+            "version, so central shows a version skew, not cosmetic convergence. "
+            "An explicit /ops/restart or a real unit restart is required to "
+            "converge. exec target was argv=%r.",
+            reason, type(exc).__name__, exc, _RUNNING_IMAGE_VERSION, _target_argv)
+        return
+    # A real os.execv never returns; reaching here means a no-op reexec_fn (test
+    # seam) — nothing more to do.
 
 
 def _schedule_restart(state, reason: str, *, kill_slots: bool = False,
@@ -3932,11 +3961,58 @@ _UPDATE_RETRY_BACKOFF = 300.0
 
 
 def _installed_pkg_version(pkg_name: str) -> str | None:
+    """Version pip has ON DISK for ``pkg_name`` (installed dist metadata).
+
+    This is what a NOT-YET-EFFECTIVE self-update flips FIRST: ``pip install``
+    swaps the site-packages files (and their ``*.dist-info``) before this process
+    has re-exec'd, so ``metadata.version()`` reports the NEW version while the
+    OLD modules are still the ones executing in memory. So it is the DISK truth,
+    NOT the running-image truth — never report it in the heartbeat (see
+    ``_running_pkg_version``). It is still the right thing to gate the self-update
+    pip on (has the target already been fetched to disk?).
+    """
     from importlib import metadata
     try:
         return metadata.version(pkg_name)
     except metadata.PackageNotFoundError:
         return None
+
+
+# ── Running-image version, snapshotted at import (honest heartbeat source) ────
+# The 2026-07-20 ae incident: after the 0.1.196 pip self-update, ae's heartbeat
+# reported pkg_version 0.1.196 / version_ok:true while the RUNNING agent still
+# served the OLD route set (404 on the new /slots/<id>/relaunch) — because the
+# heartbeat sourced its version from ``_installed_pkg_version`` (live DISK
+# metadata, already flipped by pip) instead of from the code actually running.
+# That is COSMETIC convergence: central believes the fleet is up to date while a
+# worker silently serves stale code.
+#
+# The honest source is ``abstract_hugpy_dev.__version__`` — a source-file literal
+# bound when the package was imported at process start. A pip upgrade rewrites
+# that file on disk, but the in-memory module object keeps the old value until a
+# genuinely fresh process re-imports it. So this constant tells the truth across
+# a not-yet-effective upgrade: report OLD until the process really re-execs, and
+# central's version_ok stays FALSE (a visible skew) instead of going cosmetically
+# green. Captured ONCE here, at import, so nothing can later mutate it.
+try:
+    from abstract_hugpy_dev import __version__ as _RUNNING_IMAGE_VERSION
+except Exception:  # noqa: BLE001 — run-from-copied-file: no package __version__
+    _RUNNING_IMAGE_VERSION = None
+
+
+def _running_pkg_version(pkg_name: str) -> str | None:
+    """Version of the CODE THIS PROCESS IS RUNNING — the honest heartbeat source.
+
+    Snapshotted from ``abstract_hugpy_dev.__version__`` at import (above), NOT
+    read live from dist metadata, so a self-update that pip-installed new files
+    on disk but has not yet re-exec'd keeps reporting the OLD version — the truth
+    — rather than the disk's new version. Falls back to disk metadata ONLY when
+    there is no package ``__version__`` to trust (a standalone copied agent.py),
+    where disk metadata is the best signal available.
+    """
+    if _RUNNING_IMAGE_VERSION:
+        return _RUNNING_IMAGE_VERSION
+    return _installed_pkg_version(pkg_name)
 
 
 def _update_state_path(args) -> str:
@@ -6464,7 +6540,10 @@ def _heartbeat_loop(client: CentralClient, state: WorkerState, args) -> None:
                     "spill": _spill_describe(),
                     "url": state.url,     # None -> central keeps source-IP URL
                     "port": state.port,
-                    "pkg_version": _installed_pkg_version(args.pkg_name),
+                    # HONEST version: the running image (import-time snapshot),
+                    # never live disk metadata — so a not-yet-effective self-update
+                    # shows as skew, not cosmetic convergence (2026-07-20 ae).
+                    "pkg_version": _running_pkg_version(args.pkg_name),
                     "role": state.role,
                     "rpc_endpoint": state.rpc_endpoint,
                     "free_ram": _free_ram_bytes(),
@@ -6561,7 +6640,8 @@ def _register(client: CentralClient, state: WorkerState, args) -> None:
         "ram_total": _ram_total_bytes(),
         "models": models or None,
         "worker_id": state.worker_id,
-        "pkg_version": _installed_pkg_version(args.pkg_name),
+        # HONEST version: running image, not live disk metadata (see heartbeat).
+        "pkg_version": _running_pkg_version(args.pkg_name),
         "engine": llama_cpp_cuda_status(),
         "pool": os.environ.get("WORKER_POOL", ""),
         "caps": _local_caps(),

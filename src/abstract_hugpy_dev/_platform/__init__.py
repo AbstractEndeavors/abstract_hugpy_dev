@@ -26,12 +26,62 @@ IS_LINUX = sys.platform.startswith("linux")
 EXE_SUFFIX = ".exe" if IS_WINDOWS else ""
 
 
+def _sanitize_env_str(raw: str) -> str:
+    """Strip an inline ``# comment`` and surrounding whitespace/quotes from a
+    ``.env``-style value.
+
+    ``abstract_security``/``abstract_essentials`` reads ``.env`` files line by
+    line and hands back everything after the ``=`` verbatim, comment included
+    (a shell/dotenv reader would normally treat ``KEY=val   # note`` as a
+    comment, but this one does not). A trailing inline comment on a path
+    value like ``HUGPY_ENGINE_DIR=/mnt/.../engine   # native build dir`` used
+    to get baked straight into ``os.makedirs`` calls, producing a garbage
+    directory whose name was the literal comment text (the computron
+    incident this function exists to prevent).
+
+    Rules, in order:
+      1. If the value is wrapped in a single or double quote pair, unwrap it
+         and return the inner text as-is — a quoted value owns any ``#`` it
+         contains (e.g. ``KEY="a#b"`` -> ``a#b``), including quoted values
+         that themselves contain a trailing ``# comment`` inside the quotes.
+      2. Otherwise, an unquoted value is cut at the first whitespace-then-``#``
+         (`` #``) — i.e. a ``#`` must be preceded by whitespace to start a
+         comment, so a bare ``#`` glued to non-space text (rare, but avoids
+         mangling something like a URL fragment) is left alone.
+      3. Trailing whitespace is stripped in both cases.
+    """
+    s = raw.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        return s[1:-1]
+    # unquoted: cut at the first "whitespace + #" (inline comment marker)
+    idx = None
+    for i in range(1, len(s)):
+        if s[i] == "#" and s[i - 1].isspace():
+            idx = i - 1
+            break
+    if idx is not None:
+        s = s[:idx]
+    return s.strip()
+
+
 def env_value(name: str):
     """Resolve a config override the way the rest of hugpy does.
 
     Prefer ``abstract_security.get_env_value`` (which can read the project's
-    secrets store), falling back to the process environment. Returns ``None``
-    when unset/empty so callers can ``or`` in a default.
+    secrets store from a ``.env`` file), falling back to the process
+    environment. Returns ``None`` when unset/empty so callers can ``or`` in a
+    default.
+
+    Precedence: the FILE value wins over ``os.environ`` when both are set.
+    That is inherited from ``abstract_essentials.get_env_value`` itself (it is
+    the thing consulted first, unconditionally) rather than a deliberate
+    choice made here — a deployment that drops an override into ``.env``
+    expects that file to be authoritative for the process, same as most
+    dotenv tooling. Because the file is free-form text (not shell-parsed),
+    both the file value and the ``os.environ`` fallback are run through
+    ``_sanitize_env_str`` before being returned, so a stray inline comment or
+    accidental quoting can never leak into a path/config value (see
+    ``_sanitize_env_str`` for the computron incident this closes).
     """
     val = None
     try:
@@ -43,6 +93,6 @@ def env_value(name: str):
     if val is None:
         val = os.environ.get(name)
     if isinstance(val, str):
-        val = val.strip()
+        val = _sanitize_env_str(val)
         return val or None
     return val
