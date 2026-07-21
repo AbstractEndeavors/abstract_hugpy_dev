@@ -82,6 +82,38 @@ def _remember_assignments(worker: Dict[str, Any]) -> None:
         logger.warning("assignment memory write failed for %s: %s", wid, exc)
 
 
+def forget_assignment_memory(worker_id: str) -> str:
+    """SANCTIONED maintenance path to remove one GHOST entry from the
+    assignment-memory sidecar (``worker_assignments.json``).
+
+    The design above (deleting a live row does NOT delete its memory) stays
+    intact: this refuses to touch any id that still has a live row in
+    ``workers.json`` — it can only forget ids that are ALREADY absent from the
+    live registry (stray/malformed ids, one-off manual pokes, a worker that
+    will never come back under that id). Callers that want to retire a live
+    worker's designations should remove/unassign the live row first (or just
+    leave the memory — that is the intended durability).
+
+    Returns ``"forgot"`` on success or ``"unknown"`` if ``worker_id`` was not
+    present in memory at all. Raises ``ValueError`` if ``worker_id`` is
+    currently live (refused).
+    """
+    if worker_store.get(worker_id) is not None:
+        raise ValueError(
+            f"worker {worker_id} is LIVE in the registry — assignment memory "
+            "may only be forgotten for ids absent from the live registry"
+        )
+    mem = _load_assign_memory()
+    if worker_id not in mem:
+        return "unknown"
+    del mem[worker_id]
+    tmp = _assign_memory_path() + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(mem, fh, indent=1)
+    os.replace(tmp, _assign_memory_path())
+    return "forgot"
+
+
 def _default_workers_path() -> str:
     """Sit the worker registry next to the model manifest (…/projects/)."""
     return os.path.join(os.path.dirname(settings.manifest_path), "workers.json")

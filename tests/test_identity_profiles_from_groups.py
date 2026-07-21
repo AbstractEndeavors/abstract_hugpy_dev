@@ -41,6 +41,7 @@ _SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
+import pytest  # noqa: E402
 from flask import Flask  # noqa: E402
 
 from abstract_hugpy_dev.video_intel import identity_profiles  # noqa: E402
@@ -109,6 +110,34 @@ _make_png(_CHAR_B0, (40, 200, 40))
 def _owned(slug: str, index: int, src: str) -> str:
     ext = os.path.splitext(src)[1].lower() or ".img"
     return os.path.join(_TMP_IDENTITIES, slug, f"ref_{index:02d}{ext}")
+
+
+# --------------------------------------------------------------------------- #
+# CROSS-FILE ISOLATION — this file and test_identity_video_extract_relay.py EACH rebind
+# identity_profiles.IDENTITIES_HOME/PROJECTS_HOME + media_bus.DB_PATH to their OWN
+# tempfile.mkdtemp store in their import preamble (above). Under pytest both modules import
+# at COLLECTION time, so whichever file imports last wins those shared globals and the
+# other file's tests silently run against the WRONG temp store. Re-assert THIS file's
+# bindings before every test so file import/collection order never matters.
+#
+# media_bus._initialized guards a lazy one-time schema migration keyed off whatever
+# DB_PATH happened to be bound when it last ran (see media_bus._ensure_db). If the OTHER
+# file's globals rebound DB_PATH to ITS db and that db already got migrated, _initialized
+# is left True — so when we rebind DB_PATH back to OUR db here, an already-True
+# _initialized would make _ensure_db() a no-op and skip OUR db's migration. Our db WAS
+# already schema-created by this file's own preamble (CREATE TABLE up front), so nothing
+# breaks today, but future ALTER-TABLE migrations added to _ensure_db would silently never
+# reach it. Clear _initialized here too so _ensure_db() (called at the top of every
+# media_bus function) always re-verifies/re-migrates the CURRENTLY bound db — the ALTER
+# TABLE calls are idempotent (they swallow "duplicate column" errors), so re-running them
+# against an already-migrated db is a harmless no-op.
+@pytest.fixture(autouse=True)
+def _rebind_isolation_globals():
+    identity_profiles.IDENTITIES_HOME = _TMP_IDENTITIES
+    identity_profiles.PROJECTS_HOME = _TMP_PROJECTS
+    media_bus.DB_PATH = _TMP_DB
+    media_bus._initialized = False
+    yield
 
 
 # --------------------------------------------------------------------------- #

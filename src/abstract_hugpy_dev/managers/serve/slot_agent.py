@@ -208,6 +208,22 @@ def _ensure_present(model_key, central_url):
                        SLOT_ID, model_key, exc)
 
 
+def _effective_ngl(requested, auto):
+    """Override-wins-over-autofit (k14). An EXPLICIT ``n_gpu_layers`` request WINS
+    over the autofit — that is the lever the offload speed-cliff sweep (k7) needs:
+    seat a GGUF at full offload, then relaunch it DOWN through decreasing layer
+    counts. ``None``/absent => autofit, exactly as today.
+
+    NOTE the sentinel: ``None`` is autofit; every integer is an override, INCLUDING
+    the live console designations ``-1`` ("Max GPU" — force all layers) and ``0``
+    ("CPU only"). ``-1`` is NOT an autofit alias here (managers.llama.runners.get
+    ships ``n_gpu_layers=-1`` to the slot precisely to FORCE all layers; aliasing
+    it to autofit would silently regress that path). The sweep therefore asks for
+    autofit with ``None`` at the top of the ramp and explicit non-negative counts
+    below it — it never needs ``-1`` to mean autofit."""
+    return auto if requested is None else int(requested)
+
+
 def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None,
                path=None, gpu_mem_gib=None, cpu_mem_gib=None, profile_bin=None):
     """argv for the child llama-server + the resolved (ngl, ctx, threads, cpus).
@@ -290,7 +306,7 @@ def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None,
                                   extra_reserve_bytes=_mmproj_reserve)
     else:
         auto = autofit_gpu_layers(path, extra_reserve_bytes=_mmproj_reserve)
-    ngl = n_gpu_layers if n_gpu_layers is not None else auto
+    ngl = _effective_ngl(n_gpu_layers, auto)
     ctx = int(ctx) if ctx else (_ctx_for(cfg, model_key) if cfg is not None else 4096)
     threads = int(threads) if threads else DEFAULT_LLAMA_THREADS
     cpus = str(cpus).strip() if cpus not in (None, "") else None
@@ -305,7 +321,7 @@ def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None,
         try:
             from ..spill import cpu_resident_bytes
             ram_budget = float(cpu_mem_gib) * 1e9
-            ngl_eff = n_gpu_layers if n_gpu_layers is not None else auto
+            ngl_eff = ngl                      # the already-resolved effective ngl
             need_cpu = cpu_resident_bytes(path, int(ngl_eff)) or 0
             if need_cpu > ram_budget:
                 raise RuntimeError(
@@ -527,9 +543,14 @@ class Slot:
     # -- lifecycle ---------------------------------------------------------
     def load(self, model_key, n_gpu_layers=None, ctx=None, threads=None,
              cpus=None, gpu=None, path=None, gpu_mem_gib=None,
-             cpu_mem_gib=None, profile_bin=None) -> dict:
+             cpu_mem_gib=None, profile_bin=None, force=False) -> dict:
         with self.lock:
-            if self.model_key == model_key and self.healthy():
+            # ``force`` (k14 relaunch): a relaunch re-seats the SAME model with a
+            # NEW spec (e.g. a swept-down n_gpu_layers), so it must bypass the
+            # already-serving short-circuit and actually respawn the child —
+            # otherwise a same-model relaunch is a silent no-op and the sweep can
+            # never change the offload depth.
+            if not force and self.model_key == model_key and self.healthy():
                 self.last_used = time.time()
                 return self.status()
 
@@ -693,6 +714,47 @@ class Slot:
             self.profile_bin = None
             return self.status()
 
+    def relaunch(self, n_gpu_layers=None, ctx=None) -> dict:
+        """Re-seat the CURRENTLY-loaded model with a new offload depth / context —
+        the lever the k7 offload speed-cliff sweep needs (seat at full offload,
+        then relaunch DOWN through decreasing ``n_gpu_layers``, measuring tok/s at
+        each step). This is the ONLY way to change a live slot child's ngl: the
+        slot child is a spawned process whose ngl is fixed at launch, so a change
+        means STOP-then-RESPAWN — which is exactly what this does (via a forced
+        load: SIGTERM->wait->SIGKILL of the old child, then a fresh spawn). It also
+        answers the ae "slot-child PID never recycles" blocker: relaunch replaces
+        the child under a NEW pid every time, no worker restart required.
+
+        The current model_key + its threads/cpus/gpu/profile are preserved; only
+        ``n_gpu_layers`` and ``ctx`` are overridden (``None`` for either keeps the
+        current value — ctx from the live child, ngl re-autofit). The resulting
+        allocation is reported HONESTLY (the echoed ``n_gpu_layers`` is what the
+        fresh child actually launched with, i.e. ``self.ngl`` after the respawn —
+        not merely what was requested)."""
+        mk = self.model_key
+        if mk is None:
+            raise RuntimeError(
+                f"slot {SLOT_ID}: no model loaded — nothing to relaunch")
+        requested_ngl = n_gpu_layers
+        # A deliberate operator relaunch must not be refused by a stale load
+        # backoff armed by an earlier failure of this model — clear it so the
+        # forced re-seat actually runs.
+        self._load_failures.pop(mk, None)
+        self._load_backoff_until.pop(mk, None)
+        result = self.load(
+            mk, n_gpu_layers=requested_ngl,
+            ctx=ctx if ctx is not None else self.ctx,
+            threads=self.threads, cpus=self.cpus, gpu=self.gpu,
+            gpu_mem_gib=None, cpu_mem_gib=None,
+            profile_bin=self.profile_bin, force=True)
+        # Surface the request alongside the honest launched value so the caller
+        # can see requested-vs-effective at a glance (self.ngl / status carries
+        # the measured launch value).
+        result = dict(result)
+        result["relaunched"] = True
+        result["requested_n_gpu_layers"] = requested_ngl
+        return result
+
     def _kill(self):
         if self._child_alive():
             try:
@@ -749,6 +811,26 @@ def build_app():
     @app.route("/unload", methods=["POST"])
     def unload():
         return jsonify(slot.unload())
+
+    @app.route("/relaunch", methods=["POST"])
+    def relaunch():
+        # k14: re-seat the CURRENT model with a new offload depth / context so the
+        # k7 offload speed-cliff sweep can measure tok/s per n_gpu_layers. Body:
+        # {"n_gpu_layers"?: int, "ctx"?: int} — omit either to keep it. A slot with
+        # no model loaded is a 409 (nothing to relaunch), never a 500.
+        body = request.get_json(silent=True) or {}
+        from .policy import no_local_serving, local_serving_error
+        if no_local_serving():
+            return jsonify({"error": local_serving_error(
+                slot.model_key, detail="slot serving disabled on this box")}), 403
+        if slot.model_key is None:
+            return jsonify({"error": f"slot {SLOT_ID} has no model loaded "
+                            "to relaunch"}), 409
+        try:
+            return jsonify(slot.relaunch(body.get("n_gpu_layers"),
+                                         body.get("ctx")))
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
 
     @app.route("/v1/<path:sub>", methods=["POST", "GET"])
     def proxy(sub):

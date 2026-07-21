@@ -906,6 +906,65 @@ def video_studio_movie():
 
 
 # --------------------------------------------------------------------------- #
+# 2d'''') POST /video/mlt/render — headless Kdenlive/MLT render (k22).
+#     The operator authors a project in Kdenlive on Windows against the Samba studio
+#     share, saves the .kdenlive into the WRITABLE edits/ subtree, and this route
+#     enqueues an ``mlt_render`` media_bus job that path-maps the project + renders it
+#     server-side with melt, writing the output back under edits/renders/. Query it
+#     exactly like any other media job: GET /video/jobs/<job_id>.
+#
+#     CONSOLE-OPERATOR ONLY: the blanket /video gate already admitted an operator OR a
+#     share-link guest, but this WRITES INTO the operator's real editing tree (and reads
+#     an arbitrary project file), so — like /to-editor — the body re-checks
+#     operator_authenticated() and 403s a share guest. Defense in depth.
+#
+#     JAIL: the project MUST live under the studio tree (the runner re-checks); the output
+#     is always resolved under edits/renders/ by the runner. A path outside the jail 400s
+#     here for a fast, honest rejection.
+# --------------------------------------------------------------------------- #
+@video_bp.route("/video/mlt/render", methods=["POST"])
+def video_mlt_render():
+    from ..operator_auth import operator_authenticated
+    if not operator_authenticated():
+        return jsonify({"error": "operator session required"}), 403
+
+    from abstract_hugpy_dev.video_intel.mlt_render_schema import make_mlt_render
+    from abstract_hugpy_dev.video_intel.runners.mlt_render import STUDIO_ROOT
+
+    body = request.get_json(silent=True) or {}
+    project_path = body.get("project_path")
+    if not isinstance(project_path, str) or not project_path.strip():
+        return jsonify({"error": "project_path is required (absolute path to a "
+                        ".kdenlive/.mlt project under the studio share)"}), 400
+
+    # Jail the project under the studio tree (fast 400; the runner re-checks authoritatively).
+    rp = os.path.realpath(project_path.strip())
+    if not _is_within(rp, STUDIO_ROOT):
+        return jsonify({"error": "project_path is outside the studio jail"}), 400
+    if not os.path.isfile(rp):
+        return jsonify({"error": "project_path not found"}), 404
+
+    try:
+        spec = make_mlt_render(
+            project_path=rp,
+            output_rel=body.get("output_rel"),
+            width=body.get("width"),
+            height=body.get("height"),
+            fps=body.get("fps"),
+            profile=body.get("profile"),
+            vcodec=body.get("vcodec", "libx264"),
+            acodec=body.get("acodec", "aac"),
+            container=body.get("container", "mp4"),
+            vb=body.get("vb"),
+            drive_letter=body.get("drive_letter"),
+        )
+    except (ValueError, TypeError) as exc:  # structural spec error = 400
+        return jsonify({"error": str(exc)}), 400
+    job_id = _video_enqueue("mlt_render", spec)
+    return jsonify({"job_id": job_id}), 200
+
+
+# --------------------------------------------------------------------------- #
 # 2e) GET /video/presets — curated "ideal default loads" for scene generation
 # --------------------------------------------------------------------------- #
 # Thin idiom (mirrors prompt_routes' GET /prompt/tasks): import the static

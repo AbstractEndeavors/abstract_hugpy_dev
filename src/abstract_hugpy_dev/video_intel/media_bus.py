@@ -43,6 +43,7 @@ from .identity_reconstruction_schema import (
     identity_mesh_from_dict,
 )
 from .identity_video_extract_schema import identity_video_extract_from_dict
+from .mlt_render_schema import mlt_render_from_dict
 from .result_schema import JobResult
 from .runners import DISPATCH
 
@@ -222,6 +223,9 @@ SPEC_DESERIALIZERS: Dict[str, Callable[[dict], object]] = {
     # video to the remote GPU render service, then writes the per-character view-sets back
     # into identity profiles (central has no GPU + never runs char360).
     "identity_video_extract": identity_video_extract_from_dict,
+    # MLT/Kdenlive headless render (k22) — rehydrates through its own validate-at-construction
+    # factory (mlt_render_from_dict). The runner path-maps the project + renders it with melt.
+    "mlt_render": mlt_render_from_dict,
 }
 
 

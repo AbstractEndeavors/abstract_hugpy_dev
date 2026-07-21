@@ -73,6 +73,9 @@ _SENSITIVE = [
     #  — worker_routes._apply_alloc_map; same registry-write privilege as assign.)
     ({"POST"},                   re.compile(r"^/llm/workers/[^/]+/(admit|block|admission|assign|unassign|alloc-all|unload|probe|pool|limits)$")),
     ({"DELETE"},                 re.compile(r"^/llm/workers/[^/]+$")),
+    # k10: sanctioned ghost-cleanup for the assignment-memory sidecar
+    # (worker_assignments.json) — same operator-only tier as the row DELETE above.
+    ({"DELETE"},                 re.compile(r"^/llm/workers/[^/]+/memory$")),
     # Model-level BLOCK from the serving pool (operator pool primitive — the
     # global sibling of the per-worker block verb above). Same operator-only tier
     # as assign: block/unblock are routing-registry writes. model_key can contain
@@ -135,6 +138,12 @@ _SENSITIVE = [
     # ref-drop / comfy /free) — a privileged destructive executor op on the box,
     # same operator-only tier as unload/free-ram.
     ({"POST"},                   re.compile(r"^/llm/workers/[^/]+/(restart|update|pip|config|reap|reap-approve|pin-all|unpin-all|residency-all|free-ram|evict)$")),
+    # k14: relaunch a worker's slot child with a new GPU-offload depth / context
+    # (the offload speed-cliff sweep lever). A privileged executor op on the box —
+    # it STOP->RESPAWNs a llama-server child — so it sits in the same operator-only
+    # tier as the other worker ops above. Two path segments (slot id + verb), so it
+    # needs its own rule (the single-segment worker-verb rule does not match it).
+    ({"POST"},                   re.compile(r"^/llm/workers/[^/]+/slots/[^/]+/relaunch$")),
     # P3.1 agent-node fleet: the operator-facing routes only. GET /agent/nodes
     # (the fleet roster) and POST /agent/<id>/dispatch (queue a task on a node)
     # are operator intent — gated here too, belt-and-suspenders with the
@@ -155,6 +164,11 @@ _SENSITIVE = [
     # Disk discovery sweep — rebuilds the discovery report (walks the whole
     # model tree + hub enrichment); the GET state poll stays open.
     ({"POST"},                   re.compile(r"^/models/discover$")),
+    # Hugging Face credentials (k29): the stored HF token is a secret and the
+    # write path mutates central's auth to HF — operator-only for GET/POST/DELETE.
+    # GET is gated too (it validates the token against HF and reveals its source);
+    # the token itself is never returned (only last4).
+    ({"GET", "POST", "DELETE"},  re.compile(r"^/llm/hf/auth$")),
     # Store reconcile (the flattening migration) — MOVES/ARCHIVES model dirs and
     # rewrites the registry + markers when {"apply": true}. A mutating store op,
     # same operator-only tier as discover/delete. The dry-run is also POST (it

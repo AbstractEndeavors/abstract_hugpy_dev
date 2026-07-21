@@ -4,11 +4,23 @@ from ..functions import *
 search_bp, logger = get_bp("search_bp", __name__)
 
 # Single declared token source for ALL Hugging Face calls in this module.
-# token=False FORCES anonymous (HF public search/metadata needs no auth); a
-# stale ~/.cache/huggingface/token cannot poison the call. Set HF_TOKEN only
-# for gated/private repos or higher rate limits. Everything below goes through
-# this `api` object so there is exactly one place a token can come from.
-api = HfApi(token=os.getenv("HF_TOKEN") or False)
+# The token comes from the console-managed store (get_hf_token: a saved token
+# wins, env HF_TOKEN is the fallback). `or False` FORCES anonymous when there is
+# no token — HF public search/metadata needs no auth, and a stale
+# ~/.cache/huggingface/token cannot then poison the call. A saved token lifts
+# the anonymous rate limits that make search/metadata flaky. Everything below
+# goes through this `api` object, and _rebuild_hf_api() re-points it when the
+# operator saves/clears the token at runtime (no process restart).
+from ..functions.imports.utils.hf_token import get_hf_token
+
+
+def _rebuild_hf_api():
+    global api
+    api = HfApi(token=get_hf_token() or False)
+    return api
+
+
+api = HfApi(token=get_hf_token() or False)
 
 
 # ── helpers ───────────────────────────────────────────────────────────────
@@ -377,3 +389,45 @@ def civitai_download():
 def civitai_downloads():
     """Live progress for in-flight civitai pulls (the UI polls this)."""
     return jsonify(_CIVITAI_DL)
+
+
+# ── Hugging Face credentials (console-managed) ──────────────────────────────
+# Save an HF token so central's HF calls (this module's search/metadata, plus
+# downloads) go out authenticated instead of anonymously rate-limited. The token
+# is stored 0600 outside any git tree and is never returned (only its last4).
+# Operator-gated (see operator_auth ^/llm/hf/auth$).
+@search_bp.route("/llm/hf/auth", methods=["GET"])
+def hf_auth_get():
+    from ..functions.imports.utils.hf_token import hf_auth_status
+    return jsonify(hf_auth_status(validate=True))
+
+
+@search_bp.route("/llm/hf/auth", methods=["POST"])
+def hf_auth_set():
+    from ..functions.imports.utils.hf_token import (
+        hf_auth_status, store_hf_token, validate_hf_token)
+    body = request.get_json(silent=True) or {}
+    token = str(body.get("token") or "").strip()
+    if not token:
+        return jsonify({"error": "token is required"}), 400
+    # Validate BEFORE storing so we never persist a dud (and can echo HF's own
+    # message). A network failure here is fatal for a WRITE — we won't store an
+    # unverifiable token.
+    status, _username, error = validate_hf_token(token)
+    if status == "network":
+        return jsonify({"error": error}), 502
+    if status != "ok":
+        return jsonify({"error": error or "invalid Hugging Face token"}), 400
+    store_hf_token(token)
+    _rebuild_hf_api()
+    return jsonify(hf_auth_status(validate=True))
+
+
+@search_bp.route("/llm/hf/auth", methods=["DELETE"])
+def hf_auth_delete():
+    from ..functions.imports.utils.hf_token import delete_hf_token, hf_auth_status
+    removed = delete_hf_token()
+    _rebuild_hf_api()
+    out = hf_auth_status(validate=True)
+    out["removed"] = removed
+    return jsonify(out)

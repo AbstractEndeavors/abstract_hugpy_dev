@@ -42,6 +42,10 @@ from .identity_render_relay import run_identity_mesh_build
 # requests + the store imports stay lazy INSIDE the runner, so this top-level import can
 # never break app boot AND never pulls a char360 dependency onto the central side.
 from .identity_video_extract_relay import run_identity_video_extract
+# MLT/Kdenlive headless render (k22) — a CPU-only LOCAL subprocess runner (melt). Import-safe:
+# its module top is pure stdlib (subprocess/xml/re) so this boot-time import can never break
+# app boot, and it pulls no GPU/char360 dependency onto the central side.
+from .mlt_render import run_mlt_render
 
 DISPATCH = {
     ("ffmpeg", "crop"): run_crop,
@@ -55,4 +59,5 @@ DISPATCH = {
     ("identity", "reconstruction"): run_identity_reconstruction,
     ("identity", "mesh_build"): run_identity_mesh_build,
     ("identity", "video_extract"): run_identity_video_extract,
+    ("mlt", "render"): run_mlt_render,
 }

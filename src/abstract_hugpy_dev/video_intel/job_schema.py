@@ -19,6 +19,7 @@ from .studio.job import StudioI2VSpec
 from .studio_movie_schema import StudioMovieSpec
 from .identity_reconstruction_schema import IdentityReconstructionSpec, IdentityMeshSpec
 from .identity_video_extract_schema import IdentityVideoExtractSpec
+from .mlt_render_schema import MltRenderSpec
 
 
 @dataclass(frozen=True)
@@ -76,4 +77,10 @@ JOB_REGISTRY = {
     "identity_video_extract": JobSpec(
         "identity_video_extract", IdentityVideoExtractSpec,
         ("identity", "video_extract"), "gpu", 14400),
+    # MLT/Kdenlive headless render (k22) = a CPU-only LOCAL subprocess job (melt): the
+    # operator's Kdenlive project (saved into the Samba studio share) is path-mapped +
+    # rendered server-side, output written back under edits/renders/. runner_key
+    # ("mlt","render"); "media" (CPU) queue — NO GPU reservation template; a long timeout
+    # since a real NLE timeline can be minutes.
+    "mlt_render": JobSpec("mlt_render", MltRenderSpec, ("mlt", "render"), "media", 14400),
 }

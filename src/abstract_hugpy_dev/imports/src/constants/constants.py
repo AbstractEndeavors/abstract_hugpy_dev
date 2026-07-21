@@ -126,6 +126,50 @@ MODELS_DISCOVERY_PATH = get_env_value("MODELS_DISCOVERY_PATH") or os.path.join(P
 
 MODELS_DICT_PATH = get_env_value("MODELS_DICT_PATH") or os.path.join(PROJECTS_HOME,"model_manifest.json")
 
+# ── Console-managed Hugging Face token ──────────────────────────────────────
+# The operator can save an HF token from the console so HF calls (search /
+# metadata / downloads) are authenticated instead of anonymously rate-limited.
+# It is persisted as a 0600 file OUTSIDE any git tree, next to the model
+# manifest under PROJECTS_HOME — the same runtime state root api_keys.json uses.
+# The flask-side store (functions/imports/utils/hf_token.py) OWNS writing,
+# validation, and the routes; it reads THIS path so there is one source of truth
+# for where the file lives, with no flask->constants layering violation.
+#
+# Precedence: a STORED token wins; an env HF_TOKEN is the fallback (source:"env").
+HF_TOKEN_PATH = get_env_value("HF_TOKEN_PATH") or os.path.join(PROJECTS_HOME, "hf_token")
+
+
+def read_stored_hf_token():
+    """The console-saved HF token from HF_TOKEN_PATH, or False if none/unreadable.
+    Never raises; never logs the token."""
+    try:
+        with open(HF_TOKEN_PATH, "r", encoding="utf-8") as fh:
+            tok = fh.read().strip()
+        return tok or False
+    except OSError:
+        return False
+
+
+# The GENUINE operator-supplied env token, captured ONCE before we pollute the
+# process env with a stored token below. Source detection / fallback keys off
+# THIS (never live os.environ, which apply_hf_token_to_env overwrites) so a
+# stored token can never masquerade as an "env" token after it is cleared.
+# Both the process env and the .env-backed get_env_value are consulted.
+HF_TOKEN_ENV = (os.environ.get("HF_TOKEN") or get_env_value("HF_TOKEN") or "").strip() or False
+
+# Seed the process token: a stored token overrides the env one. Setting
+# os.environ["HF_TOKEN"] means every huggingface_hub call that does NOT force
+# token=False (bare hf_hub_download / snapshot_download / HfApi()) picks it up
+# automatically at call time; the explicit HfApi(token=...) below and in
+# search_routes honour this resolved value.
+_stored_hf_token = read_stored_hf_token()
+if _stored_hf_token:
+    HF_TOKEN = _stored_hf_token
+if HF_TOKEN:
+    os.environ["HF_TOKEN"] = HF_TOKEN
+    os.environ["HUGGING_FACE_HUB_TOKEN"] = HF_TOKEN
+    hfApi = HfApi(token=HF_TOKEN)
+
 HF_CACHE = _env_root_or_default("HF_CACHE", os.path.join(MODELS_HOME,"cache"))
 
 HF_HOME = get_env_value("HF_HOME") or os.path.join(HF_CACHE,"huggingface")

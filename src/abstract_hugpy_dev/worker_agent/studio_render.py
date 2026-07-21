@@ -48,6 +48,8 @@ import time
 
 from flask import jsonify, request
 
+from . import _studio_subproc
+
 logger = logging.getLogger(__name__)
 
 # Bounded FIFO depth for jobs WAITING behind the one in flight (env-tunable). The
@@ -188,19 +190,29 @@ class StudioRenderManager:
         in-process path), record the JSON-safe result payload, and — in the finally
         — promote the next queued render so the FIFO drains serially."""
         try:
-            # Lazy imports (torch/diffusers/numpy pulled only here, never at mount).
-            from ..video_intel.runners.studio_i2v import (
-                artifact_result_to_payload,
-                run_produce_clip,
-            )
-            from ..video_intel.studio.job import studio_i2v_from_dict
-
-            spec = studio_i2v_from_dict(job.spec)
             with self._lock:
                 job.progress = {"phase": "rendering", "started_at": job.started_at}
-            should_cancel = lambda: job.cancel.is_set()  # noqa: E731
-            result = run_produce_clip(spec, should_cancel)
-            payload = artifact_result_to_payload(result)
+            # k17 deadlock fix: run the GPU render in a KILLABLE, timeout-bounded
+            # CHILD PROCESS (spawn), so a native torch/CUDA/PIL stall in the render
+            # tail (fp32 VAE decode / postprocess under VRAM contention) can never
+            # freeze THIS worker thread — the worker itself runs no native torch, and
+            # a wedged render is killed and failed honestly instead of hanging forever
+            # and requiring a manual restart. The legacy in-thread path stays behind
+            # an escape-hatch env for a box that wants it.
+            if _studio_subproc.render_inprocess_forced():
+                # Lazy imports (torch/diffusers/numpy pulled only here, never at mount).
+                from ..video_intel.runners.studio_i2v import (
+                    artifact_result_to_payload,
+                    run_produce_clip,
+                )
+                from ..video_intel.studio.job import studio_i2v_from_dict
+
+                spec = studio_i2v_from_dict(job.spec)
+                should_cancel = lambda: job.cancel.is_set()  # noqa: E731
+                result = run_produce_clip(spec, should_cancel)
+                payload = artifact_result_to_payload(result)
+            else:
+                payload = _studio_subproc.run_render_subprocess(job.spec, job.cancel)
             with self._lock:
                 job.result = payload
                 job.status = "done"

@@ -42,7 +42,7 @@ from ....managers.serve.slots import SlotPool, slots_enabled, slot_install_steps
 from ..functions.imports.utils.workers import (
     required_pkg_version, pkg_index_dir, set_worker_admission, set_worker_pool,
     set_worker_limits, enroll_required, worker_storage_view,
-    set_worker_auto_reap, record_worker_auto_reap,
+    set_worker_auto_reap, record_worker_auto_reap, forget_assignment_memory,
 )
 from ..functions.imports.utils.enrollment_tokens import (
     create_enrollment_token, verify_enrollment_token,
@@ -947,6 +947,25 @@ def workers_remove(worker_id):
     return jsonify({"removed": True, "id": worker_id})
 
 
+@worker_bp.route("/llm/workers/<worker_id>/memory", methods=["DELETE"])
+def workers_forget_memory(worker_id):
+    """k10 hardening: sanctioned removal of a GHOST assignment-memory entry
+    (worker_assignments.json) — an id with no live row in workers.json at all.
+
+    The by-design durability (a live row's designations survive row loss —
+    see the module docstring in workers.py) is untouched: this 409s if
+    ``worker_id`` is still live, and 404s if it was never in memory. Only a
+    truly stray id (already absent from the live registry) can be forgotten.
+    """
+    try:
+        result = forget_assignment_memory(worker_id)
+    except ValueError as exc:
+        abort(409, description=str(exc))
+    if result == "unknown":
+        abort(404, description="Unknown worker id in assignment memory.")
+    return jsonify({"forgot": worker_id})
+
+
 # -- admission gate (the console "switch") ---------------------------------
 # Unlike DELETE (which a heartbeat undoes), these set a PERSISTENT admission
 # state so the decision sticks across the worker's next contact.
@@ -1354,6 +1373,42 @@ def workers_evict(worker_id):
     return _relay_worker_op(worker_id, "/ops/evict",
                             request.get_json(silent=True) or {},
                             timeout=45.0, action="evict")
+
+
+@worker_bp.route("/llm/workers/<worker_id>/slots/<slot_id>/relaunch",
+                 methods=["POST"])
+def workers_slot_relaunch(worker_id, slot_id):
+    """k14: relaunch a worker's slot child with a new GPU-offload depth / context.
+
+    The lever the k7 offload speed-cliff sweep needs: seat a GGUF at full offload,
+    then relaunch it DOWN through decreasing n_gpu_layers, measuring tok/s at each
+    step. Body: {"n_gpu_layers"?: int, "ctx"?: int} — omit either to keep it
+    (n_gpu_layers absent => the slot re-autofits; an explicit count WINS). Relays
+    to the worker agent's /slots/<slot_id>/relaunch, which asks the slot supervisor
+    to STOP->RESPAWN its child (SIGTERM->SIGKILL) under a NEW pid — so this also
+    addresses the ae "slot-child PID never recycles" blocker without a worker
+    restart. Returns the worker's honest result: the echoed n_gpu_layers is the
+    value the fresh child actually LAUNCHED with, not merely what was requested.
+
+    404 unknown worker id; 409 when the worker is offline (can't relay); the
+    worker itself answers 404 for an unknown slot and 409 for an empty slot, both
+    propagated verbatim. Operator-gated in operator_auth._SENSITIVE, audited like
+    every other worker op."""
+    worker = get_worker(worker_id)
+    if worker is None:
+        abort(404, description="Unknown worker id.")
+    if worker.get("status") != "online":
+        # Offline worker: there is no agent to relay to. Refuse cleanly (409)
+        # rather than let the relay time out into a generic 502.
+        return jsonify({"ok": False, "error": {
+            "code": "WorkerOffline",
+            "message": f"worker {worker_id} is offline — cannot relaunch its "
+                       "slot until it is back online"}}), 409
+    body = request.get_json(silent=True) or {}
+    payload = {k: body[k] for k in ("n_gpu_layers", "ctx")
+               if body.get(k) not in (None, "")}
+    return _relay_worker_op(worker_id, f"/slots/{slot_id}/relaunch", payload,
+                            timeout=900.0, action="slot-relaunch")
 
 
 @worker_bp.route("/llm/workers/<worker_id>/config", methods=["POST"])

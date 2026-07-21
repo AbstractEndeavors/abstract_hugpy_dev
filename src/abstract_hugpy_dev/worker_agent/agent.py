@@ -3234,6 +3234,67 @@ def build_app(state: "WorkerState") -> Flask:
                             "vram_freed": None, "ram_freed": None,
                             "reason": f"{type(exc).__name__}: {exc}"})
 
+    @app.route("/slots/<slot_id>/relaunch", methods=["POST"])
+    def slot_relaunch(slot_id):
+        # k14: relaunch ONE of this worker's slot children with a new offload depth
+        # (n_gpu_layers) / context, so the k7 offload speed-cliff sweep can seat a
+        # GGUF at full offload then sweep it DOWN through layer counts, measuring
+        # tok/s at each step. Central relays here with {"n_gpu_layers"?, "ctx"?}.
+        # The worker resolves slot_id -> its live control URL, confirms a model is
+        # seated, and asks the slot supervisor to STOP->RESPAWN its child (the slot
+        # owns the SIGTERM->SIGKILL). This also answers the ae "slot-child PID never
+        # recycles" blocker: every relaunch respawns the child under a NEW pid.
+        # 404 = no such slot on this worker; 409 = slot empty (nothing to relaunch).
+        import httpx
+        body = request.get_json(silent=True) or {}
+        payload = {k: body[k] for k in ("n_gpu_layers", "ctx")
+                   if body.get(k) not in (None, "")}
+        try:
+            from ..managers.serve.slots import SlotPool
+            statuses = SlotPool().statuses()
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"ok": False, "error": {
+                "code": type(exc).__name__,
+                "message": f"slot pool unavailable: {exc}"}}), 502
+        target = None
+        for s in (statuses or []):
+            if str(s.get("slot_id")) == str(slot_id):
+                target = s
+                break
+        if target is None:
+            return jsonify({"ok": False, "slot_id": slot_id, "error": {
+                "code": "UnknownSlot",
+                "message": f"no slot {slot_id} on this worker"}}), 404
+        if not target.get("model_key"):
+            return jsonify({"ok": False, "slot_id": slot_id, "error": {
+                "code": "EmptySlot",
+                "message": f"slot {slot_id} has no model loaded to relaunch"}}), 409
+        control = target.get("_control")
+        try:
+            # A relaunch respawns a (possibly big) child — allow a cold-load-long
+            # window, same order as a /load warm.
+            r = httpx.post(control + "/relaunch", json=payload, timeout=900.0)
+            data = r.json()
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"ok": False, "slot_id": slot_id, "error": {
+                "code": type(exc).__name__,
+                "message": f"relaunch relay to slot failed: {exc}"}}), 502
+        if isinstance(data, dict) and data.get("error"):
+            return jsonify({"ok": False, "slot_id": slot_id,
+                            "error": data.get("error")}), r.status_code
+        # Echo the HONEST launched allocation: n_gpu_layers is what the fresh child
+        # actually launched with (slot status), not merely what was requested.
+        return jsonify({
+            "ok": True, "slot_id": slot_id,
+            "model_key": (data or {}).get("model_key"),
+            "n_gpu_layers": (data or {}).get("n_gpu_layers"),
+            "requested_n_gpu_layers": (data or {}).get("requested_n_gpu_layers"),
+            "ctx": (data or {}).get("ctx"),
+            "child_pid": (data or {}).get("child_pid"),
+            "healthy": (data or {}).get("healthy"),
+            "allocation": data,
+        }), r.status_code
+
     @app.route("/models/redownload", methods=["POST"])
     def redownload():
         # Force a CLEAN re-pull from central: evict from VRAM, DELETE the model's
