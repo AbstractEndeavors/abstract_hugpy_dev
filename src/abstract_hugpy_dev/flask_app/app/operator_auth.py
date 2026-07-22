@@ -169,6 +169,10 @@ _SENSITIVE = [
     # GET is gated too (it validates the token against HF and reveals its source);
     # the token itself is never returned (only last4).
     ({"GET", "POST", "DELETE"},  re.compile(r"^/llm/hf/auth$")),
+    # HF metadata cache forget (fetch-once policy hatch): dropping a repo's
+    # cached rows re-arms a LIVE HF fetch on next access — an operator-only
+    # refresh affordance. The GET /hf/cache stats read stays open.
+    ({"DELETE"},                 re.compile(r"^/hf/cache/.+$")),
     # Store reconcile (the flattening migration) — MOVES/ARCHIVES model dirs and
     # rewrites the registry + markers when {"apply": true}. A mutating store op,
     # same operator-only tier as discover/delete. The dry-run is also POST (it

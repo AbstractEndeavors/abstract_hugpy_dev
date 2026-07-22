@@ -11,6 +11,12 @@ from .imports import make_list,HfApi,re,safe_dump_to_file
 # ---------------------------------------------------------------------
 HUGGINGFACE_DOMAIN = "https://huggingface.co"
 
+# Don't phone home usage telemetry on the HF calls we do still make (the
+# per-repo metadata cache in comms/model_metadata.py minimizes those calls; this
+# strips the tracking headers from the rest). setdefault ONLY — an
+# operator-set value is never clobbered.
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+
 HF_TOKEN = get_env_value("HF_TOKEN") or False
 
 

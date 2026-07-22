@@ -59,10 +59,15 @@ def _estimate_total_bytes(model: dict) -> int | None:
     if not hub_id:
         return None
     repo_id, _ = split_hub_id(hub_id)
+    # Per-repo metadata rides the permanent central HF cache (fetch-once —
+    # comms/model_metadata.py): only the first estimate of a repo ever pings HF.
+    from abstract_hugpy_dev.comms.model_metadata import fetch_repo_info
     try:
-        info = hfApi.model_info(repo_id, files_metadata=True)
+        payload = fetch_repo_info(repo_id, files_metadata=True, api=hfApi)
     except Exception as exc:
         logger.info("size estimate failed for %s: %s", hub_id, exc)
+        return None
+    if payload is None:
         return None
 
     filename = model.get("filename")
@@ -76,7 +81,8 @@ def _estimate_total_bytes(model: dict) -> int | None:
             return any(fnmatch.fnmatch(path, p) for p in pats)
         return True
 
-    total = sum((s.size or 0) for s in (info.siblings or []) if will_download(s.rfilename))
+    total = sum((s.get("size") or 0) for s in (payload.get("siblings") or [])
+                if will_download(s.get("rfilename") or ""))
     return total or None
 
 

@@ -1,24 +1,20 @@
 from .imports import *       # ← the missing name
 
-_SIZE_CACHE: dict[str, tuple[float, int | None]] = {}
-_SIZE_TTL = 600
-_size_lock = threading.Lock()
 
 def model_size(hub_id: str) -> int | None:
-    now = time.time()
-    with _size_lock:
-        hit = _SIZE_CACHE.get(hub_id)
-        if hit and now - hit[0] < _SIZE_TTL:
-            return hit[1]
+    """Total repo bytes via the PERMANENT central HF metadata cache (replaced
+    the old in-memory 600s-TTL dict): first ask per repo ever hits HF, every
+    later ask is served from SQLite — fetch-once, no expiry (operator policy;
+    see comms/model_metadata.py). A live-call failure logs and returns None,
+    exactly the old contract."""
+    from abstract_hugpy_dev.comms.model_metadata import (
+        fetch_repo_info, sum_sibling_sizes)
     try:
-        info = hfApi.model_info(hub_id, files_metadata=True)
-        total = sum(s.size for s in info.siblings if s.size) or None
+        payload = fetch_repo_info(hub_id, files_metadata=True, api=hfApi)
     except Exception as exc:
         logger.warning("model_size(%s) failed: %s", hub_id, exc)   # don't hide it
-        total = None
-    with _size_lock:
-        _SIZE_CACHE[hub_id] = (now, total)
-    return total
+        return None
+    return sum_sibling_sizes(payload)
 
 def free_bytes() -> int | None:
     """Headroom on the filesystem where this repo will actually be written.

@@ -491,8 +491,17 @@ def _fp16_ignore_patterns(repo_id: str) -> "list[str] | None":
     (onnx/openvino/flax) — sdxl-turbo drops from 55GB to ~7GB. Returns None
     (no filtering) for non-diffusers repos or repos without fp16 variants, so
     a model that only ships full precision still downloads completely."""
-    from huggingface_hub import HfApi
-    files = set(HfApi().list_repo_files(repo_id))
+    # File list rides the permanent central HF cache (fetch-once —
+    # comms/model_metadata.py repo_files): only the first pull of a repo ever
+    # asks HF; a broken cache degrades to the live call as today.
+    from abstract_hugpy_dev.comms.model_metadata import model_metadata_store
+    cached = model_metadata_store.get_repo_files(repo_id)
+    if cached is not None:
+        files = set(cached)
+    else:
+        from huggingface_hub import HfApi
+        files = set(HfApi().list_repo_files(repo_id))
+        model_metadata_store.put_repo_files(repo_id, sorted(files))
     if "model_index.json" not in files:
         return None                      # not a diffusers pipeline — untouched
     twins = [f for f in files

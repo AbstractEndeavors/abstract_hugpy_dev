@@ -224,6 +224,88 @@ def _install_engine(args: argparse.Namespace) -> int:
     return 0
 
 
+def _detect_profile() -> tuple[str, str]:
+    """Pick cpu-worker/gpu-worker by probing local hardware. Returns
+    (profile, reason) — the reason is always printed, detection is never silent.
+    Imports the worker agent's GPU probe lazily: it pulls the heavy managers/
+    imports stack, which must stay optional for a bare `hugpy --help`."""
+    try:
+        from abstract_hugpy_dev.worker_agent.agent import detect_gpus
+    except Exception as exc:
+        return "cpu", f"GPU detection unavailable ({type(exc).__name__}: {exc}); defaulting to cpu-worker"
+
+    try:
+        gpus = detect_gpus()
+    except Exception as exc:
+        return "cpu", f"GPU detection failed ({type(exc).__name__}: {exc}); defaulting to cpu-worker"
+
+    if not gpus:
+        return "cpu", "no usable NVIDIA GPU detected; choosing cpu-worker"
+
+    names = ", ".join(f"{g.get('name')} (index {g.get('index')})" for g in gpus)
+    return "gpu", f"detected {len(gpus)} GPU(s): {names}; choosing gpu-worker"
+
+
+def _install_deps(args: argparse.Namespace) -> int:
+    """Install a worker box's dependency set based on what the box actually is,
+    instead of a human guessing cpu-worker/gpu-worker by hand. See WORKER-SETUP.md
+    §6 for the manual per-box recipe this complements (native/CUDA overrides
+    still need that recipe — this only resolves the pip extras).
+
+    Most fleet boxes have a GPU, so gpu-worker is the default profile — --cpu
+    (or --profile cpu) is the explicit opt-out for CPU-only boxes. --profile auto
+    runs hardware detection instead of trusting the operator's say-so."""
+    if args.cpu and args.profile not in (None, "cpu"):
+        print(f"hugpy install-deps: --cpu conflicts with --profile {args.profile}", file=sys.stderr)
+        return 2
+    requested = "cpu" if args.cpu else (args.profile or "gpu")
+
+    if requested == "auto":
+        profile, reason = _detect_profile()
+        print(f"hugpy install-deps: {reason}")
+    else:
+        profile = requested
+        print(f"hugpy install-deps: profile = {profile}-worker "
+              f"({'--cpu' if args.cpu else 'default' if args.profile is None else f'--profile {profile}'})")
+        if profile == "gpu":
+            _, detect_reason = _detect_profile()
+            if not detect_reason.startswith("detected"):
+                why = "it is the default" if args.profile is None else "you asked for it"
+                print(f"hugpy install-deps: WARNING — {detect_reason.split('; ')[0]}; "
+                      f"proceeding with gpu-worker anyway ({why}). "
+                      f"Pass --cpu if this box has no GPU.")
+
+    extra = f"{profile}-worker"
+    pkg = f"abstract_hugpy_dev[{extra}]"
+    if args.version:
+        pkg += f"=={args.version}"
+
+    cmd = [sys.executable, "-m", "pip", "install", pkg]
+    print("hugpy install-deps: would run:" if args.dry_run else "hugpy install-deps: will run:")
+    print("  " + " ".join(cmd))
+
+    if args.dry_run:
+        return 0
+
+    if not args.yes:
+        try:
+            reply = input("Proceed? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nhugpy install-deps: aborted", file=sys.stderr)
+            return 1
+        if reply not in ("y", "yes"):
+            print("hugpy install-deps: aborted", file=sys.stderr)
+            return 1
+
+    import subprocess
+    proc = subprocess.run(cmd)
+    if proc.returncode != 0:
+        print(f"hugpy install-deps: pip install failed (exit {proc.returncode})", file=sys.stderr)
+        return proc.returncode
+    print(f"hugpy install-deps: installed {pkg}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(prog="hugpy", description=__doc__,
@@ -231,9 +313,9 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("serve", help="run the hugpy console + API in one process")
-    s.add_argument("--host", default="0.0.0.0")
-    s.add_argument("--port", type=int, default=7002)
-    s.add_argument("--threads", type=int, default=8)
+    s.add_argument("--host", default="0.0.0.0", help="bind address (default: 0.0.0.0)")
+    s.add_argument("--port", type=int, default=7002, help="bind port (default: 7002)")
+    s.add_argument("--threads", type=int, default=8, help="server threads (default: 8)")
     s.add_argument("--auth", choices=("open", "external"),
                    help="auth mode (default: open, or HUGPY_AUTH_MODE)")
     s.add_argument("--origins", help="comma-separated CORS origins (default: same-origin only)")
@@ -271,6 +353,17 @@ def main(argv: list[str] | None = None) -> int:
     e.add_argument("--jobs", type=int, help="parallel build jobs (source build only)")
     e.add_argument("--force", action="store_true", help="re-download even if already installed")
 
+    i = sub.add_parser("install-deps",
+                       help="install a worker box's pip extras (gpu-worker by default, "
+                            "--cpu for CPU-only boxes)")
+    i.add_argument("--profile", choices=("gpu", "cpu", "auto"),
+                   help="gpu-worker/cpu-worker, or auto to detect (default: gpu)")
+    i.add_argument("--cpu", action="store_true", help="shorthand for --profile cpu")
+    i.add_argument("--version", help="pin abstract_hugpy_dev to this version (default: unpinned)")
+    i.add_argument("--dry-run", action="store_true",
+                   help="print the pip command and exit without running it")
+    i.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+
     # Split: everything after `worker` belongs to the agent's parser.
     if argv and argv[0] == "worker":
         return _worker(w, argv[1:])
@@ -288,6 +381,8 @@ def main(argv: list[str] | None = None) -> int:
         return _serve(args)
     if args.cmd == "install-engine":
         return _install_engine(args)
+    if args.cmd == "install-deps":
+        return _install_deps(args)
     if args.cmd == "bot":
         return _bot(args)
     if args.cmd == "chat":

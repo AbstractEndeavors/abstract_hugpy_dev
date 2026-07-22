@@ -353,6 +353,14 @@ def derive_model_config_row(name, row):
         "port": row.get("port"), "host": row.get("host"),
         "serveable": not no_runner,
         "unserveable_tasks": no_runner,
+        # Provenance DECORATION (civitai sidecar via the comfy sweep) — this
+        # derive rebuilds rows with a fixed schema, so decoration must be
+        # passed through by name or it silently dies here. No serving
+        # semantics; civitai_base_model deliberately NOT base_model (that
+        # field means PEFT adapter and trips the base_present drop above).
+        **{k: row[k] for k in ("display_name", "civitai_id",
+                               "civitai_version_id", "civitai_base_model")
+           if row.get(k) is not None},
     }, None
 
 def _absorb_disk(staple, disc):
@@ -406,6 +414,13 @@ def assess_config(cls, values):
             out[name] = f.default
         else:
             out[name] = f.default_factory()
+    # Non-field keys ride through to cls(**...) so ModelConfig's leftover
+    # catcher ("extra: everything it wasn't expecting — kept not dropped")
+    # actually receives them. Without this, decoration like the civitai
+    # provenance keys died HERE, defeating the class's own design.
+    for name, v in values.items():
+        if name not in flds:
+            out[name] = v
     return cls(**out)
 
 
@@ -662,6 +677,18 @@ def _sweep_comfy_checkpoints(merged):
             claimed.add(fn)
             if fn in files:
                 _ensure_infra(v, fn)
+    def _civitai_sidecar(fn):
+        """Read the ``<file>.civitai.json`` provenance stamp written by
+        /civitai/download, if any. Local read only; corrupt/absent -> None.
+        Files predating the stamp have no sidecar and stay EXACTLY as today
+        (no network for unstamped files, ever)."""
+        try:
+            with open(os.path.join(root, fn + ".civitai.json")) as fh:
+                sc = json.load(fh)
+            return sc if isinstance(sc, dict) else None
+        except Exception:  # noqa: BLE001 — decoration only, never a gate
+            return None
+
     # Pass 2: unclaimed files synthesize their own rows.
     rows = {}
     for fn in sorted(files - claimed):
@@ -674,6 +701,40 @@ def _sweep_comfy_checkpoints(merged):
                "framework": "comfy", "hub_id": hub, "filename": fn,
                "folder": hub, "tasks": ["text-to-image", "image-to-image"],
                "primary_task": "text-to-image", "port": None}
+        # Civitai provenance decoration (sidecar-gated): keys stay identity
+        # (name/key = comfy-<stem> unchanged), display/base_model are
+        # decoration. model_max_length stays 77 deliberately — no per-base
+        # token-length mapping exists in the codebase to reuse, and inventing
+        # SDXL dual-encoder handling here is out of scope; base_model rides
+        # the row so a future consumer CAN branch on it.
+        sidecar = _civitai_sidecar(fn)
+        if sidecar:
+            if sidecar.get("name"):
+                row["display_name"] = sidecar["name"]
+            if sidecar.get("civitai_id") is not None:
+                row["civitai_id"] = sidecar["civitai_id"]
+            if sidecar.get("version_id") is not None:
+                row["civitai_version_id"] = sidecar["version_id"]
+            if sidecar.get("base_model"):
+                # NOT row["base_model"]: that field means "PEFT adapter on
+                # <base>" and a truthy value trips the adapter gate
+                # (base_present at ~line 323) — "SD 1.5" isn't on disk as a
+                # transformers base, so the row would be DROPPED from the
+                # registry. civitai_base_model is decoration riding
+                # ModelConfig.extra, no serving semantics.
+                row["civitai_base_model"] = sidecar["base_model"]
+            # Warm the central civitai_meta table (fetch-once) — ONLY for
+            # stamped files carrying an id, and offline-safe: any failure
+            # (no network on a worker, DNS, store trouble) degrades to the
+            # unenriched row above.
+            try:
+                from ....comms.model_metadata import fetch_civitai_meta
+                fetch_civitai_meta(stem,
+                                   civitai_id=sidecar.get("civitai_id"),
+                                   version_id=sidecar.get("version_id"),
+                                   timeout=5.0)
+            except Exception:  # noqa: BLE001 — enrichment never breaks a sweep
+                pass
         _ensure_infra(row, fn)
         rows[key] = row
     return rows

@@ -218,31 +218,40 @@ def search_models():
 # ── spec: per-repo detail + install options (lazy, on row expand) ───────────
 @search_bp.route("/hf/spec", methods=["GET"])
 def hf_spec():
+    """Per-repo metadata rides the PERMANENT central HF cache (fetch-once,
+    no TTL — operator policy, see comms/model_metadata.py): the first spec of a
+    repo ever hits HF, every later one is served from SQLite. ``?refresh=1``
+    is the explicit operator re-fetch affordance (forces one live call and
+    overwrites the cached row)."""
+    from abstract_hugpy_dev.comms.model_metadata import fetch_repo_info
     hub_id = request.args.get("hub_id")
     if not hub_id:
         abort(400, description="hub_id is required.")
+    refresh = request.args.get("refresh", default="0") not in ("0", "", None)
 
     try:
-        info = api.model_info(hub_id, files_metadata=True)
+        payload = fetch_repo_info(hub_id, files_metadata=True,
+                                  force=refresh, api=api)
     except Exception as exc:
         abort(502, description=f"Hugging Face request failed: {exc}")
+    if payload is None:
+        abort(502, description="Hugging Face metadata unavailable.")
 
-    files = [FileSpec(path=s.rfilename, size=s.size) for s in info.siblings]
+    files = [FileSpec(path=s.get("rfilename"), size=s.get("size"))
+             for s in (payload.get("siblings") or []) if s.get("rfilename")]
     total = sum(f.size for f in files if f.size) or None
     free = _free_bytes()
 
-    task = getattr(info, "pipeline_tag", None) or "text-generation"
+    task = payload.get("pipeline_tag") or "text-generation"
     options = resolve_options(hub_id, task, files, free)
-
-    num_params = getattr(getattr(info, "safetensors", None), "total", None)
 
     spec = ModelSpec(
         hub_id=hub_id,
-        license=_license_of(info),
-        gated=getattr(info, "gated", None),
-        last_modified=str(getattr(info, "last_modified", "")) or None,
+        license=payload.get("license"),
+        gated=payload.get("gated"),
+        last_modified=payload.get("last_modified"),
         total_bytes=total,
-        num_params=num_params,
+        num_params=payload.get("safetensors_params"),
         context_length=_context_length(hub_id, files),
         gguf_quants=[o.id.split(":", 1)[1] for o in options.options
                      if o.id.startswith("gguf:")],
@@ -250,6 +259,25 @@ def hf_spec():
     )
 
     return jsonify({"spec": spec.model_dump(), "options": options.model_dump()})
+
+
+# ── HF metadata cache observability (operator) ──────────────────────────────
+# The permanent per-repo cache (comms/model_metadata.py): GET shows what's held;
+# DELETE <hub_id> is how the operator forces a repo re-fetch — forget the rows,
+# the next access re-fetches live. The DELETE is operator-gated (see
+# operator_auth ^/hf/cache/).
+@search_bp.route("/hf/cache", methods=["GET"])
+def hf_cache_stats():
+    from abstract_hugpy_dev.comms.model_metadata import model_metadata_store
+    return jsonify(model_metadata_store.stats())
+
+
+@search_bp.route("/hf/cache/<path:hub_id>", methods=["DELETE"])
+def hf_cache_forget(hub_id):
+    from abstract_hugpy_dev.comms.model_metadata import model_metadata_store
+    removed = model_metadata_store.forget(hub_id)
+    return jsonify({"hub_id": hub_id, "rows_removed": removed,
+                    "note": "next access re-fetches live"})
 
 
 # ── Civitai — the checkpoint habitat, wired to the comfy drop-a-file flow ────
@@ -267,6 +295,44 @@ def _checkpoints_dir() -> str:
     d = os.path.join(DEFAULT_ROOT, "checkpoints")
     os.makedirs(d, exist_ok=True)
     return d
+
+
+def _stamp_civitai_provenance(dest: str, url: str, filename: str,
+                              provenance: dict) -> None:
+    """Best-effort provenance stamp after a checkpoint lands: a
+    ``<dest>.civitai.json`` sidecar (atomic tmp+replace) plus the same dict
+    into the central model-metadata store keyed by the sweep's stem. Failure
+    must NEVER fail the download — the checkpoint is already good; provenance
+    is decoration (the pre-stamp world is exactly today's world)."""
+    import time as _time
+    stamp = {
+        "civitai_id": provenance.get("civitai_id"),
+        "version_id": provenance.get("version_id"),
+        "name": provenance.get("name"),
+        "base_model": provenance.get("base_model"),
+        "download_url": url,
+        "filename": filename,
+        "fetched_at": _time.time(),
+        # This row is the download-time stamp, NOT a Civitai API response —
+        # fetch_civitai_meta upgrades it (one live call) when asked to enrich.
+        "provenance_only": True,
+    }
+    sidecar = dest + ".civitai.json"
+    try:
+        tmp = sidecar + ".part"
+        with open(tmp, "w") as fh:
+            json.dump(stamp, fh, indent=2)
+        os.replace(tmp, sidecar)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("civitai: provenance sidecar for %s failed: %s",
+                       filename, exc)
+    try:
+        from abstract_hugpy_dev.comms.model_metadata import (
+            checkpoint_stem, model_metadata_store)
+        model_metadata_store.put_civitai_meta(checkpoint_stem(filename), stamp)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("civitai: central provenance row for %s failed: %s",
+                       filename, exc)
 
 
 @search_bp.route("/civitai/search", methods=["GET"])
@@ -303,6 +369,7 @@ def civitai_search():
         stats = it.get("stats") or {}
         rows.append({
             "civitai_id": it.get("id"),
+            "version_id": v.get("id"),
             "name": it.get("name"),
             "base_model": v.get("baseModel"),
             "version": v.get("name"),
@@ -323,11 +390,20 @@ def civitai_search():
 def civitai_download():
     """Stream ONE checkpoint into <root>/checkpoints (background). The comfy
     sweep registers it automatically once the file lands — the whole install
-    is this download. Operator-gated (writes to central storage)."""
+    is this download. Operator-gated (writes to central storage).
+
+    Optional provenance fields (the UI has them from /civitai/search rows;
+    hand-fed URLs may omit any/all): civitai_id, version_id, name, base_model.
+    When present they're stamped into a ``<dest>.civitai.json`` sidecar next
+    to the checkpoint AND into the central model-metadata store, so the comfy
+    sweep can decorate its synthesized row and fetch-once enrichment has an id
+    to ride (never a filename guess)."""
     import threading
     body = request.get_json(silent=True) or {}
     url = str(body.get("download_url") or "").strip()
     filename = os.path.basename(str(body.get("filename") or "").strip())
+    provenance = {k: body.get(k) for k in
+                  ("civitai_id", "version_id", "name", "base_model")}
     if not url.startswith("https://civitai.com/"):
         return jsonify({"error": "download_url must be a civitai.com URL"}), 400
     if not filename.endswith((".safetensors", ".ckpt")):
@@ -369,6 +445,7 @@ def civitai_download():
                         st["done_bytes"] += len(chunk)
             os.replace(tmp, dest)
             st["status"] = "done"
+            _stamp_civitai_provenance(dest, url, filename, provenance)
             logger.info("civitai: %s landed in /checkpoints — the sweep "
                         "registers it on the next registry read", filename)
         except Exception as exc:  # noqa: BLE001

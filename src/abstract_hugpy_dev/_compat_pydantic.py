@@ -138,6 +138,10 @@ def _build_shim() -> types.ModuleType:
     mod.ValidationError = ValidationError
 
     def _module_getattr(name):  # PEP 562: long-tail names → lenient stub
+        if name.startswith("__") and name.endswith("__"):
+            # Dunders must stay honest: inspect/importlib walk sys.modules and
+            # call str methods on e.g. __file__ — a stub there crashes them.
+            raise AttributeError(name)
         return _Stub
 
     mod.__getattr__ = _module_getattr

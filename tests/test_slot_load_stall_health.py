@@ -166,7 +166,7 @@ def test_backoff_arms_and_refuses_immediate_reattempt(fast, monkeypatch):
     s.profile_bin = None
     # make the load 'fail' fast: _build_cmd + popen stubbed, _wait_healthy False.
     monkeypatch.setattr(sa, "_build_cmd",
-                        lambda *a, **k: (["true"], -1, 4096, 6, None, "cpp"))
+                        lambda *a, **k: (["true"], -1, 4096, 6, None, "cpp", 48))
     monkeypatch.setattr(sa, "_model_expected_bytes", lambda mk: 46 * GIB)
     monkeypatch.setattr(sa.subprocess, "Popen", lambda *a, **k: type(
         "P", (), {"pid": 1, "poll": lambda self: None, "terminate": lambda self: None,
@@ -207,7 +207,7 @@ def test_success_clears_backoff(fast, monkeypatch):
     s._load_failures = {"big": 2}
     s._load_backoff_until = {"big": time.time() + 5}
     monkeypatch.setattr(sa, "_build_cmd",
-                        lambda *a, **k: (["true"], -1, 4096, 6, None, "cpp"))
+                        lambda *a, **k: (["true"], -1, 4096, 6, None, "cpp", 48))
     monkeypatch.setattr(sa, "_model_expected_bytes", lambda mk: 46 * GIB)
     monkeypatch.setattr(sa.subprocess, "Popen", lambda *a, **k: type(
         "P", (), {"pid": 1, "poll": lambda self: None})())

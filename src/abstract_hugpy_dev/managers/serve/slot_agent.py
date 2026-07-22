@@ -152,6 +152,35 @@ def _proc_rss_bytes(pid):
     return None
 
 
+def _proc_rss_detail(pid):
+    """The HONEST resident-memory split of a pid from /proc/<pid>/status:
+    ``{rss_anon_bytes, rss_file_bytes, rss_shmem_bytes}``.
+
+    llama.cpp mmaps the GGUF, so VmRSS counts the FILE-BACKED pages of the
+    weights as "resident" — reclaimable page cache, NOT pinned RAM. Measured on
+    ae (Qwen3-Coder-Next, 17/48 offload): VmRSS 45.2G but RssAnon only 1.5G,
+    RssFile 43.6G — the raw figure overstates true memory pressure ~28x.
+    RssAnon is the honest pinned figure; RssFile is the mmap'd/cache share.
+
+    Best-effort + Linux-only: ``{}`` on any read failure (an old kernel without
+    the Rss* split, a vanished pid, a non-Linux box) — callers OMIT the fields
+    rather than crash the heartbeat. ``rss_bytes`` (VmRSS) keeps its meaning
+    unchanged for wire back-compat."""
+    out = {}
+    keys = {"RssAnon:": "rss_anon_bytes", "RssFile:": "rss_file_bytes",
+            "RssShmem:": "rss_shmem_bytes"}
+    try:
+        with open(f"/proc/{pid}/status") as fh:
+            for line in fh:
+                for pref, name in keys.items():
+                    if line.startswith(pref):
+                        out[name] = int(line.split()[1]) * 1024
+                        break
+    except Exception:
+        return {}
+    return out
+
+
 def _cpus_to_hexmask(cpus: str) -> str:
     """Turn a cpu spec like "0-3" or "0,2,4" into llama.cpp's hex --cpu-mask."""
     bits = 0
@@ -411,7 +440,17 @@ def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None,
         if cpus:
             logger.info("slot %s: cpu pin %r ignored in llama_cpp.server mode",
                         SLOT_ID, cpus)
-    return argv, ngl, ctx, threads, cpus, ("binary" if server_bin else "python")
+    # The model's TOTAL layer count (GGUF header block_count) — the denominator
+    # the console needs to render "17/48 layers" instead of "17/undefined". Read
+    # here (the one place the slot holds the resolved file path) via the existing
+    # spill reader; best-effort None keeps the field omit-when-unset downstream.
+    try:
+        from ..spill import _gguf_layer_count
+        total_layers = _gguf_layer_count(path)
+    except Exception:  # noqa: BLE001 — never block a load on header metadata
+        total_layers = None
+    return (argv, ngl, ctx, threads, cpus,
+            ("binary" if server_bin else "python"), total_layers)
 
 
 class Slot:
@@ -428,6 +467,9 @@ class Slot:
         self.profile_bin = None      # env-profiles (stage 1): the profile venv
         # bin dir this model's child launches from (None = shared venv default).
         self.expected_bytes = None
+        # GGUF header block_count of the seated model (None = unknown/non-GGUF):
+        # the "of 48" in the console's offload readout.
+        self.total_layers = None
         self.loaded_at = 0.0
         self.last_used = 0.0
         # Free VRAM sampled at the start of the CURRENT load (slice 12): the
@@ -500,6 +542,7 @@ class Slot:
                                "clearing the stale claim", SLOT_ID, self.model_key)
                 self.model_key = self.ngl = self.ctx = None
                 self.threads = self.cpus = self.gpu = self.expected_bytes = None
+                self.total_layers = None
                 self.profile_bin = None
                 self.proc = None
         finally:
@@ -508,7 +551,7 @@ class Slot:
     def status(self) -> dict:
         from ..spill import free_vram_bytes
         self._self_heal()
-        return {
+        out = {
             "slot_id": SLOT_ID,
             "control_port": SLOT_PORT,
             "child_port": SLOT_CHILD_PORT,
@@ -517,6 +560,10 @@ class Slot:
             "healthy": self.healthy(),
             "busy": self.inflight > 0,
             "n_gpu_layers": self.ngl,
+            # GGUF block_count of the seated model — the "of N" for the console's
+            # "17/48 layers". None for non-GGUF / an unreadable header (getattr:
+            # an instance created before this field existed must not 500 /status).
+            "total_layers": getattr(self, "total_layers", None),
             "ctx": self.ctx,
             "threads": self.threads,
             "cpus": self.cpus,
@@ -539,6 +586,13 @@ class Slot:
             # silent tight loop. None once a load succeeds.
             "last_load_error": self.last_load_error,
         }
+        # Honest RSS split (omit-when-unset): rss_bytes stays VmRSS verbatim for
+        # wire back-compat, while rss_anon_bytes is the truly-pinned RAM and
+        # rss_file_bytes the mmap'd-GGUF page cache VmRSS also counts (~28x
+        # overstatement observed on ae). Absent entirely when /proc can't say.
+        if self._child_alive():
+            out.update(_proc_rss_detail(self.proc.pid))
+        return out
 
     # -- lifecycle ---------------------------------------------------------
     def load(self, model_key, n_gpu_layers=None, ctx=None, threads=None,
@@ -568,7 +622,7 @@ class Slot:
             self._kill()
             self.profile_bin = profile_bin or None
             (argv, self.ngl, self.ctx, self.threads, self.cpus,
-             self.child_kind) = _build_cmd(
+             self.child_kind, self.total_layers) = _build_cmd(
                 model_key, n_gpu_layers, ctx, threads, cpus, path=path,
                 gpu_mem_gib=gpu_mem_gib, cpu_mem_gib=cpu_mem_gib,
                 profile_bin=self.profile_bin)
@@ -711,6 +765,7 @@ class Slot:
             self._kill()
             self.model_key = self.ngl = self.ctx = None
             self.threads = self.cpus = self.gpu = self.expected_bytes = None
+            self.total_layers = None
             self.profile_bin = None
             return self.status()
 

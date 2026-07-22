@@ -1,2 +1,2 @@
-from imports.src.abstract_hugpy_dev.imports.config.models.models_config import _sweep_comfy_checkpoints
-_sweep_comfy_checkpoints()
+from imports import *
+discover_models()

@@ -1216,6 +1216,26 @@ def _vram_split_from_pidlog(pid_log: "dict | None") -> dict:
             "vram_unattributed_bytes": unattributed}
 
 
+def _slot_total_layers_fallback(model_key: str) -> "int | None":
+    """Total GGUF layer count for a SLOT-seated model whose slot build predates
+    the ``total_layers`` status field (an adopted stale slot child) — resolved
+    via the same geometry reader the offload math uses, and CACHED per model so
+    the heartbeat never re-parses a GGUF header every beat. None (also cached)
+    for non-GGUF / unresolvable — the allocation row then omits the field."""
+    if model_key in _TOTAL_LAYERS_CACHE:
+        return _TOTAL_LAYERS_CACHE[model_key]
+    tl = None
+    try:
+        _, tl = _served_gguf_geometry(model_key)
+    except Exception:  # noqa: BLE001 — best-effort metadata, never break a beat
+        tl = None
+    _TOTAL_LAYERS_CACHE[model_key] = tl
+    return tl
+
+
+_TOTAL_LAYERS_CACHE: dict = {}   # model_key -> int | None (misses cached too)
+
+
 def _allocations(slot_statuses: "list | None" = None) -> list:
     """Unified, engine-agnostic view of every resource allocation on this
     worker — one entry per SLOT-seated model and one per in-RAM (in-process)
@@ -1257,14 +1277,40 @@ def _allocations(slot_statuses: "list | None" = None) -> list:
             elif cp is not None:
                 # Child is alive but not a GPU compute app → CPU-resident (ngl=0).
                 vram_bytes, device = 0, "cpu"
-        out.append({
+        row = {
             "kind": "slot", "model_key": mk,
             "slot_id": s.get("slot_id"), "healthy": s.get("healthy"),
             "busy": s.get("busy"), "endpoint": s.get("endpoint"),
             "rss_bytes": s.get("rss_bytes"),
             "n_gpu_layers": s.get("n_gpu_layers"), "ctx": s.get("ctx"),
             "vram_bytes": vram_bytes, "device": device,
-        })
+        }
+        # Honest allocation accuracy (2026-07-22), omit-when-unset so the wire
+        # shape is unchanged for old slots/central:
+        #  * total_layers — GGUF block_count so "17/48" renders instead of
+        #    "17/undefined". The slot reports it since this build; for an
+        #    ADOPTED older slot child fall back to the agent's own GGUF-header
+        #    read (cached — one header parse per model, not per beat).
+        #  * rss_anon_bytes / rss_file_bytes — VmRSS counts the mmap'd GGUF's
+        #    file-backed pages (reclaimable cache) as resident, overstating true
+        #    pinned RAM ~28x on ae; RssAnon is the honest figure. Slot-reported,
+        #    else read from /proc/<child_pid>/status here (same box).
+        tl = s.get("total_layers")
+        if tl is None:
+            tl = _slot_total_layers_fallback(mk)
+        if tl is not None:
+            row["total_layers"] = tl
+        if s.get("rss_anon_bytes") is not None:
+            for k in ("rss_anon_bytes", "rss_file_bytes", "rss_shmem_bytes"):
+                if s.get(k) is not None:
+                    row[k] = s[k]
+        elif s.get("child_pid") is not None:
+            try:
+                from ..managers.serve.slot_agent import _proc_rss_detail
+                row.update(_proc_rss_detail(s["child_pid"]))
+            except Exception:  # noqa: BLE001 — never break the heartbeat on /proc
+                pass
+        out.append(row)
     detail = _loaded_detail()
     inproc = _inprocess_gpu_bytes()            # {} when torch missing
     try:

@@ -17,6 +17,13 @@ def clean_hub_id(directory: str, fallback: str = "") -> str:
     return hub_id.strip("/")
 
 
+# hub_id "owner" prefixes that are LOCAL conventions, not HF namespaces —
+# never resolvable on huggingface.co, never sent there (see
+# resolve_hub_model_info). "comfy/<stem>" is synthesized per local ComfyUI
+# checkpoint by models_config._sweep_comfy_checkpoints.
+_LOCAL_HUB_NAMESPACES = {"comfy"}
+
+
 def is_valid_repo_id(hub_id: str) -> bool:
     hub_id = (hub_id or "").strip("/")
     return bool(hub_id) and "/" in hub_id
@@ -224,34 +231,37 @@ def resolve_hub_model_info(directory: str, hub_id: str, api: HfApi) -> dict:
     if not is_valid_repo_id(hub_id):
         return {}
 
+    # LOCAL namespaces are not HF repos. models_config synthesizes
+    # hub_id = "comfy/<stem>" for ComfyUI checkpoint files (models_config.py
+    # _sweep_comfy_checkpoints) — asking huggingface.co about those yields a
+    # guaranteed 401/404 per checkpoint per registry walk (the ae log-spam wall,
+    # 2026-07-22) and needlessly names local files to HF. Never send them.
+    if hub_id.split("/", 1)[0].lower() in _LOCAL_HUB_NAMESPACES:
+        return {}
+
+    # Per-repo metadata rides the permanent central HF cache (fetch-once —
+    # comms/model_metadata.py). Upgraded to files_metadata=True: one RICHER fetch
+    # beats two (the sibling sizes then also serve model_size / spec / download
+    # estimates from the same cached row). Output contract unchanged.
+    from abstract_hugpy_dev.comms.model_metadata import fetch_repo_info
     try:
-        info = api.model_info(hub_id, files_metadata=False)
+        payload = fetch_repo_info(hub_id, files_metadata=True, api=api)
     except (HfHubHTTPError, HFValidationError) as exc:
         logger.warning("hub_model_info skipped for %r: %s", hub_id, exc)
         return {}
+    if payload is None:
+        return {}
 
-    params = getattr(info.safetensors, "total", None) if info.safetensors else None
-    auto_model = getattr(info.transformers_info, "auto_model", None) if info.transformers_info else None
-
-    card = info.card_data
-    def _card(key):
-        if card is None:
-            return None
-        return card.get(key) if isinstance(card, dict) else getattr(card, key, None)
-
-    languages = _card("language")
-    if isinstance(languages, str):
-        languages = [languages]
-
+    gated = payload.get("gated")
     return {
-        "pipeline_tag":     info.pipeline_tag,
-        "library_name":     info.library_name,
-        "auto_model_class": auto_model,
-        "parameter_count":  params,
-        "license":          _card("license"),
-        "gated":            bool(info.gated) if info.gated is not None else None,
-        "languages":        languages,
-        "tags":             info.tags,
+        "pipeline_tag":     payload.get("pipeline_tag"),
+        "library_name":     payload.get("library_name"),
+        "auto_model_class": payload.get("auto_model_class"),
+        "parameter_count":  payload.get("safetensors_params"),
+        "license":          payload.get("license"),
+        "gated":            bool(gated) if gated is not None else None,
+        "languages":        payload.get("languages"),
+        "tags":             payload.get("tags"),
     }
 
 

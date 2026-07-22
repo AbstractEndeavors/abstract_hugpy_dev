@@ -162,8 +162,10 @@ def test_force_bypasses_same_model_short_circuit(monkeypatch):
     spawned = {"n": 0}
 
     def _build(mk, ngl, ctx, threads, cpus, **kw):
+        # mirrors the real return shape: (..., child_kind, total_layers) — the
+        # trailing GGUF block_count feeds status()'s "17/48 layers" readout.
         return (["true"], ngl if ngl is not None else -1, ctx or 4096,
-                threads or 6, cpus, "cpp")
+                threads or 6, cpus, "cpp", 48)
     monkeypatch.setattr(sa, "_build_cmd", _build)
     monkeypatch.setattr(sa, "_model_expected_bytes", lambda mk: 1 * GIB)
 
