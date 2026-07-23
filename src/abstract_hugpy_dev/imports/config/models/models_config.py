@@ -736,6 +736,81 @@ def set_worker_boot_prewarm(worker_id, model_key, enabled):
     }
 
 
+# ---------------------------------------------------------------------------
+# Per-worker WILDCARD flag — the "take all comers" ROUTING opt-in (operator
+# doctrine 2026-07-23). Worker designations are a HARD routing scope: they seal
+# where designated models CAN route, and an UNDESIGNATED model "gets in where it
+# fits in" ONLY on workers that opted in here ("a worker can be designated to
+# take all comers while adhering to its allocated model list as priority, or it
+# can not be selected as a wildcard and adhere only to its own allocated
+# models"). A wildcard box also catches the OVERFLOW of a designated model whose
+# home workers are all unavailable (ranking sorts home above wildcard — see
+# workers.py); the request busts only when neither can serve.
+#
+# This flag changes ROUTING ELIGIBILITY only. Once a model is resident, NORMAL
+# eviction rules apply — designation affects routing, not eviction ("you don't
+# want random evictions simply because you have a verbose model registry" is
+# exactly why all-comers is an explicit per-worker opt-in). DEFAULT FALSE for
+# every worker: with no flags set, routing is identical to the pre-feature
+# fleet (defaults are promises). Not a warm source (that's the ⭐ star), not
+# eviction protection (that's 🔒static), not routing persistence (that's 📌pin).
+#
+# Shape on disk: {"wildcard": {"<worker_id>": true, ...}} — only opted-in
+# workers are stored; an absent worker id reads False. Kept in its OWN file
+# (worker_wildcard.json) beside the others so the whole-file rewrites of the
+# sibling stores (_save_media / _save_media_default / set_worker_boot_prewarm)
+# never clobber it. Never persisted onto the worker registry record — routes
+# stamp it on the response copy only, exactly like boot_prewarm.
+def _worker_wildcard_path():
+    return os.path.join(os.path.dirname(MODELS_DISCOVERY_PATH), "worker_wildcard.json")
+
+
+def worker_wildcard_state():
+    """The current per-worker wildcard opt-in map: {worker_id: True}.
+
+    Only opted-in workers appear — an ABSENT key reads False (the default-false
+    promise: no flags set == today's sealed-designation routing). Empty dict
+    when unset/cleared. Tolerates a legacy/bare shape (a top-level {wid: bool}
+    dict written without the wrapper)."""
+    p = _worker_wildcard_path()
+    if os.path.isfile(p):
+        data = safe_load_from_json(p)
+        if isinstance(data, dict):
+            wc = data.get("wildcard")
+            if isinstance(wc, dict):
+                return {str(k): True for k, v in wc.items() if v}
+            # tolerate a bare {wid: bool} map written without the wrapper
+            if "wildcard" not in data:
+                return {str(k): True for k, v in data.items() if v}
+    return {}
+
+
+def set_worker_wildcard(worker_id, enabled):
+    """Set or clear a worker's WILDCARD ("take all comers") routing opt-in.
+
+    enabled True  -> the worker becomes a wildcard: eligible to catch
+                     UNDESIGNATED models and the overflow of designated models
+                     whose home workers can't serve (its own designated models
+                     stay its priority — ranking, not this store, enforces
+                     that). enabled False -> back to the default sealed scope:
+                     the worker serves ONLY its own designated / resident /
+                     granted models. Clearing an already-absent worker is a
+                     no-op (idempotent both ways).
+
+    ROUTING ONLY — never warms anything, never protects anything from
+    eviction, never bypasses block/admission/pool/engine/task gates. Returns
+    the resulting state for that worker."""
+    enabled = bool(enabled)
+    worker_id = str(worker_id)
+    state = worker_wildcard_state()
+    if enabled:
+        state[worker_id] = True
+    else:
+        state.pop(worker_id, None)
+    safe_dump_to_file(data={"wildcard": state}, file_path=_worker_wildcard_path())
+    return {"worker_id": worker_id, "wildcard": enabled}
+
+
 def _sweep_comfy_checkpoints(merged):
     """Drop-a-file model registration: every ``*.safetensors``/``*.ckpt`` in
     ``<root>/checkpoints`` becomes a comfy registry row automatically —

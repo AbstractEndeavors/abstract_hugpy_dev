@@ -1,25 +1,35 @@
-"""Per-worker KEEP-WARM STAR (boot_prewarm) — the operator's keep-warm
-designation for a worker (operator RULINGS 2026-07-23).
+"""Per-worker BOOT-LOAD STAR (boot_prewarm) — the operator's boot-load
+designation for a worker (operator RULING 2026-07-23, post-incident).
 
-WHAT THIS IS (and is NOT). The star = the operator's keep-warm designation:
-  * RULING 1 — "the star is the ONLY warm source. nothing warms until starred
-    (or static)."
-  * RULING 2 — "star = reconcile-kept-warm" (NOT boot-once): a starred model
-    evicted under load COMES BACK on the next reconcile beat.
+WHAT THIS IS (and is NOT). The star = boot-load + ambiguity-priority, NOTHING
+else (verbatim operator, post-incident):
+  * "the star is only supposed to indicate load that model on boot."
+  * "it shouldn't effect anything but priority for ambiguous model calls."
+So the star does EXACTLY two things: (1) LOAD ON BOOT, once per process; (2) a
+PRIORITY tie-break in central's worker ranking (that half is tested in
+test_worker_wildcard.py's ranking section). It is NOT keep-warm, does NOT
+re-warm after eviction, and has NO eviction interaction.
+
+INCIDENT (2026-07-23): 0.1.201 shipped a "reconcile-kept-warm" every-beat
+re-warm (the old RULING-2). On ae it re-warmed the star (coder-next) WHILE active
+inference was in flight → slot child stalled → zombie seat → agent freeze. This
+suite REVERTS to boot-once. Co-fit-gated re-entry (reload only when it co-fits
+its evictor) is future work (Slice D, NOT built).
 
 The three levers:
-  * ⭐ star (boot_prewarm) = reconcile keeps it warm every beat; evictable under
-    pressure but RETURNS next cycle; NOT eviction-protected.
-  * 🔒 static = warm AND eviction-protected.
+  * ⭐ star (boot_prewarm) = boot-load ONCE per process + ambiguity ranking
+    priority; evictable, and once evicted STAYS cold until restart; NOT
+    eviction-protected, NOT reconcile-re-warmed.
+  * 🔒 static = warm AND eviction-protected. THE keep-warm tier.
   * 📌 pin = routing persistence only, never warms.
 And the /media star for contrast:
   * media_default = "first in the list + default-selected", a UI/routing
     PREFERENCE that loads NOTHING.
 
-The identifier stays ``boot_prewarm`` (rename churn isn't worth it) but the
-meaning is keep-warm, not boot-once. Mirrors test_block_propagation.py's shape:
+The identifier stays ``boot_prewarm`` (rename churn isn't worth it) and once
+again means exactly "boot once". Mirrors test_block_propagation.py's shape:
 the state store + the central reply carry (additive/omit-when-unset, never
-persisted onto the stored record) + the worker-side keep-warm adoption, all with
+persisted onto the stored record) + the worker-side boot-once adoption, all with
 the released-worker wire tolerance the extra=forbid relay schema requires.
 
 Sections:
@@ -27,10 +37,12 @@ Sections:
   [2] central: /llm/workers surfaces boot_prewarm; the write route is
       operator-gated; the heartbeat & register replies carry it (omit-when-unset,
       landmine-proof: never persisted onto the stored record).
-  [3] worker: _adopt_boot_prewarm KEEPS the star warm (RULING 2) — loads when
-      absent, no-ops when already loaded, RE-LOADS after an eviction on the next
-      beat, a missing model degrades gracefully, and a reply without the key is a
-      no-op (released central tolerance).
+  [3] worker: _adopt_boot_prewarm BOOT-LOADS the star ONCE — loads on the first
+      reply, no-ops when already loaded, does NOT reload after an eviction (stays
+      cold until restart), a missing model degrades gracefully, and a reply
+      without the key is a no-op (released central tolerance).
+  [4] disk-vs-fetch (k35, still valid for the boot load): the one boot firing
+      fetches only on genuine disk-absence, else reloads from disk.
 
 Run: cd .../abstract_hugpy_dev && venv/bin/python tests/test_worker_boot_prewarm.py
 """
@@ -94,8 +106,11 @@ def _reset_state():
 
 
 def _reset_worker_prewarm_state():
-    with A._STAR_WARM_LOCK:
-        A._STAR_WARMING.clear()
+    # Clear the PROCESS-LIFETIME boot-once done-latch so a fresh sub-scenario can
+    # fire the boot star again (in the real agent this only resets on a restart;
+    # the test resets it deliberately to exercise independent scenarios).
+    with A._BOOT_PREWARM_LOCK:
+        A._BOOT_PREWARM_DONE.clear()
 
 
 try:
@@ -239,8 +254,8 @@ try:
     _reset_state()
 
 
-    # ── [3] worker: keep-warm adoption (RULING 2: reconcile-kept) ────────────
-    print("\n[3] worker adoption (keep-warm: load-if-absent every beat)")
+    # ── [3] worker: boot-once adoption (fire once per process, never re-warm) ─
+    print("\n[3] worker adoption (boot-once: load on first reply, no re-warm)")
 
     # Stub the load path so no real weights move. Record every load attempt.
     # ``_resident`` is the mutable live-residency source _star_is_loaded reads
@@ -286,48 +301,59 @@ try:
         A._adopt_boot_prewarm(st, None)
         check("None reply -> no error, no load", _loaded == [])
 
-        # first reply with a star, not yet resident -> LOADS it
+        # first reply with a star, not yet resident -> LOADS it (the boot firing)
         A._adopt_boot_prewarm(st, {"boot_prewarm": "M~star"})
-        check("first heartbeat with a cold star LOADS it",
+        check("first heartbeat with a cold star LOADS it (boot firing)",
               _wait(lambda: _loaded == ["M~star"]))
-        check("after warm, star reads as resident", "M~star" in _resident)
+        check("after boot load, star reads as resident", "M~star" in _resident)
+        check("boot fire latched the star in _BOOT_PREWARM_DONE",
+              "M~star" in A._BOOT_PREWARM_DONE)
 
-        # a SECOND heartbeat while the star is STILL resident -> NO-OP (RULING 2:
-        # reload only when absent). Not a boot-once latch — an idempotent check.
+        # a SECOND heartbeat while the star is STILL resident -> NO-OP (boot-once
+        # latch AND already-resident, either would suffice).
         _loaded.clear()
         A._adopt_boot_prewarm(st, {"boot_prewarm": "M~star"})
         time.sleep(0.2)
-        check("heartbeat with an already-resident star is a NO-OP (idempotent)",
+        check("second heartbeat with an already-resident star is a NO-OP",
               _loaded == [])
 
-        # EVICTION: the star drops out of residency. RULING 2 — the NEXT beat
-        # carrying the star must RELOAD it (keep-warm, not boot-once).
+        # EVICTION: the star drops out of residency. BOOT-ONCE (incident revert) —
+        # the next beat carrying the star must NOT reload it (it stays cold until
+        # restart). This is the exact behavior 0.1.201's re-warm broke.
         _resident.discard("M~star")
         _loaded.clear()
         A._adopt_boot_prewarm(st, {"boot_prewarm": "M~star"})
-        check("RULING 2: after an eviction, the next beat RE-LOADS the star",
-              _wait(lambda: _loaded == ["M~star"]))
-        check("re-warmed star is resident again", "M~star" in _resident)
+        time.sleep(0.2)
+        check("BOOT-ONCE: after an eviction, later beats do NOT reload the star "
+              "(stays cold until restart — incident 2026-07-23)", _loaded == [])
+        check("evicted star stays non-resident (no reconcile re-warm)",
+              "M~star" not in _resident)
 
-        # and once resident again, further beats are no-ops
+        # A RESTART clears the latch (simulated) -> the boot star fires again on
+        # the first reply after restart. Proves it's boot-*once-per-process*.
+        _reset_worker_prewarm_state()   # simulates a process restart
         _loaded.clear()
         A._adopt_boot_prewarm(st, {"boot_prewarm": "M~star"})
-        time.sleep(0.15)
-        check("resident again -> subsequent beats no-op", _loaded == [])
+        check("after a restart (latch cleared), the boot star fires again",
+              _wait(lambda: _loaded == ["M~star"]))
 
-        # slot-seated residency also counts as loaded (idempotent via _slot_occupants)
+        # slot-seated residency also counts as loaded at first contact (no
+        # double-load); the latch still marks it fired.
+        _reset_worker_prewarm_state()
         _resident.clear()
         A._slot_occupants = lambda strict=False: {"M~slotstar"}
         _loaded.clear()
         A._adopt_boot_prewarm(st, {"boot_prewarm": "M~slotstar"})
         time.sleep(0.15)
-        check("a slot-seated star is seen as loaded -> no-op (no double-load)",
+        check("a slot-seated star is seen as loaded at boot -> no-op (no double-load)",
               _loaded == [])
+        check("already-resident boot star still latched (fired once)",
+              "M~slotstar" in A._BOOT_PREWARM_DONE)
         A._slot_occupants = lambda strict=False: set()
 
         # MISSING model degrades gracefully: the pull raises, the beat must not
-        # crash — AND the in-flight guard clears so a later beat can retry (no
-        # permanent latch).
+        # crash. Boot-once means the latch STAYS set even on failure — a genuine
+        # retry only comes with a restart (no per-beat retry storm).
         _reset_worker_prewarm_state()
         _loaded.clear()
         _resident.clear()
@@ -337,12 +363,15 @@ try:
         provision.ensure_model_present = lambda *a, **kw: _boom(a[0])
         A._adopt_boot_prewarm(st, {"boot_prewarm": "M~missing"})   # must not raise
         check("a missing/unloadable star degrades gracefully (no crash)",
-              _wait(lambda: "M~missing" not in A._STAR_WARMING))   # guard cleared
+              _wait(lambda: "M~missing" in A._BOOT_PREWARM_DONE))   # fired + latched
         check("missing star never became resident", "M~missing" not in _resident)
-        # in-flight guard cleared -> a subsequent beat is free to retry (keep-warm
-        # never gives up permanently the way boot-once did)
-        check("in-flight guard cleared after failure (retryable next beat)",
-              A._STAR_WARMING == set())
+        # latch STAYS set after failure -> a subsequent beat does NOT retry
+        # (boot-once: retry needs a restart, not an every-beat re-attempt)
+        _loaded.clear()
+        A._adopt_boot_prewarm(st, {"boot_prewarm": "M~missing"})
+        time.sleep(0.15)
+        check("boot-once: a failed boot star does NOT retry on later beats "
+              "(latch stays set until restart)", _loaded == [])
 
         # malformed star value is ignored (never raises, never loads)
         provision.model_is_local = lambda mk: True
@@ -363,16 +392,22 @@ try:
         _reset_worker_prewarm_state()
 
 
-    # ── [4] re-entry doctrine: fetch on first-activation ONLY, reload on re-warm
-    print("\n[4] k35 re-entry: fetch only on disk-absence, NEVER on re-warm")
+    # ── [4] disk-vs-fetch: the boot load fetches only on disk-absence ─────────
+    print("\n[4] k35 disk-vs-fetch: boot load fetches only on disk-absence")
 
+    # Still valid for the BOOT LOAD (boot-once): the single boot firing fetches
+    # only when the star is absent on disk (genuine first-activation), else loads
+    # from disk. Each sub-scenario resets the boot-once latch (simulating a
+    # restart) so the boot load fires again — in the real agent these are separate
+    # process lifetimes.
+    #
     # Two INDEPENDENT mutable facts, matching the real machine:
     #   _disk     — disk presence (drives model_is_local). Eviction does NOT
     #               touch this (VRAM-only); only a reap would remove it.
     #   _resident — VRAM/slot residency (drives loaded_model_keys). Eviction
     #               clears this while _disk stays put.
     # We assert ensure_model_present (the FETCH) fires only when a star is absent
-    # ON DISK — i.e. genuine first-activation — never on eviction re-warm.
+    # ON DISK — i.e. genuine first-activation — never when it is already on disk.
     _disk: set = set()
     _resident4: set = set()
     _fetches: list = []
@@ -404,39 +439,44 @@ try:
         st = A.WorkerState(name="t", url=None, worker_id="w-reentry")
         _reset_worker_prewarm_state()
 
-        # (a) FIRST ACTIVATION: star absent on disk -> fetch ONCE, then warm.
+        # (a) FIRST ACTIVATION: star absent on disk -> boot load FETCHES ONCE,
+        # then warms.
         _fetches.clear(); _warms.clear()
         A._adopt_boot_prewarm(st, {"boot_prewarm": "M~star"})
-        check("(a) first-activation of a disk-absent star FETCHES once",
+        check("(a) boot load of a disk-absent star FETCHES once",
               _wait(lambda: _fetches == ["M~star"]))
-        check("(a) first-activation then warms it resident",
+        check("(a) boot load then warms it resident",
               _wait(lambda: _warms == ["M~star"]))
         check("(a) star now present on disk AND resident",
               "M~star" in _disk and "M~star" in _resident4)
 
-        # (b) EVICTION: VRAM cleared, files REMAIN on disk (as _evict_model does —
-        # it never deletes disk files). The next beat must RELOAD FROM DISK with
-        # NO ensure_model_present (k35: "reload, never fetch").
-        _resident4.discard("M~star")          # evicted from VRAM
-        # _disk still holds M~star — this is the crux the doctrine hinges on
-        check("(b) precondition: evicted star is STILL on disk (_has stays True)",
+        # (b) RESTART with the model ALREADY ON DISK: a fresh process boot-loads
+        # the star, and because it is present on disk the load must come FROM DISK
+        # with NO ensure_model_present (k35: "reload, never fetch when local"). We
+        # clear residency (a fresh process has nothing resident) but keep _disk,
+        # and reset the boot-once latch to simulate the restart.
+        _resident4.discard("M~star")          # fresh process: nothing resident yet
+        _reset_worker_prewarm_state()         # simulates the restart (latch cleared)
+        check("(b) precondition: star is STILL on disk (_has stays True)",
               "M~star" in _disk and "M~star" not in _resident4)
         _fetches.clear(); _warms.clear()
         A._adopt_boot_prewarm(st, {"boot_prewarm": "M~star"})
-        check("(b) re-warm after eviction WARMS from disk",
+        check("(b) boot load with the model present WARMS from disk",
               _wait(lambda: _warms == ["M~star"]))
-        check("(b) k35: re-warm after eviction makes NO ensure_model_present call "
-              "(reload from disk, never fetch)", _fetches == [])
+        check("(b) k35: boot load of a disk-present star makes NO "
+              "ensure_model_present call (reload from disk, never fetch)",
+              _fetches == [])
         check("(b) star resident again after disk reload", "M~star" in _resident4)
 
-        # (c) a REAP (disk delete, not an eviction) DOES flip _has False, so a
-        # later re-warm correctly treats it as a fresh first-activation and
-        # fetches — proving the discriminator is disk presence, not a flag.
+        # (c) a REAP (disk delete) flips _has False, so a boot load after a
+        # restart correctly treats it as a fresh first-activation and fetches —
+        # proving the discriminator is disk presence, not a flag.
         _resident4.discard("M~star")
         _disk.discard("M~star")               # reap removed the files
+        _reset_worker_prewarm_state()         # simulates the restart (latch cleared)
         _fetches.clear(); _warms.clear()
         A._adopt_boot_prewarm(st, {"boot_prewarm": "M~star"})
-        check("(c) after a REAP (files gone), re-warm fetches again "
+        check("(c) after a REAP (files gone), the boot load fetches again "
               "(disk-absence = fresh first-activation)",
               _wait(lambda: _fetches == ["M~star"]))
     finally:

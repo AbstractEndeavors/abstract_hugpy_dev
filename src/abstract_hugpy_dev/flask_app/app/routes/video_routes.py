@@ -1176,9 +1176,13 @@ def _pick_gpu_worker(model_key):
 
     # Workers already serving this model (assigned OR loaded), stale beats ok —
     # reusing one avoids a multi-GB reload. online_only=False so a briefly-stale
-    # assignee still counts as "already has it".
+    # assignee still counts as "already has it". Wildcard catches are excluded:
+    # a "take all comers" box (worker_wildcard opt-in) is ELIGIBLE for the
+    # model but does not HAVE it, so counting it "warm" would fake the
+    # avoid-a-reload preference this set exists for.
     warm_ids = {w["id"] for w in
-                worker_store.workers_for_model(model_key, online_only=False)}
+                worker_store.workers_for_model(model_key, online_only=False)
+                if not w.get("_wildcard_catch")}
 
     eligible = []
     for w in worker_store.all():

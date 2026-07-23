@@ -1,56 +1,80 @@
-# Per-worker KEEP-WARM STAR (`boot_prewarm`)
+# Per-worker BOOT-LOAD STAR (`boot_prewarm`)
 
-Operator RULINGS 2026-07-23:
+Operator RULING **2026-07-23 (post-incident)** — verbatim:
 
-- **RULING 1** — "the star is the ONLY warm source. **nothing warms until
-  starred (or static).**"
-- **RULING 2** — "**star = reconcile-kept-warm**" (NOT boot-once): a starred
-  model that gets evicted under load **comes back on the next reconcile beat**.
-  The ⭐ star **is** the keep-warm designation.
+- "the star is only supposed to indicate **load that model on boot**."
+- "it **shouldn't effect anything but priority for ambiguous model calls**."
 
-A worker carries a single ⭐ **star** model it **keeps warm**. The identifier
-stays `boot_prewarm`/`boot-prewarm` (rename churn isn't worth it) but the
-meaning is **keep-warm**, not boot-once.
+A worker carries a single ⭐ **star** model. The star does **exactly two things
+and nothing else**:
+
+1. **Load on boot** — once per worker process lifetime.
+2. **Ranking priority** — a tie-break for ambiguous / no-warm model calls:
+   central prefers the worker whose star == the requested model.
+
+It is **NOT keep-warm**, it does **NOT re-warm after eviction**, and it has **no
+eviction interaction**. A starred model that gets evicted under pressure **stays
+cold until the worker process restarts**. The identifier stays
+`boot_prewarm`/`boot-prewarm` (rename churn isn't worth it) and once again means
+exactly **boot-once**.
+
+> **Why the revert (incident 2026-07-23).** The prior release (0.1.201) made the
+> star **reconcile-kept-warm** — central re-warmed it every beat and the worker
+> reloaded it whenever it was absent. On **ae** that re-warm fired against
+> **coder-next while active inference was in flight** → the star's slot child
+> stalled → a zombie seat → the agent froze. Re-warm-after-eviction is only safe
+> once a **co-fit gate** (reload an evicted model only when it co-fits its
+> evictor) exists — that is **future work (Slice D), not yet built** — so the
+> star is strictly boot-once until then.
 
 ## The three levers (locked semantics)
 
-| lever | warms? | eviction | notes |
-|---|---|---|---|
-| ⭐ **star** (`boot_prewarm`) | **Yes** — reconcile keeps it warm **every beat** | **Evictable under pressure, but RETURNS next reconcile cycle** | NOT eviction-protected. The star IS the keep-warm designation. |
-| 🔒 **static** | **Yes** | **Protected** — never evicted by the LLM plane | "start here AND stay here" — unchanged. |
-| 📌 **pin** | **No** | n/a | Routing persistence only — never warms. Unchanged. |
+| lever | keeps warm? | boot-loads? | eviction | notes |
+|---|---|---|---|---|
+| ⭐ **star** (`boot_prewarm`) | **No** | **Yes — once, on boot** | **Evictable; once evicted STAYS cold until restart** | Also a **ranking tie-break** for ambiguous calls. NOT eviction-protected, NOT re-warmed. |
+| 🔒 **static** | **Yes** — the keep-warm tier | yes (eager) | **Protected** — never evicted by the LLM plane | "start here AND stay here". |
+| 📌 **pin** | **No** | no | n/a | Routing persistence only — never warms. |
+
+🔒 **static is the keep-warm tier** — the one lever that keeps a model resident
+across evictions. If you want "start here **and stay here**", promote the model
+to static; the ⭐ star will not hold it.
 
 And for contrast, the /media star:
 
 | | media_default (the /media star) | ⭐ boot_prewarm (this per-worker star) |
 |---|---|---|
 | Scope | one global model | one model **per worker** |
-| Effect | "first in the list + default-selected" — a **UI/routing preference** | "**keep this model warm** on this worker" |
-| Loads anything? | **No** | **Yes — reconcile-kept warm** |
+| Effect | "first in the list + default-selected" — a **UI/routing preference** | "**boot-load** this model + rank it first for ambiguous calls" |
+| Loads anything? | **No** | **Yes — once, on the worker's boot** |
 
-**Nothing warms until starred or static.** The fleet `TASK_DEFAULTS` (sd-turbo
-et al.) are a **routing fallback** — a request naming only a task still resolves
-to its default model (`model_resolver.TASK_DEFAULTS`) — but they are **no longer
-kept warm**. 📌 pins never warm. Everything outside (⭐ star ∪ 🔒static) lazy-loads
-on first real request.
+**Nothing warms until starred (boot-load) or static.** The fleet `TASK_DEFAULTS`
+(sd-turbo et al.) are a **routing fallback** — a request naming only a task still
+resolves to its default model (`model_resolver.TASK_DEFAULTS`) — but they are
+**not kept warm** (the task-defaults floor is dead and is not coming back). 📌
+pins never warm. Everything but 🔒static lazy-loads on first real request (the
+star additionally boot-loads once).
 
-### How keep-warm works
+### How the star works
 
-- **Central side** — `_reconcile_warm_set(worker)` = `(⭐ star ∪ 🔒static) ∩
-  models_local − blocked`. Every heartbeat, central re-computes this set and
-  re-warms any cold member (rate-limited by `HUGPY_WARM_COOLDOWN_S`, fit-capped
-  by `_warmable_subset`). Because it re-runs every beat, an evicted star is
-  reloaded next cycle.
-- **Worker side** — `_adopt_boot_prewarm` runs on every register/heartbeat
-  reply: if the star is **not currently resident** (in-process or slot-seated),
-  it kicks a load through the normal on-demand path (no residency write — the
-  model stays FIFO-evictable); if it's already loaded, it's a **no-op**. An
-  in-flight guard stops two load threads racing for the same star, but it is
-  **not** a permanent latch — it clears when the load finishes, so a later beat
-  after an eviction re-warms.
+- **Worker side — boot-load once.** `_adopt_boot_prewarm` runs on every
+  register/heartbeat reply, but a **process-lifetime done-latch**
+  (`_BOOT_PREWARM_DONE`) makes it fire the load **exactly once**: on the **first**
+  reply carrying a star. It loads through the normal on-demand path (no residency
+  write — the model stays FIFO-evictable). Every later beat is a **no-op**,
+  **including after an eviction** — the star is **not** reloaded. A genuine retry
+  only comes with a worker **restart**. Missing model → logged, never crashes.
+- **Central side — ranking priority only.** `_reconcile_warm_set(worker)` keeps
+  warm **`🔒static ∩ models_local − blocked`** — the **star is not in it**, so
+  central never re-probes the star warm. The star's only central effect is a
+  **ranking tie-break**: in `pick_for_model` / `candidates_for_model` the sort key
+  is `(home, warm, star, gpu, last_picked, id)` — home beats everything, a warm
+  box beats a starred box, and the star breaks the tie when **nothing is warm**
+  (prefer the box that boot-loads the model anyway). Alias-tolerant: a star
+  recorded under a `~`-qualified key matches a bare-key request and vice versa.
 
-**Want eviction protection ("start here AND stay here")?** Promote the model to
-🔒static — that tier, not the star, protects residency.
+**Future work (Slice D, not built): co-fit-gated re-entry** — an evicted star
+would reload only when it **co-fits** with whatever evicted it (no thrash by
+construction). Until that exists, an evicted star stays cold until restart.
 
 ## API
 
@@ -96,9 +120,10 @@ curl -fsS -X POST https://dev.hugpy.ai/api/llm/workers/<ae-id>/boot-prewarm \
   -d '{"model_key": "Qwen~Qwen3-Coder-Next-GGUF", "enabled": true}'
 ```
 
-Verify: `GET /llm/workers/boot-prewarm` returns both, and each worker keeps its
-star warm every reconcile beat (`keep-warm star … warming …` in the agent log
-when it is cold; a no-op when already resident).
+Verify: `GET /llm/workers/boot-prewarm` returns both, and each worker
+**boot-loads** its star once on start (`boot star … loading once at boot …` in
+the agent log; then every later beat is a no-op — the star is **not** re-warmed).
+An evicted star stays cold until the worker restarts.
 
 ### Note on the 7B key for computron
 

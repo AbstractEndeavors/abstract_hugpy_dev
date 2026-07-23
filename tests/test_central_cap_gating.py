@@ -59,6 +59,38 @@ check("in-process model uses the advertised cap",
       remote._effective_cap(W1, MODEL) == 1)
 
 
+# --- ALIAS-TOLERANT slot classification (2026-07-23 incident) --------------
+# A live call for ``Qwen~Qwen3-Coder-Next-GGUF`` returned worker_busy while the
+# model was seated in a SLOT under the BARE key ``Qwen3-Coder-Next-GGUF`` — the
+# ~-spelling missed the slot classification and fell to the in-process cap-1.
+# _model_slot_served must be alias-tolerant via the same ~/-tail unification as
+# routing (workers._match_keys); the cap semantics themselves are unchanged.
+W_SLOT_BARE = {"id": "wsb", "name": "slotbare",
+               "slots": [{"model_key": "Qwen3-Coder-Next-GGUF", "healthy": True}]}
+W_SLOT_QUAL = {"id": "wsq", "name": "slotqual",
+               "slots": [{"model_key": "Qwen~Qwen3-Coder-Next-GGUF", "healthy": True}]}
+check("slot seated under BARE key -> ~-qualified request classifies slot-served",
+      remote._model_slot_served(W_SLOT_BARE, "Qwen~Qwen3-Coder-Next-GGUF") is True)
+check("slot seated under BARE key -> ~-qualified request is UNCAPPED (None)",
+      remote._effective_cap(W_SLOT_BARE, "Qwen~Qwen3-Coder-Next-GGUF") is None)
+check("REVERSE: slot seated under ~-qualified key -> bare request slot-served",
+      remote._model_slot_served(W_SLOT_QUAL, "Qwen3-Coder-Next-GGUF") is True)
+check("REVERSE: slot seated under ~-qualified key -> bare request UNCAPPED",
+      remote._effective_cap(W_SLOT_QUAL, "Qwen3-Coder-Next-GGUF") is None)
+check("exact-key slot match still classifies slot-served (regression)",
+      remote._model_slot_served(W_SLOT_BARE, "Qwen3-Coder-Next-GGUF") is True)
+check("a DIFFERENT model is NOT slot-served here (no false positive)",
+      remote._model_slot_served(W_SLOT_BARE, "Owner~Some-Other-GGUF") is False)
+check("a different model still uses the advertised in-process cap",
+      remote._effective_cap(W1, "Owner~Some-Other-GGUF") == 1)
+# allocations-carried slot (the other snapshot source) is alias-tolerant too
+W_SLOT_ALLOC = {"id": "wsa", "name": "slotalloc",
+                "allocations": [{"kind": "slot",
+                                 "model_key": "Qwen3-Coder-Next-GGUF"}]}
+check("allocations-carried slot (bare) -> ~-qualified request slot-served",
+      remote._model_slot_served(W_SLOT_ALLOC, "Qwen~Qwen3-Coder-Next-GGUF") is True)
+
+
 # --- reroute: primary busy -> the second holder ----------------------------
 _reset()
 remote.set_worker_candidates_provider(lambda mk, pool=None: [W1, W2])

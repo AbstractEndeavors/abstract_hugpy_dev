@@ -295,6 +295,36 @@ def _advertised_cap(worker: Optional[dict]) -> int:
     return max(1, n)
 
 
+def _slot_match_keys(model_key: str) -> set:
+    """Alias form-set for ``model_key`` — REUSES workers._match_keys (the Slice A
+    ~/-tail unification), so slot classification agrees with routing on which
+    spellings name the same model. Lazy, guarded import: remote.py deliberately
+    avoids importing the web layer at module load (the standalone worker agent
+    imports this module but never calls slot classification — that is central-
+    only). On any import failure, degrade to a local mirror of the same
+    (raw / lowercased / "/"-tail / "~"-tail) form-set — never a divergent rule,
+    just an inlined copy so a broken import can't silently drop ~-matching.
+    """
+    if not model_key:
+        return set()
+    try:
+        from abstract_hugpy_dev.flask_app.app.functions.imports.utils.workers import (
+            _match_keys as _wk_match_keys)
+        return _wk_match_keys(model_key)
+    except Exception:  # noqa: BLE001 — inline mirror of workers._match_keys
+        raw = str(model_key).strip()
+        forms = {raw, raw.lower()}
+        tail = raw.split("/")[-1]
+        forms.add(tail)
+        forms.add(tail.lower())
+        if "~" in raw:
+            base = raw.split("~", 1)[1]
+            if base:
+                forms.add(base)
+                forms.add(base.lower())
+        return forms
+
+
 def _model_slot_served(worker: Optional[dict], model_key: str) -> bool:
     """True when ``model_key`` is currently seated in a SLOT child on this worker.
 
@@ -303,6 +333,14 @@ def _model_slot_served(worker: Optional[dict], model_key: str) -> bool:
     heartbeat ``slots``/``allocations`` snapshot; any doubt → False (apply the
     cap — over-gating a slot model is a small latency cost, under-gating an
     in-process model is a crash).
+
+    ALIAS-TOLERANT (2026-07-23 incident): a slot seated under the BARE key
+    ``Qwen3-Coder-Next-GGUF`` must classify slot-served for a ~-qualified request
+    ``Qwen~Qwen3-Coder-Next-GGUF`` and vice versa — otherwise the ~-spelling
+    missed the slot and fell to the in-process cap-1 (``worker_busy`` while the
+    model was seated and relay-uncapped). Matching goes through the SAME
+    ~/-tail unification routing uses (``_slot_match_keys`` → workers._match_keys);
+    the cap SEMANTICS are unchanged, only the KEY MATCHING became alias-tolerant.
     """
     if not worker or not model_key:
         return False
@@ -317,8 +355,9 @@ def _model_slot_served(worker: Optional[dict], model_key: str) -> bool:
         return False
     if model_key in keys:
         return True
-    tail = str(model_key).split("/")[-1]
-    return any(tail == k.split("/")[-1] for k in keys)
+    # Alias match: does any slot key share a normalized form with the request?
+    wanted = _slot_match_keys(model_key)
+    return any(wanted & _slot_match_keys(k) for k in keys)
 
 
 def _effective_cap(worker: Optional[dict], model_key: str) -> Optional[int]:

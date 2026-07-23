@@ -57,8 +57,15 @@ from ..functions.imports.utils.enrollment_tokens import (
 # server-side (worker_boot_prewarm.json) beside the media stores; surfaced on the
 # worker record and carried to the worker on the heartbeat reply (omit-when-unset,
 # so an older worker just ignores it).
+# Per-worker WILDCARD flag — the "take all comers" ROUTING opt-in (operator
+# doctrine 2026-07-23): designations are a hard routing scope; an undesignated
+# model routes onto a worker ONLY if that worker opted in here. Routing
+# eligibility ONLY (default False; never a warm source, never eviction
+# protection). Persisted server-side (worker_wildcard.json) beside the star
+# store; surfaced on the worker record the same response-copy way.
 from ....imports.config.models.models_config import (
     worker_boot_prewarm_state, set_worker_boot_prewarm,
+    worker_wildcard_state, set_worker_wildcard,
 )
 
 worker_bp, logger = get_bp("worker_bp", __name__)
@@ -219,27 +226,31 @@ def _warmable_subset(worker, cold: list) -> list:
     return unsizable + capped
 
 
-# ── curated keep-warm set: the star + static, nothing else ───────────────────
-# Operator rulings 2026-07-23 (SUPERSEDES the 2026-07-15 "immutable task-default
-# floor" below):
-#   RULING 1 — "the star is the ONLY warm source. nothing warms until starred
-#               (or static)."
-#   RULING 2 — "star = reconcile-kept-warm": a starred model evicted under load
-#               COMES BACK on the next reconcile beat. The ⭐ star IS the
-#               keep-warm designation.
+# ── curated keep-warm set: 🔒static ONLY (the star does NOT reconcile-warm) ───
+# Operator rulings 2026-07-23 (post-incident — SUPERSEDES both the 2026-07-15
+# "immutable task-default floor" below AND the 0.1.201 star-in-warm-set design):
+#   "the star is only supposed to indicate load that model on boot."
+#   "it shouldn't effect anything but priority for ambiguous model calls."
 #
-# So the keep-warm set is exactly the two tiers that PROMISE presence:
-#   * ⭐ star (boot_prewarm) — the operator's per-worker keep-warm pick. Reconcile
-#     re-warms it every beat, so an eviction-under-pressure returns next cycle.
-#     Evictable (NOT eviction-protected — that's static's job); it just doesn't
-#     STAY cold.
-#   * 🔒 static — warm AND eviction-protected (unchanged).
-# Everything else — the fleet TASK_DEFAULTS (sd-turbo et al.), 📌 pins, and the
-# whole ``models`` inventory — is NO LONGER kept warm and lazy-loads on first
-# real request. This is what stops sd-turbo (and every task-default) from
-# auto-warming: a task default is a ROUTING fallback (model_resolver.TASK_DEFAULTS
-# still resolves "task named alone → default model"), never a warm designation.
-# Pure central-side — no worker release.
+# So central's reconcile keep-warm set is exactly ONE tier — the only one that
+# PROMISES central-kept presence:
+#   * 🔒 static — warm AND eviction-protected (unchanged). This is THE keep-warm
+#     tier.
+# The ⭐ star (boot_prewarm) is deliberately NOT here. The star's warm happens
+# exactly ONCE, on the WORKER'S boot (agent._adopt_boot_prewarm, boot-once); it
+# is NOT re-probed warm by this reconcile loop. The 0.1.201 build put the star in
+# this set (RULING-2 "reconcile-kept-warm"); that re-warm fought active inference
+# on ae today (star re-warm of coder-next → slot child stalled → zombie seat →
+# agent freeze). Reverted: a starred model evicted under pressure STAYS cold
+# until the worker restarts. Co-fit-gated re-entry is future work (Slice D).
+#
+# Everything else — the fleet TASK_DEFAULTS (sd-turbo et al.), 📌 pins, the ⭐
+# star, and the whole ``models`` inventory — is NOT kept warm here and lazy-loads
+# on first real request. "Nothing warms until starred (boot-load) or static":
+# the task-defaults floor stays DEAD (do not resurrect); a task default is a
+# ROUTING fallback (model_resolver.TASK_DEFAULTS still resolves "task named alone
+# → default model"), never a warm designation. Pure central-side — no worker
+# release.
 #
 # NOTE: ``_immutable_warm_defaults`` / ``_IMMUTABLE_WARM_DEFAULTS`` below are now
 # UNUSED by the warm set (dropped from _reconcile_warm_set per RULING 1). Left in
@@ -273,18 +284,22 @@ def _immutable_warm_defaults() -> frozenset:
 def _reconcile_warm_set(worker) -> list:
     """The curated set of a worker's on-disk models to keep warm on reconcile.
 
-    = (⭐ star ∪ 🔒static) ∩ on-disk − blocked (operator RULINGS 2026-07-23).
-    NOTHING warms until starred or static: the fleet TASK_DEFAULTS, 📌 pins, and
-    the whole ``models`` inventory are all excluded and lazy-load on demand. The
-    result still passes through ``_warmable_subset`` (fit-cap) before any real
-    load, so this only ever *narrows* what reconcile touches.
+    = 🔒static ∩ on-disk − blocked (operator RULING 2026-07-23, post-incident).
+    NOTHING warms here but 🔒static: the ⭐ star, the fleet TASK_DEFAULTS, 📌 pins,
+    and the whole ``models`` inventory are all excluded and lazy-load on demand
+    (the star additionally boot-loads ONCE on the worker side). The result still
+    passes through ``_warmable_subset`` (fit-cap) before any real load, so this
+    only ever *narrows* what reconcile touches.
 
-      * ⭐ star (boot_prewarm) — RULING 2 makes the star reconcile-KEPT: because
-        reconcile re-computes this set every beat and re-warms any cold member,
-        a starred model evicted under pressure is reloaded on the next beat (it
-        is evictable but does not STAY cold). The star IS the keep-warm
-        designation.
-      * 🔒 static — the one eviction-protected local-presence tier (unchanged).
+      * 🔒 static — the one eviction-protected, central-kept-warm local-presence
+        tier. THE keep-warm tier.
+
+    ⚠ The ⭐ star (boot_prewarm) is deliberately NOT reconcile-warmed. It warms
+    exactly once, on the worker's boot (agent._adopt_boot_prewarm, boot-once) —
+    re-probing it warm here is what fought active inference on ae 2026-07-23
+    (0.1.201's RULING-2 re-warm → coder-next slot child stalled → zombie seat →
+    freeze). A starred model evicted under pressure STAYS cold until the worker
+    restarts; co-fit-gated re-entry is future work (Slice D).
 
     ⚠ "on disk" = ``models_local`` (the worker's heartbeat disk-truth, UTIL-08),
     NEVER ``worker["models"]`` — that is the operator DESIGNATION set. Reading
@@ -299,23 +314,15 @@ def _reconcile_warm_set(worker) -> list:
     if not present:
         return []
     cfg = worker.get("config") or {}
-    # ⭐ STAR — this worker's per-worker keep-warm pick (a single model_key or
-    # none). RULING 1: the star is the ONLY operator-set warm source; RULING 2:
-    # reconcile keeps it warm every beat (evicted-under-load returns next cycle).
-    # Guarded — the star lookup must never break the heartbeat's reconcile hook.
-    try:
-        star = worker_boot_prewarm_state().get(worker.get("id"))
-    except Exception:  # noqa: BLE001 — a star-store miss degrades to "static only"
-        star = None
-    starred = {star} if star else set()
-    # 🔒 STATIC — warm AND eviction-protected (unchanged). The other tier that
-    # promises local presence. 📌 pins and the fleet TASK_DEFAULTS are NOT here
-    # (RULING 1): a pin is routing persistence only, a task-default is a routing
-    # fallback (model_resolver.TASK_DEFAULTS) — neither warms.
+    # 🔒 STATIC — warm AND eviction-protected. The ONLY tier central keeps warm
+    # (operator RULING 2026-07-23). The ⭐ star is NOT here (it boot-loads once,
+    # worker-side, and is never reconcile-re-warmed); 📌 pins are routing
+    # persistence only; the fleet TASK_DEFAULTS are a routing fallback
+    # (model_resolver.TASK_DEFAULTS) — none of them warm.
     static = {k for k, v in (cfg.get("residency") or {}).items() if v == "static"}
-    curated = (starred | static) & present
+    curated = static & present
     # Operator BLOCK outranks warm: a blocked model is never kept warm, even if
-    # it is the star or static. Intersect the curated set with not-blocked.
+    # it is static. Intersect the curated set with not-blocked.
     curated -= _blocked_keys()
     return sorted(curated)
 
@@ -619,11 +626,20 @@ def workers_list():
         _stars = worker_boot_prewarm_state()
     except Exception:  # noqa: BLE001 — the star map must never break /llm/workers
         _stars = {}
+    # Per-worker WILDCARD flag: whether this worker opted in as "take all
+    # comers" (routing eligibility only — see workers.py). Same response-copy
+    # surfacing discipline as the star: read once for the whole list, stamped on
+    # the row, never persisted onto the stored record, never 5xxes the roster.
+    try:
+        _wildcards = worker_wildcard_state()
+    except Exception:  # noqa: BLE001 — the flag map must never break /llm/workers
+        _wildcards = {}
     for w in rows:
         w["required_pkg_version"] = required
         w["version_ok"] = (required is None
                            or w.get("pkg_version") == required)
         w["boot_prewarm"] = _stars.get(w.get("id")) or None
+        w["wildcard"] = bool(_wildcards.get(w.get("id")))
     # Call-time attribution (2026-07-14): stamp each worker's pid_registry
     # unattributed entries that are a RELAY-dispatched foreign GPU service
     # (identity-render) with the identity slug + job_id of the active
@@ -815,6 +831,11 @@ def workers_get(worker_id):
         worker["boot_prewarm"] = worker_boot_prewarm_state().get(worker_id) or None
     except Exception:  # noqa: BLE001 — never 5xx a worker read over the star store
         worker["boot_prewarm"] = None
+    # And the wildcard routing opt-in (mirrors workers_list; response-copy only).
+    try:
+        worker["wildcard"] = bool(worker_wildcard_state().get(worker_id))
+    except Exception:  # noqa: BLE001 — never 5xx a worker read over the flag store
+        worker["wildcard"] = False
     return jsonify(worker)
 
 
@@ -857,6 +878,45 @@ def set_worker_boot_prewarm_route(worker_id):
     model_key = body.get("model_key", body.get("model"))
     enabled = body.get("enabled", body.get("starred", True))
     return jsonify(set_worker_boot_prewarm(worker_id, model_key, enabled))
+
+
+@worker_bp.route("/llm/workers/wildcard", methods=["GET"])
+def worker_wildcard_list():
+    """The full per-worker WILDCARD opt-in map: {worker_id: true}.
+
+    A wildcard worker "takes all comers": it may catch UNDESIGNATED models and
+    the overflow of designated models whose home workers can't serve, while its
+    own designated models stay its priority (ranking sorts home matches first —
+    see workers.py). Routing eligibility ONLY — never a warm source, never
+    eviction protection, never a bypass of block/admission/pool/engine/task
+    gates. An ABSENT worker id reads False (default-false promise: with no
+    flags set the fleet routes exactly as before this feature existed).
+    Read-only; unauthed by design (same tier as the /llm/workers roster and the
+    boot-prewarm map it mirrors)."""
+    return jsonify(worker_wildcard_state())
+
+
+@worker_bp.route("/llm/workers/<worker_id>/wildcard", methods=["POST"])
+def set_worker_wildcard_route(worker_id):
+    """Set (or clear) this worker's WILDCARD ("take all comers") routing opt-in.
+
+    Body: {"enabled": true|false} (default true). enabled=true opts the worker
+    in: undesignated models may route here, and designated models overflow here
+    when their home workers are all refused/at-cap — the worker's OWN designated
+    models keep priority (home ranks above wildcard-catch; overflow is pure
+    ordering, no separate machinery). enabled=false restores the default sealed
+    scope: only its own designated / resident / granted models route here.
+
+    Operator-gated (operator_auth._SENSITIVE — same routing-registry-write tier
+    as assign/boot-prewarm). ROUTING ONLY (operator doctrine 2026-07-23): once
+    resident, normal eviction rules apply — "you don't want random evictions
+    simply because you have a verbose model registry" is exactly why all-comers
+    is an explicit per-worker opt-in, default False. Persisted server-side
+    (worker_wildcard.json) so every client agrees; stamped on worker payloads as
+    ``wildcard: bool``, never persisted onto the stored worker record."""
+    body = request.get_json(silent=True) or {}
+    enabled = body.get("enabled", body.get("wildcard", True))
+    return jsonify(set_worker_wildcard(worker_id, enabled))
 
 
 @worker_bp.route("/llm/workers/<worker_id>/health", methods=["GET"])

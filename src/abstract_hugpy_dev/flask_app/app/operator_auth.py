@@ -80,6 +80,12 @@ _SENSITIVE = [
     # with a hyphen, so it needs its own rule (the single-segment worker-verb rule
     # above does not match it).
     ({"POST"},                   re.compile(r"^/llm/workers/[^/]+/boot-prewarm$")),
+    # Per-worker WILDCARD routing opt-in ("take all comers", operator doctrine
+    # 2026-07-23) — a routing-registry write, same tier as assign/boot-prewarm.
+    # The GET map (/llm/workers/wildcard) and the roster surfacing stay open —
+    # only the write is gated. Sibling rule to boot-prewarm above (the
+    # worker-verb alternation rule doesn't list this verb).
+    ({"POST"},                   re.compile(r"^/llm/workers/[^/]+/wildcard$")),
     ({"DELETE"},                 re.compile(r"^/llm/workers/[^/]+$")),
     # k10: sanctioned ghost-cleanup for the assignment-memory sidecar
     # (worker_assignments.json) — same operator-only tier as the row DELETE above.

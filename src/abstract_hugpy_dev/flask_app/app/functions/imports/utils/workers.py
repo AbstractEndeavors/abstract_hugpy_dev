@@ -1163,6 +1163,21 @@ def _match_keys(model_key: str) -> set:
     these forms so an assignment made via one spelling still routes a chat that
     uses another. Example: "Qwen/Qwen2.5-Coder-3B-Instruct-GGUF",
     "Qwen2.5-Coder-3B-Instruct-GGUF" and the lowercased variants all match.
+
+    "~"-TAIL UNIFICATION (key-match unification, operator doctrine 2026-07-23).
+    Registry keys qualify a base name with its owner via "~" ("Qwen~X",
+    "unsloth~X") while workers routinely serve/report the BARE base name ("X").
+    Before this, the two spellings never intersected — the k30 class of
+    invisible mismatches: a designation carries the ~-qualified key, the
+    worker's loaded/models list carries the bare one, and routing looked at a
+    box actually holding the model and said "not serveable here". Operator
+    doctrine: a specific call may try any same-base sibling — so the "~"-tail
+    is an alias exactly like the "/"-tail. "Qwen~X" -> {"Qwen~X", "qwen~x",
+    "X", "x"}; bare "X" -> {"X", "x"}; qualified and bare now intersect in BOTH
+    directions. (Two different owners of the SAME base intersect too — the
+    blocked-sibling guard in _serveable_match is what keeps that from serving a
+    BLOCKED sibling under an unblocked name.) Raw forms stay first-class; the
+    tails are additions, never replacements.
     """
     if not model_key:
         return set()
@@ -1171,7 +1186,83 @@ def _match_keys(model_key: str) -> set:
     tail = raw.split("/")[-1]
     forms.add(tail)
     forms.add(tail.lower())
+    if "~" in raw:
+        base = raw.split("~", 1)[1]
+        if base:
+            forms.add(base)
+            forms.add(base.lower())
     return forms
+
+
+def _serveable_match(model_key: str, wanted: set, serveable) -> bool:
+    """True iff one of ``serveable``'s advertised keys names ``model_key``.
+
+    The single membership predicate for every routing match site (the
+    eligibility gate, the engine-skip say-why counter, explain_no_worker's
+    designation walk). It replaces the old
+    ``model_key in serveable or wanted & {alias-union}`` idiom with a
+    PER-ADVERTISED-KEY decision, which is what makes the BLOCKED-SIBLING GUARD
+    possible: the "~"-tail unification in _match_keys lets a request for an
+    unblocked ``A~X`` tail-match an advertised ``B~X`` (different owner, same
+    base). If that advertised sibling is BLOCKED, counting the match would
+    effectively serve a blocked model under an unblocked name — so an
+    alias-only match against a blocked advertised key is skipped. The
+    REQUESTED key's own block gate is enforced upstream (workers_for_model
+    returns [] before any per-worker work); the blocklist is consulted here
+    ONLY for alias-matched (never literal-matched) advertised keys, keeping
+    the hot path cheap.
+    """
+    for m in serveable:
+        if m == model_key:
+            return True
+        if wanted & _match_keys(m):
+            if _model_blocked(m):
+                continue     # blocked sibling — an alias never launders a block
+            return True
+    return False
+
+
+def _wildcard_map() -> Dict[str, bool]:
+    """The per-worker WILDCARD ("take all comers") opt-in map {worker_id: True}.
+
+    Operator doctrine 2026-07-23: worker designations are a HARD routing scope;
+    an undesignated model "gets in where it fits in" ONLY on workers that
+    explicitly opted in as wildcard. Stored in models_config
+    (worker_wildcard.json — same store family as the boot_prewarm star); absent
+    key = False, so a fleet with no flags set routes exactly as before the
+    feature existed (defaults are promises). Fully guarded: a store miss must
+    never break the heartbeat/selection hot path — {} (nobody is a wildcard) is
+    the safe degradation.
+    """
+    try:
+        from abstract_hugpy_dev.imports.config.models.models_config import (
+            worker_wildcard_state)
+        return worker_wildcard_state()
+    except Exception:  # noqa: BLE001 — never let the flag store break selection
+        return {}
+
+
+def _star_map() -> Dict[str, Any]:
+    """The per-worker ⭐ BOOT-LOAD STAR map {worker_id: model_key} (or {}).
+
+    The star's ONLY routing effect (operator RULING 2026-07-23, post-incident:
+    "it shouldn't effect anything but priority for ambiguous model calls") is a
+    tie-break in worker ranking: when nothing is warm, prefer the worker whose
+    boot star == the requested model — that box would boot-load it anyway, so a
+    no-warm call lands where the model is (or will soon be) resident. The star is
+    NOT keep-warm and has NO reconcile/eviction effect (see agent boot-once +
+    worker_routes._reconcile_warm_set). Stored in models_config
+    (worker_boot_prewarm.json — same store family as the wildcard flag). Read ONCE
+    per pick call (never per candidate). Fully guarded: a store miss must never
+    break selection — {} (no star anywhere) is the safe degradation and leaves
+    ranking exactly as it was before the star key existed.
+    """
+    try:
+        from abstract_hugpy_dev.imports.config.models.models_config import (
+            worker_boot_prewarm_state)
+        return worker_boot_prewarm_state()
+    except Exception:  # noqa: BLE001 — never let the star store break selection
+        return {}
 
 
 class WorkerStore:
@@ -1904,10 +1995,15 @@ class WorkerStore:
         wanted = _match_keys(model_key)
         want_pool = (pool or "").strip()
         need_tier = env_tier_for_model(model_key)
+        # WILDCARD map, read ONCE per call (not per worker-loop iteration) —
+        # the per-worker lookup below is then a dict hit. Guarded inside
+        # _wildcard_map: a store miss degrades to "nobody is a wildcard".
+        wildcards = _wildcard_map()
         tier_skipped = 0
         task_skipped = 0
         id_lock_skipped = 0
         engine_skipped = 0
+        wildcard_engine_skipped = 0
         out = []
         for w in self.all():
             # Only admitted workers serve. Pending (awaiting operator approval) and
@@ -1925,9 +2021,13 @@ class WorkerStore:
                 # mystery) instead of every engine-broken box on the fleet.
                 _serveable = (list(w.get("models", [])) + list(w.get("loaded_models", []))
                               + list(w.get("grants", {}).keys()))
-                if (model_key in _serveable
-                        or wanted & {a for m in _serveable for a in _match_keys(m)}):
+                if _serveable_match(model_key, wanted, _serveable):
                     engine_skipped += 1
+                elif wildcards.get(w.get("id") or ""):
+                    # A WILDCARD CATCH lost to the engine gate. Counted apart
+                    # from the designated skips so the say-why log below stays
+                    # truthful ("assigned" vs "wildcard") without new machinery.
+                    wildcard_engine_skipped += 1
                 continue
             # Dedicated-pool reservation: a request for pool P uses ONLY pool-P
             # workers; a general request (no pool) uses ONLY un-pooled workers.
@@ -1952,10 +2052,30 @@ class WorkerStore:
             serveable = (list(w.get("models", [])) + list(w.get("loaded_models", []))
                          + list(w.get("grants", {}).keys()))
             # Match on the raw key OR any normalized alias (hub_id vs key vs
-            # case), so an assignment made via one form still routes a chat that
-            # names the model a slightly different way.
-            if not (model_key in serveable or wanted & {a for m in serveable for a in _match_keys(m)}):
-                continue
+            # case vs "~"-qualification), so an assignment made via one form
+            # still routes a chat that names the model a slightly different way.
+            # _serveable_match also carries the blocked-sibling guard: an
+            # alias-only match against a BLOCKED advertised sibling never
+            # counts. RESIDENT = DE FACTO DESIGNATION: ``loaded_models`` (and
+            # grants) ride in ``serveable``, so a box currently holding the
+            # model is ALWAYS a "home" match here — never route-refused —
+            # wildcard flag or not.
+            home = _serveable_match(model_key, wanted, serveable)
+            if not home:
+                # WILDCARD PLACEMENT (operator doctrine 2026-07-23):
+                # designations are a HARD routing scope — an unmatched worker
+                # is out UNLESS it explicitly opted in as a wildcard ("a worker
+                # can be designated to take all comers ... or it can not be
+                # selected as a wildcard and adhere only to its own allocated
+                # models"). A wildcard catch relaxes ONLY this
+                # designation-membership gate: every hard gate around it still
+                # applies — admission/engine/pool above, liveness/env-tier/
+                # task-capability/id-lock below, and the requested key's BLOCK
+                # gate already returned [] before the loop. Default False for
+                # every worker (absent key = not a wildcard), so a fleet with
+                # no flags set routes exactly as before this feature existed.
+                if not wildcards.get(w.get("id") or ""):
+                    continue
             if online_only and w["status"] != "online":
                 continue
             # Runtime-env tier gate: the model runs ONLY on a worker whose venv
@@ -1984,6 +2104,16 @@ class WorkerStore:
             if require_comfy_id_lock and not _comfy_id_lock_capable(w):
                 id_lock_skipped += 1
                 continue
+            if not home:
+                # Transient RESPONSE-COPY marker: ``w`` is a _public_view copy
+                # (self.all() rebuilds it from the store on every read), so this
+                # can never leak into the persisted record — same transient
+                # semantics as the derived status/storage fields. Ranking sorts
+                # home matches ABOVE wildcard catches (pick_for_model /
+                # candidates_for_model), which IS the overflow mechanism; and
+                # say-why readers can tell a candidate is here by wildcard, not
+                # designation.
+                w["_wildcard_catch"] = True
             out.append(w)
         if not out and engine_skipped:
             # The model HAS designated servers — every one was excluded because it
@@ -1998,6 +2128,16 @@ class WorkerStore:
                 "unusable (llama-cpp not loadable AND no native llama-server "
                 "binary). Repair the engine on those boxes or assign the model to "
                 "a healthy worker.", model_key, engine_skipped)
+        if not out and wildcard_engine_skipped:
+            # WILDCARD catches lost to the engine gate — kept apart from the
+            # designated-worker warning above so "assigned" never overcounts.
+            # Matters when a model's ONLY possible servers were wildcard boxes:
+            # without this line an empty result would look like "no designation"
+            # instead of "the all-comers boxes are engine-broken".
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "model %s: %d wildcard (all-comers) worker(s) skipped — "
+                "inference engine unusable", model_key, wildcard_engine_skipped)
         if not out and tier_skipped:
             # The model HAS servers — they were excluded on env tier alone. Say
             # so, or the operator sees only the downstream "no worker / local
@@ -2038,8 +2178,14 @@ class WorkerStore:
         restricts to boxes whose ComfyUI advertises the IPAdapter nodes.
 
         Preference order:
-            1. workers that already report the model as loaded (warm),
-            2. otherwise the least-recently-picked online assignee.
+            1. HOME workers (designated / resident / granted) before wildcard
+               catches — this ordering IS the overflow mechanism (operator
+               doctrine 2026-07-23): a designated model tries its home workers
+               first and spills onto wildcard ("take all comers") boxes only
+               when no home worker survives the gates; it busts only when
+               neither can serve. No separate overflow machinery exists.
+            2. workers that already report the model as loaded (warm),
+            3. otherwise the least-recently-picked online assignee.
 
         Returns ``None`` when no online worker (in the requested pool) is assigned
         to the model, which signals the caller to fall back to local execution.
@@ -2091,14 +2237,30 @@ class WorkerStore:
                 candidates = matched
 
         # Efficiency-aware ranking (capability already filtered above). Prefer,
-        # in order: a worker that already has the model warm (avoids a multi-GB
-        # reload), then one with a usable GPU over CPU-only, then the
-        # least-recently-picked (spreads load). Stable id tiebreak so the order
-        # never wobbles. (Full need-vs-capacity placement is the allocator's job;
-        # this is the lightweight default pick.)
+        # in order: a HOME match (designated/resident/granted) over a wildcard
+        # catch (the overflow-by-ordering mechanism — see the docstring), then
+        # a worker that already has the model warm (avoids a multi-GB reload),
+        # then a worker whose ⭐ boot star == this model (the ambiguity tie-break:
+        # nothing warm → prefer the box that boot-loads it anyway), then one with
+        # a usable GPU over CPU-only, then the least-recently-picked (spreads
+        # load). Stable id tiebreak so the order never wobbles. (Full
+        # need-vs-capacity placement is the allocator's job; this is the
+        # lightweight default pick.)
+        # Read the star store ONCE per pick (never per candidate), alias-tolerant
+        # via _match_keys (same unification Slice A uses): a star recorded under a
+        # ~-qualified key still matches a bare-key request and vice versa.
+        star_map = _star_map()
+        wanted_forms = _match_keys(model_key)
+
+        def _starred(w: Dict[str, Any]) -> bool:
+            s = star_map.get(w.get("id"))
+            return bool(s) and bool(wanted_forms & _match_keys(str(s)))
+
         def _rank(w: Dict[str, Any]):
             warm = model_key in (w.get("loaded_models") or [])
-            return (0 if warm else 1,
+            return (1 if w.get("_wildcard_catch") else 0,
+                    0 if warm else 1,
+                    0 if _starred(w) else 1,
                     0 if _has_usable_gpu(w) else 1,
                     w.get("last_picked", 0),
                     w.get("id", ""))
@@ -2129,7 +2291,9 @@ class WorkerStore:
         """Ranked ONLINE workers that can serve ``model_key`` — the cap-aware
         relay router's alternatives list (concurrency hardening 2026-07-11).
 
-        Same eligibility + ranking as ``pick_for_model`` (warm, then GPU, then
+        Same eligibility + ranking as ``pick_for_model`` (home before wildcard
+        catch — the relay's fallback walk must also prefer home, so overflow
+        stays overflow — then warm, then ⭐ star, then GPU, then
         least-recently-picked), but WITHOUT the ``last_picked`` write: central's
         in-flight gate iterates this to reroute around a worker that is at its
         advertised in-process concurrency cap, and re-stamping every candidate on
@@ -2146,9 +2310,20 @@ class WorkerStore:
             if matched:
                 candidates = matched
 
+        # Star store read ONCE (never per candidate), alias-tolerant — see
+        # pick_for_model's _rank for the rationale (ambiguity tie-break only).
+        star_map = _star_map()
+        wanted_forms = _match_keys(model_key)
+
+        def _starred(w: Dict[str, Any]) -> bool:
+            s = star_map.get(w.get("id"))
+            return bool(s) and bool(wanted_forms & _match_keys(str(s)))
+
         def _rank(w: Dict[str, Any]):
             warm = model_key in (w.get("loaded_models") or [])
-            return (0 if warm else 1,
+            return (1 if w.get("_wildcard_catch") else 0,
+                    0 if warm else 1,
+                    0 if _starred(w) else 1,
                     0 if _has_usable_gpu(w) else 1,
                     w.get("last_picked", 0),
                     w.get("id", ""))
@@ -2368,13 +2543,23 @@ def explain_no_worker(model_key: str, pool: Optional[str] = None,
         wanted = _match_keys(model_key)
         want_pool = (pool or "").strip()
         need_tier = env_tier_for_model(model_key)
+        wildcards = _wildcard_map()   # read once; guarded (miss -> {})
         reasons: List[str] = []
         for w in worker_store.all():
             serveable = list(w.get("models", [])) + list(w.get("loaded_models", []))
-            if not (model_key in serveable
-                    or wanted & {a for m in serveable for a in _match_keys(m)}):
+            # Same membership predicate as workers_for_model (alias-tolerant,
+            # blocked-sibling-guarded) so this diagnostic never disagrees with
+            # the selector it explains. A WILDCARD worker is a potential server
+            # for ANY model, so one excluded by a hard gate belongs in the
+            # honest answer too — tagged "(wildcard)" so the operator can tell a
+            # designation failure from lost all-comers overflow capacity.
+            home = _serveable_match(model_key, wanted, serveable)
+            wildcard = (not home) and bool(wildcards.get(w.get("id") or ""))
+            if not (home or wildcard):
                 continue                          # not designated for this model
             name = w.get("name") or w.get("id") or "worker"
+            if wildcard:
+                name = f"{name} (wildcard)"
             if w.get("admission") != "approved":
                 reasons.append(f"{name}: not approved (admission={w.get('admission')!r})")
                 continue
