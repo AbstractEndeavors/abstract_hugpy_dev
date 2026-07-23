@@ -5297,13 +5297,31 @@ def _queued_ahead_of(subject: str) -> set:
 
 def _vram_residents(state: "WorkerState") -> "list[dict]":
     """Every GPU-resident model this box holds, from the pid-registry MEASURED
-    snapshot (in_process + slot subprocess + comfy), each with its real
-    vram_bytes and host_mode. This is the resident TRUTH the eviction planner
-    ranks — it includes the slot child ('max GPU' alloc and all: alloc is a
-    sizing preference, not a residency shield) that the in-process contention
-    path was blind to. Comfy rows are surfaced but EXCLUDED from eviction here
-    (0.1.137: comfy is out of allocations; it has its own Fix B headroom path)."""
+    snapshot (in_process + slot subprocess + comfy) UNIONED with the LIVE slot
+    statuses, each with its real vram_bytes and host_mode. This is the resident
+    TRUTH the eviction planner ranks — it includes the slot child ('max GPU'
+    alloc and all: alloc is a sizing preference, not a residency shield) that
+    the in-process contention path was blind to. Comfy rows are surfaced but
+    EXCLUDED from eviction here (0.1.137: comfy is out of allocations; it has
+    its own Fix B headroom path).
+
+    THE k30 INVISIBILITY FIX (2026-07-23): the pid registry is per-process,
+    in-memory state repopulated by the heartbeat loop. A slot occupant can be
+    plainly visible in the allocations view (live slot status + nvidia-smi)
+    while the registry has no record for it yet — a fresh re-exec before the
+    first beat, a swept/mis-verified record, or a child whose pid the reconcile
+    second pass tagged as an anonymous ``cuda_context`` lump (model_key=None,
+    which this function used to skip). The evict planner then enumerated ZERO
+    residents on an occupied card and refused with the self-contradictory
+    "evicted 0 idle ... 0 protected still hold the card" — a de-facto
+    protection class (invisibility) the operator never sanctioned. Fix: the
+    planner enumerates the SAME collection the allocations view shows — the
+    registry rows PLUS every live slot occupant (model_key set), joining the
+    slot child's real VRAM from nvidia-smi when the registry attribution is
+    missing. Only static / actively-replying / queued-ahead / comfy protect
+    (operator ruling 2026-07-23)."""
     out: list[dict] = []
+    seen: set = set()
     try:
         from . import pid_registry as _pidreg
         snap = _pidreg.snapshot_for_heartbeat() or {}
@@ -5311,6 +5329,7 @@ def _vram_residents(state: "WorkerState") -> "list[dict]":
             mk = row.get("model_key")
             if not mk:
                 continue                    # cuda_context lump / idle comfy: no model
+            seen.add(mk)
             out.append({
                 "model_key": mk,
                 "vram_bytes": int(row.get("vram_bytes") or 0),
@@ -5318,6 +5337,31 @@ def _vram_residents(state: "WorkerState") -> "list[dict]":
                 "alive": bool(row.get("alive", True)),
             })
     except Exception:  # noqa: BLE001 — no registry -> nothing to plan against
+        pass
+    # Union in LIVE slot occupants the registry doesn't know (k30). A slot with
+    # a model_key claim is a resource allocation whether or not the registry has
+    # caught up; its child holds the VRAM. Join nvidia-smi on child_pid for the
+    # honest bytes (0 when unjoinable — candidacy is what matters; _fits() is
+    # re-measured from the device after each eviction anyway).
+    try:
+        gpu_procs = None
+        for s in (_slot_statuses() or []):
+            mk = (s or {}).get("model_key")
+            if not mk or mk in seen:
+                continue
+            if gpu_procs is None:
+                gpu_procs = _gpu_process_vram() or {}
+            cp = s.get("child_pid")
+            info = gpu_procs.get(cp) if cp is not None else None
+            vb = int(info["mib"]) * _MIB if info is not None else 0
+            seen.add(mk)
+            out.append({
+                "model_key": mk,
+                "vram_bytes": vb,
+                "host_mode": "subprocess",
+                "alive": bool(s.get("healthy", True)),
+            })
+    except Exception:  # noqa: BLE001 — slot pool unreadable -> registry rows stand
         pass
     return out
 
@@ -5470,7 +5514,8 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
                                    -int(r.get("vram_bytes") or 0)))
 
     evicted: list[str] = []
-    freed = 0
+    evict_failed: list[dict] = []            # attempted but not freed — carried
+    freed = 0                                # in the refusal so counts are TRUE
     for r in candidates:
         chk = _fits()
         if chk:
@@ -5483,6 +5528,17 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
             evicted.append(mk)
             _note_vram_eviction(mk, model_key, fb, res.get("host_mode") or "")
             _trim_host_ram()                 # so the next _fits() sees the room
+        else:
+            # An eviction that resolved to a no-op ("not resident here", a
+            # changed slot handle, a failed unload) must not vanish from the
+            # story — the old message counted only successes, so a card held by
+            # an unevictable-in-practice resident read "evicted 0 ... 0
+            # protected", contradicting the visible occupancy (k30).
+            evict_failed.append({"model_key": mk,
+                                 "host_mode": res.get("host_mode"),
+                                 "reason": res.get("reason")})
+            logger.warning("VRAM evict-to-fit: eviction of %s did not free it "
+                           "(%s: %s)", mk, res.get("host_mode"), res.get("reason"))
 
     final = _fits()
     if final:
@@ -5558,6 +5614,26 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
     # or CPU remainder OOM), in the C4 vision-fit style.
     # t28: a load-FAIL calibration sample (prediction with no successful load).
     _record_calibration_refuse(model_key, _det)
+    # A TRUTHFUL account of what holds the card (k30): only claim "protected
+    # resident(s) still hold the card" when there ARE protected residents; a
+    # failed eviction is reported as such; and when the planner saw NO residents
+    # at all on an occupied card, say the occupancy is unattributed instead of
+    # the self-contradictory "evicted 0 ... 0 protected still hold the card".
+    holders: list[str] = []
+    if protected:
+        holders.append(f"{len(protected)} protected resident(s) still hold the card")
+    if evict_failed:
+        holders.append(f"{len(evict_failed)} eviction attempt(s) failed to free "
+                       "their resident")
+    if not protected and not evict_failed and not candidates and not evicted:
+        occupied = None
+        if fv is not None and total:
+            occupied = max(0, int(total) - int(fv))
+        holders.append(
+            f"no evictable resident is attributable to a model, yet "
+            f"~{_human_bytes(occupied)} of the card is in use — GPU memory is "
+            "held by process(es) this worker cannot map to a model_key "
+            "(orphaned/adopted child or out-of-band process)")
     reason = {
         "state": "refused",
         "model_key": model_key,
@@ -5566,8 +5642,8 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
             f"{_human_bytes(fv)} free of {_human_bytes(total)} "
             f"({_human_bytes(ceiling_reserve)} ceiling reserve); "
             f"evicted {len(evicted)} idle resident(s) freeing "
-            f"{_human_bytes(freed)}, but {len(protected)} protected resident(s) "
-            f"still hold the card"
+            f"{_human_bytes(freed)}"
+            + ("; " + "; ".join(holders) if holders else "")
         ),
         "needs_bytes": need,
         # The weights+kv SPLIT (slice 11) — the honest report the operator asked
@@ -5583,6 +5659,7 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
         "ceiling_reserve_bytes": ceiling_reserve,
         "evicted": evicted,
         "evicted_freed_bytes": freed,
+        "evict_failed": evict_failed,
         "protected": [{"model_key": p["model_key"],
                        "vram_bytes": p.get("vram_bytes"),
                        "host_mode": p.get("host_mode"), "why": p.get("why")}

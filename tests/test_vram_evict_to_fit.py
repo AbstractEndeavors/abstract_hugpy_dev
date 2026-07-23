@@ -32,6 +32,10 @@ D = importlib.import_module("abstract_hugpy_dev.managers.dispatch.dispatch")
 
 GIB = 1 << 30
 
+# The real function object, captured BEFORE any fixture monkeypatches the module
+# attribute — the k30 end-to-end test restores it to drive the slot union.
+_REAL_VRAM_RESIDENTS = A._vram_residents
+
 
 class _State:
     pass
@@ -376,3 +380,133 @@ def test_full_fit_never_reaches_partial_and_pin_is_cleared(rig, gguf_rig):
     assert plan["action"] == "proceed"
     assert spill._NGL_OVERRIDE.get(gguf_rig.geo["path"]) is None   # re-decided full
     assert "subject" not in A._PARTIAL_NGL
+
+
+# ═══════════ k30 (2026-07-23): the invisibility protection class is closed ═══
+# Incident (ae): a chat load for the 51.8G coder was fast-refused with
+# "evicted 0 idle resident(s) freeing 0 B, but 0 protected resident(s) still
+# hold the card" while an IDLE 18.85G Fable slot occupant plainly held it. Root
+# cause: the evict planner enumerated ONLY the in-memory pid registry; a slot
+# occupant the registry hadn't (re)recorded — fresh re-exec, swept record, or a
+# child tagged as an anonymous cuda_context lump (model_key=None) — was
+# invisible, i.e. immune to eviction: a de-facto third protection class beyond
+# the operator's ruling (only 🔒static and actively-answering protect). Fix:
+# _vram_residents unions LIVE slot occupants with the registry, and the refusal
+# only claims what is true (failed evictions counted; unattributed occupancy
+# named instead of "0 protected still hold the card").
+
+def test_vram_residents_unions_live_slot_occupant_missing_from_registry(monkeypatch):
+    """A slot occupant with NO pid-registry record is still an enumerable
+    resident (the same collection the allocations view shows)."""
+    from abstract_hugpy_dev.worker_agent import pid_registry as PR
+
+    class _EmptyReg:
+        @staticmethod
+        def snapshot_for_heartbeat():
+            return {"models": [], "unattributed": []}     # registry knows nothing
+    monkeypatch.setattr(A, "_slot_statuses", lambda: [
+        {"slot_id": "1", "model_key": "Fable-Distill", "child_pid": 4242,
+         "busy": False, "healthy": True},
+        {"slot_id": "2", "model_key": None, "child_pid": None},
+    ])
+    monkeypatch.setattr(A, "_gpu_process_vram",
+                        lambda: {4242: {"name": "llama-server", "mib": 17977}})
+    monkeypatch.setattr(PR, "snapshot_for_heartbeat", _EmptyReg.snapshot_for_heartbeat)
+
+    rows = A._vram_residents(_State())
+    assert [r["model_key"] for r in rows] == ["Fable-Distill"]
+    assert rows[0]["host_mode"] == "subprocess"
+    assert rows[0]["vram_bytes"] == 17977 * (1 << 20)     # joined from nvidia-smi
+
+
+def test_vram_residents_does_not_duplicate_registry_backed_slot(monkeypatch):
+    from abstract_hugpy_dev.worker_agent import pid_registry as PR
+    monkeypatch.setattr(PR, "snapshot_for_heartbeat", lambda: {"models": [
+        {"model_key": "Fable-Distill", "pid": 4242, "host_mode": "subprocess",
+         "vram_bytes": 5, "alive": True},
+        {"model_key": None, "pid": 999, "host_mode": "cuda_context",
+         "vram_bytes": 1, "alive": True},                 # anonymous lump: skipped
+    ], "unattributed": []})
+    monkeypatch.setattr(A, "_slot_statuses", lambda: [
+        {"slot_id": "1", "model_key": "Fable-Distill", "child_pid": 4242}])
+    rows = A._vram_residents(_State())
+    assert [r["model_key"] for r in rows] == ["Fable-Distill"]   # once, not twice
+
+
+def test_k30_idle_slot_invisible_to_registry_is_evicted_not_refused(
+        rig, monkeypatch):
+    """THE k30 SHAPE end-to-end: registry-blind idle 18.85G slot occupant, a
+    51.8G subject. The planner must see it via the slot union and evict it —
+    then the 48-layer hybrid becomes viable (18/48 >= the 3-layer floor)."""
+    # Un-stub _vram_residents: use the REAL union against fake registry+slots
+    # (the rig fixture replaced it; _REAL_VRAM_RESIDENTS was captured at import).
+    monkeypatch.setattr(A, "_vram_residents", _REAL_VRAM_RESIDENTS)
+    from abstract_hugpy_dev.worker_agent import pid_registry as PR
+    monkeypatch.setattr(PR, "snapshot_for_heartbeat",
+                        lambda: {"models": [], "unattributed": []})
+    fable_vram = int(18851299328)
+    slot_rows = [{"slot_id": "1", "model_key": "Fable-Distill",
+                  "child_pid": 4242, "busy": False, "healthy": True}]
+    monkeypatch.setattr(A, "_slot_statuses", lambda: list(slot_rows))
+    monkeypatch.setattr(A, "_gpu_process_vram",
+                        lambda: {4242: {"name": "llama-server",
+                                        "mib": fable_vram // (1 << 20)}})
+    # 23.6G card, 4.0G free, subject needs 51.8G (the incident numbers).
+    rig.card["total"] = int(23.6 * GIB)
+    rig.card["free"] = int(4.0 * GIB)
+    rig.card["need"] = int(51.8 * GIB)
+    # The fake evictor must free the slot occupant's bytes when asked.
+    rig.residents["Fable-Distill"] = {"vram_bytes": fable_vram,
+                                      "host_mode": "subprocess"}
+    # Hybrid geometry: coder-next 48 layers, plenty of host RAM.
+    monkeypatch.setattr(A, "_served_gguf_geometry",
+                        lambda mk: ("/models/coder-next/q4.gguf", 48))
+    monkeypatch.setattr(A, "_free_ram_bytes", lambda: 200 * GIB)
+    A._PARTIAL_NGL.clear()
+    from abstract_hugpy_dev.managers import spill as _spill
+    _spill._NGL_OVERRIDE.clear()
+
+    plan = A._vram_evict_to_fit(_State(), "Qwen~Qwen3-Coder-Next-GGUF")
+    assert "Fable-Distill" in plan["evicted"]             # the squatter yielded
+    # Full 51.8G still can't fit a 23.6G card — but the hybrid now admits:
+    # budget = (4.0 + 18.85 hmm freed) - 2.36 reserve ≈ 20.4G; per-layer =
+    # 51.8/48 ≈ 1.079G -> 18 layers ≥ the 3-layer floor.
+    assert plan["action"] == "partial"
+    assert plan["n_gpu_layers"] >= 17
+
+
+def test_k30_refusal_message_is_truthful_when_nothing_enumerable(rig, monkeypatch):
+    """Occupied card, ZERO enumerable residents: the refusal must NOT claim
+    'N protected resident(s) still hold the card' — it names the unattributed
+    occupancy instead."""
+    rig.card["total"] = int(23.6 * GIB)
+    rig.card["free"] = int(4.0 * GIB)
+    rig.card["need"] = int(51.8 * GIB)
+    # residents dict left EMPTY -> the (stubbed) planner sees nothing.
+    monkeypatch.setattr(A, "_served_gguf_geometry", lambda mk: (None, None))
+    plan = A._vram_evict_to_fit(_State(), "coder")
+    assert plan["action"] == "refuse"
+    msg = plan["reason"]["reason"]
+    assert "protected resident(s) still hold the card" not in msg
+    assert "cannot map to a model_key" in msg
+    assert plan["reason"]["evict_failed"] == []
+
+
+def test_k30_failed_eviction_is_counted_in_the_refusal(rig, monkeypatch):
+    """An eviction attempt that frees nothing must surface in the refusal
+    (evict_failed), never silently read as 'evicted 0 ... 0 protected'."""
+    rig.card["free"] = 1 * GIB
+    rig.card["need"] = 30 * GIB
+    rig.residents["stuck"] = {"vram_bytes": 20 * GIB, "host_mode": "subprocess"}
+    monkeypatch.setattr(A, "_served_gguf_geometry", lambda mk: (None, None))
+    monkeypatch.setattr(
+        A, "_evict_model",
+        lambda state, mk, force=False: {"model_key": mk, "evicted": False,
+                                        "vram_freed": None, "host_mode": "slot",
+                                        "reason": "slot unload failed: boom"})
+    plan = A._vram_evict_to_fit(_State(), "subject")
+    assert plan["action"] == "refuse"
+    assert plan["evicted"] == []
+    ef = plan["reason"]["evict_failed"]
+    assert len(ef) == 1 and ef[0]["model_key"] == "stuck"
+    assert "eviction attempt(s) failed" in plan["reason"]["reason"]
