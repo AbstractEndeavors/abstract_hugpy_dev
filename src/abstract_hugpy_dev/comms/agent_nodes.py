@@ -55,7 +55,7 @@ import time
 import uuid
 from typing import Any, Optional
 
-from .shared import default_db_path
+from .shared import default_db_path, retry_on_emfile
 
 _TOKEN_PREFIX = "agt_"
 _NODE_PREFIX = "agn_"
@@ -156,7 +156,11 @@ class AgentNodeStore:
 
     # -- plumbing ------------------------------------------------------------
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path, timeout=5.0)
+        # This store is the SOURCE OF TRUTH for agent-node registration — a
+        # failed open here surfaces as a 500 (by design; no per-process
+        # fallback). The restart-burst EMFILE is transient, so retry the open
+        # (see comms.shared.retry_on_emfile) before letting it propagate.
+        conn = retry_on_emfile(lambda: sqlite3.connect(self.path, timeout=5.0))
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")

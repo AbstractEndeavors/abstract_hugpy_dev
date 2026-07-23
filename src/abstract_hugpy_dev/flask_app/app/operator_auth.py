@@ -72,6 +72,14 @@ _SENSITIVE = [
     # (alloc-all = bulk GPU-allocation write for a selection of a worker's models
     #  — worker_routes._apply_alloc_map; same registry-write privilege as assign.)
     ({"POST"},                   re.compile(r"^/llm/workers/[^/]+/(admit|block|admission|assign|unassign|alloc-all|unload|probe|pool|limits)$")),
+    # Per-worker KEEP-WARM STAR ("star") — operator intent that projects onto the
+    # fleet (which model a worker keeps warm; reconcile-kept every beat), same
+    # registry-write privilege tier as assign. The GET map
+    # (/llm/workers/boot-prewarm) and the per-worker read (surfaced on the roster)
+    # stay open — only the write is gated. Two path segments (worker id + verb)
+    # with a hyphen, so it needs its own rule (the single-segment worker-verb rule
+    # above does not match it).
+    ({"POST"},                   re.compile(r"^/llm/workers/[^/]+/boot-prewarm$")),
     ({"DELETE"},                 re.compile(r"^/llm/workers/[^/]+$")),
     # k10: sanctioned ghost-cleanup for the assignment-memory sidecar
     # (worker_assignments.json) — same operator-only tier as the row DELETE above.

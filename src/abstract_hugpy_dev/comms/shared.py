@@ -26,15 +26,92 @@ uuids and each process still only cancels what it holds a handle for.
 """
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
+import random
 import sqlite3
 import threading
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional, TypeVar
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
+
+# ---------------------------------------------------------------------------
+# EMFILE burst hardening (incident 2026-07-23)
+# ---------------------------------------------------------------------------
+# On a restart, all gunicorn workers spawn at once and simultaneously open
+# store-backed files on the virtiofs mount (/mnt/llm_storage). Under that
+# concurrent-open burst the mount MOMENTARILY returns EMFILE ("Too many open
+# files") — this is the mount degrading under load, NOT a real per-process
+# fd-limit breach (each proc held ~50 of 65536). SQLite surfaces the very same
+# transient as OperationalError("unable to open database file"). Both settle in
+# well under a second. This helper retries the store-open with exponential
+# backoff + small jitter so a burst settles instead of surfacing a 500.
+#
+# It is DELIBERATELY narrow: only EMFILE OSErrors and the one sqlite "unable to
+# open database file" message are retryable. Every other error (a real
+# permission fault, a corrupt db, a genuinely different sqlite error) propagates
+# immediately — a burst-settle retry must never paper over a real fault.
+
+
+def _is_emfile(exc: BaseException) -> bool:
+    """True for the transient store-open faults the mount throws under an
+    open burst: an OSError with errno EMFILE, or the sqlite OperationalError
+    whose message is 'unable to open database file' (same root cause, surfaced
+    through the sqlite open path). Nothing else is retryable."""
+    if isinstance(exc, sqlite3.OperationalError):
+        return "unable to open database file" in str(exc).lower()
+    if isinstance(exc, OSError):
+        return exc.errno == errno.EMFILE
+    return False
+
+
+def retry_on_emfile(
+    fn: Callable[[], _T],
+    *,
+    attempts: int = 5,
+    base_delay: float = 0.05,
+    max_delay: float = 0.8,
+    sleep: Callable[[float], None] = time.sleep,
+    rng: Optional[Callable[[], float]] = random.random,
+) -> _T:
+    """Call ``fn()`` and, on a transient EMFILE / 'unable to open database file'
+    store-open fault, retry with exponential backoff + jitter; re-raise the LAST
+    error once ``attempts`` are exhausted.
+
+    Only the transient store-open faults (see ``_is_emfile``) are retried — any
+    other exception propagates immediately, unretried. Backoff is
+    ``min(max_delay, base_delay * 2**i)`` plus up to one base_delay of jitter
+    (``rng()`` in [0,1)); pass ``rng=None`` for deterministic (jitter-free)
+    backoff in tests, and inject ``sleep`` to make tests fast. ``attempts`` is
+    the total number of tries (>=1), so there are at most ``attempts - 1``
+    sleeps.
+    """
+    if attempts < 1:
+        attempts = 1
+    last: BaseException
+    for i in range(attempts):
+        try:
+            return fn()
+        except BaseException as exc:  # noqa: BLE001 — re-raised unless retryable
+            if not _is_emfile(exc):
+                raise
+            last = exc
+            if i >= attempts - 1:
+                break
+            delay = min(max_delay, base_delay * (2 ** i))
+            if rng is not None:
+                delay += base_delay * rng()
+            logger.warning(
+                "store-open EMFILE burst (attempt %d/%d): %s — backing off %.3fs",
+                i + 1, attempts, exc, delay,
+            )
+            sleep(delay)
+    raise last
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -97,7 +174,10 @@ class SqliteMirror:
 
     # -- plumbing ------------------------------------------------------------
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path, timeout=2.0)
+        # sqlite3.connect is the store-open point that throws the transient
+        # EMFILE / 'unable to open database file' under a restart burst — retry
+        # just the open, then run the (handle-local) PRAGMAs normally.
+        conn = retry_on_emfile(lambda: sqlite3.connect(self.path, timeout=2.0))
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA busy_timeout=2000")

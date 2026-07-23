@@ -144,11 +144,14 @@ finally:
 # ── 5) reconcile warm-set ∩ not-blocked + _kick_warm provisioning filter ─────
 wr = importlib.import_module("abstract_hugpy_dev.flask_app.app.routes.worker_routes")
 
+# Warm set = (⭐ star ∪ 🔒static) ∩ on-disk − blocked (operator RULINGS 2026-07-23;
+# warm_whitelist / task-defaults NO LONGER warm). Use 🔒static for both members so
+# this exercises the ∩ not-blocked guard without needing to inject a star.
 WK = {"id": "wk", "name": "box", "url": "http://192.0.2.1:9100",
       "models_local": ["A", "B"],
-      "config": {"warm_whitelist": ["A", "B"], "residency": {}}}
+      "config": {"residency": {"A": "static", "B": "static"}}}
 _reset()
-check("reconcile: warm set holds whitelisted on-disk models when unblocked",
+check("reconcile: warm set holds static on-disk models when unblocked",
       wr._reconcile_warm_set(WK) == ["A", "B"])
 bl.block("A")
 check("reconcile: BLOCK removes A from the curated warm set (∩ not-blocked)",

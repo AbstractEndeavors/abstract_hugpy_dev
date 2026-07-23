@@ -31,6 +31,19 @@ except ImportError:  # pragma: no cover - non-POSIX fallback
 
 from .schemas import settings
 
+# EMFILE burst hardening (incident 2026-07-23): this store lives on the virtiofs
+# mount (beside workers.json / the manifest). On a restart all gunicorn workers
+# open it at once and the mount momentarily throws EMFILE — which surfaced here
+# as a 500 on POST /llm/workers/register (worker 'ae' logged "initial
+# registration failed: HTTP 500"). Retrying the file-open past the transient
+# lets the burst settle so the wrapped reader succeeds. Best-effort import so a
+# packaging skew can never break the token store.
+try:
+    from abstract_hugpy_dev.comms.shared import retry_on_emfile
+except Exception:  # pragma: no cover - degrade to un-retried open on import skew
+    def retry_on_emfile(fn, **_kw):  # type: ignore[misc]
+        return fn()
+
 _TOKEN_PREFIX = "hpw_"
 
 
@@ -70,7 +83,11 @@ class EnrollmentTokenStore:
                 fh.seek(0)
                 raw = fh.read()
             elif os.path.exists(self._path):
-                with open(self._path, "r", encoding="utf-8") as f:
+                # Retry the open past a restart-burst EMFILE (the read itself is
+                # cheap once the handle exists).
+                with retry_on_emfile(
+                    lambda: open(self._path, "r", encoding="utf-8")
+                ) as f:
                     raw = f.read()
             else:
                 return {}
@@ -107,7 +124,13 @@ class EnrollmentTokenStore:
     def _transaction(self):
         with self._lock:
             self._ensure_parent()
-            fd = os.open(self._path, os.O_RDWR | os.O_CREAT, 0o600)
+            # verify_enrollment_token() (the register/heartbeat auth gate) goes
+            # through here to stamp last_used — so a restart-burst EMFILE on this
+            # open is exactly what 500'd registration. Retry the open past the
+            # transient before building the buffered handle.
+            fd = retry_on_emfile(
+                lambda: os.open(self._path, os.O_RDWR | os.O_CREAT, 0o600)
+            )
             fh = os.fdopen(fd, "r+", encoding="utf-8")
             try:
                 if fcntl is not None:

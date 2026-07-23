@@ -26,6 +26,8 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
+from abstract_hugpy_dev.comms.shared import retry_on_emfile
+
 logger = logging.getLogger(__name__)
 
 MAX_FAILURES = 5
@@ -78,7 +80,10 @@ class ReservationRegistry:
 
     # -- plumbing ------------------------------------------------------------
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path, timeout=2.0)
+        # The reservation-registry init was one of the restart-burst EMFILE
+        # casualties (2026-07-23). Retry the store-open (see
+        # comms.shared.retry_on_emfile) before the handle-local PRAGMAs.
+        conn = retry_on_emfile(lambda: sqlite3.connect(self.path, timeout=2.0))
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA busy_timeout=2000")

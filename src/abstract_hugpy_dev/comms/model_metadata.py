@@ -73,6 +73,8 @@ import threading
 import time
 from typing import Any, Optional
 
+from .shared import retry_on_emfile
+
 logger = logging.getLogger(__name__)
 
 # Telemetry off at the earliest shared import point. setdefault ONLY — an
@@ -254,7 +256,9 @@ class ModelMetadataStore:
 
     # -- plumbing ------------------------------------------------------------
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path, timeout=2.0)
+        # Retry the store-open past the restart-burst EMFILE (see
+        # comms.shared.retry_on_emfile) before running the handle-local PRAGMAs.
+        conn = retry_on_emfile(lambda: sqlite3.connect(self.path, timeout=2.0))
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA busy_timeout=2000")

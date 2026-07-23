@@ -4196,6 +4196,201 @@ def _log_blocked_skip_once(model_key: str, where: str) -> None:
                 "operator (won't retry until unblocked)", where, model_key)
 
 
+# ── Per-worker KEEP-WARM STAR (boot_prewarm) ────────────────────────────────
+# Operator RULINGS 2026-07-23 (these SUPERSEDE the earlier "boot-once" design):
+#   RULING 1 — "the star is the ONLY warm source. nothing warms until starred
+#               (or static)."
+#   RULING 2 — "star = reconcile-kept-warm" (NOT boot-once): a starred model
+#               evicted under load COMES BACK on the next reconcile beat. The ⭐
+#               star IS the keep-warm designation.
+#
+# Central publishes this worker's star on every register/heartbeat reply as a
+# plain scalar ``worker['boot_prewarm'] = "<model_key>"`` — the exact additive/
+# omit-when-unset wire idiom as calibration/reservations/blocked_models, so an
+# older released central just omits it and this code tolerates its absence.
+#
+# SEMANTICS (the ⭐ lever): the star = the operator's keep-warm designation.
+# reconcile keeps it warm EVERY BEAT — this adopt runs on each reply and loads
+# the star IF NOT CURRENTLY LOADED (an idempotent check against the live
+# dispatch/slot residency). So: evicted-under-pressure → next beat reloads it;
+# already-loaded → no-op. It stays a NORMALLY EVICTABLE (FIFO) on-demand
+# resident — NOT eviction-protected. (For "start here AND stay here", the
+# operator promotes the model to 🔒static — that tier, not this one, protects
+# residency.) The identifier stays ``boot_prewarm`` (rename churn isn't worth
+# it) but it now means "keep-warm star", not "boot once".
+#   _STAR_WARMING  model_keys with a warm thread IN FLIGHT right now — an
+#                  in-flight guard (NOT a done-latch): it only stops spawning a
+#                  SECOND load thread for the same star while the first is still
+#                  running, then clears. It never suppresses a re-warm after an
+#                  eviction (that would re-break RULING 2). Cleared when the
+#                  thread finishes.
+_STAR_WARMING: set = set()
+_STAR_WARM_LOCK = threading.Lock()
+
+
+def _star_is_loaded(model_key: str) -> bool:
+    """True iff the star model is CURRENTLY resident on this worker — in-process
+    OR seated in a slot. The idempotent check that makes keep-warm a no-op when
+    the star is already loaded (RULING 2: reload only when absent). Guarded —
+    an accessor hiccup reads as 'not loaded' so a beat re-warms rather than
+    wrongly skipping."""
+    try:
+        if model_key in set(loaded_model_keys()):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        if model_key in _slot_occupants():
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
+def _load_star_if_absent(state: "WorkerState", model_key: str) -> None:
+    """Load the ⭐ star through the NORMAL on-demand path — NOT the static eager
+    tier — IF it is not already resident. Provisions it present (downloading if
+    absent, DEMAND purpose so the worker's own fit_plan evicts-to-fit rather than
+    central budget-refusing), then warms it resident the same way the on-demand
+    preload branch does (slot-fill for a GGUF slot occupant; runner_for +
+    ensure_loaded otherwise).
+
+    Crucially this does NOT touch residency: it never writes a 'static' override,
+    so the loaded model stays a normal FIFO-evictable resident (RULING 2 keeps it
+    warm by RELOADING each beat when absent, never by protecting it). Fully
+    guarded — a keep-warm failure must NEVER crash the agent or a heartbeat.
+
+    The _STAR_WARMING in-flight guard is cleared in a finally so a later beat
+    (e.g. after an eviction) can warm the star again."""
+    try:
+        if _is_blocked_locally(model_key):
+            _log_blocked_skip_once(model_key, "keep-warm star")
+            return
+        try:
+            from .provision import (ensure_model_present, ensure_model_registered,
+                                     model_is_local)
+            # Learn the model from central if this worker's registry hasn't yet,
+            # and work against the canonical local key.
+            try:
+                canonical = ensure_model_registered(model_key, state.central_url) or model_key
+            except Exception:  # noqa: BLE001 — resolution failure -> try the bare key
+                canonical = model_key
+            # Comfy-backed rows own their own residency (symlinks); just ensure
+            # the checkpoint is available and stop (no runner preload, no slot).
+            try:
+                from .provision import ensure_comfy_checkpoint
+                from .imports import get_model_config
+                if getattr(get_model_config(canonical), "framework", None) == "comfy":
+                    ok = ensure_comfy_checkpoint(canonical, state.central_url)
+                    logger.info("keep-warm star: comfy checkpoint for %s: %s",
+                                canonical, "ready" if ok else "NOT available")
+                    return
+            except Exception:  # noqa: BLE001 — fall through to the normal flow
+                pass
+            # RE-ENTRY doctrine (k35 eviction-re-entry-designated): "reload from
+            # disk, NEVER fetch." An evicted star must reload FROM DISK — it must
+            # not re-download (re-fetching an evicted model risks re-pulling the
+            # exact files a reap just removed — the 2026-07-17 ae pin-storm
+            # class). The disk/VRAM distinction is what separates the two cases,
+            # and ``model_is_local`` reads DISK PRESENCE ONLY (not VRAM
+            # residency):
+            #   * ``not _has`` (absent on disk) — a genuine FIRST ACTIVATION of a
+            #     not-yet-present star (the operator just starred it, this box
+            #     doesn't have it). Fetch it ONCE: that download fulfils the
+            #     deliberate star order, and it's ONE model (not the pin-storm's
+            #     many), so no storm risk.
+            #   * ``_has`` (present on disk, not resident) — the RE-WARM /
+            #     RE-ENTRY case. Eviction (_evict_model) frees VRAM/RAM only and
+            #     NEVER deletes disk files, so a warmed-then-evicted star stays
+            #     on disk → ``_has`` stays True → the fetch below is SKIPPED and
+            #     the warm mechanism reloads from disk. Exactly k35's "reload,
+            #     never fetch". (Only a REAP — a separate, guarded disk delete —
+            #     flips ``_has`` False, at which point re-warm correctly treats it
+            #     as a fresh first-activation, not an eviction re-entry.)
+            try:
+                _has = model_is_local(canonical)
+            except Exception:  # noqa: BLE001
+                _has = False
+            if not _has:
+                # Fetch fires ONLY here — genuine disk-absence = first activation.
+                # Never on re-warm-after-eviction (that path keeps _has True).
+                logger.info("keep-warm star: first-activation fetch of %s "
+                            "(absent on disk)…", canonical)
+                ensure_model_present(canonical, state.central_url, state=state,
+                                     purpose="demand")
+            # Warm it resident — the SAME mechanism the on-demand preload branch
+            # uses, WITHOUT the _residency 'static' gate. Slot boxes seat a GGUF
+            # via the slot filler; everything else warms in-process via runner_for.
+            _has_slots = False
+            try:
+                from ..managers.serve.slots import slots_enabled
+                _has_slots = slots_enabled()
+            except Exception:  # noqa: BLE001
+                pass
+            if _has_slots:
+                try:
+                    _fill_empty_slots(state)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("keep-warm star: slot fill for %s failed: %s",
+                                   canonical, exc)
+            if canonical not in _slot_occupants():
+                try:
+                    from abstract_hugpy_dev.managers.dispatch.dispatch import runner_for
+                    logger.info("keep-warm star: warming %s (on-demand, evictable)…",
+                                canonical)
+                    runner = runner_for(model_key=canonical)
+                    _ensure = getattr(runner, "ensure_loaded", None)
+                    if callable(_ensure):
+                        _ensure()
+                    logger.info("keep-warm star: warmed %s (resident, FIFO-evictable)",
+                                canonical)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("keep-warm star: warm of %s failed: %s", canonical, exc)
+        except BudgetRefusal as exc:
+            # Won't fit — a DECISION, not a crash. Log and continue.
+            logger.warning("keep-warm star %s REFUSED (won't fit): %s",
+                           model_key, exc.reason.get("reason"))
+        except Exception as exc:  # noqa: BLE001 — keep-warm must never crash the agent
+            logger.warning("keep-warm star %s failed: %s", model_key, exc)
+    finally:
+        # Clear the in-flight guard so a FUTURE beat (e.g. after an eviction) can
+        # re-warm the star — RULING 2. This is NOT a done-latch.
+        with _STAR_WARM_LOCK:
+            _STAR_WARMING.discard(model_key)
+
+
+def _adopt_boot_prewarm(state: "WorkerState", worker: "dict | None") -> None:
+    """Adopt central's per-worker KEEP-WARM STAR from a register/heartbeat reply
+    and keep it warm — RULING 2: load it IF NOT CURRENTLY LOADED, every beat.
+
+    Reconcile-kept (NOT boot-once): on EVERY reply carrying a star, if the star
+    is not currently resident (evicted, or never loaded), kick a load; if it is
+    already resident, no-op. So an eviction-under-pressure is repaired on the
+    next beat, and a loaded star costs nothing. Central omits the key when no
+    star is set, and an older/released central never sends it, so a reply without
+    ``boot_prewarm`` is the normal no-op. Fully guarded (mirrors
+    _adopt_blocked_models): a star adoption must NEVER fail a beat.
+
+    Loading runs on a daemon thread so a multi-GB pull never blocks the heartbeat
+    loop; the _STAR_WARMING in-flight guard stops a second thread racing the
+    first for the same star (it is NOT a permanent latch — it clears when the
+    thread finishes, so the next beat after an eviction can warm again)."""
+    star = (worker or {}).get("boot_prewarm")
+    if not star or not isinstance(star, str):
+        return
+    # Already resident? Keep-warm is a no-op (RULING 2: reload only when absent).
+    if _star_is_loaded(star):
+        return
+    with _STAR_WARM_LOCK:
+        if star in _STAR_WARMING:
+            return  # a warm thread for this star is already in flight this beat
+        _STAR_WARMING.add(star)
+    logger.info("keep-warm star %s not resident — warming (evictable, NOT static)",
+                star)
+    threading.Thread(target=_load_star_if_absent, args=(state, star),
+                     daemon=True).start()
+
+
 _COMFY_URL_BASE_ENV = "_HUGPY_COMFY_URL_BASE"  # sentinel: the pre-projection
 # COMFY_URL (systemd drop-in / env / none), captured once and carried across
 # os.execv so clearing the setting reverts to the real base, never the last
@@ -7041,6 +7236,13 @@ def _heartbeat_loop(client: CentralClient, state: WorkerState, args) -> None:
             # _adopt_blocked_models. Gates only this worker's own background
             # warm/load-ahead loops (slot fill, provisioning re-kick).
             _adopt_blocked_models(worker)
+            # Per-worker KEEP-WARM STAR (operator RULINGS 2026-07-23): if central
+            # named a star for this worker, keep it warm — load it IF NOT
+            # CURRENTLY LOADED (a normally-evictable on-demand resident, NOT
+            # static). Reconcile-kept, NOT boot-once: this runs every beat, so a
+            # star evicted under pressure is reloaded on the next beat; an
+            # already-loaded star is a no-op (idempotent).
+            _adopt_boot_prewarm(state, worker)
             # Keep the STORAGE budget's two central-owned inputs on state: the
             # disk allocation and the LRU clock the FIFO orders by. Both are
             # facts only central holds; the pull path reads them off state.
@@ -7100,6 +7302,11 @@ def _register(client: CentralClient, state: WorkerState, args) -> None:
     # for this worker_id from a previous session) and pre-provision them.
     _sync_assignment(state, worker)
     _apply_central_limits(worker)
+    # Per-worker KEEP-WARM STAR (operator RULINGS 2026-07-23): the register reply
+    # may already carry this worker's star — warm it at first contact if not
+    # already resident (a normally-evictable on-demand resident, NOT static). The
+    # heartbeat loop then keeps it warm every beat (reconcile-kept, not once).
+    _adopt_boot_prewarm(state, worker)
     logger.info("registered as worker id=%s serving models=%s", state.worker_id, worker.get("models"))
     # Converge to central's required package version before serving (restarts).
     _self_update_if_needed(worker.get("required_pkg_version"), args, state)

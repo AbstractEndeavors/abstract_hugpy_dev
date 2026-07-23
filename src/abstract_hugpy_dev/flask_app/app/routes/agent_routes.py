@@ -460,20 +460,27 @@ def install_link_create():
 
 
 def _install_public_base() -> str:
-    """Public base for building install URLs — same idiom as the video-share
-    ``_public_base``: an explicit ``HUGPY_PUBLIC_BASE`` wins; else reconstruct
-    from the forwarded proto/host. The public entry is the ``/api`` mount
-    (host front → :7001 → :7002), so ``/api`` is appended unless the base
-    already ends with it or the request itself arrived bare."""
+    """Public base for building install URLs. An explicit ``HUGPY_PUBLIC_BASE``
+    is AUTHORITATIVE (include the ``/api`` mount in it if the deployment has
+    one); else reconstruct from the forwarded proto/host and append ``/api``
+    UNCONDITIONALLY when the request arrived through a proxy (any
+    ``X-Forwarded-*`` present).
+
+    Why unconditional: the dev front's ``/api`` proxy STRIPS the prefix before
+    the request reaches Flask (same as prod nginx — the v1-gate landmine), so
+    ``request.path`` NEVER carries ``/api`` here and sniffing it is
+    structurally impossible. Every proxied entry to this app is the ``/api``
+    mount; only a direct-to-:7002 call (no forwarded headers) is bare.
+    First-mint 404 (operator, 2026-07-23) was this exact miss."""
     base = (os.getenv("HUGPY_PUBLIC_BASE") or "").strip().rstrip("/")
-    if not base:
-        proto = (request.headers.get("X-Forwarded-Proto") or request.scheme
-                 or "https").split(",")[0].strip()
-        host = (request.headers.get("X-Forwarded-Host") or request.host
-                or "").split(",")[0].strip()
-        base = f"{proto}://{host}".rstrip("/") if host else ""
-    if base and not base.endswith("/api") and (
-            request.path == "/api" or request.path.startswith("/api/")):
+    if base:
+        return base
+    fwd_proto = (request.headers.get("X-Forwarded-Proto") or "").strip()
+    fwd_host = (request.headers.get("X-Forwarded-Host") or "").strip()
+    proto = (fwd_proto or request.scheme or "https").split(",")[0].strip()
+    host = (fwd_host or request.host or "").split(",")[0].strip()
+    base = f"{proto}://{host}".rstrip("/") if host else ""
+    if base and (fwd_proto or fwd_host) and not base.endswith("/api"):
         base += "/api"
     return base
 
@@ -563,6 +570,14 @@ trap 'rm -f "$TMP"' EXIT
 if ! curl -fsSL "$PY_URL" -o "$TMP"; then
   echo "hugpy-agent installer: download failed — the link may be used up, expired, or revoked." >&2
   exit 1
+fi
+# Re-attach stdin to the terminal: under `curl … | bash` stdin is the curl
+# pipe, and a TUI launched downstream would enable mouse tracking while
+# reading a dead pipe — the terminal's mouse reports then spill into the
+# shell as ^[[<…M garbage (operator report 2026-07-23). The installer's
+# launcher also re-binds defensively; this is the belt to that suspender.
+if [ ! -t 0 ] && [ -r /dev/tty ]; then
+  exec "$PY" "$TMP" "$@" </dev/tty
 fi
 exec "$PY" "$TMP" "$@"
 """

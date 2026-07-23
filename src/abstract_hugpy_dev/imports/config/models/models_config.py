@@ -16,6 +16,16 @@ refresh_registry() explicitly — e.g. on hugpy module startup.
 
 from .imports import *
 
+# EMFILE burst hardening (incident 2026-07-23): media_models.json lives on the
+# virtiofs mount; the restart-open burst threw EMFILE here (logged via
+# safe_read_from_json). Retry the store-read past the transient. Best-effort
+# import so a packaging skew can never break config loading.
+try:
+    from abstract_hugpy_dev.comms.shared import retry_on_emfile
+except Exception:  # pragma: no cover - degrade to un-retried read on import skew
+    def retry_on_emfile(fn, **_kw):  # type: ignore[misc]
+        return fn()
+
 logger = get_logFile(__name__)
 
 
@@ -537,7 +547,7 @@ def _load_media():
     p = _media_path()
     enabled, disabled = set(), set()
     if os.path.isfile(p):
-        data = safe_load_from_json(p)
+        data = retry_on_emfile(lambda: safe_load_from_json(p))
         if isinstance(data, dict):
             enabled = set(data.get("enabled") or [])
             disabled = set(data.get("disabled") or [])
@@ -629,6 +639,100 @@ def set_media_default(model_key, enabled):
         "model_key": model_key,
         "media_default": new_default == model_key,
         "default": new_default,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Per-worker KEEP-WARM STAR (boot_prewarm) — the ONE model a given worker keeps
+# warm. Mirrors the media_default store above (same mechanism: a plain JSON file
+# next to the discovery report), but is a DIFFERENT thing and MUST NOT be
+# conflated with it — and is DIFFERENT from 🔒static too. The three levers:
+#
+#   * media_default (the /media star) = "first in the list + default-selected"
+#     — a routing/UI PREFERENCE only. It does NOT load anything.
+#   * ⭐ boot_prewarm (this per-worker star) = the operator's KEEP-WARM
+#     designation: reconcile keeps it warm every beat, so a star evicted under
+#     pressure returns next cycle. Evictable, NOT eviction-protected.
+#   * 🔒 static = warm AND eviction-protected (a different, heavier tier).
+#   * 📌 pin = routing persistence only, never warms.
+#
+# Scoped PER WORKER and many-valued: one star per worker id, keyed worker_id ->
+# model_key. Shape on disk: {"prewarm": {"<worker_id>": "<model_key>", ...}}.
+#
+# SEMANTICS (operator RULINGS 2026-07-23):
+#   RULING 1 — "the star is the ONLY warm source. nothing warms until starred
+#               (or static)."
+#   RULING 2 — "star = reconcile-kept-warm" (NOT boot-once): a starred model
+#               evicted under load COMES BACK on the next reconcile beat. The
+#               star IS the keep-warm designation.
+# So the star is loaded once and then RECONCILE keeps it warm every beat — if a
+# busy box evicts it, the next reconcile beat reloads it. It is a NORMALLY
+# EVICTABLE (FIFO) on-demand resident: NOT eviction-protected (it just doesn't
+# STAY cold). This is NOT the static tier (which IS eviction-protected +
+# operator-doctrine); do NOT conflate. For "start here AND stay here" with
+# eviction protection, the operator promotes the model to 🔒static themselves.
+# The identifier stays ``boot_prewarm``/``prewarm`` (rename churn isn't worth it)
+# but the meaning is keep-warm, not boot-once.
+#
+# Kept in its OWN file (worker_boot_prewarm.json) so the whole-file rewrites of
+# the other stores (_save_media / _save_media_default) never clobber it.
+def _worker_boot_prewarm_path():
+    return os.path.join(os.path.dirname(MODELS_DISCOVERY_PATH), "worker_boot_prewarm.json")
+
+
+def worker_boot_prewarm_state():
+    """The current per-worker keep-warm star map: {worker_id: model_key}.
+    Empty dict when unset/cleared. Tolerates a legacy/bare shape (a top-level
+    {wid: key} dict written without the wrapper)."""
+    p = _worker_boot_prewarm_path()
+    if os.path.isfile(p):
+        data = safe_load_from_json(p)
+        if isinstance(data, dict):
+            prewarm = data.get("prewarm")
+            if isinstance(prewarm, dict):
+                return {str(k): v for k, v in prewarm.items() if v}
+            # tolerate a bare {wid: key} map written without the wrapper
+            if "prewarm" not in data:
+                return {str(k): v for k, v in data.items() if v}
+    return {}
+
+
+def set_worker_boot_prewarm(worker_id, model_key, enabled):
+    """Set or clear a worker's single KEEP-WARM STAR (one-star-per-worker).
+
+    enabled True  -> make ``model_key`` this worker's keep-warm star,
+                     REPLACING any previous star for that worker.
+    enabled False -> clear this worker's star IFF ``model_key`` is the worker's
+                     current star (clearing a non-current key is a no-op, so a
+                     stale clear never disturbs the standing star). Passing
+                     model_key=None with enabled False clears unconditionally.
+
+    NOTE: the star = the operator's keep-warm designation (operator RULINGS
+    2026-07-23; NOT the media_default preference, NOT the 🔒static tier) —
+    reconcile keeps it warm every beat, so a star evicted under pressure returns
+    next cycle. It does NOT mark the model static, does NOT protect it from
+    eviction (evictable, but returns next reconcile beat), and does NOT require
+    the model to be present/allocated. Returns the resulting state for that
+    worker."""
+    enabled = bool(enabled)
+    worker_id = str(worker_id)
+    state = worker_boot_prewarm_state()
+    current = state.get(worker_id)
+    if enabled:
+        state[worker_id] = model_key
+        new_star = model_key
+    else:
+        if model_key is None or current == model_key:
+            state.pop(worker_id, None)
+            new_star = None
+        else:
+            new_star = current
+    safe_dump_to_file(data={"prewarm": state}, file_path=_worker_boot_prewarm_path())
+    return {
+        "worker_id": worker_id,
+        "model_key": model_key,
+        "boot_prewarm": new_star,
+        "starred": new_star is not None,
     }
 
 

@@ -167,35 +167,39 @@ def test_empty_cold_list_is_a_noop():
 
 
 # --------------------------------------------------------------------------- #
-# curated keep-warm set: warm the designated subset, NOT the whole inventory
-# (operator, 2026-07-15: "defaults immutable, others customizable, lazy-load
-#  the rest"). _reconcile_warm_set = (immutable defaults ∪ pins ∪ static ∪
-#  warm_whitelist) ∩ on-disk. Everything else lazy-loads.
+# curated keep-warm set: warm ONLY the ⭐ star ∪ 🔒static, NOT the inventory and
+# NOT the fleet TASK_DEFAULTS (operator RULINGS 2026-07-23, SUPERSEDING the
+# 2026-07-15 "immutable defaults floor"):
+#   RULING 1 — "the star is the ONLY warm source. nothing warms until starred
+#               (or static)."
+#   RULING 2 — "star = reconcile-kept-warm": reconcile keeps the star warm every
+#               beat, so an evicted star returns next cycle.
+# _reconcile_warm_set = (⭐ star ∪ 🔒static) ∩ models_local − blocked. Task
+# defaults, 📌 pins, and warm_whitelist are ALL excluded now and lazy-load.
 # --------------------------------------------------------------------------- #
-class _patched_defaults:
-    """Pin wr._immutable_warm_defaults() to a known set; restore on exit.
+class _patched_star:
+    """Pin wr.worker_boot_prewarm_state() to a known {worker_id: model_key} map;
+    restore on exit. The star is the operator's per-worker keep-warm pick — this
+    injects it without touching the on-disk star store."""
 
-    Sets the module cache directly so the real TASK_DEFAULTS import is bypassed
-    (the test asserts the *selection logic*, not the fleet's actual defaults)."""
-
-    def __init__(self, keys):
-        self.keys = frozenset(keys)
+    def __init__(self, star_map):
+        self.star_map = dict(star_map or {})
         self.orig = None
 
     def __enter__(self):
-        self.orig = wr._IMMUTABLE_WARM_DEFAULTS
-        wr._IMMUTABLE_WARM_DEFAULTS = self.keys
+        self.orig = wr.worker_boot_prewarm_state
+        wr.worker_boot_prewarm_state = lambda: dict(self.star_map)
         return self
 
     def __exit__(self, *exc):
-        wr._IMMUTABLE_WARM_DEFAULTS = self.orig
+        wr.worker_boot_prewarm_state = self.orig
 
 
-# an ae-like box: a big on-disk set, a couple defaults on disk, a few pins.
-# NB the warm set reads ``models_local`` (heartbeat DISK TRUTH, UTIL-08) — the
-# ``models`` key is the operator DESIGNATION set and must never feed warming.
+# an ae-like box: a big on-disk set, a couple (would-be) defaults on disk, a few
+# pins. NB the warm set reads ``models_local`` (heartbeat DISK TRUTH, UTIL-08) —
+# the ``models`` key is the operator DESIGNATION set and must never feed warming.
 _INV = ["junk-%d" % i for i in range(40)]
-_ON_DISK = ["def-chat", "def-vl"] + _INV + ["pin-x", "pin-off"]
+_ON_DISK = ["def-chat", "def-vl"] + _INV + ["pin-x", "pin-off", "the-star"]
 INV_WORKER = {
     "id": "wbig", "name": "aebox",
     "models": _ON_DISK,
@@ -204,44 +208,55 @@ INV_WORKER = {
 }
 
 
-def test_curated_set_is_defaults_only_pins_excluded():
-    # 📌 pins are NOT warmed (operator ruling 2026-07-17: pin has no bearing on
-    # the pull; warming an absent pin CAUSES a pull — the ae evict→re-pull
-    # thrash). Only present defaults warm; the pinned-true entry stays lazy.
-    with _patched_defaults({"def-chat", "def-vl", "def-not-on-disk"}):
+def test_curated_set_is_star_only_defaults_and_pins_excluded():
+    # RULING 1: task-defaults NO LONGER warm (sd-turbo et al. lazy-load), 📌 pins
+    # never warmed. ONLY the ⭐ star (present on disk) warms.
+    with _patched_star({"wbig": "the-star"}):
         warm = wr._reconcile_warm_set(INV_WORKER)
-    assert warm == ["def-chat", "def-vl"], warm
-    assert "pin-x" not in warm
+    assert warm == ["the-star"], warm
+    assert "def-chat" not in warm and "def-vl" not in warm   # defaults excluded now
+    assert "pin-x" not in warm                               # pins never warm
 
 
-def test_curated_set_drops_the_whole_inventory():
-    with _patched_defaults({"def-chat", "def-vl"}):
-        warm = set(wr._reconcile_warm_set(INV_WORKER))
-    assert not (warm & set(_INV)), warm            # zero junk warmed
-    assert len(warm) <= 3, warm                    # only the curated handful
-
-
-def test_curated_set_honors_absent_default_is_not_invented():
-    # A fleet default the box does NOT have on disk is never warmed (you can't
-    # keep warm what isn't there) — guards against warming a missing model_key.
-    w = {"id": "w", "models": ["only-this"], "models_local": ["only-this"],
-         "config": {}}
-    with _patched_defaults({"some-default", "another"}):
+def test_curated_set_unstarred_non_static_model_is_not_warmed():
+    # The direct sd-turbo case: a former task-default that is NOT this worker's
+    # star and NOT static must NOT be in the warm set (RULING 1).
+    w = {"id": "w", "models": ["sd-turbo", "other"],
+         "models_local": ["sd-turbo", "other"], "config": {}}
+    with _patched_star({}):   # no star for this worker
         assert wr._reconcile_warm_set(w) == []
 
 
-def test_curated_set_forward_compat_warm_whitelist_and_static():
-    # config schema has neither today; honor them if a future writer sets them.
+def test_curated_set_drops_the_whole_inventory():
+    with _patched_star({"wbig": "the-star"}):
+        warm = set(wr._reconcile_warm_set(INV_WORKER))
+    assert not (warm & set(_INV)), warm            # zero junk warmed
+    assert warm == {"the-star"}, warm              # only the star
+
+
+def test_curated_set_star_must_be_on_disk():
+    # A star the box does NOT have on disk is never warmed by reconcile (you
+    # can't keep warm what isn't there — the worker-side keep-warm loader is what
+    # pulls-then-warms an absent star; reconcile only warms present members).
+    w = {"id": "w", "models": ["only-this"], "models_local": ["only-this"],
+         "config": {}}
+    with _patched_star({"w": "not-on-disk"}):
+        assert wr._reconcile_warm_set(w) == []
+
+
+def test_curated_set_star_union_static():
+    # ⭐ star ∪ 🔒static both warm; 📌 pin, on_demand, and everything else lazy.
     w = {"id": "w", "models": ["a", "b", "c", "d"],
          "models_local": ["a", "b", "c", "d"],
-         "config": {"warm_whitelist": ["a"], "residency": {"b": "static", "c": "on_demand"}}}
-    with _patched_defaults(set()):
+         "config": {"warm_whitelist": ["c"],   # whitelist NO LONGER warms (RULING 1)
+                    "residency": {"b": "static", "d": "on_demand"}}}
+    with _patched_star({"w": "a"}):
         warm = wr._reconcile_warm_set(w)
-    assert warm == ["a", "b"], warm                # whitelist:a + static:b; c/d lazy
+    assert warm == ["a", "b"], warm             # star:a + static:b; c(whitelist)/d lazy
 
 
 def test_curated_set_empty_models_is_noop():
-    with _patched_defaults({"def-chat"}):
+    with _patched_star({"w": "def-chat"}):
         assert wr._reconcile_warm_set({"id": "w", "models": [], "config": {}}) == []
         assert wr._reconcile_warm_set({"id": "w"}) == []
 

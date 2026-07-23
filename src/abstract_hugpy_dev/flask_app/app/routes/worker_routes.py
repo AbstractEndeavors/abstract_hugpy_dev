@@ -48,6 +48,18 @@ from ..functions.imports.utils.enrollment_tokens import (
     create_enrollment_token, verify_enrollment_token,
     revoke_enrollment_token, list_enrollment_tokens,
 )
+# Per-worker KEEP-WARM STAR (boot_prewarm) — the operator's keep-warm
+# designation (operator RULINGS 2026-07-23): reconcile keeps it warm every beat,
+# so a star evicted under pressure returns next cycle. "nothing warms until
+# starred or static." DISTINCT from media_default (a UI/routing preference that
+# loads nothing) and from 🔒static (which is eviction-protected). The identifier
+# stays ``boot_prewarm`` but the meaning is keep-warm, not boot-once. Persisted
+# server-side (worker_boot_prewarm.json) beside the media stores; surfaced on the
+# worker record and carried to the worker on the heartbeat reply (omit-when-unset,
+# so an older worker just ignores it).
+from ....imports.config.models.models_config import (
+    worker_boot_prewarm_state, set_worker_boot_prewarm,
+)
 
 worker_bp, logger = get_bp("worker_bp", __name__)
 
@@ -207,34 +219,44 @@ def _warmable_subset(worker, cold: list) -> list:
     return unsizable + capped
 
 
-# ── curated keep-warm set: immutable defaults + operator's picks ─────────────
-# Reconcile used to treat *every* model in ``worker["models"]`` as something to
-# keep warm. But ``models`` is the box's whole reported/accumulated inventory
-# (ae carries 104), most of it non-GGUF and unsizable — so even with the fit
-# prefilter above, reconcile would still load-probe the ~dozens of unsizable
-# ones each cooldown. The operator's fix (2026-07-15): reconcile should warm a
-# CURATED set, not the inventory —
-#   * IMMUTABLE DEFAULTS — the fleet's default model per task (TASK_DEFAULTS:
-#     chat, VL, ASR, embed, summarize, depth, detect, classify, segment,
-#     text-to-image). Whichever a box has ON DISK is kept warm so the default
-#     task paths never cold-start ("defaults are promises"). Not operator-
-#     removable — that's what "immutable" means.
-#   * CUSTOMIZABLE — the operator's explicit picks on top: pinned models (the
-#     live keep-resident lever) plus, forward-compat, a ``residency: static``
-#     map or an explicit ``config["warm_whitelist"]`` if either is ever set.
-# Everything else on disk lazy-loads on first real request (already works).
-# This is the analog of the pin-declutter: stop warming the accumulated union,
-# warm only what's designated. Pure central-side — no worker release.
+# ── curated keep-warm set: the star + static, nothing else ───────────────────
+# Operator rulings 2026-07-23 (SUPERSEDES the 2026-07-15 "immutable task-default
+# floor" below):
+#   RULING 1 — "the star is the ONLY warm source. nothing warms until starred
+#               (or static)."
+#   RULING 2 — "star = reconcile-kept-warm": a starred model evicted under load
+#               COMES BACK on the next reconcile beat. The ⭐ star IS the
+#               keep-warm designation.
+#
+# So the keep-warm set is exactly the two tiers that PROMISE presence:
+#   * ⭐ star (boot_prewarm) — the operator's per-worker keep-warm pick. Reconcile
+#     re-warms it every beat, so an eviction-under-pressure returns next cycle.
+#     Evictable (NOT eviction-protected — that's static's job); it just doesn't
+#     STAY cold.
+#   * 🔒 static — warm AND eviction-protected (unchanged).
+# Everything else — the fleet TASK_DEFAULTS (sd-turbo et al.), 📌 pins, and the
+# whole ``models`` inventory — is NO LONGER kept warm and lazy-loads on first
+# real request. This is what stops sd-turbo (and every task-default) from
+# auto-warming: a task default is a ROUTING fallback (model_resolver.TASK_DEFAULTS
+# still resolves "task named alone → default model"), never a warm designation.
+# Pure central-side — no worker release.
+#
+# NOTE: ``_immutable_warm_defaults`` / ``_IMMUTABLE_WARM_DEFAULTS`` below are now
+# UNUSED by the warm set (dropped from _reconcile_warm_set per RULING 1). Left in
+# place — harmless and cheap — rather than churn; TASK_DEFAULTS itself is
+# untouched and still drives routing (model_resolver.py) and the /prompt defaults
+# feed (prompt_routes.py). If a future cleanup wants them gone, this pair (and
+# only this pair) is safe to delete.
 _IMMUTABLE_WARM_DEFAULTS: frozenset | None = None
 
 
 def _immutable_warm_defaults() -> frozenset:
-    """Fleet default model_keys (one per task) — the immutable keep-warm floor.
+    """Fleet default model_keys (one per task), sourced from ``TASK_DEFAULTS``.
 
-    Sourced from ``TASK_DEFAULTS`` (the same table dispatch falls back to when a
-    caller names only a task). Guarded so a refactor of the constant's home can
-    never break heartbeat reconcile — a miss degrades to "warm only the
-    operator's pins", never to an exception on the hot path.
+    ⚠ NO LONGER part of the keep-warm set (operator RULING 1, 2026-07-23: only
+    the ⭐ star and 🔒static warm). Retained as a harmless helper; TASK_DEFAULTS
+    stays the ROUTING fallback table (model_resolver.py). Guarded so a refactor
+    of the constant's home can never raise on any caller.
     """
     global _IMMUTABLE_WARM_DEFAULTS
     if _IMMUTABLE_WARM_DEFAULTS is None:
@@ -243,9 +265,7 @@ def _immutable_warm_defaults() -> frozenset:
                 TASK_DEFAULTS as _TASK_DEFAULTS)
             _IMMUTABLE_WARM_DEFAULTS = frozenset(
                 str(v) for v in _TASK_DEFAULTS.values() if v)
-        except Exception:  # noqa: BLE001 — never fail reconcile over a default lookup
-            logger.warning("reconcile: could not load TASK_DEFAULTS for the "
-                           "immutable warm floor; warming pins only")
+        except Exception:  # noqa: BLE001 — never fail over a default lookup
             _IMMUTABLE_WARM_DEFAULTS = frozenset()
     return _IMMUTABLE_WARM_DEFAULTS
 
@@ -253,44 +273,49 @@ def _immutable_warm_defaults() -> frozenset:
 def _reconcile_warm_set(worker) -> list:
     """The curated set of a worker's on-disk models to keep warm on reconcile.
 
-    = (immutable task-defaults ∪ pinned ∪ ``static`` residency ∪ explicit
-    ``warm_whitelist``) ∩ what the box actually has on disk. NOT the full
-    ``models`` inventory — everything outside this set lazy-loads on demand.
-    The result still passes through ``_warmable_subset`` (fit-cap) before any
-    real load, so this only ever *narrows* what reconcile touches.
+    = (⭐ star ∪ 🔒static) ∩ on-disk − blocked (operator RULINGS 2026-07-23).
+    NOTHING warms until starred or static: the fleet TASK_DEFAULTS, 📌 pins, and
+    the whole ``models`` inventory are all excluded and lazy-load on demand. The
+    result still passes through ``_warmable_subset`` (fit-cap) before any real
+    load, so this only ever *narrows* what reconcile touches.
 
-    ⚠ "on disk" = ``models_local`` (the worker's heartbeat disk-truth,
-    UTIL-08), NEVER ``worker["models"]`` — that is the operator DESIGNATION
-    set (see allocated_totals). Reading designations here made the ∩ a no-op,
-    so every unloaded pin probed "cold", and the worker's /probe downloads
-    absent models (ensure_model_present) — central itself re-created the
-    eager pull storm through the probe side door, 600s at a time, surviving
-    worker restarts (2026-07-17: ae ground toward its full 1.2TB attribution
-    at ~5GB/min until this line). A worker that reports no models_local warms
-    NOTHING — a missed warm costs one first-call load; the designation
-    fallback costs a terabyte.
+      * ⭐ star (boot_prewarm) — RULING 2 makes the star reconcile-KEPT: because
+        reconcile re-computes this set every beat and re-warms any cold member,
+        a starred model evicted under pressure is reloaded on the next beat (it
+        is evictable but does not STAY cold). The star IS the keep-warm
+        designation.
+      * 🔒 static — the one eviction-protected local-presence tier (unchanged).
+
+    ⚠ "on disk" = ``models_local`` (the worker's heartbeat disk-truth, UTIL-08),
+    NEVER ``worker["models"]`` — that is the operator DESIGNATION set. Reading
+    designations here made the ∩ a no-op, so every unloaded designation probed
+    "cold" and the worker's /probe downloads absent models — central re-creating
+    the eager-pull storm through the probe side door (2026-07-17: ae ground
+    toward its full 1.2TB at ~5GB/min until this was fixed). A worker that
+    reports no models_local warms NOTHING — a missed warm costs one first-call
+    load; the designation fallback costs a terabyte.
     """
     present = set(worker.get("models_local") or [])
     if not present:
         return []
     cfg = worker.get("config") or {}
-    # 📌 PIN IS NOT IN THE WARM SET (operator ruling 2026-07-17: "the pins only
-    # should designate that the model allocation survives restarts... neither
-    # [pin nor allocation] should have any bearing on the pull"). Warming a
-    # pinned model CAUSES a pull when its files are absent (warm → load →
-    # ensure_model_present → download), so pins-in-the-warm-set made pin bear
-    # on the pull — and, after an eviction, re-pulled the exact files the reap
-    # had just removed within the post-delete heartbeat-lag window (ae,
-    # 2026-07-17: the approved sweep freed 199G and reconcile re-downloaded
-    # ~91G of it minutes later). Only the tiers that PROMISE presence warm:
-    # the immutable task defaults ("defaults are promises") and 🔒static (the
-    # one durable local-presence tier), plus an explicit warm_whitelist.
+    # ⭐ STAR — this worker's per-worker keep-warm pick (a single model_key or
+    # none). RULING 1: the star is the ONLY operator-set warm source; RULING 2:
+    # reconcile keeps it warm every beat (evicted-under-load returns next cycle).
+    # Guarded — the star lookup must never break the heartbeat's reconcile hook.
+    try:
+        star = worker_boot_prewarm_state().get(worker.get("id"))
+    except Exception:  # noqa: BLE001 — a star-store miss degrades to "static only"
+        star = None
+    starred = {star} if star else set()
+    # 🔒 STATIC — warm AND eviction-protected (unchanged). The other tier that
+    # promises local presence. 📌 pins and the fleet TASK_DEFAULTS are NOT here
+    # (RULING 1): a pin is routing persistence only, a task-default is a routing
+    # fallback (model_resolver.TASK_DEFAULTS) — neither warms.
     static = {k for k, v in (cfg.get("residency") or {}).items() if v == "static"}
-    whitelist = set(cfg.get("warm_whitelist") or [])
-    curated = (_immutable_warm_defaults() | static | whitelist) & present
+    curated = (starred | static) & present
     # Operator BLOCK outranks warm: a blocked model is never kept warm, even if
-    # it is an immutable task-default / static / whitelisted. Intersect the
-    # curated set with not-blocked (the ∩ enforcement #3 asks for).
+    # it is the star or static. Intersect the curated set with not-blocked.
     curated -= _blocked_keys()
     return sorted(curated)
 
@@ -586,10 +611,19 @@ def workers_list():
     carries version_ok against central's required_pkg_version."""
     required = required_pkg_version()
     rows = list_workers()
+    # Per-worker KEEP-WARM STAR: the model this worker keeps warm (reconcile-kept
+    # every beat; evictable but returns next cycle; NOT static). Surfaced as
+    # ``boot_prewarm: <model_key>|null`` so the console can render the star. Read
+    # once for the whole list (never 5xxes the roster over it).
+    try:
+        _stars = worker_boot_prewarm_state()
+    except Exception:  # noqa: BLE001 — the star map must never break /llm/workers
+        _stars = {}
     for w in rows:
         w["required_pkg_version"] = required
         w["version_ok"] = (required is None
                            or w.get("pkg_version") == required)
+        w["boot_prewarm"] = _stars.get(w.get("id")) or None
     # Call-time attribution (2026-07-14): stamp each worker's pid_registry
     # unattributed entries that are a RELAY-dispatched foreign GPU service
     # (identity-render) with the identity slug + job_id of the active
@@ -756,6 +790,18 @@ def workers_register():
         abort(403, description="Worker is blocked by the operator.")
     # Tell the agent which package version to converge to (self-update handshake).
     worker["required_pkg_version"] = required_pkg_version()
+    # Per-worker KEEP-WARM STAR (operator RULINGS 2026-07-23): carry this
+    # worker's star from FIRST contact so the agent can warm it immediately
+    # (thereafter the heartbeat keeps it warm every beat). Additive/omit-when-
+    # unset (a released worker without the feature just ignores the extra key),
+    # and this is the register reply (never persisted onto the stored record via
+    # a mutation). Fully guarded — registration must never 5xx over the star store.
+    try:
+        _star = worker_boot_prewarm_state().get(worker.get("id"))
+        if _star:
+            worker["boot_prewarm"] = _star
+    except Exception:  # noqa: BLE001 — star lookup must never break registration
+        logger.debug("boot-prewarm register hook failed", exc_info=True)
     return jsonify(worker)
 
 
@@ -764,7 +810,53 @@ def workers_get(worker_id):
     worker = get_worker(worker_id)
     if worker is None:
         abort(404, description="Unknown worker id.")
+    # Surface the boot-prewarm star here too (mirrors workers_list).
+    try:
+        worker["boot_prewarm"] = worker_boot_prewarm_state().get(worker_id) or None
+    except Exception:  # noqa: BLE001 — never 5xx a worker read over the star store
+        worker["boot_prewarm"] = None
     return jsonify(worker)
+
+
+@worker_bp.route("/llm/workers/boot-prewarm", methods=["GET"])
+def worker_boot_prewarm_list():
+    """The full per-worker KEEP-WARM STAR map: {worker_id: model_key}.
+
+    The ⭐ star = the operator's keep-warm designation (operator RULINGS
+    2026-07-23) — reconcile keeps it warm every beat, so a star evicted under
+    pressure returns next cycle. It is a NORMALLY EVICTABLE resident, NOT
+    eviction-protected (that's 🔒static), and NOT the media_default UI
+    preference. "nothing warms until starred or static." Read-only; unauthed by
+    design (same tier as the /llm/workers roster it mirrors). (The path/field
+    keep the ``boot-prewarm``/``boot_prewarm`` identifier — rename churn isn't
+    worth it — but the meaning is keep-warm, not boot-once.)"""
+    return jsonify(worker_boot_prewarm_state())
+
+
+@worker_bp.route("/llm/workers/<worker_id>/boot-prewarm", methods=["POST"])
+def set_worker_boot_prewarm_route(worker_id):
+    """Set (or clear) this worker's ⭐ KEEP-WARM STAR — the ONE model this worker
+    keeps warm.
+
+    Body: {"model_key": "<key>", "enabled": bool}. enabled=True (default) makes
+    ``model_key`` this worker's star, REPLACING any previous one. enabled=False
+    clears it (only if ``model_key`` matches the current star, or if model_key is
+    omitted/null — an unconditional clear). Single value per worker, persisted
+    server-side (worker_boot_prewarm.json) so every client agrees.
+
+    Operator-gated (operator_auth._SENSITIVE). The star = the operator's
+    keep-warm designation (operator RULINGS 2026-07-23): reconcile keeps it warm
+    EVERY beat, so a star evicted under pressure returns next cycle. It is NOT
+    the media_default UI preference and NOT 🔒static — it does NOT mark the model
+    static, does NOT protect it from eviction (evictable under pressure, but it
+    returns next reconcile beat), and does NOT require the model to be
+    present/allocated. "nothing warms until starred or static." For "start here
+    AND stay here" with eviction protection, promote the model to 🔒static
+    instead — that tier is what protects residency."""
+    body = request.get_json(silent=True) or {}
+    model_key = body.get("model_key", body.get("model"))
+    enabled = body.get("enabled", body.get("starred", True))
+    return jsonify(set_worker_boot_prewarm(worker_id, model_key, enabled))
 
 
 @worker_bp.route("/llm/workers/<worker_id>/health", methods=["GET"])
@@ -930,6 +1022,21 @@ def workers_heartbeat(worker_id):
             reply_extra["blocked_models"] = blocked
     except Exception:  # noqa: BLE001 — block propagation is best-effort; never 5xx a beat
         logger.debug("blocklist heartbeat hook failed", exc_info=True)
+    # Per-worker KEEP-WARM STAR ("star", operator RULINGS 2026-07-23): publish
+    # THIS worker's star on the reply (additive, OMIT-WHEN-UNSET — same wire idiom
+    # as calibration/reservations/blocked_models: a plain scalar the worker reads
+    # with .get(), an older released worker just ignores it, so the extra=forbid
+    # relay schema is never broken). The worker KEEPS IT WARM: on every beat it
+    # loads the star if not currently resident (a NORMALLY EVICTABLE on-demand
+    # resident, NOT static, NOT the media_default UI preference), so an eviction
+    # under pressure is repaired next beat. Only sent when a star is set for this
+    # worker. Fully guarded — never fails a beat.
+    try:
+        star = worker_boot_prewarm_state().get(worker_id)
+        if star:
+            reply_extra["boot_prewarm"] = star
+    except Exception:  # noqa: BLE001 — star propagation is best-effort; never 5xx a beat
+        logger.debug("boot-prewarm heartbeat hook failed", exc_info=True)
     # Sent on a COPY so the ephemeral corrections/reservations/blocked set never
     # persist onto the stored worker record (they must not ride the relay wire
     # built from it).
