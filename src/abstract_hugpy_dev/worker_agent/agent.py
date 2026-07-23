@@ -3309,6 +3309,28 @@ def build_app(state: "WorkerState") -> Flask:
                             "vram_freed": None, "ram_freed": None,
                             "reason": f"{type(exc).__name__}: {exc}"})
 
+    @app.route("/ops/reap-orphans", methods=["POST"])
+    def ops_reap_orphans():
+        # p27: kill ORPHANED GPU children this worker itself leaked (own-venv
+        # llama-server whose slot claim cleared but whose process kept VRAM —
+        # enumerable since c34199e as cuda_context/model_key-None rows, but
+        # unevictable because every eviction verb keys on model_key). Central
+        # relays this through its operator gate + audit log like every /ops/*;
+        # the worker trusts central's relay (same idiom as /ops/pip).
+        # Body: {"dry_run"?: bool} — DEFAULTS TO TRUE when absent (preview).
+        # OPERATOR/CENTRAL-INVOKED ONLY — never wired to a loop/heartbeat
+        # (doctrine, see _reap_gpu_orphans). Never 500s the control plane.
+        body = request.get_json(silent=True) or {}
+        dry_run = True if "dry_run" not in body else bool(body.get("dry_run"))
+        try:
+            return jsonify({"ok": True,
+                            **_reap_gpu_orphans(state, dry_run=dry_run)})
+        except Exception as exc:  # noqa: BLE001 — reap must never 500 the control plane
+            return jsonify({"ok": False, "dry_run": dry_run, "results": [],
+                            "reaped_count": 0, "term_failed_count": 0,
+                            "skipped_count": 0, "reapable_vram_bytes": 0,
+                            "error": f"{type(exc).__name__}: {exc}"})
+
     @app.route("/slots/<slot_id>/relaunch", methods=["POST"])
     def slot_relaunch(slot_id):
         # k14: relaunch ONE of this worker's slot children with a new offload depth
@@ -5187,6 +5209,294 @@ def _evict_model(state: "WorkerState", model_key: str,
     #    is OUT OF SCOPE for this slice — we never os.kill an arbitrary PID, so
     #    such a model simply reads as not-resident here. Idempotent no-op, HTTP 200.
     return _result("none", False, "not resident on this worker")
+
+
+# ── GPU orphan reaper (p27, 2026-07-23) ─────────────────────────────────────
+# THE k30 GAP this closes: an orphaned llama-server child — its slot claim
+# cleared (slot swapped/respawned) but the child never exited — keeps holding
+# VRAM. Since c34199e it is ENUMERABLE (the reconcile second pass tags it
+# ``cuda_context`` with model_key None) but UNEVICTABLE: every eviction verb
+# keys on model_key, and an orphan has none. This verb kills by PID — the ONLY
+# place in the agent that does — so its admission gates are deliberately
+# fail-closed and narrow.
+
+# Minimum process age before a pid may be reaped. Closes the mid-spawn race: a
+# fresh slot child exists (and holds VRAM) for a beat BEFORE its slot claim
+# registers — without this grace a reap racing a spawn would kill a legitimate
+# newborn. Read defensively so a malformed env value can never break import.
+try:
+    _ORPHAN_MIN_AGE_S = max(
+        0.0, float(os.environ.get("HUGPY_ORPHAN_MIN_AGE_S", "300") or "300"))
+except (TypeError, ValueError):
+    _ORPHAN_MIN_AGE_S = 300.0
+
+# How long a SIGTERM'd orphan gets to exit before SIGKILL — same discipline as
+# the slot supervisor's own child kill (terminate -> wait -> kill).
+_ORPHAN_TERM_WAIT_S = 10.0
+
+
+def _clock_ticks_per_s() -> float:
+    """Kernel clock ticks per second (for /proc starttime -> seconds). 100 on
+    every mainstream Linux; read via os.sysconf when available."""
+    try:
+        return float(os.sysconf("SC_CLK_TCK")) or 100.0
+    except (AttributeError, ValueError, OSError):
+        return 100.0
+
+
+def _proc_age_s(pid: int) -> "float | None":
+    """Age of process ``pid`` in seconds, or None when it cannot be measured
+    (gone / non-Linux / unreadable) — callers treat None as UNVERIFIABLE and
+    fail closed. Primary source: /proc/<pid>/stat starttime (ticks since boot)
+    against /proc/uptime — the same per-lifetime anchor the recycled-PID guard
+    uses, so age and identity come from one number. Fallback: mtime of the
+    /proc/<pid> directory (set at process creation)."""
+    try:
+        from .pid_registry import _default_proc_info
+        info = _default_proc_info(int(pid))
+    except Exception:  # noqa: BLE001 — probe failure = unverifiable
+        info = None
+    if info is not None and info.get("starttime") is not None:
+        try:
+            with open("/proc/uptime", "r") as fh:
+                uptime_s = float(fh.read().split()[0])
+            started_s = float(info["starttime"]) / _clock_ticks_per_s()
+            age = uptime_s - started_s
+            if age >= 0:
+                return age
+        except (OSError, ValueError, IndexError):
+            pass
+    try:
+        st = os.stat("/proc/%d" % int(pid))
+        age = time.time() - st.st_mtime
+        return age if age >= 0 else None
+    except (OSError, ValueError):
+        return None
+
+
+def _reap_own_pids() -> set:
+    """The agent's own pid + its direct infra children (slot SUPERVISORS it
+    spawned) — never reap targets, by construction."""
+    own = {os.getpid()}
+    try:
+        for p in list(_SLOT_PROCS.values()):
+            if p is not None and p.poll() is None and p.pid:
+                own.add(int(p.pid))
+    except Exception:  # noqa: BLE001 — best-effort; os.getpid() always guards
+        pass
+    return own
+
+
+def _self_venv_marker() -> "str | None":
+    """The SAME own-venv marker the heartbeat passes pid_registry.reconcile
+    (this python's venv root, e.g. ``/opt/hugpy/venv``): a GPU process whose
+    name/cmdline contains it runs OUR interpreter/binaries. None when it cannot
+    be derived — callers fail closed (nothing is reapable without it)."""
+    try:
+        marker = os.path.dirname(os.path.dirname(sys.executable)) or None
+    except Exception:  # noqa: BLE001
+        return None
+    # A degenerate marker ("", "/", ".") would match EVERY process name —
+    # substring matching makes that a kill-anything wildcard. Refuse it.
+    if not marker or marker in ("/", "."):
+        return None
+    return marker
+
+
+def _reap_gpu_orphans(state: "WorkerState", dry_run: bool = True) -> dict:
+    """Enumerate and (unless ``dry_run``) kill ORPHANED GPU children this worker
+    itself leaked: processes from OUR OWN venv that hold VRAM but that no live
+    slot claims. Exposed as POST /ops/reap-orphans.
+
+    DOCTRINE — OPERATOR/CENTRAL-INVOKED ONLY. This verb must NEVER be called
+    from any loop, heartbeat, sweep, or timer. It is the one place the agent
+    kills by raw PID; automation of it is explicitly unsanctioned (operator
+    ruling, p27 2026-07-23). Wire it to a button/relay, never a schedule.
+
+    A pid is reapable ONLY when ALL FOUR gates hold — any gate UNVERIFIABLE
+    means NOT reapable (fail-closed):
+
+      1. OWN-VENV   — its nvidia-smi process_name or /proc cmdline contains this
+                      worker's own venv marker (same marker source the pid
+                      registry's cuda_context second pass uses). Comfy
+                      (_COMFY_NAME_MARKER in the name) and anything foreign fail
+                      by construction; the agent's own pid and its direct infra
+                      pids (slot supervisors) are excluded outright.
+      2. NO CLAIM   — no current slot status references the pid as child_pid.
+                      Slot statuses UNREADABLE -> nothing is reapable this pass.
+      3. HOLDS GPU  — the pid appears in the current nvidia-smi snapshot with
+                      mib > 0 (a CPU-only stray is not this verb's business).
+      4. MIN AGE    — the process is older than HUGPY_ORPHAN_MIN_AGE_S (default
+                      300s), closing the mid-spawn race where a slot child
+                      exists before its claim registers.
+
+    Kill discipline: SIGTERM -> wait up to 10s -> SIGKILL, with a recycled-PID
+    identity re-check (starttime) immediately before each signal. Per-pid result
+    rows: {pid, name, vram_bytes, action: reaped|term_failed|skipped, reason}.
+    ``dry_run`` (the DEFAULT) only reports what would be reaped."""
+    gpu_procs = _gpu_process_vram() or {}
+    marker = _self_venv_marker()
+    own = _reap_own_pids()
+    slots = _slot_statuses()
+    claimed: "set | None" = None
+    if slots is not None:
+        claimed = {s.get("child_pid") for s in slots
+                   if isinstance(s, dict) and s.get("child_pid") is not None}
+    try:
+        from .pid_registry import _COMFY_NAME_MARKER as _comfy_marker
+        from .pid_registry import _default_proc_info as _proc_info
+    except Exception:  # noqa: BLE001 — no registry module -> nothing verifiable
+        _comfy_marker, _proc_info = "comfyui", (lambda _pid: None)
+
+    results: list = []
+    reapable_bytes = 0
+    for pid, meta in sorted(gpu_procs.items()):
+        name = str((meta or {}).get("name") or "")
+        mib = int((meta or {}).get("mib") or 0)
+        vram_bytes = mib * _MIB
+
+        def _skip(reason: str) -> None:
+            results.append({"pid": pid, "name": name, "vram_bytes": vram_bytes,
+                            "action": "skipped", "reason": reason})
+
+        # Gate 3 first (cheap): must actually hold GPU memory.
+        if mib <= 0:
+            _skip("holds no VRAM (mib<=0)")
+            continue
+        # Own-pid / infra exclusion — before anything else.
+        if pid in own:
+            _skip("agent's own pid / direct infra pid — never reapable")
+            continue
+        # Comfy fails own-venv BY CONSTRUCTION (external adopted service).
+        if _comfy_marker in name.lower():
+            _skip("comfy process — never reapable (external adopted service)")
+            continue
+        # Gate 1: OWN-VENV. Marker underivable -> nothing reapable (fail-closed).
+        if marker is None:
+            _skip("own-venv marker unavailable — cannot prove ownership "
+                  "(fail-closed)")
+            continue
+        info = _proc_info(pid)
+        cmdline = str((info or {}).get("cmdline") or "")
+        if marker not in name and marker not in cmdline:
+            _skip("not from this worker's venv — foreign process, out of scope")
+            continue
+        # Gate 2: NO LIVE CLAIM. Unreadable slot pool -> unverifiable -> skip.
+        if claimed is None:
+            _skip("slot statuses unreadable — cannot prove no live claim "
+                  "(fail-closed)")
+            continue
+        if pid in claimed:
+            _skip("live slot claims this pid as child_pid — not an orphan")
+            continue
+        # Gate 4: MIN AGE. Unmeasurable age -> unverifiable -> skip.
+        age = _proc_age_s(pid)
+        if age is None:
+            _skip("process age unmeasurable — cannot rule out mid-spawn race "
+                  "(fail-closed)")
+            continue
+        if age < _ORPHAN_MIN_AGE_S:
+            _skip(f"process too young ({age:.0f}s < min age "
+                  f"{_ORPHAN_MIN_AGE_S:.0f}s) — mid-spawn race protection")
+            continue
+
+        # ALL FOUR GATES HOLD — this pid is a reapable orphan.
+        reapable_bytes += vram_bytes
+        if dry_run:
+            results.append({"pid": pid, "name": name, "vram_bytes": vram_bytes,
+                            "action": "skipped",
+                            "reason": "dry_run — would be reaped "
+                                      "(all four gates hold)"})
+            logger.info(
+                "reap-orphans DRY RUN: pid %s (%s, %s) is a reapable orphan "
+                "(own-venv, unclaimed, holds GPU, age %.0fs)",
+                pid, name, _human_bytes(vram_bytes), age)
+            continue
+
+        # Recycled-PID identity anchor: capture starttime NOW; re-verify before
+        # each signal so a pid recycled mid-reap is never signalled.
+        anchor = (info or {}).get("starttime")
+
+        def _still_same() -> bool:
+            cur = _proc_info(pid)
+            if cur is None:
+                return False                        # gone — nothing to signal
+            if anchor is not None and cur.get("starttime") is not None:
+                return int(cur["starttime"]) == int(anchor)
+            # No starttime anchor available: corroborate via cmdline instead;
+            # unverifiable identity -> do NOT signal.
+            return bool(cmdline) and cur.get("cmdline") == cmdline
+
+        logger.warning(
+            "reap-orphans: KILLING orphaned GPU child pid=%s name=%r vram=%s "
+            "age=%.0fs (own-venv match %r, no live slot claim) — SIGTERM",
+            pid, name, _human_bytes(vram_bytes), age, marker)
+        import signal as _signal
+        try:
+            if not _still_same():
+                results.append({"pid": pid, "name": name,
+                                "vram_bytes": vram_bytes, "action": "skipped",
+                                "reason": "pid identity changed before SIGTERM "
+                                          "(recycled/exited) — not signalled"})
+                continue
+            os.kill(pid, _signal.SIGTERM)
+        except ProcessLookupError:
+            results.append({"pid": pid, "name": name, "vram_bytes": vram_bytes,
+                            "action": "reaped",
+                            "reason": "already exited at SIGTERM"})
+            continue
+        except OSError as exc:
+            results.append({"pid": pid, "name": name, "vram_bytes": vram_bytes,
+                            "action": "term_failed",
+                            "reason": f"SIGTERM failed: {type(exc).__name__}: {exc}"})
+            continue
+        # Wait up to _ORPHAN_TERM_WAIT_S for a clean exit.
+        deadline = time.time() + _ORPHAN_TERM_WAIT_S
+        exited = False
+        while time.time() < deadline:
+            if _proc_info(pid) is None or not _still_same():
+                exited = True
+                break
+            time.sleep(0.25)
+        if exited:
+            logger.warning("reap-orphans: pid %s exited on SIGTERM", pid)
+            results.append({"pid": pid, "name": name, "vram_bytes": vram_bytes,
+                            "action": "reaped", "reason": "SIGTERM honored"})
+            continue
+        logger.warning("reap-orphans: pid %s survived SIGTERM %.0fs — SIGKILL",
+                       pid, _ORPHAN_TERM_WAIT_S)
+        try:
+            if _still_same():
+                os.kill(pid, _signal.SIGKILL)
+                results.append({"pid": pid, "name": name,
+                                "vram_bytes": vram_bytes, "action": "reaped",
+                                "reason": "SIGKILL after SIGTERM timeout"})
+            else:
+                results.append({"pid": pid, "name": name,
+                                "vram_bytes": vram_bytes, "action": "reaped",
+                                "reason": "exited between SIGTERM wait and SIGKILL"})
+        except ProcessLookupError:
+            results.append({"pid": pid, "name": name, "vram_bytes": vram_bytes,
+                            "action": "reaped",
+                            "reason": "exited before SIGKILL"})
+        except OSError as exc:
+            results.append({"pid": pid, "name": name, "vram_bytes": vram_bytes,
+                            "action": "term_failed",
+                            "reason": f"SIGKILL failed: {type(exc).__name__}: {exc}"})
+
+    reaped = [r for r in results if r["action"] == "reaped"]
+    failed = [r for r in results if r["action"] == "term_failed"]
+    if not dry_run and (reaped or failed):
+        _trim_host_ram()                # hand back the freed arena, same as evict
+    return {
+        "dry_run": bool(dry_run),
+        "results": results,
+        "reaped_count": len(reaped),
+        "term_failed_count": len(failed),
+        "skipped_count": len(results) - len(reaped) - len(failed),
+        "reapable_vram_bytes": reapable_bytes,
+        "min_age_s": _ORPHAN_MIN_AGE_S,
+    }
 
 
 # ── VRAM evict-to-fit at admission (slice 10, the VRAM twin of disk evict-to-fit) ─

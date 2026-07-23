@@ -57,7 +57,10 @@ def _enforce_media_gate():
     endpoint = request.endpoint or ""
     if any(endpoint.endswith(sfx) for sfx in _GATE_EXEMPT_SUFFIXES):
         return
-    if media_key_required() and not verify_api_key(_bearer_token()):
+    # required_scope="ml" (2026-07-23): the key must carry "ml" or "full".
+    # Legacy keys read as ["full"] and still pass; a "v1"-only key does not.
+    if media_key_required() and not verify_api_key(_bearer_token(),
+                                                   required_scope="ml"):
         return jsonify({
             "ok": False,
             "error": ("media-intelligence requires an API key. Pass "

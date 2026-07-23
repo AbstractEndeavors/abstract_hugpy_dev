@@ -19,6 +19,13 @@ public-vs-internal curation the /endpoints inspector surfaces:
         POST /agent/<id>/dispatch         {task} -> queue it for a node  (operator)
   * the terminal (operator, human-driven, no browser):
         GET  /agent/client.sh             serve the bash dispatch client   (open)
+  * secure one-time install links (2026-07-23):
+        POST   /agent/install-links            mint scoped key + link   (operator, strict)
+        GET    /agent/install-links            list links + status      (operator, strict)
+        DELETE /agent/install-links/<id>       revoke link AND its key  (operator, strict)
+        GET    /agent/install/<link_id>        one-time templated .py download (link capability)
+        GET    /agent/install/<link_id>.sh     POSIX wrapper (free fetch; .py is the use)
+        GET    /agent/install/<link_id>.ps1    Windows wrapper (free fetch; .py is the use)
 
 Gates, all fail-closed:
   * ``register`` is the unauthenticated bootstrap (a node has no credential
@@ -186,10 +193,15 @@ def _require_api_key() -> None:
     except Exception:
         # fail closed: if the key module can't load we cannot verify -> refuse
         abort(401, description="Agent registration key gate unavailable.")
-    if not verify_api_key(_api_key_bearer()):
+    # required_scope="agent-register" (2026-07-23): the key must carry that
+    # scope or "full". Legacy keys (no scopes field) read as ["full"] and keep
+    # passing; a narrowly scoped install-link key (e.g. ["v1"]) cannot enroll
+    # a node unless the operator granted it "agent-register" at mint time.
+    if not verify_api_key(_api_key_bearer(), required_scope="agent-register"):
         abort(401, description=(
-            "Agent registration requires a valid API key. Pass "
-            "'Authorization: Bearer <key>' (create keys in the console under API access)."))
+            "Agent registration requires a valid API key with the "
+            "'agent-register' scope. Pass 'Authorization: Bearer <key>' "
+            "(create keys in the console under API access)."))
 
 
 # ── machine-to-machine: nodes enroll + heartbeat ───────────────────────────
@@ -346,6 +358,277 @@ def agent_client_sh():
     with open(path, encoding="utf-8") as fh:
         script = fh.read()
     return Response(script, mimetype="text/x-shellscript")
+
+
+# ── secure one-time install links (2026-07-23, operator-approved) ──────────
+# The console owner mints a labeled/scoped ONE-TIME download link for the
+# hugpy-agent installer. The download templates a freshly minted scoped key
+# into the installer's EMBEDDED_API_KEY slot — the operator never sees or
+# handles the raw key (it is NEVER in the mint response; it exists only inside
+# the download). Mint/list/revoke are OPERATOR-gated (the operator token /
+# session — a mere api key can never mint a key: "no key-minting-by-key",
+# same structural rule as the video-share links). The download GET itself is
+# gated by the link_id (an unguessable secrets.token_urlsafe capability).
+#
+# Use counting: only the .py fetch consumes a use. The .sh/.ps1 wrappers are
+# free (audited but not decremented) so the one-liner
+#     curl -fsSL <base>/agent/install/<link_id>.sh | bash
+# — which fetches the wrapper AND then the .py — costs exactly ONE use.
+
+def _install_links_mod():
+    from ..functions.imports.utils import install_links
+    return install_links
+
+
+def _find_installer_py() -> "str | None":
+    """Locate ``hugpy_agent/install/install_hugpy_agent.py`` on disk.
+
+    Same discovery idiom as ``_find_dispatch_client`` (the served client.sh):
+    ``HUGPY_AGENT_INSTALLER_PY`` overrides outright and is AUTHORITATIVE when
+    set (a bad override 404s visibly instead of silently falling back); else
+    walk up from THIS file until a directory containing the installer is found.
+    SINGLE SOURCE by design: the installer ships in the hugpy_agent repo (its
+    tests import it from there) and central serves that same file — no
+    build-time copy to drift."""
+    override = os.getenv("HUGPY_AGENT_INSTALLER_PY")
+    if override:
+        return override if os.path.isfile(override) else None
+    d = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(20):
+        candidate = os.path.join(
+            d, "hugpy_agent", "install", "install_hugpy_agent.py")
+        if os.path.isfile(candidate):
+            return candidate
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return None
+
+
+_EMBED_LINE = 'EMBEDDED_API_KEY = ""'
+
+
+def _template_installer(source: str, raw_key: str) -> "str | None":
+    """Replace the installer's EMBEDDED_API_KEY slot with the raw key.
+    Returns None if the slot line is missing (installer drifted — refuse to
+    serve an un-keyed download from a one-time link)."""
+    if _EMBED_LINE not in source:
+        return None
+    # repr() the key so any quoting is safe; the slot is a plain assignment.
+    return source.replace(_EMBED_LINE, f"EMBEDDED_API_KEY = {raw_key!r}", 1)
+
+
+@agent_bp.route("/agent/install-links", methods=["POST"])
+def install_link_create():
+    """OPERATOR: mint a scoped key + its one-time install link.
+    Body: {label (required), scopes (default ["v1"]), key_expires_at? (epoch s
+    or ISO-8601), link_ttl_s (default 86400), max_uses (default 1)}.
+    Returns {url, link_id, label, scopes, expires_at, max_uses, uses_left,
+    key_id, status} — NEVER the raw key."""
+    _require_operator_strict()
+    body = request.get_json(silent=True) or {}
+    label = (body.get("label") or "").strip()
+    if not label:
+        abort(400, description="An install link requires a 'label'.")
+    scopes = body.get("scopes")
+    if scopes is not None and not isinstance(scopes, list):
+        abort(400, description="'scopes' must be a list.")
+    key_expires_at = body.get("key_expires_at")
+    if isinstance(key_expires_at, str) and key_expires_at.strip():
+        # Accept ISO-8601 too (the spec says "optional ISO"); epoch also fine.
+        from datetime import datetime
+        try:
+            key_expires_at = datetime.fromisoformat(
+                key_expires_at.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            abort(400, description="'key_expires_at' must be epoch seconds or ISO-8601.")
+    elif isinstance(key_expires_at, str):
+        key_expires_at = None
+    try:
+        link = _install_links_mod().create_install_link(
+            label=label,
+            scopes=scopes,
+            key_expires_at=key_expires_at,
+            link_ttl_s=body.get("link_ttl_s"),
+            max_uses=body.get("max_uses"),
+        )
+    except ValueError as exc:
+        abort(400, description=str(exc))
+    link["url"] = f"{_install_public_base()}/agent/install/{link['link_id']}"
+    return jsonify(link), 201
+
+
+def _install_public_base() -> str:
+    """Public base for building install URLs — same idiom as the video-share
+    ``_public_base``: an explicit ``HUGPY_PUBLIC_BASE`` wins; else reconstruct
+    from the forwarded proto/host. The public entry is the ``/api`` mount
+    (host front → :7001 → :7002), so ``/api`` is appended unless the base
+    already ends with it or the request itself arrived bare."""
+    base = (os.getenv("HUGPY_PUBLIC_BASE") or "").strip().rstrip("/")
+    if not base:
+        proto = (request.headers.get("X-Forwarded-Proto") or request.scheme
+                 or "https").split(",")[0].strip()
+        host = (request.headers.get("X-Forwarded-Host") or request.host
+                or "").split(",")[0].strip()
+        base = f"{proto}://{host}".rstrip("/") if host else ""
+    if base and not base.endswith("/api") and (
+            request.path == "/api" or request.path.startswith("/api/")):
+        base += "/api"
+    return base
+
+
+@agent_bp.route("/agent/install-links", methods=["GET"])
+def install_link_list():
+    """OPERATOR: every link with computed status (active/exhausted/expired/
+    revoked) + use counts. Raw keys never appear (scrubbed store-side)."""
+    _require_operator_strict()
+    return jsonify({"links": _install_links_mod().list_install_links()})
+
+
+@agent_bp.route("/agent/install-links/<link_id>", methods=["DELETE"])
+def install_link_revoke(link_id):
+    """OPERATOR: revoke the link AND the key it minted."""
+    _require_operator_strict()
+    if not _install_links_mod().revoke_install_link(link_id):
+        abort(404, description="Unknown install link.")
+    return jsonify({"ok": True})
+
+
+def _require_operator_strict() -> None:
+    """The operator gate for install-link management — WITHOUT the
+    ``HUGPY_AGENT_OPEN`` testing waiver ``_require_operator`` honors. These
+    routes MINT credentials (the same category as ``/agent/register``'s
+    permanent key gate): open mode may waive the fleet-view gates, never a
+    credential-minting one. Fails closed if the gate module is unavailable."""
+    try:
+        from ..operator_auth import operator_authenticated
+    except Exception:
+        abort(401, description="Operator authentication required for this route.")
+    if not operator_authenticated():
+        abort(401, description="Operator authentication required for this route.")
+
+
+def _serve_install_py(link_id: str):
+    """The one-time download itself: template the raw key in, consume a use."""
+    from flask import Response
+    mod = _install_links_mod()
+    path = _find_installer_py()
+    if path is None:
+        abort(404, description=(
+            "Installer source not found on this deployment "
+            "(hugpy_agent/install/install_hugpy_agent.py missing)."))
+    with open(path, encoding="utf-8") as fh:
+        source = fh.read()
+    remote = (request.headers.get("X-Forwarded-For") or
+              request.remote_addr or "").split(",")[0].strip()
+    raw_key = mod.consume_download(link_id, remote_addr=remote)
+    if raw_key is None:
+        abort(410, description=(
+            "This install link is no longer valid — it was used up, expired, "
+            "or revoked. Ask the console owner to mint a fresh one."))
+    body = _template_installer(source, raw_key)
+    if body is None:
+        # The slot line drifted out of the installer: refuse rather than serve
+        # an un-keyed installer from a link that just consumed a use.
+        logger.error("install link %s…: EMBEDDED_API_KEY slot missing in %s",
+                     link_id[:8], path)
+        abort(500, description="Installer template slot missing on this deployment.")
+    logger.info("install link %s… served install_hugpy_agent.py to %s",
+                link_id[:8], remote or "?")
+    resp = Response(body, mimetype="text/x-python")
+    resp.headers["Content-Disposition"] = (
+        'attachment; filename="install_hugpy_agent.py"')
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+_SH_WRAPPER = """#!/bin/sh
+# hugpy-agent one-time installer bootstrap (POSIX).
+# Fetches the python installer from the SAME one-time link and runs it.
+# This wrapper fetch does NOT consume the link — only the .py fetch does.
+set -e
+PY_URL="{py_url}"
+PY=""
+for c in python3 python; do
+  if command -v "$c" >/dev/null 2>&1; then PY="$c"; break; fi
+done
+if [ -z "$PY" ]; then
+  echo "hugpy-agent installer: python3 is required but was not found on PATH." >&2
+  echo "Install python3 (e.g. 'sudo apt install python3' / 'brew install python3') and re-run." >&2
+  exit 1
+fi
+TMP="$(mktemp /tmp/install_hugpy_agent.XXXXXX.py)"
+trap 'rm -f "$TMP"' EXIT
+if ! curl -fsSL "$PY_URL" -o "$TMP"; then
+  echo "hugpy-agent installer: download failed — the link may be used up, expired, or revoked." >&2
+  exit 1
+fi
+exec "$PY" "$TMP" "$@"
+"""
+
+_PS1_WRAPPER = """# hugpy-agent one-time installer bootstrap (Windows PowerShell).
+# Fetches the python installer from the SAME one-time link and runs it.
+# This wrapper fetch does NOT consume the link — only the .py fetch does.
+$ErrorActionPreference = 'Stop'
+$PyUrl = '{py_url}'
+$Py = $null
+foreach ($c in @('py', 'python3', 'python')) {{
+  if (Get-Command $c -ErrorAction SilentlyContinue) {{ $Py = $c; break }}
+}}
+if (-not $Py) {{
+  Write-Error 'hugpy-agent installer: python is required but was not found on PATH. Install it from https://python.org and re-run.'
+  exit 1
+}}
+$Tmp = Join-Path $env:TEMP ("install_hugpy_agent_" + [System.Guid]::NewGuid().ToString('N') + '.py')
+try {{
+  Invoke-WebRequest -UseBasicParsing -Uri $PyUrl -OutFile $Tmp
+  & $Py $Tmp @args
+}} finally {{
+  Remove-Item -Force -ErrorAction SilentlyContinue $Tmp
+}}
+"""
+
+
+def _serve_install_wrapper(link_id: str, kind: str):
+    """The .sh / .ps1 convenience wrappers. Validity-checked (a dead link 410s
+    here too, honestly) but NEVER decrements — only the .py fetch counts."""
+    from flask import Response
+    mod = _install_links_mod()
+    if not mod.peek_active(link_id):
+        abort(410, description=(
+            "This install link is no longer valid — it was used up, expired, "
+            "or revoked. Ask the console owner to mint a fresh one."))
+    remote = (request.headers.get("X-Forwarded-For") or
+              request.remote_addr or "").split(",")[0].strip()
+    mod.note_wrapper_fetch(link_id, remote_addr=remote, kind=kind)
+    # The wrapper fetches the .py from the SAME path the caller just used,
+    # minus the extension — so whatever base/mount reached us keeps working.
+    py_url = f"{_install_public_base()}/agent/install/{link_id}"
+    if kind == "sh":
+        body = _SH_WRAPPER.format(py_url=py_url)
+        mime = "text/x-shellscript"
+        fname = "install_hugpy_agent.sh"
+    else:
+        body = _PS1_WRAPPER.format(py_url=py_url)
+        mime = "text/plain"
+        fname = "install_hugpy_agent.ps1"
+    resp = Response(body, mimetype=mime)
+    resp.headers["Content-Disposition"] = f'attachment; filename="{fname}"'
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@agent_bp.route("/agent/install/<link_id>", methods=["GET"])
+def install_download(link_id):
+    """The one-time download. ``<link_id>`` bare serves the templated .py
+    (consumes a use); ``<link_id>.sh`` / ``<link_id>.ps1`` serve the platform
+    wrappers (free — they fetch the .py themselves, which is the one use)."""
+    if link_id.endswith(".sh"):
+        return _serve_install_wrapper(link_id[:-3], "sh")
+    if link_id.endswith(".ps1"):
+        return _serve_install_wrapper(link_id[:-4], "ps1")
+    return _serve_install_py(link_id)
 
 
 # ── console UI: operator lists nodes + dispatches tasks ────────────────────

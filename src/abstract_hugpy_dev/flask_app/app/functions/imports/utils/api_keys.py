@@ -25,6 +25,45 @@ from .schemas import settings
 _LOCK = threading.Lock()
 _KEY_PREFIX = "hp_"
 
+# ── scopes (2026-07-23, secure install links) ──────────────────────────────
+# A key may be SCOPED to a subset of the API surface. Vocabulary (small on
+# purpose — grow it only when a new gated surface exists):
+#   "v1"             the /v1 inference surface (chat/completions, models)
+#   "ml"             the media-intelligence /ml surface
+#   "agent-register" the /agent/register fleet bootstrap
+#   "full"           everything (the pre-scope behavior)
+# LEGACY rows have no `scopes` field: they read as ["full"] so nothing that
+# exists today changes behavior (lazy/additive migration — the store file is
+# never rewritten wholesale; a row gains fields only when it is next written).
+SCOPES = ("v1", "ml", "agent-register", "full")
+_DEFAULT_SCOPES = ["full"]
+
+
+def _scopes_of(rec: dict[str, Any]) -> list[str]:
+    """A record's effective scopes — legacy rows (no field / empty) = full."""
+    scopes = rec.get("scopes")
+    if not isinstance(scopes, list) or not scopes:
+        return list(_DEFAULT_SCOPES)
+    return [str(s) for s in scopes]
+
+
+def _scope_ok(rec: dict[str, Any], required_scope: Optional[str]) -> bool:
+    if not required_scope:
+        return True
+    scopes = _scopes_of(rec)
+    return "full" in scopes or required_scope in scopes
+
+
+def _is_expired(rec: dict[str, Any], now: Optional[float] = None) -> bool:
+    """Key expiry — legacy rows have no `expires_at` and never expire."""
+    exp = rec.get("expires_at")
+    if not exp:
+        return False
+    try:
+        return float(exp) <= (now if now is not None else time.time())
+    except (TypeError, ValueError):
+        return False
+
 
 def _store_path() -> str:
     return os.path.join(os.path.dirname(settings.manifest_path), "api_keys.json")
@@ -65,22 +104,48 @@ def _hash(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
-def create_api_key(name: str = "", pool: str = "") -> dict[str, Any]:
+def create_api_key(name: str = "", pool: str = "",
+                   label: str = "",
+                   scopes: Optional[list[str]] = None,
+                   created_by: str = "operator",
+                   expires_at: Optional[float] = None) -> dict[str, Any]:
     """Mint a key. The returned dict includes the FULL key — the only time
     it is ever available; persist only its hash.
 
     ``pool`` binds the key to a dedicated worker pool: requests authenticated
     with it route to that pool by default (the app needs no per-request flag).
+
+    2026-07-23 scope additions (all optional — the legacy 2-arg call mints
+    exactly what it always did, a full-scope operator key):
+      * ``label``      free-form operator description (distinct from ``name``,
+                       which existing UI uses as the short handle).
+      * ``scopes``     subset of ``SCOPES``; omitted/empty => ["full"].
+                       Unknown scope strings are rejected (ValueError) — a typo
+                       must never silently mint a broader or dead key.
+      * ``created_by`` "operator" (console mint) | "install-link" (a key baked
+                       into a one-time installer download).
+      * ``expires_at`` epoch seconds; None => never expires.
     """
+    if scopes is None or not scopes:
+        scopes = list(_DEFAULT_SCOPES)
+    scopes = [str(s).strip() for s in scopes if str(s).strip()]
+    bad = [s for s in scopes if s not in SCOPES]
+    if bad:
+        raise ValueError(f"unknown scope(s): {bad}; valid: {list(SCOPES)}")
     token = _KEY_PREFIX + secrets.token_hex(20)
     key_id = secrets.token_hex(8)
     record = {
         "id": key_id,
         "name": (name or "").strip() or "unnamed",
+        "label": (label or "").strip(),
         "pool": (pool or "").strip(),
+        "scopes": scopes,
+        "created_by": (created_by or "operator").strip() or "operator",
         "prefix": token[:11],
         "hash": _hash(token),
         "created_at": time.time(),
+        "expires_at": float(expires_at) if expires_at else None,
+        "disabled": False,
         "last_used": None,
         "revoked": False,
     }
@@ -100,7 +165,16 @@ def list_api_keys() -> list[dict[str, Any]]:
     for rec in data["keys"].values():
         if rec.get("revoked"):
             continue
-        out.append({k: v for k, v in rec.items() if k != "hash"})
+        row = {k: v for k, v in rec.items() if k != "hash"}
+        # Lazy-migration read view: legacy rows (pre-2026-07-23) surface the
+        # defaults without the store file ever being rewritten.
+        row.setdefault("label", "")
+        row["scopes"] = _scopes_of(rec)
+        row.setdefault("created_by", "operator")
+        row.setdefault("expires_at", None)
+        row.setdefault("disabled", False)
+        row["expired"] = _is_expired(rec)
+        out.append(row)
     out.sort(key=lambda r: r.get("created_at") or 0, reverse=True)
     return out
 
@@ -116,7 +190,16 @@ def revoke_api_key(key_id: str) -> bool:
     return True
 
 
-def verify_api_key(token: Optional[str]) -> bool:
+def verify_api_key(token: Optional[str],
+                   required_scope: Optional[str] = None) -> bool:
+    """Validate a presented key on its own merits (hash + revocation, and —
+    2026-07-23 — expiry/disabled when those fields are present on the row).
+
+    ``required_scope`` (optional): when passed, the key must ALSO carry that
+    scope or "full". When omitted, behavior is exactly the pre-scope contract —
+    every existing call site is unchanged, and legacy rows (no ``scopes``
+    field) read as ["full"] so they pass any scope check.
+    """
     if not token:
         return False
     hashed = _hash(token.strip())
@@ -126,6 +209,12 @@ def verify_api_key(token: Optional[str]) -> bool:
             if rec.get("revoked"):
                 continue
             if rec.get("hash") == hashed:
+                if rec.get("disabled"):
+                    return False
+                if _is_expired(rec):
+                    return False
+                if not _scope_ok(rec, required_scope):
+                    return False
                 rec["last_used"] = time.time()
                 _save(data)
                 return True

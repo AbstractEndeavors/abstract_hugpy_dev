@@ -65,7 +65,12 @@ def v1_auth(fn):
     """Enforce the site's key policy: open unless require_key is on."""
     @wraps(fn)
     def wrapper(*args, **kwargs):
-        if api_key_required() and not verify_api_key(_bearer_token()):
+        # required_scope="v1" (2026-07-23): a key must carry the "v1" scope or
+        # "full" to pass this gate. Legacy keys (no scopes field) read as
+        # ["full"], so every pre-scope key still passes — only deliberately
+        # narrower keys (e.g. an "ml"-only install-link key) are refused here.
+        if api_key_required() and not verify_api_key(_bearer_token(),
+                                                     required_scope="v1"):
             return _openai_error(
                 "Missing or invalid API key. Pass 'Authorization: Bearer <key>' "
                 "(create keys in the console under API access).",
@@ -398,7 +403,18 @@ def keys_create():
     body = request.get_json(silent=True) or {}
     # Optional `pool` binds the key to a dedicated worker pool so the app's
     # requests route to its reserved workers from the key alone.
-    return jsonify(create_api_key(body.get("name", ""), pool=body.get("pool", "")))
+    # Optional `label` / `scopes` (2026-07-23): scoped/labeled keys; omitted =>
+    # full-scope, exactly the pre-scope mint. Unknown scopes 400 (never a typo
+    # silently minting the wrong key).
+    scopes = body.get("scopes")
+    if scopes is not None and not isinstance(scopes, list):
+        return jsonify({"error": "'scopes' must be a list"}), 400
+    try:
+        return jsonify(create_api_key(
+            body.get("name", ""), pool=body.get("pool", ""),
+            label=body.get("label", ""), scopes=scopes))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
 
 
 @v1_bp.route("/keys/<key_id>", methods=["DELETE"])

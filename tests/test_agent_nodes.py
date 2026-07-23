@@ -61,7 +61,7 @@ def client(store, monkeypatch):
     below using ``unkeyed_client``."""
     monkeypatch.setattr(agent_routes, "agent_node_store", store)
     from abstract_hugpy_dev.flask_app.app.functions.imports.utils import api_keys as _ak
-    monkeypatch.setattr(_ak, "verify_api_key", lambda tok: tok == _GOOD_KEY)
+    monkeypatch.setattr(_ak, "verify_api_key", lambda tok, required_scope=None: tok == _GOOD_KEY)
     app = Flask(__name__)
     app.register_blueprint(agent_routes.agent_bp)
     return app.test_client()
@@ -73,7 +73,7 @@ def unkeyed_client(store, monkeypatch):
     the gate's negative space (no key, bad key) without a real key store."""
     monkeypatch.setattr(agent_routes, "agent_node_store", store)
     from abstract_hugpy_dev.flask_app.app.functions.imports.utils import api_keys as _ak
-    monkeypatch.setattr(_ak, "verify_api_key", lambda tok: False)
+    monkeypatch.setattr(_ak, "verify_api_key", lambda tok, required_scope=None: False)
     app = Flask(__name__)
     app.register_blueprint(agent_routes.agent_bp)
     return app.test_client()
@@ -297,7 +297,7 @@ def test_register_gate_rejects_revoked_key(store, monkeypatch):
     from abstract_hugpy_dev.flask_app.app.functions.imports.utils import api_keys as _ak
     revoked = {"hp_was_good"}
 
-    def _verify(tok):
+    def _verify(tok, required_scope=None):
         return tok is not None and tok not in revoked
 
     monkeypatch.setattr(_ak, "verify_api_key", _verify)

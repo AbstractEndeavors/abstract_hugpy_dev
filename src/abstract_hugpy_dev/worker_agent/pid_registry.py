@@ -399,11 +399,21 @@ class PidRegistry:
                     explained.add(p)
                     continue
                 # (2) ComfyUI — call-time attribution or recognized-idle.
+                # DISPLAY HONESTY (p27 companion, operator-sanctioned shape):
+                # comfy is ONE process-class row — "comfy — X GB" — never fake
+                # per-model rows. ``display_label``/``is_process_row`` are the
+                # UI keys for that: is_process_row says "this is a measured
+                # PROCESS occupancy row, not a per-model resident"; any
+                # ``model_key`` on it is the call-time claimed model, a LABEL
+                # for the active job only (attribution, not residency).
+                # Additive-only fields on a worker->central free-dict payload
+                # (heartbeat ``pid_registry``), so old central/UI ignore them.
                 if _COMFY_NAME_MARKER in name.lower():
                     call = self._active_foreign_call_locked("comfy", ttl)
                     row = {
                         "pid": p, "host_mode": "comfy", "vram_bytes": mib * _MIB,
-                        "alive": True, "service": "comfy", "name": name}
+                        "alive": True, "service": "comfy", "name": name,
+                        "display_label": "comfy", "is_process_row": True}
                     if call is not None:
                         row["model_key"] = call.get("model_key")
                         row["job_id"] = call.get("job_id")

@@ -152,6 +152,16 @@ _SENSITIVE = [
     # are deliberately NOT here — their credential is the node's enroll token.
     ({"GET"},                    re.compile(r"^/agent/nodes$")),
     ({"POST"},                   re.compile(r"^/agent/[^/]+/dispatch$")),
+    # 2026-07-23 secure one-time install links: mint/list/revoke are CREDENTIAL-
+    # MINTING operator actions (each link mints a scoped api key) — same tier as
+    # /keys and /keys/video-share. Belt-and-suspenders with the blueprint's own
+    # _require_operator_strict (which, unlike the fleet-view gates, does NOT
+    # honor the HUGPY_AGENT_OPEN testing waiver — see _path_is_sensitive: these
+    # two rules are excluded from that waiver too). The download GET
+    # /agent/install/<link_id> is deliberately NOT here — the unguessable
+    # link_id IS its capability, exactly like the video-share links.
+    ({"GET", "POST"},            re.compile(r"^/agent/install-links$")),
+    ({"DELETE"},                 re.compile(r"^/agent/install-links/[^/]+$")),
     # P3.1b: the single-task detail read (a run's full row incl. its result) is
     # the operator's drill-in for the P3.3 console — gated like /agent/nodes.
     # Scoped to GET and to the /tasks/<seq> shape (with a trailing seq), so the
@@ -259,8 +269,14 @@ def _path_is_sensitive() -> bool:
     method = request.method
     for methods, rx in _SENSITIVE:
         if method in methods and rx.match(path):
-            # The agent-fleet rules (and ONLY those) honor the open flag.
-            if path.startswith("/agent/") and _agent_gates_open():
+            # The agent-fleet VIEW rules honor the open flag — but never the
+            # install-link rules: those MINT credentials (each link mints a
+            # scoped api key), the same category the 2026-07-16 ruling made
+            # un-waivable on /agent/register. Open mode may open the fleet
+            # view; it can never open a key-minting surface.
+            if (path.startswith("/agent/")
+                    and not path.startswith("/agent/install-links")
+                    and _agent_gates_open()):
                 continue
             return True
     return False
