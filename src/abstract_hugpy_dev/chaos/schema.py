@@ -32,7 +32,7 @@ Top-level shape
     "model_key":       str,
     "framework":       str,           # gguf | transformers | ...
     "effective_bytes": int,           # weights on disk (from /models)
-    "alloc_mode":      str,           # autofit|max-gpu|cpu-only|budget|bands
+    "alloc_mode":      str,           # gpu-only|ram-only|max-gpu|max-ram|explicit
     "spill":           dict,          # the EXACT /assign spill applied
     "ctx_pct":         int | null,    # context target (% of model max)
     "target_workers":  [str, ...],    # workers the spill was written to
@@ -110,10 +110,14 @@ from __future__ import annotations
 
 SCHEMA_VERSION = "chaos-obs/1"
 
-# The alloc modes the runner draws from. GGUF models get the full set; a
-# non-GGUF (transformers) model is engine-gated to autofit only (an explicit
-# GGUF-only spill is refused at /assign), which the runner honours.
-ALLOC_MODES = ("autofit", "max-gpu", "cpu-only", "budget", "bands")
+# The alloc modes the runner draws from — the FIVE flat operator modes (k37),
+# single-sourced from managers.alloc_modes. GGUF models get the full set; a
+# non-GGUF (transformers) model is engine-gated to the three coarse placement
+# intents (gpu-only / ram-only / max-gpu) — max-ram/explicit on a non-GGUF is
+# refused at /assign (fine-grained placement is GGUF-only until Slice C),
+# which the runner honours. Legacy names (autofit/cpu-only/budget/bands) are
+# still accepted by build_spill via the alias table, never emitted.
+from ..managers.alloc_modes import ALLOC_MODES  # noqa: F401 — one vocabulary
 
 # The ctx% dimension of the assortment cube (percent of a model's max context).
 CTX_PCTS = (25, 50, 75, 100)
@@ -144,6 +148,9 @@ SPILL_KEYS = frozenset({
     "n_gpu_layers", "gpu_mem_gib", "cpu_mem_gib", "threads", "tensor_split",
     "gpu_mem_gib_deviation_pct", "cpu_mem_gib_deviation_pct",
     "ctx_pct", "ctx_deviation_pct", "priority",
+    # k37 allocation-mode keys (max-ram / explicit ride these; version-gated
+    # at central's emission seam so they are never a dead knob on an old worker).
+    "alloc_mode", "leniency_pct", "priority_device",
 })
 
 # Skip reasons — the runner records a skip observation rather than firing.

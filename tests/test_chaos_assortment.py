@@ -43,8 +43,10 @@ check("n_exercisable excludes the unassigned model",
 sm = {m["model_key"]: m for m in A.servable_models(models)}
 check("gguf model gets all 5 alloc modes",
       set(A.modes_for(sm["small-gguf"]["framework"])) == set(A.ALLOC_MODES))
-check("transformers model gets autofit only",
-      A.modes_for(sm["tf-model"]["framework"]) == ("autofit",))
+check("transformers model gets the coarse trio only (k37: max-ram/explicit "
+      "are GGUF-only until Slice C)",
+      A.modes_for(sm["tf-model"]["framework"])
+      == ("gpu-only", "ram-only", "max-gpu"))
 
 # ── candidate workers = already-assigned online ─────────────────────────────
 widx = A.worker_index(workers)
@@ -75,8 +77,8 @@ check("no draw ever selects the blocked model",
       all(d["model_key"] != "blocked-model" for d in draws_a + draws_c))
 check("combo.ctx_pct matches the spill's ctx_pct (or None)",
       all(d["ctx_pct"] == (d["spill"].get("ctx_pct")) for d in draws_a))
-check("cpu-only draws carry no ctx_pct",
-      all(d["ctx_pct"] is None for d in draws_a if d["alloc_mode"] == "cpu-only"))
+check("ram-only draws carry no ctx_pct",
+      all(d["ctx_pct"] is None for d in draws_a if d["alloc_mode"] == "ram-only"))
 
 # ── spill construction stays within recognised keys ─────────────────────────
 from abstract_hugpy_dev.chaos.schema import SPILL_KEYS

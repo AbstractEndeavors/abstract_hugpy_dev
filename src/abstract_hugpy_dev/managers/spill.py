@@ -677,15 +677,97 @@ def clear_ngl_override(model_path) -> None:
         pass
 
 
+# ── k37 allocation modes (worker-side wire: HUGPY_ALLOC_MODE etc.) ──────────
+# The five-mode selector's NEW spill keys land here as env (set per request by
+# agent._apply_spill): alloc_mode -> HUGPY_ALLOC_MODE, leniency_pct ->
+# HUGPY_LENIENCY_PCT, priority_device -> HUGPY_PRIORITY_DEVICE. Only max-ram /
+# explicit ever ride this wire — gpu-only/ram-only/max-gpu keep the unchanged
+# legacy n_gpu_layers encoding. Central version-gates emission so an old
+# worker never receives these; on a mode-aware worker they must never be a
+# dead knob, so both engine paths below consult them.
+def alloc_mode_env() -> Optional[str]:
+    """The request's allocation mode from HUGPY_ALLOC_MODE ("max-ram" |
+    "explicit"), or None (legacy encoding / no mode — behave exactly as
+    before)."""
+    raw = _env("HUGPY_ALLOC_MODE")
+    if raw is None:
+        return None
+    low = raw.strip().lower()
+    return low or None
+
+
+def leniency_pct_env() -> Optional[float]:
+    """explicit mode's leniency (percent OF THE MODEL that may land off its
+    ideal device before bust), 0..100, or None when unset."""
+    v = _env_float("HUGPY_LENIENCY_PCT")
+    if v is None:
+        return None
+    return max(0.0, min(100.0, v))
+
+
+def priority_device_env() -> str:
+    """explicit mode's priority device ("gpu" default | "ram")."""
+    raw = (_env("HUGPY_PRIORITY_DEVICE") or "gpu").strip().lower()
+    return "ram" if raw == "ram" else "gpu"
+
+
+# RAM safety factor for the max-ram fill (mirror of _VRAM_SAFETY: never budget
+# every last byte of MemAvailable for weights).
+_RAM_FILL_SAFETY = 0.95
+
+
+def maxram_gpu_layers(model_path: str, free_ram: Optional[int] = None) -> int:
+    """n_gpu_layers for the **max-ram** mode: fill the RAM budget FIRST, and
+    only the OVERFLOW layers go to the GPU — autofit's per-layer pricing,
+    inverted. 0 when the whole model fits RAM (pure RAM residency; the GPU is
+    only touched when RAM genuinely can't hold everything).
+
+    The RAM budget = budgetable free RAM (reserve- and ceiling-aware) capped by
+    an explicit HUGPY_CPU_MEM_GIB when set, with a safety factor so the fill
+    never rides MemAvailable to the OOM floor. Whether the GPU can actually
+    hold the overflow is the ADMISSION engine's question
+    (flex.plan_explicit_offload, ram priority) — this is the loader-level
+    intent, exactly like autofit_gpu_layers is for max-gpu."""
+    try:
+        file_bytes = os.path.getsize(model_path)
+    except OSError:
+        return 0
+    if file_bytes <= 0:
+        return 0
+    if free_ram is None:
+        free_ram = free_ram_bytes()
+        cpu_gib = _env_float("HUGPY_CPU_MEM_GIB")
+        if cpu_gib is not None:
+            cap = int(cpu_gib * 2**30)
+            free_ram = min(free_ram, cap) if free_ram else cap
+    total_layers = _gguf_layer_count(model_path) or _ASSUMED_LAYERS
+    per_layer = file_bytes / max(total_layers, 1)
+    ram_budget = int((free_ram or 0) * _RAM_FILL_SAFETY)
+    in_ram = min(total_layers, int(ram_budget // per_layer)) if per_layer > 0 else total_layers
+    overflow = max(0, total_layers - in_ram)
+    logger.info(
+        "max-ram gguf: file=%.1fGiB ram_budget=%.1fGiB -> %d/%d layers in RAM, "
+        "%d overflow to GPU",
+        file_bytes / 2**30, ram_budget / 2**30, in_ram, total_layers, overflow)
+    return overflow
+
+
 def gguf_gpu_layers(model_path: str) -> int:
     """Resolve n_gpu_layers for a GGUF model: the worker's partial-offload pin
-    first (honest layers-that-fit), else env (+autofit)."""
+    first (honest layers-that-fit), else the k37 allocation mode (max-ram's
+    inverted fill), else env (+autofit)."""
     try:
         pinned = _NGL_OVERRIDE.get(os.path.abspath(model_path))
     except (TypeError, OSError):
         pinned = None
     if pinned is not None:
         return int(pinned)
+    # k37: max-ram inverts the fill (RAM first, overflow to GPU). explicit
+    # falls through to autofit — its VRAM target rides HUGPY_GPU_MEM_GIB which
+    # already caps autofit; the leniency FLOOR is enforced at admission
+    # (flex.plan_explicit_offload), not here.
+    if alloc_mode_env() == "max-ram":
+        return maxram_gpu_layers(model_path)
     raw = _env("HUGPY_N_GPU_LAYERS")
     if raw is None or raw.lower() == "auto":
         return autofit_gpu_layers(model_path)
@@ -816,11 +898,21 @@ def _gib(n: float) -> str:
     return f"{n:.2f}GiB"
 
 
-def transformers_max_memory() -> Optional[dict]:
+def transformers_max_memory(model_need_bytes: Optional[int] = None) -> Optional[dict]:
     """Build a ``max_memory`` map for device_map='auto', or None to skip.
 
     Explicit env budgets win; otherwise autofit from detected free VRAM/RAM.
     Returns None when no GPU is visible (let transformers stay on CPU).
+
+    k37 **max-ram** (HUGPY_ALLOC_MODE=max-ram): RAM-priority placement —
+    generous CPU budget + only the REMAINDER on the GPU. accelerate fills GPUs
+    first, so RAM priority is expressed by capping the GPU budget at what the
+    CPU budget cannot hold: gpu = max(0, need − cpu). ``model_need_bytes``
+    (optional, from a loader that knows its size — Slice C wires the gap
+    loaders) makes that remainder honest; without it the GPU budget is 0 (pure
+    RAM — safe, never a silent GPU fill against an explicit RAM priority).
+    NOTE central engine-gates max-ram/explicit to GGUF models today, so this
+    branch is defense-in-depth + the Slice C seam, not a live central path.
 
     PLACEMENT INTENT (t26): HUGPY_N_GPU_LAYERS is honored here as engine-agnostic
     placement, NOT a layer count (see n_gpu_layers_intent):
@@ -838,6 +930,21 @@ def transformers_max_memory() -> Optional[dict]:
     gpu_gib = _env_float("HUGPY_GPU_MEM_GIB")
     cpu_gib = _env_float("HUGPY_CPU_MEM_GIB")
     n_gpu = _env_int("HUGPY_N_GPU") or 1
+
+    # k37 max-ram: RAM-priority — generous CPU, remainder (if known) on GPU.
+    if alloc_mode_env() == "max-ram":
+        if cpu_gib is None:
+            fr = free_ram_bytes()
+            cpu_gib = (fr * 0.8) / 2**30 if fr else 16.0
+        if gpu_gib is None:
+            if model_need_bytes:
+                gpu_gib = max(0.0, (int(model_need_bytes) / 2**30) - cpu_gib)
+            else:
+                gpu_gib = 0.0          # unknown need: never silently fill the GPU
+        mm_ram: dict[Any, str] = {i: _gib(gpu_gib) for i in range(max(n_gpu, 1))}
+        mm_ram["cpu"] = _gib(cpu_gib)
+        logger.info("transformers placement=max-ram max_memory=%s", mm_ram)
+        return mm_ram
 
     # CPU-only intent: force everything off the GPU. Bind even with a GPU present
     # (an explicit CPU-only placement, not autofit) — gpu budget 0, generous CPU.
@@ -880,6 +987,10 @@ def describe() -> dict[str, Any]:
     """Human-readable snapshot of the current spill config (for heartbeats/UI)."""
     return {
         "mode": (_env("HUGPY_N_GPU_LAYERS") or "auto"),
+        "alloc_mode": alloc_mode_env(),          # k37: max-ram|explicit|None
+        "leniency_pct": leniency_pct_env(),
+        "priority_device": (priority_device_env()
+                            if alloc_mode_env() == "explicit" else None),
         "n_gpu_layers_env": _env("HUGPY_N_GPU_LAYERS"),
         "gpu_mem_gib": _env_float("HUGPY_GPU_MEM_GIB"),
         "cpu_mem_gib": _env_float("HUGPY_CPU_MEM_GIB"),

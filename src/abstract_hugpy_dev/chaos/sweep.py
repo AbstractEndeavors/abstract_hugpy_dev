@@ -402,7 +402,7 @@ class SweepRunner:
                     "seed": None, "round": None, "ts_start": time.time()})
         obs["combo"].update({
             "model_key": target["model_key"], "framework": target["framework"],
-            "effective_bytes": target["effective_bytes"], "alloc_mode": "budget",
+            "effective_bytes": target["effective_bytes"], "alloc_mode": "explicit",
             "ctx_pct": self.ctx_pct, "target_workers": [target["worker"]]})
         sw = blank_sweep()
         sw.update({"vram_share_pct": pct, "ctx_pct": self.ctx_pct,
@@ -508,7 +508,7 @@ class SweepRunner:
             "need_bytes": need_bytes, "needs_weights_bytes": target["effective_bytes"],
             "needs_kv_bytes": (need_bytes - target["effective_bytes"]
                                if need_bytes >= target["effective_bytes"] else None),
-            "ctx_pct": self.ctx_pct, "placement_mode": "budget"})
+            "ctx_pct": self.ctx_pct, "placement_mode": "explicit"})
         obs["measured"] = measured
         allocation = measured.get("allocation") or {}
         ngl = allocation.get("n_gpu_layers")

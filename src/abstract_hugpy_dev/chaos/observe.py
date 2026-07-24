@@ -55,10 +55,10 @@ def build_predicted(client, combo: dict, workers: list[dict]) -> dict:
 
     band = None
     spill = combo.get("spill") or {}
-    if combo.get("alloc_mode") == "bands":
+    if combo.get("alloc_mode") in ("bands", "explicit"):   # k37 rename (bands->explicit)
         band = {k: spill.get(k) for k in (
             "gpu_mem_gib", "gpu_mem_gib_deviation_pct",
-            "ctx_deviation_pct", "priority")}
+            "ctx_deviation_pct", "priority", "leniency_pct")}
 
     return {
         "need_bytes": need if isinstance(need, int) else None,

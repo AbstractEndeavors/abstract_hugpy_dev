@@ -765,7 +765,19 @@ _SPILL_ENV = {
     # shard a model, it ships this (+ tensor_split) as a per-request spill
     # override; spill.llama_kwargs() turns it into Llama(rpc_servers=...).
     "rpc_servers": "HUGPY_RPC_SERVERS",
+    # k37 allocation modes: only max-ram/explicit ride these NEW keys (the
+    # gpu-only/ram-only/max-gpu trio keeps the unchanged n_gpu_layers wire).
+    # Central version-gates emission to workers that honor them (>= 0.1.203).
+    "alloc_mode": "HUGPY_ALLOC_MODE",
+    "leniency_pct": "HUGPY_LENIENCY_PCT",
+    "priority_device": "HUGPY_PRIORITY_DEVICE",
 }
+
+# Mode-contract keys are CLEARED when absent from a request's spill: a leaked
+# HUGPY_ALLOC_MODE=max-ram from a previous request would silently flip the
+# next model's placement (a dead-wrong knob), unlike the layer/budget knobs
+# whose stickiness is long-standing behavior we don't change here.
+_SPILL_ENV_CLEAR_WHEN_ABSENT = ("alloc_mode", "leniency_pct", "priority_device")
 
 
 # ── operator resource limits (two-tier) ─────────────────────────────────────
@@ -1696,6 +1708,13 @@ def _apply_spill(spill: dict | None) -> None:
     reassigning before first use. For the common case (assign, then chat) the
     override lands before the model is built.
     """
+    spill = spill or {}
+    # Clear the k37 mode-contract envs FIRST (even for an empty spill): a
+    # max-gpu request is {} on the wire, and it must reset any mode a prior
+    # request left behind — otherwise the mode leaks across models.
+    for key in _SPILL_ENV_CLEAR_WHEN_ABSENT:
+        if key not in spill or spill[key] is None:
+            os.environ.pop(_SPILL_ENV[key], None)
     if not spill:
         return
     for key, env_name in _SPILL_ENV.items():
@@ -6100,11 +6119,40 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
             except (TypeError, ValueError):
                 pass
         intent, requested = _gguf_ngl_intent(model_key)
-        from .flex import plan_partial_offload
-        partial = plan_partial_offload(
-            weights_bytes=weights, kv_bytes=kv_eff, total_layers=total_layers,
-            vram_budget_bytes=budget, ram_free_bytes=_free_ram_bytes(),
-            intent=intent, requested_layers=requested)
+        # k37: max-ram / explicit route to the leniency-band engine — degrade
+        # WITHIN the band toward the floor, bust past it with a refusal naming
+        # mode + floor. The mode arrives as env (HUGPY_ALLOC_MODE etc., set by
+        # _apply_spill from the version-gated spill keys). gpu-only/ram-only/
+        # max-gpu keep today's plan_partial_offload path byte-identical.
+        from ..managers.spill import (alloc_mode_env as _amode,
+                                      leniency_pct_env as _lenpct,
+                                      priority_device_env as _pdev)
+        _mode = _amode()
+        if _mode in ("max-ram", "explicit"):
+            from .flex import plan_explicit_offload
+            _gpu_t = os.environ.get("HUGPY_GPU_MEM_GIB")
+            _cpu_t = os.environ.get("HUGPY_CPU_MEM_GIB")
+            def _gib_bytes(v):
+                try:
+                    return int(float(v) * (2 ** 30)) if v else None
+                except (TypeError, ValueError):
+                    return None
+            partial = plan_explicit_offload(
+                weights_bytes=weights, kv_bytes=kv_eff,
+                total_layers=total_layers, vram_budget_bytes=budget,
+                ram_free_bytes=_free_ram_bytes(), mode=_mode,
+                priority_device=("ram" if _mode == "max-ram" else _pdev()),
+                gpu_target_bytes=_gib_bytes(_gpu_t),
+                ram_target_bytes=_gib_bytes(_cpu_t),
+                # max-ram = explicit(ram priority, 100% target, generous
+                # leniency): bust only when RAM+GPU together can't satisfy.
+                leniency_pct=(100.0 if _mode == "max-ram" else (_lenpct() or 0.0)))
+        else:
+            from .flex import plan_partial_offload
+            partial = plan_partial_offload(
+                weights_bytes=weights, kv_bytes=kv_eff, total_layers=total_layers,
+                vram_budget_bytes=budget, ram_free_bytes=_free_ram_bytes(),
+                intent=intent, requested_layers=requested)
 
     if partial is not None and partial.admit:
         # Admit the hybrid. Pin the honest layer count for the in-process

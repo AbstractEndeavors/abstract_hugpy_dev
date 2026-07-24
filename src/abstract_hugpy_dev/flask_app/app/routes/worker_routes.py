@@ -30,6 +30,7 @@ from flask import request, jsonify, abort, send_file, Response
 
 from .imports import *
 from ....managers.serve.overrides import get_override, set_override, available_gguf_files, all_overrides, gguf_variants_detail
+from ....managers.serve.overrides import effective_alloc_mode as _effective_alloc_mode
 # Serving/slot drivers: imported at module scope (the route handlers below call
 # these by bare name). They are not on the functions star re-export chain.
 from ....managers.serve.serve import (
@@ -605,9 +606,12 @@ class HeartbeatRequest(BaseModel):
 
 class AssignRequest(BaseModel):
     model_key: str
-    # Optional per-assignment GPU/CPU spill override. Empty/omitted = autofit.
-    # Recognized keys: n_gpu_layers (int|"auto"|"off"), gpu_mem_gib (float),
-    # cpu_mem_gib (float), tensor_split (list[float]).
+    # Optional per-assignment GPU/CPU spill override. Empty/omitted = max-gpu
+    # (autofit). Recognized keys: n_gpu_layers (int|"auto"|"off"), gpu_mem_gib
+    # (float), cpu_mem_gib (float), tensor_split (list[float]), the t21 band
+    # keys, and the k37 mode keys alloc_mode ("max-ram"|"explicit" after
+    # normalization; legacy names resolved), leniency_pct (0..100, % of the
+    # model), priority_device ("gpu"|"ram").
     spill: dict | None = None
 
 
@@ -1316,6 +1320,14 @@ def workers_assign(worker_id):
     band_reason = _validate_band_values(body.spill)
     if band_reason is not None:
         return jsonify({"error": band_reason}), 400
+    # k37: resolve legacy alloc_mode names + rewrite the coarse trio onto the
+    # unchanged n_gpu_layers wire; alloc_mode only persists for max-ram/
+    # explicit (accepted on input, canonical on disk, never emitted back).
+    if isinstance(body.spill, dict) and "alloc_mode" in body.spill:
+        from ....managers.alloc_modes import normalize_spill
+        body.spill, _mode_note = normalize_spill(body.spill)
+        if _mode_note:
+            logger.info("assign %s: %s", body.model_key, _mode_note)
     if body.model_key not in get_models_dict(dict_return=True):
         # JSON (not abort's HTML) so the UI surfaces a clean reason instead of a
         # raw 404 page. A key that isn't in the manifest is usually a name-vs-key
@@ -1821,8 +1833,14 @@ def workers_residency_all(worker_id):
 # percent budget was resolved per model).
 _BAND_SPILL_KEYS = {"gpu_mem_gib_deviation_pct", "cpu_mem_gib_deviation_pct",
                     "ctx_pct", "ctx_deviation_pct", "priority"}
-_ALLOC_SPILL_KEYS = {"n_gpu_layers", "gpu_mem_gib", "cpu_mem_gib",
-                     "threads", "tensor_split"} | _BAND_SPILL_KEYS
+# k37 allocation-mode keys: only max-ram/explicit ever ride these on the wire
+# (normalize_spill rewrites the gpu-only/ram-only/max-gpu trio onto the
+# unchanged n_gpu_layers encoding); central version-gates their EMISSION
+# (WorkerStore.spill_for) so an old worker never sees a dead knob.
+_MODE_SPILL_KEYS = {"alloc_mode", "leniency_pct", "priority_device"}
+_ALLOC_SPILL_KEYS = ({"n_gpu_layers", "gpu_mem_gib", "cpu_mem_gib",
+                      "threads", "tensor_split"}
+                     | _BAND_SPILL_KEYS | _MODE_SPILL_KEYS)
 
 
 def _validate_alloc_spill(spill):
@@ -1849,7 +1867,12 @@ def _validate_alloc_spill(spill):
     band_reason = _validate_band_values(spill)
     if band_reason is not None:
         return None, band_reason
-    return dict(spill), None
+    # k37: resolve legacy mode names + rewrite the coarse trio onto the
+    # unchanged legacy wire (alloc_mode only survives for max-ram/explicit).
+    # Legacy names accepted on input, resolved + logged, never written back.
+    from ....managers.alloc_modes import normalize_spill
+    clean, _note = normalize_spill(spill)
+    return clean, None
 
 
 def _validate_band_values(spill) -> "str | None":
@@ -1884,6 +1907,28 @@ def _validate_band_values(spill) -> "str | None":
             return "priority must be a non-negative integer (0 = normal)"
         if v < 0:
             return f"priority={spill['priority']} out of range — must be >= 0"
+    # k37 allocation-mode keys (shared by the single and bulk paths, like the
+    # bands above). Legacy names are VALID input (resolved downstream by
+    # normalize_spill); only a genuinely unknown mode is rejected at the door.
+    if "alloc_mode" in spill and spill["alloc_mode"] is not None:
+        from ....managers.alloc_modes import resolve_alloc_mode, ALLOC_MODES
+        canonical, _ = resolve_alloc_mode(spill["alloc_mode"])
+        if canonical is None:
+            return (f"alloc_mode={spill['alloc_mode']!r} is not a recognized "
+                    f"allocation mode — one of {list(ALLOC_MODES)} (legacy "
+                    "names autofit/cpu-only are accepted and resolved)")
+    if "leniency_pct" in spill and spill["leniency_pct"] is not None:
+        try:
+            v = float(spill["leniency_pct"])
+        except (TypeError, ValueError):
+            return ("leniency_pct must be a number 0..100 (percent OF THE "
+                    "MODEL that may land off its ideal device)")
+        if not (0.0 <= v <= 100.0):
+            return f"leniency_pct={spill['leniency_pct']} out of range — must be 0..100"
+    if "priority_device" in spill and spill["priority_device"] is not None:
+        if str(spill["priority_device"]).strip().lower() not in ("gpu", "ram"):
+            return (f"priority_device={spill['priority_device']!r} must be "
+                    "'gpu' (default) or 'ram'")
     return None
 
 
@@ -1907,8 +1952,13 @@ def _validate_band_values(spill) -> "str | None":
 # t21 bands ride the explicit allocation and are GGUF-only just like the budgets
 # they band (spec: "explicit budgets are GGUF-only"; the UI gates them the same
 # way). So a spill carrying ONLY a band/priority is still classified GGUF-only.
+# k37: the allocation-mode keys join the GGUF-only class — max-ram/explicit
+# (the only modes that ride alloc_mode after normalize_spill) need fine-grained
+# placement that the transformers gap loaders don't wire yet (Slice C). The
+# coarse trio (gpu-only/ram-only/max-gpu) rides n_gpu_layers and stays
+# engine-agnostic, exactly as before.
 _EXPLICIT_BUDGET_KEYS = ({"gpu_mem_gib", "cpu_mem_gib", "threads", "tensor_split"}
-                         | _BAND_SPILL_KEYS)
+                         | _BAND_SPILL_KEYS | _MODE_SPILL_KEYS)
 
 
 def _alloc_is_gguf_only(spill) -> bool:
@@ -1955,9 +2005,18 @@ def _alloc_spill_ok_for_engine(spill, model_key) -> "tuple[bool, str | None]":
     if _is_gguf_framework(fw):
         return True, None
     shown = fw or "unknown engine"
+    mode = (spill or {}).get("alloc_mode")
+    if mode:
+        # k37: name the refused MODE honestly. Fine-grained placement
+        # (max-ram/explicit) is GGUF-only until the accelerate loader gap
+        # closes (Slice C).
+        return False, (f"allocation mode '{mode}' is GGUF-only for now — "
+                       f"fine-grained placement needs loader wiring the "
+                       f"{shown} path doesn't have yet; '{model_key}' may use "
+                       "gpu-only, ram-only, or max-gpu")
     return False, (f"{_alloc_label(spill)} is a GGUF-only allocation "
-                   f"(explicit budget); '{model_key}' is {shown} — use autofit, "
-                   "Max GPU, or CPU only for a non-GGUF model")
+                   f"(explicit budget); '{model_key}' is {shown} — use "
+                   "max-gpu, gpu-only, or ram-only for a non-GGUF model")
 
 
 def _apply_alloc_map(worker_id, model_keys, spill):
@@ -2145,14 +2204,25 @@ def _apply_alloc_map_multi(worker_id, model_keys, spills_by_key):
 
 
 def _alloc_label(spill) -> str:
-    """Human label for a spill contract (mirrors the UI's spillLabel)."""
+    """Human label for a spill contract — the k37 flat mode names (the honest
+    rename: {}==max-gpu fit-and-spill; -1==gpu-only all-or-bust; off==ram-only)."""
     if not spill:
-        return "autofit"
+        return "max-gpu"
+    mode = spill.get("alloc_mode")
+    if mode:                                   # max-ram / explicit ride this key
+        parts = [str(mode)]
+        if spill.get("gpu_mem_gib") is not None:
+            parts.append(f"{spill['gpu_mem_gib']}G VRAM")
+        if spill.get("cpu_mem_gib") is not None:
+            parts.append(f"{spill['cpu_mem_gib']}G RAM")
+        if spill.get("leniency_pct") is not None:
+            parts.append(f"±{spill['leniency_pct']}% leniency")
+        return " · ".join(parts)
     ngl = spill.get("n_gpu_layers")
     if ngl in (-1, "-1"):
-        return "max GPU"
+        return "gpu-only"
     if ngl in (0, "0", "off"):
-        return "CPU only"
+        return "ram-only"
     parts = []
     if spill.get("gpu_mem_gib") is not None:
         parts.append(f"{spill['gpu_mem_gib']}G VRAM")
@@ -3783,6 +3853,9 @@ def serving_get(model_key):
                         "error": f"Unknown model: {model_key}"}), 404
     row = spec_row(spec)
     row["override"] = get_override(model_key)
+    # k37: the model's EFFECTIVE allocation mode (persisted alloc_mode, else
+    # read-time derivation from the legacy knobs; blank model == max-gpu).
+    row["alloc_mode"] = _effective_alloc_mode(model_key)
     _with_gguf(row, model_key)
     return jsonify(row)
 
@@ -3795,6 +3868,7 @@ def serving_set(model_key):
 
     row = spec_row(serve_spec_for(model_key))
     row["override"] = get_override(model_key)
+    row["alloc_mode"] = _effective_alloc_mode(model_key)
     _with_gguf(row, model_key)
     if do_apply:
         row["apply"] = _apply_serving(model_key)

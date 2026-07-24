@@ -10,9 +10,12 @@ and REVERSIBLE:
     changes an existing spill and restores it, never creates/removes a
     designation (pins are routing-only, but staying on already-assigned pairs
     keeps every trial trivially reversible);
-  * alloc modes are framework-gated: a GGUF model gets the full set; a
-    non-GGUF (transformers) model gets autofit only (an explicit GGUF-only
-    spill is refused at /assign by the engine gate).
+  * alloc modes are framework-gated: a GGUF model gets the full FIVE-mode set
+    (k37: gpu-only / ram-only / max-gpu / max-ram / explicit); a non-GGUF
+    (transformers) model gets only the three coarse placement intents
+    (gpu-only / ram-only / max-gpu) — max-ram/explicit need fine-grained
+    placement the gap loaders don't wire yet (Slice C) and are refused at
+    /assign by the engine gate, which the runner honours.
 
 Nothing here talks to the network — it consumes /models + /llm/workers payloads
 so it is unit-testable with fixtures."""
@@ -21,14 +24,16 @@ from __future__ import annotations
 import random
 
 from .schema import ALLOC_MODES, CTX_PCTS
+from ..managers.alloc_modes import NONGGUF_ALLOWED_MODES, resolve_alloc_mode
 
 CHAT_TASKS = frozenset({"text-generation", "image-text-to-text",
                         "text2text-generation"})
 
-# GGUF-only alloc modes carry n_gpu_layers / gpu budgets; a transformers model
-# is engine-gated to autofit at /assign, so only offer it autofit.
+# Framework gating (k37): GGUF gets all five modes; a transformers model is
+# engine-gated at /assign to the three coarse placement intents, so only offer
+# those (max-ram/explicit on a non-GGUF would be a guaranteed 409).
 GGUF_MODES = ALLOC_MODES
-NONGGUF_MODES = ("autofit",)
+NONGGUF_MODES = NONGGUF_ALLOWED_MODES
 
 # Hybrid feasibility margin: predicted need must fit under margin*(vram+ram) of
 # at least one candidate box, else the combo is predicted-infeasible (skip,
@@ -152,21 +157,30 @@ def _budget_gib_for(need_bytes: int | None, card_gib: float | None,
 
 def build_spill(mode: str, ctx_pct: int, budget_gib: float | None,
                 rng: random.Random) -> dict:
-    """Construct the /assign spill for a drawn (mode, ctx_pct). ctx_pct rides
-    the spill (validated 1..100) on every GPU-bearing mode so the ctx dimension
-    is real; cpu-only omits it (irrelevant off-GPU)."""
-    if mode == "autofit":
-        spill: dict = {}
-    elif mode == "max-gpu":
+    """Construct the /assign spill for a drawn (mode, ctx_pct) — the k37
+    five-mode wire encoding. ctx_pct rides the spill (validated 1..100) on the
+    GPU-bearing tunable modes so the ctx dimension is real; ram-only omits it
+    (irrelevant off-GPU) and max-gpu stays ZERO-knob (the operator's
+    cut-and-dry autofit — {}).
+
+    Legacy mode names (autofit / cpu-only / old max-gpu semantics via
+    "budget"/"bands") are accepted and resolved through the alias table —
+    accepted on input, never emitted back."""
+    canonical, _alias = resolve_alloc_mode(mode)
+    mode = canonical or "max-gpu"
+    if mode == "max-gpu":
+        spill: dict = {}                    # autofit, zero knobs — by design
+    elif mode == "gpu-only":
         spill = {"n_gpu_layers": -1, "ctx_pct": int(ctx_pct)}
-    elif mode == "cpu-only":
+    elif mode == "ram-only":
         spill = {"n_gpu_layers": "off"}
-    elif mode == "budget":
-        spill = {"gpu_mem_gib": budget_gib, "ctx_pct": int(ctx_pct)}
-    elif mode == "bands":
+    elif mode == "max-ram":
+        spill = {"alloc_mode": "max-ram", "ctx_pct": int(ctx_pct)}
+    elif mode == "explicit":
         spill = {
+            "alloc_mode": "explicit",
             "gpu_mem_gib": budget_gib,
-            "gpu_mem_gib_deviation_pct": rng.choice([10.0, 25.0, 50.0]),
+            "leniency_pct": rng.choice([10.0, 25.0, 50.0]),
             "ctx_pct": int(ctx_pct),
             "ctx_deviation_pct": rng.choice([10.0, 25.0, 50.0]),
             "priority": rng.choice([0, 0, 1]),  # bias to normal
@@ -199,9 +213,9 @@ def draw_combo(rng: random.Random, models: list[dict], workers: list[dict],
     budget_gib = _budget_gib_for(m["effective_bytes"], card_gib, rng)
     spill = build_spill(mode, ctx_pct, budget_gib, rng)
     warm_on = sorted(c for c in cands if mk in widx[c]["warm"])
-    # combo.ctx_pct == what the spill actually encodes (None for autofit/cpu-only
-    # where ctx is not a controllable dimension), so the record never claims a
-    # ctx target it didn't apply.
+    # combo.ctx_pct == what the spill actually encodes (None for max-gpu/
+    # ram-only where ctx is not a controlled dimension), so the record never
+    # claims a ctx target it didn't apply.
     applied_ctx = spill.get("ctx_pct")
     return {
         "model_key": mk, "framework": m["framework"],

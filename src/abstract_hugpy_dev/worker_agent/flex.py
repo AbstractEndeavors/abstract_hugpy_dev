@@ -355,6 +355,156 @@ def plan_partial_offload(*, weights_bytes: Optional[int], kv_bytes: Optional[int
     return plan
 
 
+# ── k37: the explicit / max-ram admission engine ─────────────────────────────
+# LENIENCY (operator-confirmed math): N% leniency = up to N% OF THE MODEL may
+# land off its ideal device before bust. The ideal share on the priority device
+# slides from its target down to (target − N% of the model) — the FLOOR — and
+# the engine DEGRADES within that band before busting past it. 100% GPU target
+# + 30% leniency -> floor 70% GPU / 30% RAM. The conversion onto the band
+# machinery above: whole = the MODEL's bytes, deviation_pct = leniency_pct, so
+# band_floor(target_bytes, leniency_pct, model_bytes) IS the leniency floor.
+def leniency_floor_pct(target_pct: float, leniency_pct: Optional[float]) -> float:
+    """The floor SHARE (percent of the model) the priority device may degrade
+    to: max(0, target − leniency). 100/30 -> 70."""
+    try:
+        t = max(0.0, min(100.0, float(target_pct)))
+    except (TypeError, ValueError):
+        t = 100.0
+    lo = float(leniency_pct or 0.0)
+    return max(0.0, t - max(0.0, lo))
+
+
+def plan_explicit_offload(*, weights_bytes: Optional[int], kv_bytes: Optional[int],
+                          total_layers: Optional[int],
+                          vram_budget_bytes: Optional[int],
+                          ram_free_bytes: Optional[int],
+                          mode: str = "explicit",
+                          priority_device: str = "gpu",
+                          gpu_target_bytes: Optional[int] = None,
+                          ram_target_bytes: Optional[int] = None,
+                          leniency_pct: Optional[float] = None,
+                          ram_safety_frac: float = 0.95) -> Optional["PartialPlan"]:
+    """Layers-that-fit plan for the k37 **explicit** and **max-ram** modes —
+    degrade WITHIN the leniency band toward the floor, bust past it with an
+    HONEST refusal that names the mode and the floor. PURE (no I/O), like
+    plan_partial_offload, and returns the same :class:`PartialPlan` so the
+    agent's admit/refuse plumbing is shared.
+
+    max-ram IS explicit(ram priority, 100% target, 100% leniency) internally —
+    the caller passes ``mode="max-ram"`` so refusals still name the flat mode
+    the operator chose (the 5 flat names are a cognitive-load boundary; the
+    shared engine is an implementation detail).
+
+    Semantics per priority device:
+      * ``gpu``: ideal = the VRAM target (bytes; default the whole model).
+        Place as many layers as the VRAM budget holds, capped at the target
+        (degrade = accept less GPU than ideal, down to the leniency floor).
+        Below the floor -> bust. The RAM remainder must fit budgetable RAM.
+      * ``ram``: mirror — fill RAM toward its target first; only the OVERFLOW
+        layers go to the GPU (autofit's per-layer pricing, inverted). RAM
+        share below the floor -> bust; overflow the GPU can't hold -> bust
+        ("can't satisfy").
+
+    Returns None when not computable (missing geometry/size) so the caller
+    keeps its existing honest-refusal path unchanged."""
+    try:
+        total_layers = int(total_layers)
+        weights = int(weights_bytes)
+    except (TypeError, ValueError):
+        return None
+    if total_layers <= 0 or weights <= 0:
+        return None
+    kv = max(0, int(kv_bytes or 0))
+    vram_budget = max(0, int(vram_budget_bytes or 0))
+    ram_free = max(0, int(ram_free_bytes or 0))
+    ram_budget = int(ram_free * ram_safety_frac)
+    whole = weights + kv                       # the MODEL — leniency's denominator
+    dev = "ram" if str(priority_device).strip().lower() == "ram" else "gpu"
+
+    # Integer layer math (never float-divide whole/total then floor — a 1-ulp
+    # error would drop a layer at exact fits): layers(x) = x·total // whole,
+    # ceil for the floor requirement.
+    def _layers_for(x: float) -> int:
+        return max(0, min(int((int(x) * total_layers) // whole), total_layers))
+
+    def _layers_ceil(x: float) -> int:
+        return max(0, min(int(-((-int(x) * total_layers) // whole)), total_layers))
+
+    if dev == "gpu":
+        ideal = min(whole, int(gpu_target_bytes)) if gpu_target_bytes else whole
+        floor = band_floor(ideal, leniency_pct, whole)
+        achievable = min(ideal, vram_budget)
+        n_gpu = _layers_for(achievable)
+        floor_layers = _layers_ceil(floor)
+    else:
+        ideal = min(whole, int(ram_target_bytes)) if ram_target_bytes else whole
+        floor = band_floor(ideal, leniency_pct, whole)
+        achievable = min(ideal, ram_budget)
+        in_ram = _layers_for(achievable)
+        n_gpu = total_layers - in_ram          # ONLY the overflow rides the GPU
+        floor_layers = _layers_ceil(floor)
+    floor_pct = int(round(100.0 * floor / whole)) if whole else 0
+    ideal_pct = int(round(100.0 * ideal / whole)) if whole else 0
+
+    frac = n_gpu / float(total_layers)
+    weights_gpu = int(round(weights * frac))
+    weights_cpu = max(0, weights - weights_gpu)
+    kv_gpu = int(round(kv * frac))
+    kv_cpu = max(0, kv - kv_gpu)
+    vram_need = weights_gpu + kv_gpu
+    ram_need = weights_cpu + kv_cpu
+    gpu_pct = int(round(100 * frac))
+
+    plan = PartialPlan(
+        admit=True, n_gpu_layers=n_gpu, gpu_pct=gpu_pct, total_layers=total_layers,
+        vram_need_bytes=vram_need, ram_need_bytes=ram_need,
+        weights_gpu_bytes=weights_gpu, weights_cpu_bytes=weights_cpu,
+        kv_gpu_bytes=kv_gpu, kv_cpu_bytes=kv_cpu,
+        vram_budget_bytes=vram_budget, ram_free_bytes=ram_free,
+        floor_layers=floor_layers,
+        note=(f"{mode} ({dev}-priority): {n_gpu}/{total_layers} layers on GPU "
+              f"({gpu_pct}%), floor {floor_pct}% on {dev}"))
+
+    # Bust past the floor: the priority device could not be given even the
+    # LOOSEST allowed share (target − leniency). Name mode + floor honestly.
+    placed_layers = (n_gpu if dev == "gpu" else total_layers - n_gpu)
+    if placed_layers < floor_layers:
+        plan.admit = False
+        lo = float(leniency_pct or 0.0)
+        plan.reject_reason = (
+            f"{mode}: even the loosened floor won't fit — target {ideal_pct}% of "
+            f"the model on {dev.upper()} with {lo:g}% leniency gives a floor of "
+            f"{floor_pct}% ({floor_layers}/{total_layers} layers, "
+            f"~{floor / 2**30:.1f} GiB) but only "
+            f"{(vram_budget if dev == 'gpu' else ram_budget) / 2**30:.1f} GiB of "
+            f"{dev.upper()} is budgetable — bust past the leniency floor")
+        return plan
+
+    if dev == "gpu":
+        # RAM guard on the spilled remainder — degrading within the band must
+        # never OOM host RAM.
+        if ram_need > ram_budget:
+            plan.admit = False
+            plan.reject_reason = (
+                f"{mode}: the {total_layers - n_gpu} off-GPU layer(s) need "
+                f"~{ram_need / 2**30:.1f} GiB host RAM but only "
+                f"~{ram_budget / 2**30:.1f} GiB is budgetable — would OOM system RAM")
+            return plan
+    else:
+        # GPU guard on the overflow — "can't satisfy -> bust" (max-ram) /
+        # explicit ram-priority overflow that the card can't hold.
+        if vram_need > vram_budget:
+            plan.admit = False
+            plan.reject_reason = (
+                f"{mode}: RAM holds {total_layers - n_gpu}/{total_layers} layers; "
+                f"the {n_gpu}-layer overflow needs ~{vram_need / 2**30:.1f} GiB "
+                f"VRAM but only ~{vram_budget / 2**30:.1f} GiB is budgetable — "
+                f"can't satisfy")
+            return plan
+
+    return plan
+
+
 # ── the flex-before-evict decision ───────────────────────────────────────────
 class FlexPlan:
     """The result of :func:`plan_flex`.

@@ -298,6 +298,44 @@ class ServeSpec:
         return _unit_slug(self.model_key)
 
 
+def _ngl_for_alloc_mode(alloc_mode, model_file, extra) -> "int | None":
+    """Materialize a persisted k37 ``alloc_mode`` onto the serve spec's
+    n_gpu_layers (the -ngl the unit/in-process load uses), or None to keep the
+    legacy extra/default resolution (mode unset, or the file is unresolvable
+    so honest layer math is impossible — degrade, never guess 0).
+
+    Same-box rail: the code computing this IS the version that honors it, so
+    no version gate applies here (unlike central's relay emission seam)."""
+    from ..alloc_modes import resolve_alloc_mode
+    canonical, _ = resolve_alloc_mode(alloc_mode)
+    if canonical is None:
+        return None
+    if canonical == "gpu-only":
+        return -1
+    if canonical == "ram-only":
+        return 0
+    if not model_file or not os.path.isfile(model_file):
+        return None                    # can't price layers — keep legacy path
+    try:
+        from .. import spill as _spill
+        if canonical == "max-ram":
+            return _spill.maxram_gpu_layers(model_file)
+        # max-gpu / explicit: honest fit-and-spill. explicit's VRAM target
+        # (gpu_mem_gib) caps the fit; leniency-floor enforcement is the worker
+        # admission engine's job (flex.plan_explicit_offload).
+        fv = _spill.free_vram_bytes()
+        try:
+            tgt = extra.get("gpu_mem_gib")
+            if canonical == "explicit" and tgt:
+                cap = int(float(tgt) * 2 ** 30)
+                fv = min(fv, cap) if fv else cap
+        except (TypeError, ValueError):
+            pass
+        return _spill.autofit_gpu_layers(model_file, free_vram=fv)
+    except Exception:  # noqa: BLE001 — spec build must never die on layer math
+        return None
+
+
 def serve_spec_for(model_key=None, *, cfg=None) -> ServeSpec:
     cfg = cfg if cfg is not None else get_model_config(model_key)
     model_key = cfg.model_key or model_key or cfg.name   # canonical registry key wins
@@ -322,6 +360,12 @@ def serve_spec_for(model_key=None, *, cfg=None) -> ServeSpec:
         if mmproj:
             extra_args += ["--mmproj", mmproj]
 
+    # k37: a persisted alloc_mode materializes onto n_gpu_layers here (gpu-only
+    # -> -1, ram-only -> 0, max-gpu/explicit -> honest fit, max-ram -> inverted
+    # RAM-first fit). Mode unset (the common case) keeps the legacy resolution
+    # byte-identical.
+    mode_ngl = _ngl_for_alloc_mode(extra.get("alloc_mode"), model_file, extra)
+
     return ServeSpec(
         model_key=model_key,
         mode=mode,
@@ -330,7 +374,8 @@ def serve_spec_for(model_key=None, *, cfg=None) -> ServeSpec:
         port=port,
         ctx_size=_ctx_for(cfg, model_key, extra),
         threads=int(extra.get("threads") or DEFAULT_LLAMA_THREADS),
-        n_gpu_layers=int(extra.get("n_gpu_layers", DEFAULT_LLAMA_NGL)),
+        n_gpu_layers=(int(mode_ngl) if mode_ngl is not None
+                      else int(extra.get("n_gpu_layers", DEFAULT_LLAMA_NGL))),
         always_on=bool(extra.get("always_on", False)),
         ttl_seconds=extra.get("ttl_seconds") or (None if extra.get("always_on", False) else LLAMA_SWAP_TTL),
         extra_args=tuple(extra_args),

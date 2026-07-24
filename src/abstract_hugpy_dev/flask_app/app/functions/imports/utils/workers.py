@@ -1929,11 +1929,29 @@ class WorkerStore:
             return _public_view(worker)
 
     def spill_for(self, worker_id: str, model_key: str) -> Dict[str, Any]:
-        """Per-assignment spill override for (worker, model), or {} for autofit."""
+        """Per-assignment spill override for (worker, model), or {} for
+        max-gpu (autofit). THE version-gated emission seam (k37): a spill
+        carrying the NEW allocation-mode keys (alloc_mode/leniency_pct/
+        priority_device — max-ram/explicit) is only emitted to a worker whose
+        pkg_version honors them; an older worker gets {} (max-gpu autofit) for
+        the request and the downgrade is logged honestly — a selected mode
+        must never be a silent dead knob. The PERSISTED contract is untouched
+        (it applies the moment the worker updates)."""
         worker = self._load().get(worker_id)
         if worker is None:
             return {}
-        return dict(worker.get("spill_by_model", {}).get(model_key, {}))
+        spill = dict(worker.get("spill_by_model", {}).get(model_key, {}))
+        try:
+            from ......managers.alloc_modes import gate_spill_for_worker
+            gated, note = gate_spill_for_worker(
+                spill, worker.get("pkg_version"),
+                worker.get("name") or worker_id)
+            if note:
+                logger.warning("alloc-mode downgrade for %s on %s: %s",
+                               model_key, worker.get("name") or worker_id, note)
+            return gated
+        except Exception:  # noqa: BLE001 — the gate must never break relaying
+            return spill
 
     def set_load_report(self, worker_id: str, model_key: str,
                         report: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:

@@ -38,14 +38,23 @@ ALLOWED_FIELDS = {
     "n_gpu_layers",   # GPU offload (-1 all, 0 cpu, N layers)
     "threads",        # CPU threads
     "llama_ctx",      # context window
-    "gpu_mem_gib",    # transformers per-GPU budget
-    "cpu_mem_gib",    # transformers CPU/RAM budget
+    "gpu_mem_gib",    # transformers per-GPU budget / explicit-mode VRAM target
+    "cpu_mem_gib",    # transformers CPU/RAM budget / explicit-mode RAM target
     "always_on",      # systemd always-on vs swap on-demand
     "ttl_seconds",    # swap idle-unload TTL
     "gguf_file",      # which downloaded .gguf to serve (basename; "" = auto/default)
+    # k37 — the five-mode allocation selector (gpu-only|ram-only|max-gpu|
+    # max-ram|explicit; legacy names resolved on write, never stored back).
+    "alloc_mode",
+    "leniency_pct",   # explicit mode: N% OF THE MODEL may land off its ideal
+                      # device before bust (100% GPU + 30% -> floor 70/30)
+    "priority",       # explicit mode: flex priority (0 = normal; higher
+                      # compresses lower-priority neighbours within bands)
+    "priority_device",  # explicit mode: which device the target favors
+                        # ("gpu" default | "ram")
 }
-_INT_FIELDS = {"n_gpu_layers", "threads", "llama_ctx", "ttl_seconds"}
-_FLOAT_FIELDS = {"gpu_mem_gib", "cpu_mem_gib"}
+_INT_FIELDS = {"n_gpu_layers", "threads", "llama_ctx", "ttl_seconds", "priority"}
+_FLOAT_FIELDS = {"gpu_mem_gib", "cpu_mem_gib", "leniency_pct"}
 _BOOL_FIELDS = {"always_on"}
 
 
@@ -282,6 +291,26 @@ def gguf_variants_detail(model_key: str, model_dir: str, cfg=None) -> dict:
 def _coerce(field: str, value):
     if value is None or value == "":
         return None  # signals "clear this field"
+    if field == "alloc_mode":
+        # Legacy names (autofit/cpu-only/...) resolve to canonical on WRITE, so
+        # the stored value is always one of the five flat modes — accepted on
+        # input, never stored/emitted back. Unknown -> clear + log (degrade,
+        # never 500 a serving-settings POST over a typo).
+        from ..alloc_modes import resolve_alloc_mode, ALLOC_MODES
+        canonical, was_alias = resolve_alloc_mode(value)
+        if canonical is None:
+            logger.warning("ignoring unknown alloc_mode %r (recognized: %s)",
+                           value, ", ".join(ALLOC_MODES))
+            return None
+        if was_alias:
+            logger.info("alloc_mode legacy name %r stored as %r", value, canonical)
+        return canonical
+    if field == "priority_device":
+        v = str(value).strip().lower()
+        if v not in ("gpu", "ram"):
+            logger.warning("ignoring unknown priority_device %r (gpu|ram)", value)
+            return None
+        return v
     if field in _INT_FIELDS:
         return int(value)
     if field in _FLOAT_FIELDS:
@@ -315,6 +344,17 @@ def set_override(model_key: str, fields: dict) -> dict:
             data.pop(model_key, None)
         _save(data)
         return current
+
+
+def effective_alloc_mode(model_key: str) -> str:
+    """The model's EFFECTIVE allocation mode (k37) — the persisted
+    ``alloc_mode`` when set, else READ-TIME DERIVATION from the legacy knobs
+    (n_gpu_layers -1 -> gpu-only, 0/"off" -> ram-only, explicit budgets/bands
+    -> explicit, unset -> max-gpu). Derivation IS the migration: no override
+    file is ever rewritten for the rename, and a blank model reads max-gpu
+    (fit-and-spill, never OOM — defaults-are-promises)."""
+    from ..alloc_modes import derive_alloc_mode
+    return derive_alloc_mode(get_override(model_key))
 
 
 def _save(data: dict) -> None:

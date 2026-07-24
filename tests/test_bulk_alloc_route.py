@@ -112,7 +112,7 @@ try:
           all(c[2] == {"n_gpu_layers": -1} for c in assign_calls))
     check("maxgpu: NEVER relayed (no restart)", relay_seen["n"] == 0)
     check("maxgpu: restarting is always False", body["restarting"] is False)
-    check("maxgpu: alloc label", body["alloc"] == "max GPU")
+    check("maxgpu: alloc label (k37 honest name)", body["alloc"] == "gpu-only")
     check("maxgpu: per-model results all ok",
           body["results"] == {"a": "ok", "b": "ok"})
     check("maxgpu: counts", body["counts"] == {"ok": 2, "error": 0, "skipped": 0, "total": 2})
@@ -126,7 +126,7 @@ try:
     body = r.get_json()
     check("autofit: empty spill written (clears override)",
           assign_calls == [("wid", "a", {})])
-    check("autofit: label", body["alloc"] == "autofit")
+    check("autofit: label (k37 honest name)", body["alloc"] == "max-gpu")
     # null spill is ALSO autofit
     assign_calls.clear()
     r = client.post("/llm/workers/wid/alloc-all",
@@ -137,7 +137,7 @@ try:
     # 3) CPU only + custom budgets label correctly -----------------------------
     r = client.post("/llm/workers/wid/alloc-all",
                     json={"model_keys": ["a"], "spill": {"n_gpu_layers": "off"}})
-    check("cpu-only: label", r.get_json()["alloc"] == "CPU only")
+    check("cpu-only: label (k37 honest name)", r.get_json()["alloc"] == "ram-only")
     r = client.post("/llm/workers/wid/alloc-all",
                     json={"model_keys": ["a"],
                           "spill": {"gpu_mem_gib": 8, "cpu_mem_gib": 16, "threads": 4}})
@@ -208,9 +208,9 @@ try:
           wr._validate_alloc_spill({"n_gpu_layers": -1}) == ({"n_gpu_layers": -1}, None))
     clean, reason = wr._validate_alloc_spill({"bad": 1})
     check("validate: unknown key rejected", clean is None and "unsupported" in reason)
-    check("label: empty -> autofit", wr._alloc_label({}) == "autofit")
-    check("label: -1 -> max GPU", wr._alloc_label({"n_gpu_layers": -1}) == "max GPU")
-    check("label: off -> CPU only", wr._alloc_label({"n_gpu_layers": "off"}) == "CPU only")
+    check("label: empty -> max-gpu (k37)", wr._alloc_label({}) == "max-gpu")
+    check("label: -1 -> gpu-only (k37)", wr._alloc_label({"n_gpu_layers": -1}) == "gpu-only")
+    check("label: off -> ram-only (k37)", wr._alloc_label({"n_gpu_layers": "off"}) == "ram-only")
 
     # 9) the route is operator-gated (assign-family tier) ----------------------
     oa = importlib.import_module(
