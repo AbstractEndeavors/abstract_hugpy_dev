@@ -68,12 +68,26 @@ def _remember_assignments(worker: Dict[str, Any]) -> None:
         return
     try:
         mem = _load_assign_memory()
-        mem[wid] = {
+        prior = mem.get(wid) if isinstance(mem.get(wid), dict) else {}
+        entry = {
             "name": worker.get("name"),
             "models": list(worker.get("models") or []),
             "spill_by_model": dict(worker.get("spill_by_model") or {}),
             "remembered_at": _now(),
         }
+        # Durable HARDWARE FACTS ride the same sidecar so they survive even a
+        # full registry loss (operator addendum 2026-07-24): carry the last-known
+        # totals, advance-only — never overwrite a remembered fact with an absent
+        # one, so a re-register during a transient probe miss can't erase them.
+        gpu_known = (worker.get(_GPU_TOTAL_DURABLE_KEY)
+                     or prior.get(_GPU_TOTAL_DURABLE_KEY))
+        ram_known = (worker.get(_RAM_TOTAL_DURABLE_KEY)
+                     or prior.get(_RAM_TOTAL_DURABLE_KEY))
+        if gpu_known:
+            entry[_GPU_TOTAL_DURABLE_KEY] = gpu_known
+        if ram_known:
+            entry[_RAM_TOTAL_DURABLE_KEY] = ram_known
+        mem[wid] = entry
         tmp = _assign_memory_path() + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(mem, fh, indent=1)
@@ -494,6 +508,18 @@ def _has_usable_gpu(worker: Dict[str, Any]) -> bool:
 
 _GIB = 2 ** 30
 
+# Spill keys that constitute a PERSISTED placement intent. If a (worker, model)
+# spill carries ANY of these, it is NOT blank — the capability-aware default is
+# never consulted and the persisted contract is honored verbatim (an explicit
+# alloc_mode ALWAYS wins). Only a spill with none of these is "blank" and gets
+# the feasibility-derived default in spill_for. Kept in sync with the mode/
+# budget/band key families in managers.alloc_modes + worker_routes.
+_PLACEMENT_SPILL_KEYS = frozenset({
+    "alloc_mode", "n_gpu_layers", "leniency_pct", "priority", "priority_device",
+    "gpu_mem_gib", "cpu_mem_gib", "gpu_mem_gib_deviation_pct",
+    "cpu_mem_gib_deviation_pct", "tensor_split", "threads",
+})
+
 
 def _limit_bytes(worker: Dict[str, Any], key: str) -> Optional[int]:
     """A central limit (limits.<key> in GiB) as bytes, or None if unset."""
@@ -705,6 +731,152 @@ def _model_size_bytes(model_key: str) -> Optional[int]:
         return int(size) if size else None
     except Exception:  # noqa: BLE001 — unknown size is a valid answer here
         return None
+
+
+def _model_moe_gpu_bytes(model_key: str) -> Optional[int]:
+    """The GPU-side need of a detected-MoE GGUF under the expert split (its
+    non-expert bytes + mmproj), or None for dense/non-GGUF/unresolvable.
+
+    Same source as _model_size_bytes: the registry row annotated by
+    _annotate_gguf_size, whose ``moe`` field rides gguf_variants_detail exactly
+    like effective_bytes (spill.gguf_moe_detail caches the header parse per
+    file, so this costs the enrichment read it already does — never a
+    per-request re-parse). Feasibility uses it so a MoE the split makes
+    serveable is never eliminated against its full file size."""
+    if not model_key:
+        return None
+    try:
+        from ....routes.llm_storage_routes import _annotate_gguf_size
+        from ......imports.config.models.models_config import get_models_dict
+        manifest = get_models_dict(dict_return=True) or {}
+        entry = manifest.get(model_key)
+        if not isinstance(entry, dict):
+            return None
+        model = dict(entry)                     # copy: annotators mutate
+        _annotate_gguf_size(model, model_key)
+        moe = model.get("moe") or {}
+        nexp = moe.get("non_expert_bytes")
+        if not nexp:
+            return None
+        return int(nexp) + int(model.get("mmproj_bytes") or 0)
+    except Exception:  # noqa: BLE001 — MoE sizing is additive; unknown is fine
+        return None
+
+
+def _model_engine(model_key: str) -> Optional[str]:
+    """One model's engine/framework from central's registry, lowercased, or None
+    when unresolvable. Used to pick the FEASIBLE blank default (GGUF is always
+    max-gpu; only a non-GGUF model can default to ram-only). None -> the caller
+    degrades to max-gpu (never guess an engine)."""
+    if not model_key:
+        return None
+    try:
+        from ......imports.config.main import get_model_config
+        cfg = get_model_config(model_key)
+        fw = getattr(cfg, "framework", None)
+        return str(fw).lower() if fw else None
+    except Exception:  # noqa: BLE001 — unknown engine: caller treats as unknown
+        return None
+
+
+# Durable hardware-total fields (operator addendum 2026-07-24): a box's GPU and
+# RAM CAPACITY are physical FACTS, not per-session state — they don't change
+# between a worker's restarts. Central persists the last KNOWN-GOOD reading per
+# worker identity in these fields (mirrors the auto_reap/wildcard durable-field
+# pattern: a plain persisted key that register/heartbeat leave intact). They are
+# ADVANCE-ONLY from a real reading — a transient empty/partial gpu probe (driver
+# not ready right after boot; detect_gpus() returning []) NEVER wipes them — so
+# feasibility has totals for every worker central has ever met, and the
+# fail-open collapses to genuinely first-contact-only. _remember_hw_totals
+# updates them; the *_total_bytes readers prefer the live figure and fall back
+# to the durable one.
+_GPU_TOTAL_DURABLE_KEY = "gpu_total_bytes_known"
+_RAM_TOTAL_DURABLE_KEY = "ram_total_bytes_known"
+
+
+def _live_gpu_total_bytes(worker: Dict[str, Any]) -> Optional[int]:
+    """GPU total from the CURRENT gpus[] reading only (no durable fallback)."""
+    gpus = [g for g in (worker.get("gpus") or []) if isinstance(g, dict)]
+    totals = [g.get("memory_total") for g in gpus if g.get("memory_total")]
+    if not totals:
+        return None
+    try:
+        return int(sum(totals))
+    except (TypeError, ValueError):
+        return None
+
+
+def _remember_hw_totals(worker: Dict[str, Any]) -> None:
+    """Persist the worker's last KNOWN-GOOD GPU/RAM totals as durable facts.
+    ADVANCE-ONLY: called after register/heartbeat merges the new reading, it
+    copies a real (non-None, >0) live total into the durable key and NEVER
+    overwrites a good durable value with an absent/zero one — so a transient
+    probe miss can't erase a fact central already learned. Idempotent + cheap;
+    safe to call on every register/heartbeat inside the transaction."""
+    live_gpu = _live_gpu_total_bytes(worker)
+    if live_gpu:
+        worker[_GPU_TOTAL_DURABLE_KEY] = live_gpu
+    ram = worker.get("ram_total")
+    try:
+        ram = int(ram) if ram else None
+    except (TypeError, ValueError):
+        ram = None
+    if ram:
+        worker[_RAM_TOTAL_DURABLE_KEY] = ram
+
+
+def _worker_gpu_total_bytes(worker: Dict[str, Any]) -> Optional[int]:
+    """Box-wide TOTAL GPU capacity (bytes) = sum of gpus[].memory_total, the same
+    physical-truth source _vram_summary reads — falling back to the DURABLE
+    last-known total (_GPU_TOTAL_DURABLE_KEY) when the current reading is missing
+    (a re-register window, or a transient empty probe). None only when central
+    has NEVER seen a total for this worker (true first contact -> caller degrades
+    to max-gpu, never derives ram-only blind)."""
+    live = _live_gpu_total_bytes(worker)
+    if live:
+        return live
+    durable = worker.get(_GPU_TOTAL_DURABLE_KEY)
+    try:
+        return int(durable) if durable else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _worker_ram_total_bytes(worker: Dict[str, Any]) -> Optional[int]:
+    """The box's RAW installed memory (bytes) — the ``ram_total`` field
+    _ram_summary reads, falling back to the DURABLE last-known RAM total when the
+    current field is absent (re-register window / older beat). None only when
+    central has never seen a RAM total for this worker."""
+    for key in ("ram_total", _RAM_TOTAL_DURABLE_KEY):
+        v = worker.get(key)
+        if v is None:
+            continue
+        try:
+            iv = int(v)
+        except (TypeError, ValueError):
+            continue
+        if iv:
+            return iv
+    return None
+
+
+def derived_default_mode(worker: Dict[str, Any], model_key: str) -> str:
+    """The FEASIBLE blank default alloc mode for one (worker, model) — engine +
+    box-totals aware (operator ruling 2026-07-24). Pure glue over the stdlib
+    ``feasible_default_mode``: resolves the engine, effective size, GPU total,
+    RAM total from central's authoritative sources and asks the shared math.
+    ANY lookup miss degrades to 'max-gpu' (today's blank behavior) — never a
+    500, never a guess. This ONLY supplies the default when NOTHING is persisted
+    for the model; an explicit alloc_mode always wins upstream."""
+    try:
+        from ......managers.alloc_modes import feasible_default_mode
+        return feasible_default_mode(
+            _model_engine(model_key),
+            _model_size_bytes(model_key),
+            _worker_gpu_total_bytes(worker),
+            _worker_ram_total_bytes(worker))
+    except Exception:  # noqa: BLE001 — a derivation must never break a read/relay
+        return "max-gpu"
 
 
 def allocated_totals(worker: Dict[str, Any]) -> Dict[str, Any]:
@@ -1493,6 +1665,10 @@ class WorkerStore:
                 # feature become durable without an explicit assign.
                 if existing.get("models"):
                     _remember_assignments(existing)
+                # Durable hardware facts: advance last-known GPU/RAM totals from
+                # this reading (never wiped by a transient empty probe) so a
+                # re-register that momentarily lacks totals still has them.
+                _remember_hw_totals(existing)
                 return _public_view(existing)
 
             wid = worker_id or uuid.uuid4().hex
@@ -1502,9 +1678,13 @@ class WorkerStore:
             remembered = _load_assign_memory().get(wid) if worker_id else None
             restored_models: List[str] = []
             restored_spill: Dict[str, Any] = {}
+            restored_gpu_known = None
+            restored_ram_known = None
             if remembered:
                 restored_models = list(remembered.get("models") or [])
                 restored_spill = dict(remembered.get("spill_by_model") or {})
+                restored_gpu_known = remembered.get(_GPU_TOTAL_DURABLE_KEY)
+                restored_ram_known = remembered.get(_RAM_TOTAL_DURABLE_KEY)
                 if restored_models:
                     logger.warning(
                         "register: restoring %d remembered designation(s) for "
@@ -1549,6 +1729,14 @@ class WorkerStore:
                 "created_at": _now(),
                 "last_seen": _now(),
             }
+            # Inherit durable hardware facts remembered for this id (a returning
+            # worker whose live row was lost keeps its totals immediately), then
+            # advance from THIS register's reading if it carried them.
+            if restored_gpu_known:
+                worker[_GPU_TOTAL_DURABLE_KEY] = restored_gpu_known
+            if restored_ram_known:
+                worker[_RAM_TOTAL_DURABLE_KEY] = restored_ram_known
+            _remember_hw_totals(worker)
             workers[wid] = worker
             return _public_view(worker)
 
@@ -1747,6 +1935,10 @@ class WorkerStore:
                 worker["task_capabilities"] = task_capabilities
             if pool and pool.strip():   # non-empty only — see register() note
                 worker["pool"] = pool.strip()
+            # Advance the durable hardware facts from this beat's totals (a beat
+            # carries gpus[] w/ memory_total + ram_total). Advance-only, so a
+            # beat that transiently omits them keeps the last-known fact.
+            _remember_hw_totals(worker)
             return _public_view(worker)
 
     def remove(self, worker_id: str) -> bool:
@@ -1941,6 +2133,27 @@ class WorkerStore:
         if worker is None:
             return {}
         spill = dict(worker.get("spill_by_model", {}).get(model_key, {}))
+        # CAPABILITY-AWARE BLANK DEFAULT (operator ruling 2026-07-24): when
+        # NOTHING placement-affecting is persisted for this (worker, model), the
+        # blank default is derived by FEASIBILITY instead of the flat max-gpu.
+        # A transformers model far too big for this box's GPU but that fits RAM
+        # defaults to ram-only ON THIS WORKER, so its blank default SERVES
+        # (defaults-are-promises) instead of a doomed all-GPU attempt. GGUF and
+        # any fitting/unresolvable case keep max-gpu ({} — unchanged). This only
+        # ever touches the BLANK case; an explicit persisted contract is left
+        # exactly as-is. The emitted encoding is the LEGACY n_gpu_layers key —
+        # no version gate needed (every worker version honors it).
+        if not (set(spill) & _PLACEMENT_SPILL_KEYS):
+            try:
+                mode = derived_default_mode(worker, model_key)
+            except Exception:  # noqa: BLE001 — never break the relay over a derive
+                mode = "max-gpu"
+            if mode == "ram-only":
+                logger.info("blank default for %s on %s derived to ram-only "
+                            "(feasibility: oversized for GPU, fits RAM)",
+                            model_key, worker.get("name") or worker_id)
+                return {"n_gpu_layers": "off"}
+            return {}                            # max-gpu: today's blank ({})
         try:
             from ......managers.alloc_modes import gate_spill_for_worker
             gated, note = gate_spill_for_worker(
@@ -2428,6 +2641,86 @@ def set_load_report(worker_id: str, model_key: str,
 
 def spill_for(worker_id: str, model_key: str) -> Dict[str, Any]:
     return worker_store.spill_for(worker_id, model_key)
+
+
+def derived_default_for(worker_id: str, model_key: str) -> Optional[str]:
+    """The feasibility-derived BLANK default mode for (worker, model) from the
+    RAW worker record, or None if the worker is unknown. Degrades to 'max-gpu'
+    on any miss (via derived_default_mode). Read-only — used to SURFACE the
+    derived default the UI distinguishes from a stored one."""
+    worker = worker_store._load().get(worker_id)
+    if worker is None:
+        return None
+    return derived_default_mode(worker, model_key)
+
+
+_FEAS_FAILOPEN_SEEN: set = set()
+
+
+def _warn_feasibility_failopen(worker: Dict[str, Any], model_key: str,
+                               size, gpu_total, ram_total) -> None:
+    """Self-policing drift signal (operator refinement 2026-07-24): feasibility
+    only falls OPEN (all modes selectable) when central couldn't resolve the
+    model size or the box totals — which should be a RARE, TRANSIENT state (a
+    fresh worker before its first heartbeat; a registry row before enrichment).
+    Log it ONCE per (model, worker, missing-set) at WARNING so a transient never
+    spams but a PERSISTENT fail-open (real drift the keeper should see) surfaces.
+    Only fires when something is actually missing."""
+    missing = []
+    if not size:
+        missing.append("no model size")
+    if not gpu_total or ram_total is None:
+        missing.append("no gpu/ram totals")
+    if not missing:
+        return
+    wid = worker.get("id") or worker.get("name") or "?"
+    key = (wid, model_key, ",".join(missing))
+    if key in _FEAS_FAILOPEN_SEEN:
+        return
+    _FEAS_FAILOPEN_SEEN.add(key)
+    logger.warning("feasibility fail-open for %s on %s: %s — all alloc modes "
+                   "offered (transient before enrichment is fine; a persistent "
+                   "one is a drift signal)",
+                   model_key, worker.get("name") or wid, "; ".join(missing))
+
+
+def feasible_modes_for(worker_id: str, model_key: str) -> Optional[tuple]:
+    """The feasible allocation modes for (worker, model) from the RAW record —
+    engine + box-totals aware. None if the worker is unknown; degrades to the
+    full mode set on any lookup miss (never eliminate on missing data). Used to
+    SURFACE the selectable set and to ENFORCE it at /assign."""
+    worker = worker_store._load().get(worker_id)
+    if worker is None:
+        return None
+    try:
+        from ......managers.alloc_modes import feasible_modes
+        size = _model_size_bytes(model_key)
+        gpu_total = _worker_gpu_total_bytes(worker)
+        ram_total = _worker_ram_total_bytes(worker)
+        _warn_feasibility_failopen(worker, model_key, size, gpu_total, ram_total)
+        return feasible_modes(_model_engine(model_key), size, gpu_total, ram_total,
+                              moe_split_gpu_bytes=_model_moe_gpu_bytes(model_key))
+    except Exception:  # noqa: BLE001 — a derivation must never break a read/relay
+        from ......managers.alloc_modes import ALLOC_MODES
+        return ALLOC_MODES
+
+
+def feasibility_context(worker_id: str, model_key: str) -> Dict[str, Any]:
+    """The raw numbers behind a feasibility decision for (worker, model), for an
+    honest 409 reason and the UI. All bytes; None where central can't resolve.
+    Empty dict if the worker is unknown."""
+    worker = worker_store._load().get(worker_id)
+    if worker is None:
+        return {}
+    return {
+        "engine": _model_engine(model_key),
+        "model_bytes": _model_size_bytes(model_key),
+        "gpu_total_bytes": _worker_gpu_total_bytes(worker),
+        "ram_total_bytes": _worker_ram_total_bytes(worker),
+        # MoE (2026-07-24): the expert-split GPU need (non-expert + mmproj) a
+        # feasibility decision priced GPU-fit with; None for dense models.
+        "moe_split_gpu_bytes": _model_moe_gpu_bytes(model_key),
+    }
 
 
 def list_workers() -> List[Dict[str, Any]]:

@@ -243,7 +243,7 @@ def test_load_stores_total_layers_from_build_cmd(monkeypatch):
     s.last_load_error = None
     s.child_base = "http://127.0.0.1:9101"
     monkeypatch.setattr(sa, "_build_cmd",
-                        lambda *a, **k: (["true"], 17, 16384, 6, None, "cpp", 48))
+                        lambda *a, **k: (["true"], 17, 16384, 6, None, "cpp", 48, None))
     monkeypatch.setattr(sa, "_model_expected_bytes", lambda mk: 46 * GIB)
     monkeypatch.setattr(sa.subprocess, "Popen", lambda *a, **k: type(
         "P", (), {"pid": 1, "poll": lambda self: None})())

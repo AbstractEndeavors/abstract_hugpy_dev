@@ -36,6 +36,12 @@ _LOCK = threading.Lock()
 ALLOWED_FIELDS = {
     "serve_mode",     # off | systemd | swap
     "n_gpu_layers",   # GPU offload (-1 all, 0 cpu, N layers)
+    "n_cpu_moe",      # MoE expert split: N MoE layers whose EXPERT tensors stay
+                      # on CPU (999 = all — spill.MOE_ALL_LAYERS). Rides
+                      # llama-server --n-cpu-moe; measured on ae 2026-07-24:
+                      # -1 layers + 999 beat the 17/48 layer split by +59% tok/s
+                      # at 5x less VRAM on an 80B-A3B MoE. Absent -> auto policy
+                      # (MoE hybrid auto-splits; dense/fits-whole unchanged).
     "threads",        # CPU threads
     "llama_ctx",      # context window
     "gpu_mem_gib",    # transformers per-GPU budget / explicit-mode VRAM target
@@ -53,7 +59,8 @@ ALLOWED_FIELDS = {
     "priority_device",  # explicit mode: which device the target favors
                         # ("gpu" default | "ram")
 }
-_INT_FIELDS = {"n_gpu_layers", "threads", "llama_ctx", "ttl_seconds", "priority"}
+_INT_FIELDS = {"n_gpu_layers", "n_cpu_moe", "threads", "llama_ctx", "ttl_seconds",
+               "priority"}
 _FLOAT_FIELDS = {"gpu_mem_gib", "cpu_mem_gib", "leniency_pct"}
 _BOOL_FIELDS = {"always_on"}
 
@@ -275,7 +282,32 @@ def gguf_variants_detail(model_key: str, model_dir: str, cfg=None) -> dict:
     eff_quant = eff_variant["bytes"] if eff_variant else 0
     out_variants = [{"filename": v["filename"], "bytes": v["bytes"],
                      "is_effective": (v is eff_variant)} for v in variants]
+    # MoE detection + expert/non-expert byte split of the EFFECTIVE quant
+    # (spill.gguf_moe_detail — cached per file, so this rides the same
+    # discovery/enrichment reads effective_bytes does at no recurring cost).
+    # Central feasibility uses non_expert_bytes as the GPU-side need under the
+    # MoE-split plan; a dense model or any read failure simply omits the key.
+    moe = None
+    try:
+        moe_path = eff_full
+        if not moe_path and eff_variant:
+            moe_path = os.path.join(model_dir, eff_variant["members"][0])
+        if moe_path and os.path.isfile(moe_path):
+            from ..spill import gguf_moe_detail
+            d_moe = gguf_moe_detail(moe_path)
+            if d_moe.get("is_moe"):
+                # Compact wire view (the per-layer map stays worker-side in the
+                # spill cache; central sizing needs only the byte totals).
+                moe = {"is_moe": True,
+                       "expert_count": d_moe.get("expert_count"),
+                       "expert_used_count": d_moe.get("expert_used_count"),
+                       "sparsity": d_moe.get("sparsity"),
+                       "expert_bytes": d_moe.get("expert_bytes"),
+                       "non_expert_bytes": d_moe.get("non_expert_bytes")}
+    except Exception:  # noqa: BLE001 — MoE detail is additive; never break sizing
+        moe = None
     return {
+        **({"moe": moe} if moe else {}),
         "variants": out_variants,                   # [{filename, bytes, is_effective}]
         "mmproj_bytes": mmproj,
         "effective_gguf": eff,

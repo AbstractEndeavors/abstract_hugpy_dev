@@ -242,6 +242,7 @@ def _build_runner(model_key: str) -> "LlamaCppBaseRunner":
                     # processes were spawned earlier and never see env changes.
                     for env_name, key in (("HUGPY_GPU_MEM_GIB", "gpu_mem_gib"),
                                           ("HUGPY_CPU_MEM_GIB", "cpu_mem_gib"),
+                                          ("HUGPY_N_CPU_MOE", "n_cpu_moe"),
                                           ("DEFAULT_LLAMA_THREADS", "threads")):
                         v = _os.environ.get(env_name)
                         if v:

@@ -52,6 +52,47 @@ Fine-grained placement (max-ram/explicit) needs loader wiring the transformers
 gap loaders don't have yet; until that ships, picking one for a transformers
 model refuses honestly instead of silently doing something else.
 
+## MoE models — the expert split (measured, on by default)
+
+A Mixture-of-Experts GGUF is mostly **cold expert tensors**: on
+Qwen3-Coder-Next (80B-A3B class, 512 experts / 10 used per token) the expert
+FFN tensors are ~43.6 GiB of the ~45.1 GiB file — the always-hot
+attention/shared/KV share is only ~1.5 GiB. Splitting **by kind of bytes**
+instead of by whole layers changes everything:
+
+| plan (ae / RTX 3090, coder-next) | tok/s | VRAM |
+|---|---|---|
+| naive layer split (autofit, 17/48 layers) | ~15.2 | 16.6 GiB |
+| **MoE split** (`n_gpu_layers=-1` + `--n-cpu-moe 999`) | **~24.1** | **3.2 GiB** |
+
++59% throughput AND 5× less VRAM — a strict improvement, so it is the
+**default** for the hybrid case:
+
+- **Auto policy** (no knobs): a detected-MoE GGUF whose whole file does **not**
+  fit the card (exactly when autofit would have produced a partial layer
+  split) serves with all layers on the GPU and the expert tensors on CPU.
+  *Whole model fits → fully on GPU, unchanged. Dense model → byte-identical to
+  before (no expert tensors, nothing to split).* Detection is the GGUF header
+  the loader already parses: `expert_count > 0` is a MoE; the expert tensors
+  are the `blk.<i>.ffn_*_exps.*` names (`_exps` is the per-tensor expert bit).
+- **The knob**: `n_cpu_moe` — a first-class serve override / spill key (like
+  `n_gpu_layers`): the number of MoE layers whose expert tensors stay on CPU
+  (`999` = all, `0` = experts on GPU). An explicit value always wins over the
+  auto policy, and explicit `n_gpu_layers` designations (gpu-only/ram-only or
+  a layer count) always win over the auto split.
+- **Fit/feasibility price the split**: probes, the ⭐ boot load, admission and
+  central's feasibility judge a MoE by its **non-expert GPU share** (+KV) when
+  the split governs — a 41.6 GB MoE on an empty 24 GB card *fits* (needs
+  ~3 GiB of VRAM); its expert bytes are checked against host RAM instead.
+- **Engine**: needs a native `llama-server` with `--n-cpu-moe` (probed once;
+  an older binary or the `llama_cpp.server` python fallback degrades to the
+  layer-split behavior with one log line — never a crash).
+
+**Coexistence note**: ae's worker unit currently carries
+`LLAMA_ARG_N_CPU_MOE=999` (the transition-era env hack that proved the win).
+Explicit `--n-cpu-moe` argv beats the env in llama-server, so this feature is
+correct with or without it — the env line can be removed once this ships.
+
 ## Legacy names (the honest rename)
 
 Old controls were misleadingly named; existing settings keep working — old
@@ -73,7 +114,8 @@ time** (`-1` → gpu-only, `0/"off"` → ram-only, budgets/bands → explicit, u
 ## Old workers
 
 `max-ram` and `explicit` ride new spill keys (`alloc_mode`, `leniency_pct`,
-`priority_device`). Central only emits them to workers running **0.1.203+**;
+`priority_device`), and the MoE `n_cpu_moe` knob rides the same gate.
+Central only emits them to workers running **0.1.203+**;
 an older worker gets max-gpu (autofit) for that request and the downgrade is
 logged — your persisted choice is kept and applies the moment the worker
 updates. A selected mode is never a silent dead knob.

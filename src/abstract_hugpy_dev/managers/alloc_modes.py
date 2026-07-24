@@ -84,8 +84,13 @@ LEGACY_ALLOC_ALIASES = {
 }
 
 # Spill keys that only a mode-aware worker understands. Presence of ANY of
-# these on a spill makes it version-gated (gate_spill_for_worker).
-NEW_SPILL_KEYS = frozenset({"alloc_mode", "leniency_pct", "priority_device"})
+# these on a spill makes it version-gated (gate_spill_for_worker). n_cpu_moe
+# (the MoE expert-split knob, 2026-07-24) ships in the SAME cut as the mode
+# keys, so the one MODE_MIN_PKG_VERSION gate covers it — an older worker would
+# silently drop the knob (unknown spill keys are ignored), and a selected knob
+# must never be a silent no-op.
+NEW_SPILL_KEYS = frozenset({"alloc_mode", "leniency_pct", "priority_device",
+                            "n_cpu_moe"})
 
 # First worker package version whose spill/env plumbing honors the new keys
 # (Slice B2 ships in this cut). Anything older gets the max-gpu fallback.
@@ -96,6 +101,188 @@ MODE_MIN_PKG_VERSION = "0.1.203"
 # explicit need fine-grained placement the gap loaders don't wire yet
 # (Slice C) — they are refused honestly at /assign for non-GGUF models.
 NONGGUF_ALLOWED_MODES = ("gpu-only", "ram-only", "max-gpu")
+
+# GGUF family: the HF-canonical 'gguf' plus the llama_cpp synonym. A GGUF model
+# is ALWAYS max-gpu by default (partial offload makes any size feasible — the
+# runner spills whatever won't fit to RAM), so its feasible default never
+# depends on the box's totals. Everything else (transformers / comfy) loads
+# whole-tensor via accelerate, so an oversized model genuinely cannot land on
+# the GPU and its feasible default is worker-dependent.
+GGUF_ENGINES = frozenset({"gguf", "llama_cpp"})
+
+# Headroom factor for the transformers GPU-fit test (feasible_default_mode).
+# A transformers model whose effective footprint exceeds this fraction of the
+# box's TOTAL GPU capacity "clearly cannot fit the GPU" and defaults to
+# ram-only on that worker. 0.9 leaves ~10% for the CUDA context, activation
+# working set, and KV/attention scratch that ride alongside the weights — a
+# model at 0.95× total VRAM would OOM the moment it allocated its first
+# forward-pass buffer, so 0.9 is the defensible "clearly cannot fit" line
+# (not a fit PREDICTION — the real autofit/accelerate placement still runs; this
+# only picks the read-time DEFAULT so a doomed max-gpu is never the blank
+# promise). Above 0.9× GPU but within RAM -> ram-only; above RAM too -> leave
+# max-gpu and let the worker refuse honestly (no invented fourth state).
+_GPU_FIT_HEADROOM = 0.9
+
+
+def is_gguf_engine(engine: Any) -> bool:
+    """True for the GGUF family (gguf / llama_cpp), case-insensitive. Anything
+    else — including None/unknown — is treated as non-GGUF by the caller, but
+    the feasible-default logic degrades unknown engines to max-gpu regardless."""
+    return str(engine or "").strip().lower() in GGUF_ENGINES
+
+
+def _as_int(v: Any) -> "Optional[int]":
+    try:
+        return int(v) if v else None
+    except (TypeError, ValueError):
+        return None
+
+
+def feasible_modes(engine: Any,
+                   model_bytes: "Optional[int]",
+                   gpu_total_bytes: "Optional[int]",
+                   ram_total_bytes: "Optional[int]",
+                   moe_split_gpu_bytes: "Optional[int]" = None) -> tuple:
+    """The allocation modes that are FEASIBLE for one (model x worker), in
+    ALLOC_MODES display order (operator ruling 2026-07-24 scope-extension: "the
+    user shouldn't be able to select an option that implies something it cannot
+    do"). The blank default is the best member of this set (feasible_default_mode
+    returns exactly that). PURE — the enforcement/surface glue lives at the
+    routes.
+
+    Feasibility matrix (each rule is a hard can-it-physically-land test, not a
+    fit prediction — the real placement still runs; this only bounds what may be
+    SELECTED so an impossible mode is never offered):
+
+      * ``gpu-only`` — the model fits the GPU total within the headroom factor
+        (``model <= _GPU_FIT_HEADROOM * gpu_total``). All-or-bust on the GPU, so
+        it must plausibly fit the GPU alone.
+      * ``ram-only`` — the model fits RAM total (``model <= ram_total``). Binds
+        the CPU; never touches the GPU.
+      * ``max-gpu`` — GGUF: ALWAYS (partial offload spills whatever won't fit to
+        RAM, so it is universally feasible). Transformers/comfy: ONLY if the
+        model fits the GPU total (same headroom test as gpu-only) — the gap
+        loaders place whole-tensor, so an oversized transformers model genuinely
+        cannot use the GPU and max-gpu must NOT be offered (the operator's
+        68 GB-on-24 GB case).
+      * ``max-ram`` — a split exists: the model fits RAM+GPU COMBINED (its
+        overflow rides the GPU). ENGINE-GATED: non-GGUF stays refused (409) until
+        Slice C wires fine-grained transformers placement, so it is dropped for
+        non-GGUF here regardless of the numbers.
+      * ``explicit`` — some split exists (``model <= gpu_total + ram_total``);
+        ENGINE-GATED the same as max-ram (non-GGUF dropped until Slice C).
+
+    UNKNOWN size or unknown totals -> ALL modes feasible: never eliminate on
+    missing data (degrade to today's permissiveness). Specifically, if
+    ``model_bytes`` is unknown, or the total a rule needs is unknown, that rule
+    does NOT eliminate its mode. The engine gate on max-ram/explicit is the ONLY
+    elimination that fires without size/totals (it is a capability fact, not a
+    measurement).
+
+    ``moe_split_gpu_bytes`` (MoE, 2026-07-24): for a detected-MoE GGUF the
+    caller passes the GPU-side need of the expert split (non-expert bytes —
+    surfaced by gguf_variants_detail's ``moe`` at enrichment). GPU-fit tests
+    (gpu-only / a non-GGUF-style max-gpu check) then price THAT instead of the
+    full file: under the auto policy (and/or an operator ``n_cpu_moe``) the
+    card only ever holds the non-expert share, so eliminating gpu-only against
+    the full 41.6GB would wrongly bar a mode the split makes serveable. Dense
+    models pass None — byte-identical."""
+    size = _as_int(model_bytes)
+    gpu_total = _as_int(gpu_total_bytes)
+    ram_total = _as_int(ram_total_bytes)
+    gguf = is_gguf_engine(engine)
+    unknown_size = size is None
+    # The GPU-side footprint used for GPU-fit tests: the MoE split's non-expert
+    # share when known (never larger than the full size), else the full size.
+    moe_gpu = _as_int(moe_split_gpu_bytes)
+    gpu_size = min(size, moe_gpu) if (size is not None and moe_gpu) else size
+
+    out = []
+    for mode in ALLOC_MODES:
+        if mode == "gpu-only":
+            # Fits GPU (headroom). Unknown size/gpu_total -> don't eliminate.
+            feasible = (unknown_size or gpu_total is None
+                        or gpu_size <= _GPU_FIT_HEADROOM * gpu_total)
+        elif mode == "ram-only":
+            feasible = (unknown_size or ram_total is None
+                        or size <= ram_total)
+        elif mode == "max-gpu":
+            if gguf:
+                feasible = True                  # partial offload: universal
+            else:
+                feasible = (unknown_size or gpu_total is None
+                            or size <= _GPU_FIT_HEADROOM * gpu_total)
+        elif mode in ("max-ram", "explicit"):
+            # Engine gate (a capability fact, fires even on missing data).
+            if not gguf:
+                feasible = False
+            else:
+                combined = None
+                if gpu_total is not None or ram_total is not None:
+                    combined = (gpu_total or 0) + (ram_total or 0)
+                feasible = (unknown_size or combined is None
+                            or size <= combined)
+        else:  # pragma: no cover — ALLOC_MODES is closed
+            feasible = True
+        if feasible:
+            out.append(mode)
+    # Never return an empty set — a model must always have SOMETHING selectable
+    # (defaults-are-promises). If the numbers eliminated everything (e.g. a
+    # transformers model bigger than RAM and GPU), fall back to max-gpu so the
+    # worker can refuse HONESTLY downstream rather than the UI offering nothing.
+    return tuple(out) if out else ("max-gpu",)
+
+
+def feasible_default_mode(engine: Any,
+                          model_bytes: "Optional[int]",
+                          gpu_total_bytes: "Optional[int]",
+                          ram_total_bytes: "Optional[int]") -> str:
+    """The BLANK default alloc mode derived by FEASIBILITY for one (model x
+    worker), engine-aware (operator ruling 2026-07-24). This ONLY supplies the
+    default when NOTHING is persisted — an explicit alloc_mode always wins
+    upstream; this is never consulted for a model that has one.
+
+      * GGUF (any size) -> ``max-gpu`` ALWAYS. Partial offload makes every size
+        feasible on any GPU (spill the rest to RAM), so this is today's blank
+        default, unchanged, and independent of the box totals.
+      * transformers/comfy:
+          - if the footprint CLEARLY cannot fit the GPU
+            (``model_bytes > _GPU_FIT_HEADROOM * gpu_total_bytes``) but DOES fit
+            RAM (``model_bytes <= ram_total_bytes``) -> ``ram-only`` (emits the
+            legacy ``{"n_gpu_layers": "off"}`` — works on ANY worker version, no
+            gate). This is the "68 GB model, 24 GB GPU, 124 GB RAM -> RAM-only"
+            case: the only feasible option, so it IS the default.
+          - if it plausibly fits the GPU -> ``max-gpu`` (today's default;
+            autofit/accelerate handles it).
+          - if it fits NEITHER (bigger than RAM too) -> ``max-gpu`` and let the
+            worker refuse honestly (no invented fourth state).
+
+    DEGRADE-NOT-GUESS: any missing input (unknown size, unknown GPU total, or —
+    for the ram-only decision — unknown RAM total) falls back to ``max-gpu``,
+    today's behavior. A default is never derived from a guessed number."""
+    if is_gguf_engine(engine):
+        return "max-gpu"
+    # Non-GGUF: need a real size and a real GPU total to say anything.
+    if not model_bytes or not gpu_total_bytes:
+        return "max-gpu"
+    try:
+        size = int(model_bytes)
+        gpu_total = int(gpu_total_bytes)
+    except (TypeError, ValueError):
+        return "max-gpu"
+    if size <= _GPU_FIT_HEADROOM * gpu_total:
+        return "max-gpu"                       # plausibly fits the GPU
+    # Clearly can't fit the GPU. RAM-only only if it actually fits RAM AND we
+    # know RAM (an unknown RAM total can't justify ram-only -> leave max-gpu).
+    if not ram_total_bytes:
+        return "max-gpu"
+    try:
+        ram_total = int(ram_total_bytes)
+    except (TypeError, ValueError):
+        return "max-gpu"
+    if size <= ram_total:
+        return "ram-only"                      # the only feasible landing
+    return "max-gpu"                           # fits neither -> honest refusal downstream
 
 
 def resolve_alloc_mode(name: Any) -> "tuple[Optional[str], bool]":

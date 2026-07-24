@@ -288,13 +288,25 @@ class SlotPool:
                                 and verdict.get("action") == "partial"
                                 and verdict.get("n_gpu_layers") is not None):
                             eff_opts["n_gpu_layers"] = verdict["n_gpu_layers"]
-                            logger.info(
-                                "VRAM ceiling: %s admitted as a PARTIAL offload — "
-                                "%s/%s layers on GPU (%s%%); launching child with "
-                                "--n-gpu-layers %s", model_key,
-                                verdict["n_gpu_layers"],
-                                (verdict.get("partial") or {}).get("total_layers"),
-                                verdict.get("gpu_pct"), verdict["n_gpu_layers"])
+                            # MoE expert split (2026-07-24): the admission may
+                            # answer the hybrid with -1 + n_cpu_moe instead of a
+                            # layer count — thread it so the child launches with
+                            # --n-cpu-moe (all layers on GPU, experts on CPU).
+                            if verdict.get("n_cpu_moe") is not None:
+                                eff_opts["n_cpu_moe"] = verdict["n_cpu_moe"]
+                                logger.info(
+                                    "VRAM ceiling: %s admitted as a MoE expert "
+                                    "split — n_gpu_layers=%s, --n-cpu-moe %s "
+                                    "(experts to CPU)", model_key,
+                                    verdict["n_gpu_layers"], verdict["n_cpu_moe"])
+                            else:
+                                logger.info(
+                                    "VRAM ceiling: %s admitted as a PARTIAL offload — "
+                                    "%s/%s layers on GPU (%s%%); launching child with "
+                                    "--n-gpu-layers %s", model_key,
+                                    verdict["n_gpu_layers"],
+                                    (verdict.get("partial") or {}).get("total_layers"),
+                                    verdict.get("gpu_pct"), verdict["n_gpu_layers"])
                             break
                         if isinstance(verdict, dict) and verdict.get("evicted"):
                             statuses = self.statuses()

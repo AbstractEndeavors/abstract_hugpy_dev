@@ -413,6 +413,262 @@ def _gguf_layer_count(model_path: str) -> Optional[int]:
         return None
 
 
+# ── MoE detection + expert/non-expert byte split (2026-07-24 measured win) ──
+# Measured on ae/3090 (Qwen3-Coder-Next, an 80B-A3B-class MoE): the naive layer
+# split (autofit 17/48) gave ~15.2 tok/s @ 16.6 GiB VRAM; the MoE-aware split
+# (--n-cpu-moe 999 + n_gpu_layers=-1: ALL attention/shared/KV on GPU, expert FFN
+# tensors on CPU) gave ~24.1 tok/s @ 3.2 GiB VRAM — +59% AND 5x less VRAM.
+# Mechanism: MoE bytes are mostly expert FFN tensors and each token touches only
+# a few experts, so keeping the always-hot non-expert tensors on the GPU beats
+# splitting whole layers. Dense models have no expert tensors -> the flag is a
+# no-op and everything below reads "not MoE" (byte-identical behavior).
+#
+# Detection (operator-grounded 2026-07-24; verified against the real coder-next
+# GGUF header — qwen3next.expert_count = 512, expert_used_count = 10):
+#   * KV ``{arch}.expert_count`` — the arch-agnostic suffix ``.expert_count``.
+#     ``expert_count == 0`` (or absent) IS the definition of dense: detection is
+#     this ONE key, no heuristics. ``.expert_used_count`` rides for reporting.
+#   * Tensor names literally mark the experts: ``blk.<i>.ffn_(gate|up|down)_exps.*``
+#     — the ``_exps`` suffix is the per-tensor is_expert bit, with the layer
+#     attribution ``<i>`` built in. The router (``ffn_gate_inp``) and the
+#     shared experts (``ffn_*_shexp``) do NOT carry the suffix and stay on the
+#     GPU, exactly as llama-server's --n-cpu-moe keeps them.
+# Tensor bytes come from the header's tensor-info table (name + data offset),
+# sized by offset-difference within the data section — exact (padding included)
+# without a GGML type-size table. Parsed ONCE per file (cache keyed by
+# path+size+mtime, mirroring how block_count is only read at plan time — never
+# re-parsed per beat).
+#
+# THE PRINCIPLE (why this exists as a decision input, not a nicety): autofit's
+# defect was reducing a TYPED tensor list to an opaque byte-bag at one decision
+# step — asking "how many whole layers fit" instead of "what KIND of bytes are
+# these". The GGUF header already says which bytes are cold expert weights and
+# which are always-hot attention/shared/KV; the fix is the decision function
+# CONSUMING metadata it already has. Any future placement decision should start
+# from this typed view, never re-flatten it to a single size.
+_MOE_EXPERT_TENSOR_RE = None                     # compiled lazily (re import below)
+_MOE_DETAIL_CACHE: dict = {}                     # abspath -> {"sig": (sz, mt), "detail": {...}}
+# n_cpu_moe value meaning "ALL expert layers on CPU" (llama-server caps it to
+# the model's layer count, so any large sentinel works; 999 matches the ae
+# deployment's proven LLAMA_ARG_N_CPU_MOE=999).
+MOE_ALL_LAYERS = 999
+
+
+def _expert_tensor_re():
+    """The is_expert bit: a name segment ending in ``_exps`` (with the layer
+    index captured for per-layer attribution). ``ffn_gate_inp`` (router) and
+    ``ffn_*_shexp`` (shared experts) never match — GPU-resident by design."""
+    global _MOE_EXPERT_TENSOR_RE
+    if _MOE_EXPERT_TENSOR_RE is None:
+        import re
+        _MOE_EXPERT_TENSOR_RE = re.compile(r"^blk\.(\d+)\..*_exps(\.|$)")
+    return _MOE_EXPERT_TENSOR_RE
+
+
+def _gguf_scan_moe(model_path: str) -> dict:
+    """One-file GGUF header scan for the MoE split: KV expert counts + the
+    expert/non-expert tensor byte split. {} on any parse issue (dense path)."""
+    out: dict = {}
+    try:
+        import struct
+
+        with open(model_path, "rb") as fh:
+            if fh.read(4) != b"GGUF":
+                return out
+            version = struct.unpack("<I", fh.read(4))[0]
+            if version < 2:
+                return out
+            n_tensors = struct.unpack("<Q", fh.read(8))[0]
+            n_kv = struct.unpack("<Q", fh.read(8))[0]
+
+            def read_str() -> str:
+                n = struct.unpack("<Q", fh.read(8))[0]
+                return fh.read(n).decode("utf-8", "replace")
+
+            def read_val(t: int):
+                simple = {0: "<b", 1: "<B", 2: "<h", 3: "<H", 4: "<i",
+                          5: "<I", 6: "<f", 7: "<?", 10: "<q", 11: "<Q", 12: "<d"}
+                if t in simple:
+                    fmt = simple[t]
+                    return struct.unpack(fmt, fh.read(struct.calcsize(fmt)))[0]
+                if t == 8:
+                    return read_str()
+                if t == 9:
+                    et = struct.unpack("<I", fh.read(4))[0]
+                    n = struct.unpack("<Q", fh.read(8))[0]
+                    return [read_val(et) for _ in range(n)]
+                raise ValueError(f"unknown gguf type {t}")
+
+            alignment = 32
+            for _ in range(n_kv):
+                key = read_str()
+                vtype = struct.unpack("<I", fh.read(4))[0]
+                val = read_val(vtype)
+                if key.endswith(".expert_count"):
+                    out["expert_count"] = val
+                elif key.endswith(".expert_used_count"):
+                    out["expert_used_count"] = val
+                elif key == "general.alignment":
+                    try:
+                        alignment = int(val) or 32
+                    except (TypeError, ValueError):
+                        pass
+
+            infos = []
+            for _ in range(n_tensors):
+                name = read_str()
+                nd = struct.unpack("<I", fh.read(4))[0]
+                fh.read(8 * nd)                          # dims (unused: offset-diff sizing)
+                fh.read(4)                               # ggml type
+                off = struct.unpack("<Q", fh.read(8))[0]
+                infos.append((name, off))
+            header_end = fh.tell()
+
+        data_start = (header_end + alignment - 1) // alignment * alignment
+        data_bytes = os.path.getsize(model_path) - data_start
+        if data_bytes < 0 or not infos:
+            # A header with no tensor table (or a truncated file) can't be split.
+            out["expert_bytes"] = 0
+            out["non_expert_bytes"] = 0
+            return out
+        infos.sort(key=lambda t: t[1])
+        exp = nexp = 0
+        by_layer: dict = {}
+        rx = _expert_tensor_re()
+        for i, (name, off) in enumerate(infos):
+            end = infos[i + 1][1] if i + 1 < len(infos) else data_bytes
+            size = max(0, end - off)
+            m = rx.match(name)
+            if m:
+                exp += size
+                layer = int(m.group(1))
+                by_layer[layer] = by_layer.get(layer, 0) + size
+            else:
+                nexp += size
+        out["expert_bytes"] = int(exp)
+        out["non_expert_bytes"] = int(nexp)
+        out["expert_bytes_by_layer"] = by_layer
+    except Exception:  # noqa: BLE001 — unreadable header == dense path, never raise
+        return {}
+    return out
+
+
+def _gguf_shard_paths(model_path: str) -> list:
+    """All shard files of a split GGUF (``…-00001-of-0000N.gguf``), or just
+    ``[model_path]`` for a single-file model. Mirrors the slot supervisor's
+    shard-summing (_total_gguf_bytes) so the MoE split is shard-aware too."""
+    try:
+        import glob
+        import re
+        base = os.path.basename(model_path)
+        m = re.search(r"-\d{5}-of-(\d{5})\.gguf$", base)
+        if m:
+            patt = f"{base[:m.start()]}-*-of-{m.group(1)}.gguf"
+            shards = sorted(
+                s for s in glob.glob(os.path.join(os.path.dirname(model_path), patt))
+                if os.path.isfile(s))
+            if shards:
+                return shards
+    except Exception:  # noqa: BLE001
+        pass
+    return [model_path]
+
+
+def gguf_moe_detail(model_path) -> dict:
+    """THE MoE reader: ``{is_moe, expert_count, expert_used_count, expert_bytes,
+    non_expert_bytes, files}`` for a GGUF (shard-aware: byte splits summed across
+    all shards of a split model). ``{"is_moe": False}`` for a dense model, a
+    non-GGUF path, or ANY read failure — missing metadata degrades to the dense
+    path, never raises. Cached per path by (size, mtime): the header is parsed
+    once per file version, never per beat/request."""
+    try:
+        path = os.path.abspath(str(model_path))
+        st = os.stat(path)
+        sig = (int(st.st_size), int(st.st_mtime))
+    except (TypeError, ValueError, OSError):
+        return {"is_moe": False}
+    cached = _MOE_DETAIL_CACHE.get(path)
+    if cached is not None and cached.get("sig") == sig:
+        return cached["detail"]
+    expert = nexpert = 0
+    expert_count = expert_used = None
+    by_layer: dict = {}
+    shards = _gguf_shard_paths(path)
+    for shard in shards:
+        scan = _gguf_scan_moe(shard)
+        if not scan:
+            continue
+        expert += int(scan.get("expert_bytes") or 0)
+        nexpert += int(scan.get("non_expert_bytes") or 0)
+        for layer, b in (scan.get("expert_bytes_by_layer") or {}).items():
+            by_layer[layer] = by_layer.get(layer, 0) + int(b)
+        if expert_count is None and scan.get("expert_count") is not None:
+            try:
+                expert_count = int(scan["expert_count"])
+            except (TypeError, ValueError):
+                pass
+        if expert_used is None and scan.get("expert_used_count") is not None:
+            try:
+                expert_used = int(scan["expert_used_count"])
+            except (TypeError, ValueError):
+                pass
+    # expert_count == 0 or absent IS the definition of dense (operator
+    # grounding); expert bytes must also exist for a split to mean anything.
+    is_moe = bool(expert_count and expert_count > 0 and expert > 0)
+    # Sparsity (expert_used_count / expert_count): the fraction of expert bytes
+    # a token actually touches — it predicts the per-token CPU traffic of a
+    # split (coder-next: 43.59 GiB x 10/512 ~= 0.85 GiB/token, which against
+    # RAM bandwidth reproduces the measured ~24 tok/s). Carried for the
+    # placement evaluator; None when either count is unreadable.
+    sparsity = None
+    if expert_count and expert_used:
+        try:
+            sparsity = float(expert_used) / float(expert_count)
+        except (TypeError, ValueError, ZeroDivisionError):
+            sparsity = None
+    detail = {"is_moe": is_moe, "expert_count": expert_count,
+              "expert_used_count": expert_used, "sparsity": sparsity,
+              "expert_bytes": int(expert), "non_expert_bytes": int(nexpert),
+              "expert_bytes_by_layer": by_layer,
+              "files": len(shards)}
+    _MOE_DETAIL_CACHE[path] = {"sig": sig, "detail": detail}
+    return detail
+
+
+def moe_split_need(detail: dict, n_cpu_moe: Optional[int] = None) -> "Optional[dict]":
+    """Per-layer-aware pricing of a MoE split: what a load with ``--n-cpu-moe N``
+    puts where. ``{"cpu_bytes", "gpu_bytes", "layers_on_cpu"}`` or None for a
+    dense/unreadable detail (caller keeps opaque-size pricing).
+
+    llama-server moves the expert tensors of the FIRST N block indices to CPU
+    (everything else — attention, router, shared experts, embeddings, output,
+    and the expert tensors of layers >= N — stays GPU-side). ``n_cpu_moe`` of
+    None or >= the attributed layer count means ALL experts on CPU (the 999
+    sentinel). The per-layer map keeps a future partial split precisely
+    priceable instead of re-flattening the typed tensor list to one number."""
+    if not isinstance(detail, dict) or not detail.get("is_moe"):
+        return None
+    expert = int(detail.get("expert_bytes") or 0)
+    nexpert = int(detail.get("non_expert_bytes") or 0)
+    by_layer = detail.get("expert_bytes_by_layer") or {}
+    layers = sorted(by_layer)
+    if n_cpu_moe is None or not layers or int(n_cpu_moe) >= len(layers):
+        return {"cpu_bytes": expert, "gpu_bytes": nexpert,
+                "layers_on_cpu": len(layers)}
+    n = max(0, int(n_cpu_moe))
+    cpu = sum(int(by_layer[i]) for i in layers[:n])
+    return {"cpu_bytes": int(cpu), "gpu_bytes": int(nexpert + (expert - cpu)),
+            "layers_on_cpu": n}
+
+
+def n_cpu_moe_env() -> Optional[int]:
+    """Explicit per-request/per-model n_cpu_moe from HUGPY_N_CPU_MOE (the spill
+    wire, set by the worker's _apply_spill), or None when unset. The number of
+    MoE layers whose EXPERT tensors stay on CPU (MOE_ALL_LAYERS/999 = all);
+    explicit always wins over the auto policy."""
+    return _env_int("HUGPY_N_CPU_MOE")
+
+
 # ── KV-cache quantification (slice 11 / t27) ────────────────────────────────
 # Operator (2026-07-17): "the context can necessarily be quantified into ram
 # needed correct? ... this should be a variable as well based on percentage max."
@@ -992,6 +1248,7 @@ def describe() -> dict[str, Any]:
         "priority_device": (priority_device_env()
                             if alloc_mode_env() == "explicit" else None),
         "n_gpu_layers_env": _env("HUGPY_N_GPU_LAYERS"),
+        "n_cpu_moe": n_cpu_moe_env(),            # MoE expert-split knob (env wire)
         "gpu_mem_gib": _env_float("HUGPY_GPU_MEM_GIB"),
         "cpu_mem_gib": _env_float("HUGPY_CPU_MEM_GIB"),
         "tensor_split": tensor_split(),

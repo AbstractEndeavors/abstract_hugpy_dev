@@ -237,6 +237,39 @@ def _ensure_present(model_key, central_url):
                        SLOT_ID, model_key, exc)
 
 
+# llama-server --n-cpu-moe support probe (MoE expert split, 2026-07-24). The
+# flag pattern-matches expert FFN tensors (ffn_(up|down|gate)_exps) onto CPU
+# buffers; it exists in every llama.cpp new enough to serve the fleet's MoE
+# models (proven live on ae via its env alias LLAMA_ARG_N_CPU_MOE=999 — the
+# arg parser maps that env 1:1 onto --n-cpu-moe). An OLDER binary would reject
+# the unknown flag at spawn, so we probe `--help` ONCE per binary path and
+# degrade (omit the arg + log once) when it predates the flag.
+_SERVER_FLAG_CACHE: dict = {}
+_MOE_DEGRADE_LOGGED = set()
+
+
+def _server_supports_flag(server_bin, flag) -> bool:
+    key = (str(server_bin), str(flag))
+    cached = _SERVER_FLAG_CACHE.get(key)
+    if cached is not None:
+        return cached
+    ok = False
+    try:
+        out = subprocess.run([server_bin, "--help"], capture_output=True,
+                             text=True, timeout=15)
+        ok = flag in ((out.stdout or "") + (out.stderr or ""))
+    except Exception:  # noqa: BLE001 — can't probe -> assume unsupported (omit arg)
+        ok = False
+    _SERVER_FLAG_CACHE[key] = ok
+    return ok
+
+
+def _log_moe_degrade_once(key, msg):
+    if key not in _MOE_DEGRADE_LOGGED:
+        _MOE_DEGRADE_LOGGED.add(key)
+        logger.warning(msg)
+
+
 def _effective_ngl(requested, auto):
     """Override-wins-over-autofit (k14). An EXPLICIT ``n_gpu_layers`` request WINS
     over the autofit — that is the lever the offload speed-cliff sweep (k7) needs:
@@ -254,8 +287,22 @@ def _effective_ngl(requested, auto):
 
 
 def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None,
-               path=None, gpu_mem_gib=None, cpu_mem_gib=None, profile_bin=None):
+               path=None, gpu_mem_gib=None, cpu_mem_gib=None, profile_bin=None,
+               n_cpu_moe=None):
     """argv for the child llama-server + the resolved (ngl, ctx, threads, cpus).
+
+    ``n_cpu_moe`` (MoE expert split, 2026-07-24): number of MoE layers whose
+    EXPERT tensors stay on CPU (999/spill.MOE_ALL_LAYERS = all), emitted as
+    llama-server ``--n-cpu-moe``. Explicit (per-load opts / persisted override)
+    always wins. Absent -> the AUTO policy: a detected-MoE GGUF whose autofit
+    verdict is a HYBRID (partial layer split — the whole model doesn't fit VRAM)
+    is served with n_gpu_layers=-1 + --n-cpu-moe 999 INSTEAD of the layer split
+    (measured strictly better on ae: +59% tok/s at 5x less VRAM). Whole-model-
+    fits -> fully-on-GPU exactly as today (with an explicit ``--n-cpu-moe 0`` so
+    a unit-level LLAMA_ARG_N_CPU_MOE env hack can't silently displace the
+    experts); dense -> byte-identical to today (no flag). This function is THE
+    choke point for every slot child spawn — /load, k14 /relaunch, and direct
+    slot loads all funnel through here — so the policy holds for all of them.
 
     ``profile_bin`` (env-profiles stage 1): when the agent seats a model
     attributed to a dependency profile, it hands the profile venv's bin dir here.
@@ -340,6 +387,73 @@ def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None,
     threads = int(threads) if threads else DEFAULT_LLAMA_THREADS
     cpus = str(cpus).strip() if cpus not in (None, "") else None
 
+    # The model's TOTAL layer count (GGUF header block_count) — the denominator
+    # for the console's "17/48 layers" AND the hybrid test for the MoE policy.
+    try:
+        from ..spill import _gguf_layer_count
+        total_layers = _gguf_layer_count(path)
+    except Exception:  # noqa: BLE001 — never block a load on header metadata
+        total_layers = None
+
+    # ── MoE expert split (measured win, 2026-07-24) ─────────────────────────
+    # Decide the effective --n-cpu-moe BEFORE the engine branch so both child
+    # kinds can degrade honestly. moe_mode: "explicit" (per-load opts/override —
+    # always wins), "auto" (detected-MoE hybrid -> -1 + all experts on CPU
+    # instead of the layer split), "pin-gpu" (detected-MoE that fully fits under
+    # autofit -> explicit 0 so an inherited LLAMA_ARG_N_CPU_MOE env can't
+    # silently displace the experts), or None (dense / explicit layer
+    # designation / k37 mode engine active — byte-identical to before).
+    eff_n_cpu_moe = None
+    moe_mode = None
+    moe_fallback_ngl = ngl                   # what we revert to if we must degrade
+    if n_cpu_moe not in (None, ""):
+        try:
+            eff_n_cpu_moe = int(n_cpu_moe)
+            moe_mode = "explicit"
+        except (TypeError, ValueError):
+            eff_n_cpu_moe = None
+    else:
+        try:
+            from ..spill import gguf_moe_detail, alloc_mode_env, MOE_ALL_LAYERS
+            moe = gguf_moe_detail(path)
+            # AUTO policy only when nothing explicit governs placement: no
+            # explicit n_gpu_layers request and no k37 mode engine in play.
+            if (moe.get("is_moe") and alloc_mode_env() is None
+                    and n_gpu_layers is None):
+                if total_layers and 0 < auto < int(total_layers):
+                    # The HYBRID situation — autofit would do a partial layer
+                    # split. MoE-aware split is strictly better (ae, coder-next:
+                    # 24.1 vs 15.2 tok/s at 3.2 vs 16.6 GiB VRAM) UNLESS the
+                    # expert tensors clearly cannot live in host RAM — then the
+                    # layer split (whose CPU share is smaller) stays the
+                    # success path (defaults-are-promises: only ever improve).
+                    exp = int(moe.get("expert_bytes") or 0)
+                    avail = _mem_available_bytes()
+                    if avail:
+                        from ..spill import ram_reserve_bytes
+                        avail = max(0, avail - ram_reserve_bytes())
+                    if exp and avail and exp > avail * 0.95:
+                        _log_moe_degrade_once(
+                            ("ram", model_key),
+                            f"slot {SLOT_ID}: {model_key} is MoE but its expert "
+                            f"tensors (~{exp / 1e9:.1f} GB) exceed budgetable RAM "
+                            f"(~{avail / 1e9:.1f} GB) — keeping the layer-split "
+                            "hybrid instead of the MoE split")
+                    else:
+                        ngl = -1
+                        eff_n_cpu_moe = MOE_ALL_LAYERS
+                        moe_mode = "auto"
+                elif auto == -1:
+                    # Whole model fits -> fully-on-GPU as today, but pin the
+                    # experts ON the GPU explicitly (argv beats env in
+                    # llama-server) so a transition-era LLAMA_ARG_N_CPU_MOE
+                    # unit env can't silently push them to CPU.
+                    eff_n_cpu_moe = 0
+                    moe_mode = "pin-gpu"
+        except Exception:  # noqa: BLE001 — MoE policy must never block a load
+            eff_n_cpu_moe = None
+            moe_mode = None
+
     # Preflight: when nothing can offload to GPU (auto<=0 — e.g. no GPU on this
     # node) the weights are CPU-RAM-resident, so a model bigger than free RAM will
     # OOM mid-load. Sum ALL shards (the resolved path is only shard 1) and fail
@@ -351,7 +465,16 @@ def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None,
             from ..spill import cpu_resident_bytes
             ram_budget = float(cpu_mem_gib) * 1e9
             ngl_eff = ngl                      # the already-resolved effective ngl
-            need_cpu = cpu_resident_bytes(path, int(ngl_eff)) or 0
+            if eff_n_cpu_moe and moe_mode in ("auto", "explicit"):
+                # MoE split: the CPU-resident share is the expert tensors, not a
+                # layer fraction (ngl=-1 would otherwise read as 0 CPU bytes).
+                try:
+                    from ..spill import gguf_moe_detail
+                    need_cpu = int(gguf_moe_detail(path).get("expert_bytes") or 0)
+                except Exception:  # noqa: BLE001
+                    need_cpu = 0
+            else:
+                need_cpu = cpu_resident_bytes(path, int(ngl_eff)) or 0
             if need_cpu > ram_budget:
                 raise RuntimeError(
                     f"{model_key}: CPU-resident share ~{need_cpu / 1e9:.1f} GB exceeds "
@@ -381,11 +504,38 @@ def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None,
         os.path.isfile(LLAMA_SERVER_BIN) or shutil.which(LLAMA_SERVER_BIN))) else None
 
     if server_bin:
+        # MoE flag support: an older llama-server predating --n-cpu-moe would
+        # reject the unknown flag at spawn. Probe once per binary; degrade by
+        # OMITTING the arg (+ one log). An AUTO-applied split also reverts to
+        # the layer-split hybrid it replaced (never launch -1 without the
+        # expert override — that would be the OOM the policy exists to avoid).
+        if eff_n_cpu_moe is not None and not _server_supports_flag(
+                server_bin, "--n-cpu-moe"):
+            _log_moe_degrade_once(
+                ("flag", server_bin),
+                f"slot {SLOT_ID}: installed llama-server ({server_bin}) predates "
+                "--n-cpu-moe — omitting the MoE expert split (layer-split/plain "
+                "behavior stands); update the engine (`hugpy install-engine`) "
+                "to enable it")
+            if moe_mode == "auto":
+                ngl = moe_fallback_ngl
+            eff_n_cpu_moe = None
+            moe_mode = None
         argv = [
             server_bin, "-m", path,
             "--host", "127.0.0.1", "--port", str(SLOT_CHILD_PORT),
             "--n-gpu-layers", str(ngl), "-c", str(ctx), "-t", str(threads),
         ]
+        if eff_n_cpu_moe is not None:
+            # Explicit argv beats any inherited LLAMA_ARG_N_CPU_MOE env (the
+            # transition-era ae unit hack), so the launched split is
+            # deterministic regardless of the unit's environment.
+            argv += ["--n-cpu-moe", str(eff_n_cpu_moe)]
+            if moe_mode in ("auto", "explicit"):
+                logger.info(
+                    "slot %s: %s MoE split (%s) — n_gpu_layers=%s, experts of "
+                    "%s layer(s) on CPU (--n-cpu-moe)", SLOT_ID, model_key,
+                    moe_mode, ngl, eff_n_cpu_moe)
         if cpus:
             # Soft pin via llama.cpp's own affinity (taskset is escaped by llama.cpp's
             # per-thread sched_setaffinity). For HARD, kernel-enforced dedication use
@@ -421,6 +571,22 @@ def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None,
                 "llama_cpp.server fallback cannot load the projector, images "
                 "would be silently ignored. Install/point to a llama-server "
                 "build (`hugpy install-engine`) to seat vision models.")
+        # MoE expert split: llama_cpp.server (the python fallback) has no
+        # --n-cpu-moe equivalent. Degrade: omit + one log; an AUTO-applied
+        # split reverts to the layer-split hybrid (never -1 without the
+        # expert override).
+        if eff_n_cpu_moe is not None:
+            _log_moe_degrade_once(
+                ("python-child", model_key),
+                f"slot {SLOT_ID}: {model_key} wants a MoE expert split "
+                "(--n-cpu-moe) but this box serves via llama_cpp.server, which "
+                "cannot express it — keeping the layer-split behavior; install "
+                "a native llama-server (`hugpy install-engine`) for the "
+                "measured MoE speedup")
+            if moe_mode == "auto":
+                ngl = moe_fallback_ngl
+            eff_n_cpu_moe = None
+            moe_mode = None
         import sys as _sys
         # Env-profiles (stage 1): launch this python child from the profile
         # venv's interpreter when one is attributed (raises errors-as-data if the
@@ -440,17 +606,10 @@ def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None,
         if cpus:
             logger.info("slot %s: cpu pin %r ignored in llama_cpp.server mode",
                         SLOT_ID, cpus)
-    # The model's TOTAL layer count (GGUF header block_count) — the denominator
-    # the console needs to render "17/48 layers" instead of "17/undefined". Read
-    # here (the one place the slot holds the resolved file path) via the existing
-    # spill reader; best-effort None keeps the field omit-when-unset downstream.
-    try:
-        from ..spill import _gguf_layer_count
-        total_layers = _gguf_layer_count(path)
-    except Exception:  # noqa: BLE001 — never block a load on header metadata
-        total_layers = None
+    # total_layers was read above (needed by the MoE hybrid test); it rides the
+    # return so the console can render "17/48 layers" instead of "17/undefined".
     return (argv, ngl, ctx, threads, cpus,
-            ("binary" if server_bin else "python"), total_layers)
+            ("binary" if server_bin else "python"), total_layers, eff_n_cpu_moe)
 
 
 class Slot:
@@ -470,6 +629,9 @@ class Slot:
         # GGUF header block_count of the seated model (None = unknown/non-GGUF):
         # the "of 48" in the console's offload readout.
         self.total_layers = None
+        # Effective --n-cpu-moe the child LAUNCHED with (None = no MoE split /
+        # dense / unsupported engine): the honest MoE-placement readout.
+        self.n_cpu_moe = None
         self.loaded_at = 0.0
         self.last_used = 0.0
         # Free VRAM sampled at the start of the CURRENT load (slice 12): the
@@ -543,6 +705,7 @@ class Slot:
                 self.model_key = self.ngl = self.ctx = None
                 self.threads = self.cpus = self.gpu = self.expected_bytes = None
                 self.total_layers = None
+                self.n_cpu_moe = None
                 self.profile_bin = None
                 self.proc = None
         finally:
@@ -564,6 +727,9 @@ class Slot:
             # "17/48 layers". None for non-GGUF / an unreadable header (getattr:
             # an instance created before this field existed must not 500 /status).
             "total_layers": getattr(self, "total_layers", None),
+            # Effective --n-cpu-moe the child launched with (MoE expert split);
+            # None = no split. getattr for the same pre-field-instance reason.
+            "n_cpu_moe": getattr(self, "n_cpu_moe", None),
             "ctx": self.ctx,
             "threads": self.threads,
             "cpus": self.cpus,
@@ -597,7 +763,8 @@ class Slot:
     # -- lifecycle ---------------------------------------------------------
     def load(self, model_key, n_gpu_layers=None, ctx=None, threads=None,
              cpus=None, gpu=None, path=None, gpu_mem_gib=None,
-             cpu_mem_gib=None, profile_bin=None, force=False) -> dict:
+             cpu_mem_gib=None, profile_bin=None, force=False,
+             n_cpu_moe=None) -> dict:
         with self.lock:
             # ``force`` (k14 relaunch): a relaunch re-seats the SAME model with a
             # NEW spec (e.g. a swept-down n_gpu_layers), so it must bypass the
@@ -622,10 +789,10 @@ class Slot:
             self._kill()
             self.profile_bin = profile_bin or None
             (argv, self.ngl, self.ctx, self.threads, self.cpus,
-             self.child_kind, self.total_layers) = _build_cmd(
+             self.child_kind, self.total_layers, self.n_cpu_moe) = _build_cmd(
                 model_key, n_gpu_layers, ctx, threads, cpus, path=path,
                 gpu_mem_gib=gpu_mem_gib, cpu_mem_gib=cpu_mem_gib,
-                profile_bin=self.profile_bin)
+                profile_bin=self.profile_bin, n_cpu_moe=n_cpu_moe)
             # per-load GPU pin overrides the slot's MAIN_GPU default
             self.gpu = gpu if gpu not in (None, "") else MAIN_GPU
             self.expected_bytes = _model_expected_bytes(model_key)
@@ -766,10 +933,11 @@ class Slot:
             self.model_key = self.ngl = self.ctx = None
             self.threads = self.cpus = self.gpu = self.expected_bytes = None
             self.total_layers = None
+            self.n_cpu_moe = None
             self.profile_bin = None
             return self.status()
 
-    def relaunch(self, n_gpu_layers=None, ctx=None) -> dict:
+    def relaunch(self, n_gpu_layers=None, ctx=None, n_cpu_moe=None) -> dict:
         """Re-seat the CURRENTLY-loaded model with a new offload depth / context —
         the lever the k7 offload speed-cliff sweep needs (seat at full offload,
         then relaunch DOWN through decreasing ``n_gpu_layers``, measuring tok/s at
@@ -801,13 +969,15 @@ class Slot:
             ctx=ctx if ctx is not None else self.ctx,
             threads=self.threads, cpus=self.cpus, gpu=self.gpu,
             gpu_mem_gib=None, cpu_mem_gib=None,
-            profile_bin=self.profile_bin, force=True)
+            profile_bin=self.profile_bin, force=True,
+            n_cpu_moe=n_cpu_moe)
         # Surface the request alongside the honest launched value so the caller
         # can see requested-vs-effective at a glance (self.ngl / status carries
         # the measured launch value).
         result = dict(result)
         result["relaunched"] = True
         result["requested_n_gpu_layers"] = requested_ngl
+        result["requested_n_cpu_moe"] = n_cpu_moe
         return result
 
     def _kill(self):
@@ -859,7 +1029,8 @@ def build_app():
                                      path=body.get("path"),
                                      gpu_mem_gib=body.get("gpu_mem_gib"),
                                      cpu_mem_gib=body.get("cpu_mem_gib"),
-                                     profile_bin=body.get("profile_bin")))
+                                     profile_bin=body.get("profile_bin"),
+                                     n_cpu_moe=body.get("n_cpu_moe")))
         except Exception as exc:  # noqa: BLE001
             return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
 
@@ -883,7 +1054,8 @@ def build_app():
                             "to relaunch"}), 409
         try:
             return jsonify(slot.relaunch(body.get("n_gpu_layers"),
-                                         body.get("ctx")))
+                                         body.get("ctx"),
+                                         n_cpu_moe=body.get("n_cpu_moe")))
         except Exception as exc:  # noqa: BLE001
             return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
 

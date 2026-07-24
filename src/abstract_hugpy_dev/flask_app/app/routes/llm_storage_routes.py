@@ -60,6 +60,12 @@ def _annotate_gguf_size(model: dict, mk: str) -> None:
     model["effective_gguf"] = d.get("effective_gguf")
     model["gguf_variants"] = d.get("variants") or []
     model["mmproj_bytes"] = d.get("mmproj_bytes")
+    # MoE (2026-07-24): the effective quant's expert/non-expert split, riding
+    # the registry the same way effective_bytes does (computed once per file —
+    # spill.gguf_moe_detail caches by path+size+mtime). Feasibility prices the
+    # GPU side of a MoE by non_expert_bytes; absent for dense models.
+    if d.get("moe"):
+        model["moe"] = d["moe"]
 
 
 def _annotate_size(model: dict, mk: str) -> None:

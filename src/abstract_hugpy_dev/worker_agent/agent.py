@@ -752,6 +752,11 @@ def _run_once(payload: dict) -> dict:
 
 _SPILL_ENV = {
     "n_gpu_layers": "HUGPY_N_GPU_LAYERS",
+    # MoE expert split (2026-07-24): N MoE layers whose expert tensors stay on
+    # CPU (999 = all). Rides to slot children as per-load opts (runners/get.py)
+    # and to llama-server as --n-cpu-moe. Cleared when absent — a leaked split
+    # would silently displace the next model's experts.
+    "n_cpu_moe": "HUGPY_N_CPU_MOE",
     "gpu_mem_gib": "HUGPY_GPU_MEM_GIB",
     "cpu_mem_gib": "HUGPY_CPU_MEM_GIB",
     # Explicit per-model core budget (slot loads pass it to the child;
@@ -777,7 +782,8 @@ _SPILL_ENV = {
 # HUGPY_ALLOC_MODE=max-ram from a previous request would silently flip the
 # next model's placement (a dead-wrong knob), unlike the layer/budget knobs
 # whose stickiness is long-standing behavior we don't change here.
-_SPILL_ENV_CLEAR_WHEN_ABSENT = ("alloc_mode", "leniency_pct", "priority_device")
+_SPILL_ENV_CLEAR_WHEN_ABSENT = ("alloc_mode", "leniency_pct", "priority_device",
+                                "n_cpu_moe")
 
 
 # ── operator resource limits (two-tier) ─────────────────────────────────────
@@ -3363,7 +3369,7 @@ def build_app(state: "WorkerState") -> Flask:
         # 404 = no such slot on this worker; 409 = slot empty (nothing to relaunch).
         import httpx
         body = request.get_json(silent=True) or {}
-        payload = {k: body[k] for k in ("n_gpu_layers", "ctx")
+        payload = {k: body[k] for k in ("n_gpu_layers", "ctx", "n_cpu_moe")
                    if body.get(k) not in (None, "")}
         try:
             from ..managers.serve.slots import SlotPool
@@ -4141,6 +4147,14 @@ _FLEX_CTX_FLOOR: dict = {}               # model_key -> committed compressed ctx
 # shard-blind autofit. Cleared when the model is re-admitted (re-decides) or fits
 # fully. Empty == no active partial-offload commitment.
 _PARTIAL_NGL: dict = {}                   # model_key -> {"path", "n"}
+# MoE expert split (2026-07-24): the split the VRAM admission COMMITTED a
+# detected-MoE model to when its FULL weights can never fit the card (the hybrid
+# situation). Value: {"path": served_quant_path, "n_cpu_moe": N}. Rides the
+# admission verdict -> slot opts -> llama-server --n-cpu-moe (n_gpu_layers=-1 +
+# experts on CPU); ALSO the marker that flips this model's calibration verdict
+# to "partial" so a 3.2 GiB MoE-split footprint never feeds the full-load
+# correction ratio. Cleared alongside _PARTIAL_NGL when an admission re-decides.
+_MOE_SPLIT: dict = {}                     # model_key -> {"path", "n_cpu_moe"}
 # t28 load-and-learn: the worker's half of the calibration loop.
 #   _CALIB_BUFFER      pending calibration_sample dicts, drained into each
 #                      heartbeat (worker->central, additive/optional).
@@ -4748,16 +4762,81 @@ def _served_gguf_geometry(model_key: str) -> "tuple[str | None, int | None]":
 
 
 def _clear_partial_ngl(model_key: str) -> None:
-    """Drop any committed partial-offload for ``model_key`` (this admission
-    re-decides) and clear the in-process spill override for its path, so a model
-    that now fits fully is never forced back onto a stale partial plan."""
+    """Drop any committed partial-offload OR MoE split for ``model_key`` (this
+    admission re-decides) and clear the in-process spill override for its path,
+    so a model that now fits fully is never forced back onto a stale plan."""
     prev = _PARTIAL_NGL.pop(model_key, None)
+    _MOE_SPLIT.pop(model_key, None)
     if prev and prev.get("path"):
         try:
             from ..managers import spill as _spill
             _spill.clear_ngl_override(prev["path"])
         except Exception:  # noqa: BLE001
             pass
+
+
+# ── MoE-aware placement (2026-07-24 measured win; operator-grounded) ─────────
+# Why: autofit's defect was reducing a TYPED tensor list to an opaque byte-bag —
+# "how many whole layers fit" instead of "what KIND of bytes are these". A MoE's
+# bytes are ~97% cold expert tensors (each token touches expert_used/expert_count
+# of them); the always-hot attention/shared/KV share is tiny. Splitting BY KIND
+# (llama-server --n-cpu-moe: experts to CPU, everything else + KV on GPU) beat
+# the 17/48 layer split on ae by +59% tok/s at 5x less VRAM. The helpers below
+# make every fit/admission path consume that typed view (spill.gguf_moe_detail —
+# header-derived, cached) instead of the flat file size.
+def _moe_detail_for(model_key: str) -> "dict | None":
+    """spill.gguf_moe_detail of the SERVED quant (the same path resolution the
+    loader uses), or None for dense / non-GGUF / any miss (degrade to the
+    opaque-size path, never raise)."""
+    try:
+        ppath, _tl = _served_gguf_geometry(model_key)
+        if not ppath:
+            return None
+        from ..managers import spill as _spill
+        det = _spill.gguf_moe_detail(ppath)
+        return det if det.get("is_moe") else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _moe_plan_for(model_key: str) -> "dict | None":
+    """The MoE split that GOVERNS this model's next load, or None (dense path).
+
+    Returns {"path", "n_cpu_moe", "gpu_weight_bytes", "cpu_bytes", "detail"}:
+      * explicit HUGPY_N_CPU_MOE (the n_cpu_moe spill/override wire) WINS — the
+        split is priced per-layer-exactly at that N (spill.moe_split_need);
+      * else AUTO-ELIGIBLE: a detected-MoE GGUF with NO explicit layer
+        designation (HUGPY_N_GPU_LAYERS unset/auto) and no k37 mode engine
+        active — priced at all-experts-on-CPU (MOE_ALL_LAYERS). Whether the
+        auto split is ACTUALLY APPLIED is the caller's budget question (it only
+        replaces the plan when the whole model can't fit — fits-whole stays
+        fully-on-GPU, byte-identical to today).
+    Explicit n_gpu_layers / gpu-only / ram-only / max-ram / explicit-mode all
+    return None here: explicit operator placement always wins over auto."""
+    det = _moe_detail_for(model_key)
+    if not det:
+        return None
+    try:
+        from ..managers import spill as _spill
+        ncm = _spill.n_cpu_moe_env()
+        if ncm is None:
+            intent, requested = _gguf_ngl_intent(model_key)
+            if intent != "auto" or requested is not None:
+                return None                      # explicit layer designation wins
+            if _spill.alloc_mode_env() is not None:
+                return None                      # k37 mode engine owns placement
+            ncm = _spill.MOE_ALL_LAYERS
+        elif ncm <= 0:
+            return None                          # explicit "experts on GPU" = no split
+        split = _spill.moe_split_need(det, ncm)
+        if not split or not split.get("cpu_bytes"):
+            return None                          # nothing moves -> dense pricing
+        ppath, _tl = _served_gguf_geometry(model_key)
+        return {"path": ppath, "n_cpu_moe": int(ncm),
+                "gpu_weight_bytes": int(split["gpu_bytes"]),
+                "cpu_bytes": int(split["cpu_bytes"]), "detail": det}
+    except Exception:  # noqa: BLE001 — pricing gap -> dense path
+        return None
 
 
 def _resolved_ctx(model_key: str, cfg: dict | None = None) -> "tuple[int | None, int | None, int | None]":
@@ -4880,9 +4959,35 @@ def _incoming_need_detail(model_key: str) -> dict:
     # current correction. None correction -> total == base_total (byte-identical).
     corr = _calib_correction(model_key)
     total = int(base_total * corr) if corr else base_total
-    return {"total": total, "base_total": base_total,
-            "calibration_correction": (corr or 1.0),
-            "weights": int(weights), "kv": int(kv or 0), **det}
+    out = {"total": total, "base_total": base_total,
+           "calibration_correction": (corr or 1.0),
+           "weights": int(weights), "kv": int(kv or 0), **det}
+    # MoE expert split (2026-07-24): when a MoE split governs this model
+    # (explicit n_cpu_moe, or auto-eligible under the default placement), carry
+    # the TYPED need alongside the opaque total: GPU-side = non-expert weights
+    # (x the same 1.15 headroom the weights term uses) + the WHOLE KV (all
+    # layers stay on the GPU under the split); CPU-side = the expert bytes
+    # (RAM/page-cache, mirroring cpu_resident_bytes accounting). Fit paths use
+    # ``total`` first (fits-whole stays fully-on-GPU) and fall back to
+    # ``moe_split.gpu_total`` when the whole model can't fit — the hybrid
+    # situation the split was measured to win. No calibration correction on the
+    # split figure: corrections are learned from FULL loads only (a MoE-split
+    # residency reports verdict "partial" and never feeds the ratio).
+    try:
+        plan = _moe_plan_for(model_key)
+    except Exception:  # noqa: BLE001 — additive; never break a working fit
+        plan = None
+    if plan:
+        out["moe_split"] = {
+            "path": plan.get("path"),
+            "n_cpu_moe": plan["n_cpu_moe"],
+            "gpu_total": int(plan["gpu_weight_bytes"] * 1.15) + int(kv or 0),
+            "cpu_bytes": plan["cpu_bytes"],
+            "expert_count": (plan.get("detail") or {}).get("expert_count"),
+            "expert_used_count": (plan.get("detail") or {}).get("expert_used_count"),
+            "sparsity": (plan.get("detail") or {}).get("sparsity"),
+        }
+    return out
 
 
 # ── t28 load-and-learn — worker capture + learned-correction application ─────
@@ -4943,6 +5048,16 @@ def _build_calibration_success(mk: str, row: dict) -> "dict | None":
     base_total = det.get("base_total")
     if not base_total:
         return None
+    verdict = _calib_verdict(row.get("device"), row.get("n_gpu_layers"),
+                             row.get("total_layers"))
+    # MoE expert split (2026-07-24): a split residency launches with ngl=-1 but
+    # only the non-expert share lands on the GPU — letting it read as "full"
+    # would feed a wildly-low measured/predicted ratio into the full-load
+    # correction (3.2G measured vs ~48G predicted). Classify it as "partial"
+    # (the existing excluded-from-ratio vocabulary; the wire stays additive).
+    if verdict == "full" and (mk in _MOE_SPLIT
+                              or (row or {}).get("n_cpu_moe") is not None):
+        verdict = "partial"
     sample = {
         "model_key": mk,
         "engine": _model_framework(mk),
@@ -4950,8 +5065,7 @@ def _build_calibration_success(mk: str, row: dict) -> "dict | None":
         "needs_kv_bytes": det.get("kv"),
         "ctx_pct": det.get("ctx_pct"),
         "need_total_bytes": base_total,
-        "verdict": _calib_verdict(row.get("device"), row.get("n_gpu_layers"),
-                                  row.get("total_layers")),
+        "verdict": verdict,
         "n_gpu_layers": row.get("n_gpu_layers"),
         "total_layers": row.get("total_layers"),
         "vram_bytes": row.get("vram_bytes"),
@@ -5071,13 +5185,27 @@ def _worker_fit_check(model_key: str) -> bool:
 
     NEED = weights + KV(resolved ctx) (slice 11): the ctx tax is planned, not
     discovered at OOM. _incoming_need_detail is the ONE authoritative need; kv is
-    0 when ctx_pct is unset (byte-identical to today)."""
-    need = _incoming_need_detail(model_key).get("total")
+    0 when ctx_pct is unset (byte-identical to today).
+
+    MoE (2026-07-24): when the full model doesn't fit but a MoE split governs
+    the plan, the GPU-side need is the TYPED non-expert share (+KV) — the split
+    is what will actually load, so pricing the full file would misjudge exactly
+    the case the split wins (a 41.6GB MoE on an empty 23.6GiB card fits FINE).
+    The expert (CPU) share is checked against free RAM, failing open when RAM
+    is unmeasurable."""
+    det = _incoming_need_detail(model_key)
+    need = det.get("total")
     if not need:
         return True
     fv = _free_vram_bytes()
     if fv is not None:
-        return fv >= need
+        if fv >= need:
+            return True
+        ms = det.get("moe_split")
+        if ms and fv >= int(ms.get("gpu_total") or 0):
+            fr = _free_ram_bytes()
+            return fr is None or fr >= int(ms.get("cpu_bytes") or 0)
+        return False
     fr = _free_ram_bytes()
     if fr is not None:
         return fr >= need
@@ -5141,13 +5269,25 @@ def _worker_slot_fit_check(model_key: str) -> bool:
         return True                          # can't read free VRAM -> allow
     # NEED = weights + KV(resolved ctx) (slice 11) — the ONE authoritative need,
     # so the ceiling gate reserves the ctx tax too. kv=0 when ctx_pct unset.
-    need = _incoming_need_detail(model_key).get("total")
+    det = _incoming_need_detail(model_key)
+    need = det.get("total")
     if not need:
         return True                          # unknown weight size -> allow
     headroom = int(total * (1.0 - _vram_ceiling_frac()))
     # Loading consumes ~need; the card is OK if free-after-load still leaves the
     # (1 - ceiling) reserve. Equivalent to "post-load fill <= ceiling".
-    return (fv - need) >= headroom
+    if (fv - need) >= headroom:
+        return True
+    # MoE (2026-07-24): the full model breaches the ceiling, but when a MoE
+    # split governs the plan the load actually lands only the non-expert share
+    # (+KV) on the card — gate on THAT typed need (expert share vs free RAM,
+    # failing open when RAM is unmeasurable). This is what lets the /probe and
+    # the boot star of a 41.6GB MoE pass on an empty 23.6GiB card.
+    ms = det.get("moe_split")
+    if ms and (fv - int(ms.get("gpu_total") or 0)) >= headroom:
+        fr = _free_ram_bytes()
+        return fr is None or fr >= int(ms.get("cpu_bytes") or 0)
+    return False
 
 
 def _worker_evictable(model_key: str) -> bool:
@@ -5948,6 +6088,52 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
                 "reason": None, "note": "unknown weight size — fail open"}
     ceiling_reserve = int(total * (1.0 - _vram_ceiling_frac()))
 
+    # ── MoE re-target (2026-07-24): typed bytes over the opaque byte-bag ─────
+    # When a MoE split governs this model AND its FULL weights can never fit
+    # this card even empty (need > card - reserve), the plan that will actually
+    # load is the split — so the whole admission (flex, eviction, fit checks)
+    # prices ITS GPU need (non-expert + KV) instead of chasing an impossible
+    # full fit (which would evict every innocent resident and then refuse
+    # anyway). RAM-guarded: experts must fit budgetable host RAM (fail open on
+    # unmeasurable). Only when `need` came from the authoritative detail — an
+    # explicit caller-passed need is a test/pre-priced figure and stands.
+    moe_commit = None
+    if need == _det.get("total"):
+        ms = _det.get("moe_split")
+        if ms and int(need) > max(0, int(total) - ceiling_reserve):
+            fr_now = _free_ram_bytes()
+            exp_bytes = int(ms.get("cpu_bytes") or 0)
+            if fr_now is not None and exp_bytes > fr_now * 0.95:
+                logger.info(
+                    "MoE split for %s skipped: expert tensors (~%s) exceed "
+                    "budgetable RAM (~%s) — keeping full-need admission",
+                    model_key, _human_bytes(exp_bytes), _human_bytes(fr_now))
+            elif ms.get("gpu_total"):
+                need = int(ms["gpu_total"])
+                moe_commit = dict(ms)
+                logger.info(
+                    "MoE re-target for %s: full weights can never fit this card "
+                    "— admission prices the expert split instead (GPU need %s, "
+                    "experts ~%s to CPU)", model_key, _human_bytes(need),
+                    _human_bytes(exp_bytes))
+
+    def _moe_admit_verdict(evicted_list, freed_bytes) -> dict:
+        """Commit + emit the MoE-split admit: n_gpu_layers=-1 + --n-cpu-moe
+        rides the verdict to the slot child; the _MOE_SPLIT marker keeps the
+        calibration verdict honest ("partial", never the full-load ratio)."""
+        _MOE_SPLIT[model_key] = {"path": moe_commit.get("path"),
+                                 "n_cpu_moe": moe_commit["n_cpu_moe"]}
+        return {"action": "partial", "evicted": evicted_list,
+                "freed_bytes": freed_bytes, "reason": None,
+                "n_gpu_layers": -1, "n_cpu_moe": moe_commit["n_cpu_moe"],
+                "moe": {k: moe_commit.get(k) for k in
+                        ("n_cpu_moe", "gpu_total", "cpu_bytes", "expert_count",
+                         "expert_used_count", "sparsity")},
+                "note": (f"MoE expert split: all layers on GPU "
+                         f"(~{_human_bytes(moe_commit.get('gpu_total'))} "
+                         f"non-expert + KV), expert tensors "
+                         f"(~{_human_bytes(moe_commit.get('cpu_bytes'))}) on CPU")}
+
     def _fits() -> "bool | None":
         fv = _free_vram_bytes()
         if fv is None:
@@ -5959,6 +6145,8 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
         return {"action": "proceed", "evicted": [], "freed_bytes": 0,
                 "reason": None, "note": "can't read free VRAM — fail open"}
     if ok:
+        if moe_commit is not None:
+            return _moe_admit_verdict([], 0)
         return {"action": "proceed", "evicted": [], "freed_bytes": 0, "reason": None}
 
     # Over the ceiling — plan the minimum eviction set.
@@ -6009,7 +6197,13 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
     fv_now = _free_vram_bytes()
     if fv_now is not None:
         deficit = ceiling_reserve - (fv_now - need)      # >0 here (ok was False)
-        subject = {"weights_bytes": _det.get("weights"), "kv_bytes": _det.get("kv"),
+        # Under a MoE re-target the subject's GPU-side weights are the typed
+        # non-expert share (what actually lands on the card), not the full file.
+        _subj_weights = _det.get("weights")
+        if moe_commit is not None:
+            _subj_weights = max(0, int(moe_commit.get("gpu_total") or 0)
+                                - int(_det.get("kv") or 0))
+        subject = {"weights_bytes": _subj_weights, "kv_bytes": _det.get("kv"),
                    "ctx_pct": _det.get("ctx_pct"),
                    "ctx_deviation_pct": _ctx_deviation_pct(model_key),
                    "priority": _flex_priority(model_key)}
@@ -6032,14 +6226,22 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
             # Commit the subject to its compressed ctx so the SERVED -c and the
             # KV admission reserved agree, and re-price `need` at that floor. The
             # captured _fits() closure re-reads `need`, so this shrinks the fit
-            # target for both the flex re-check and the eviction loop.
+            # target for both the flex re-check and the eviction loop. Under a
+            # MoE re-target the weight term is the typed non-expert share.
             _FLEX_CTX_FLOOR[model_key] = int(plan.self_ctx_pct)
             new_kv = _kvat(_det.get("kv"), _det.get("ctx_pct"), plan.self_ctx_pct)
-            need = int(_det.get("weights") or 0) + int(new_kv or 0)
+            need = int(_subj_weights or 0) + int(new_kv or 0)
+            if moe_commit is not None:
+                moe_commit["gpu_total"] = int(need)
         if plan.action == "flex" and _fits():
             # Fits WITHIN bands — no eviction. (Neighbour compression in the plan
             # is realised as reduced eviction / priority order until in-place
             # resident shrink lands; self-flex alone already cleared the ceiling.)
+            if moe_commit is not None:
+                out = _moe_admit_verdict([], 0)
+                out["note"] += f"; flex: {plan.note}"
+                out["flex"] = plan.as_dict()
+                return out
             return {"action": "proceed", "evicted": [], "freed_bytes": 0,
                     "reason": None, "note": f"flex: {plan.note}",
                     "flex": plan.as_dict()}
@@ -6084,6 +6286,8 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
 
     final = _fits()
     if final:
+        if moe_commit is not None:
+            return _moe_admit_verdict(evicted, freed)
         return {"action": "evicted", "evicted": evicted,
                 "freed_bytes": freed, "reason": None}
 
@@ -6236,6 +6440,14 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
                        "host_mode": p.get("host_mode"), "why": p.get("why")}
                       for p in protected],
     }
+    # MoE honesty: when a split governed (or was considered for) this model,
+    # carry its typed numbers so the refusal explains what the split would have
+    # needed — the operator sees "even the 2.9G non-expert share didn't fit",
+    # not a bare full-size refusal.
+    if _det.get("moe_split"):
+        reason["moe_split"] = {k: v for k, v in _det["moe_split"].items()
+                               if k != "path"}
+        reason["moe_split"]["was_plan"] = moe_commit is not None
     if flex_note:
         reason["flex_note"] = flex_note      # what the band flex tried, for hover
     if partial is not None and not partial.admit:

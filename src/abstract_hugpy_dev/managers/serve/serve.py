@@ -360,6 +360,19 @@ def serve_spec_for(model_key=None, *, cfg=None) -> ServeSpec:
         if mmproj:
             extra_args += ["--mmproj", mmproj]
 
+    # MoE expert split (2026-07-24): a persisted n_cpu_moe override rides the
+    # spec as llama-server argv (--n-cpu-moe N — experts of the first N MoE
+    # layers stay on CPU; 999 = all). Explicit argv beats any unit-level
+    # LLAMA_ARG_N_CPU_MOE env, so the served split is deterministic. Absent ->
+    # no arg (the slot path applies the detected-MoE auto policy; the
+    # systemd/swap spec stays byte-identical for dense/unset).
+    _ncm = extra.get("n_cpu_moe")
+    if _ncm not in (None, "") and "--n-cpu-moe" not in extra_args:
+        try:
+            extra_args += ["--n-cpu-moe", str(int(_ncm))]
+        except (TypeError, ValueError):
+            pass
+
     # k37: a persisted alloc_mode materializes onto n_gpu_layers here (gpu-only
     # -> -1, ram-only -> 0, max-gpu/explicit -> honest fit, max-ram -> inverted
     # RAM-first fit). Mode unset (the common case) keeps the legacy resolution

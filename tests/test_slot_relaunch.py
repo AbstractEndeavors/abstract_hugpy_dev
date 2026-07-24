@@ -162,10 +162,11 @@ def test_force_bypasses_same_model_short_circuit(monkeypatch):
     spawned = {"n": 0}
 
     def _build(mk, ngl, ctx, threads, cpus, **kw):
-        # mirrors the real return shape: (..., child_kind, total_layers) — the
-        # trailing GGUF block_count feeds status()'s "17/48 layers" readout.
+        # mirrors the real return shape: (..., child_kind, total_layers,
+        # n_cpu_moe) — block_count feeds status()'s "17/48 layers" readout and
+        # the trailing n_cpu_moe is the MoE expert-split the child launched with.
         return (["true"], ngl if ngl is not None else -1, ctx or 4096,
-                threads or 6, cpus, "cpp", 48)
+                threads or 6, cpus, "cpp", 48, kw.get("n_cpu_moe"))
     monkeypatch.setattr(sa, "_build_cmd", _build)
     monkeypatch.setattr(sa, "_model_expected_bytes", lambda mk: 1 * GIB)
 
@@ -203,7 +204,8 @@ def test_relaunch_route_relays_to_slot(monkeypatch):
     app, slot = sa.build_app()
     slot.model_key = "coder"
     captured = {}
-    slot.relaunch = lambda ngl, ctx: captured.update(ngl=ngl, ctx=ctx) or {
+    slot.relaunch = lambda ngl, ctx, n_cpu_moe=None: captured.update(
+        ngl=ngl, ctx=ctx) or {
         "model_key": "coder", "n_gpu_layers": ngl, "relaunched": True}
     client = app.test_client()
     r = client.post("/relaunch", json={"n_gpu_layers": 12, "ctx": 2048})

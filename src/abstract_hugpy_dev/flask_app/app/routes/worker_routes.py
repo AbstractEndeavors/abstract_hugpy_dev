@@ -1367,6 +1367,15 @@ def workers_assign(worker_id):
     ok, reason = _alloc_spill_ok_for_engine(body.spill, body.model_key)
     if not ok:
         return jsonify({"error": reason}), 409
+    # Capability gate (operator ruling 2026-07-24): the selected mode must be
+    # FEASIBLE for THIS (model, worker) — an infeasible mode (max-gpu for a model
+    # far too big for the box's GPU) is refused with a numbers-naming 409, so a
+    # selection can never imply something the box can't do. Degrades to allow on
+    # any unknown (feasible_modes is permissive on missing data).
+    ok2, reason2 = _alloc_mode_feasible_for_worker(
+        body.spill, worker_id, body.model_key)
+    if not ok2:
+        return jsonify({"error": reason2}), 409
     worker = assign_model(worker_id, body.model_key, spill=body.spill)
     if worker is None:
         abort(404, description="Unknown worker id.")
@@ -1584,7 +1593,9 @@ def workers_slot_relaunch(worker_id, slot_id):
             "message": f"worker {worker_id} is offline — cannot relaunch its "
                        "slot until it is back online"}}), 409
     body = request.get_json(silent=True) or {}
-    payload = {k: body[k] for k in ("n_gpu_layers", "ctx")
+    # n_cpu_moe (MoE expert split, 2026-07-24) rides the same optional contract
+    # as n_gpu_layers: omit to keep/re-decide, an explicit value WINS.
+    payload = {k: body[k] for k in ("n_gpu_layers", "ctx", "n_cpu_moe")
                if body.get(k) not in (None, "")}
     return _relay_worker_op(worker_id, f"/slots/{slot_id}/relaunch", payload,
                             timeout=900.0, action="slot-relaunch")
@@ -1838,9 +1849,13 @@ _BAND_SPILL_KEYS = {"gpu_mem_gib_deviation_pct", "cpu_mem_gib_deviation_pct",
 # unchanged n_gpu_layers encoding); central version-gates their EMISSION
 # (WorkerStore.spill_for) so an old worker never sees a dead knob.
 _MODE_SPILL_KEYS = {"alloc_mode", "leniency_pct", "priority_device"}
+# MoE expert split (2026-07-24): n_cpu_moe = N MoE layers whose expert tensors
+# stay on CPU (999 = all). GGUF-only (llama-server --n-cpu-moe); emission is
+# version-gated with the mode keys (alloc_modes.NEW_SPILL_KEYS).
+_MOE_SPILL_KEYS = {"n_cpu_moe"}
 _ALLOC_SPILL_KEYS = ({"n_gpu_layers", "gpu_mem_gib", "cpu_mem_gib",
                       "threads", "tensor_split"}
-                     | _BAND_SPILL_KEYS | _MODE_SPILL_KEYS)
+                     | _BAND_SPILL_KEYS | _MODE_SPILL_KEYS | _MOE_SPILL_KEYS)
 
 
 def _validate_alloc_spill(spill):
@@ -1958,7 +1973,7 @@ def _validate_band_values(spill) -> "str | None":
 # coarse trio (gpu-only/ram-only/max-gpu) rides n_gpu_layers and stays
 # engine-agnostic, exactly as before.
 _EXPLICIT_BUDGET_KEYS = ({"gpu_mem_gib", "cpu_mem_gib", "threads", "tensor_split"}
-                         | _BAND_SPILL_KEYS | _MODE_SPILL_KEYS)
+                         | _BAND_SPILL_KEYS | _MODE_SPILL_KEYS | _MOE_SPILL_KEYS)
 
 
 def _alloc_is_gguf_only(spill) -> bool:
@@ -2017,6 +2032,48 @@ def _alloc_spill_ok_for_engine(spill, model_key) -> "tuple[bool, str | None]":
     return False, (f"{_alloc_label(spill)} is a GGUF-only allocation "
                    f"(explicit budget); '{model_key}' is {shown} — use "
                    "max-gpu, gpu-only, or ram-only for a non-GGUF model")
+
+
+def _fmt_gib(nbytes):
+    """A byte count as a compact 'N.N GiB' for an honest 409 reason, or '?' when
+    central couldn't resolve it (never fabricate a number in the message)."""
+    if not nbytes:
+        return "?"
+    try:
+        return f"{float(nbytes) / (1 << 30):.1f}GiB"
+    except (TypeError, ValueError):
+        return "?"
+
+
+def _alloc_mode_feasible_for_worker(spill, worker_id, model_key):
+    """CAPABILITY GATE (operator ruling 2026-07-24): the selected alloc mode must
+    be FEASIBLE for this (model, worker) — a mode that implies something the box
+    physically can't do (max-gpu for a 68 GiB transformers model on a 24 GiB GPU)
+    is refused with an honest reason naming the numbers, exactly like the engine
+    gate. Returns (True, None) when feasible, (False, reason) otherwise.
+
+    DEGRADE-NOT-500: an unknown worker, unresolvable size/totals, or any lookup
+    miss -> (True, None) (feasible_modes already degrades to the full set on
+    missing data, so this never eliminates on a guess)."""
+    try:
+        from ..functions.imports.utils.workers import (
+            feasible_modes_for, feasibility_context)
+        from ....managers.alloc_modes import derive_alloc_mode
+        feasible = feasible_modes_for(worker_id, model_key)
+        if not feasible:                       # unknown worker -> let assign 404
+            return True, None
+        mode = derive_alloc_mode(spill)        # blank spill -> 'max-gpu'
+        if mode in feasible:
+            return True, None
+        ctx = feasibility_context(worker_id, model_key)
+        return False, (
+            f"allocation mode '{mode}' is not feasible for '{model_key}' on this "
+            f"worker: model {_fmt_gib(ctx.get('model_bytes'))} vs GPU "
+            f"{_fmt_gib(ctx.get('gpu_total_bytes'))} / RAM "
+            f"{_fmt_gib(ctx.get('ram_total_bytes'))} — feasible: "
+            f"{', '.join(feasible)}")
+    except Exception:  # noqa: BLE001 — a capability check must never 500 assign
+        return True, None
 
 
 def _apply_alloc_map(worker_id, model_keys, spill):
@@ -2078,6 +2135,15 @@ def _apply_alloc_map(worker_id, model_keys, spill):
                                f"this model is {shown}")
                 skipN += 1
                 continue
+        # CAPABILITY GATE (operator ruling 2026-07-24): an infeasible mode for
+        # THIS (model, worker) is SKIPPED with the numbers-naming reason (same
+        # skip class as the engine gate) — the registry is never written with a
+        # selection the box can't honor. Degrades to allow on any unknown.
+        feasok, feasreason = _alloc_mode_feasible_for_worker(spill, worker_id, mk)
+        if not feasok:
+            results[mk] = f"skipped — {feasreason}"
+            skipN += 1
+            continue
         try:
             # assign_model writes spill_by_model[mk] = spill ({} clears it). The
             # model is already designated (we filtered to `designated`), so this
@@ -3826,6 +3892,60 @@ def _gguf_detail(model_key):
         return {}
 
 
+def _attach_alloc_feasibility(row, model_key):
+    """Surface the STORED-vs-DERIVED default + the per-worker FEASIBLE mode set
+    on a serving row (operator ruling 2026-07-24), so the UI can (a) label a
+    derived default distinctly from a stored one and (b) disable the modes a
+    given (model, worker) can't do — the same disable pattern the engine gate
+    already drives.
+
+    Adds:
+      * ``alloc_mode_derived`` (bool): True when NO alloc_mode is persisted — the
+        model-level ``alloc_mode`` is then the read-time default, not a stored
+        choice. (Model-level ``alloc_mode`` blank == max-gpu, per k37.)
+      * ``alloc_by_worker`` ({worker_id: {name, feasible:[...], derived_default}})
+        for EVERY worker this model is designated to — the per-(model,worker)
+        selectable set and its feasibility-derived blank default. Only present
+        when at least one such worker resolves; a per-worker miss is skipped.
+
+    Fully guarded: any failure omits the fields rather than erroring the route
+    (degrade-not-500). The /llm/workers list shape is untouched."""
+    try:
+        persisted_mode = (get_override(model_key) or {}).get("alloc_mode")
+        row["alloc_mode_derived"] = persisted_mode is None
+    except Exception:  # noqa: BLE001
+        return
+    try:
+        from ..functions.imports.utils.workers import (
+            list_workers, feasible_modes_for, derived_default_for)
+        by_worker = {}
+        for w in list_workers():
+            wid = w.get("id")
+            if not wid or model_key not in set(w.get("models") or []):
+                continue
+            feasible = feasible_modes_for(wid, model_key)
+            if feasible is None:
+                continue
+            entry = {"name": w.get("name"), "feasible": list(feasible)}
+            dd = derived_default_for(wid, model_key)
+            if dd is not None:
+                entry["derived_default"] = dd
+            by_worker[wid] = entry
+        if by_worker:
+            row["alloc_by_worker"] = by_worker
+            # A model-level union so a UI that isn't worker-scoped can still show
+            # the widest feasible set (never disables a mode SOME worker allows).
+            union = []
+            for entry in by_worker.values():
+                for m in entry["feasible"]:
+                    if m not in union:
+                        union.append(m)
+            row["alloc_modes_feasible"] = union
+    except Exception:  # noqa: BLE001 — a surface miss omits the field, never 500s
+        row.pop("alloc_by_worker", None)
+        row.pop("alloc_modes_feasible", None)
+
+
 def _with_gguf(row, model_key):
     """Attach the variant choices + sizes to a serving row (shared by GET/POST)."""
     row["available_gguf"], row["gguf_file"] = _gguf_choices(model_key)
@@ -3856,6 +3976,7 @@ def serving_get(model_key):
     # k37: the model's EFFECTIVE allocation mode (persisted alloc_mode, else
     # read-time derivation from the legacy knobs; blank model == max-gpu).
     row["alloc_mode"] = _effective_alloc_mode(model_key)
+    _attach_alloc_feasibility(row, model_key)
     _with_gguf(row, model_key)
     return jsonify(row)
 
@@ -3869,6 +3990,7 @@ def serving_set(model_key):
     row = spec_row(serve_spec_for(model_key))
     row["override"] = get_override(model_key)
     row["alloc_mode"] = _effective_alloc_mode(model_key)
+    _attach_alloc_feasibility(row, model_key)
     _with_gguf(row, model_key)
     if do_apply:
         row["apply"] = _apply_serving(model_key)
