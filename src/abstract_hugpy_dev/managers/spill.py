@@ -433,6 +433,17 @@ def _gguf_layer_count(model_path: str) -> Optional[int]:
 #     attribution ``<i>`` built in. The router (``ffn_gate_inp``) and the
 #     shared experts (``ffn_*_shexp``) do NOT carry the suffix and stay on the
 #     GPU, exactly as llama-server's --n-cpu-moe keeps them.
+#   * The name is a CONVENTION, so it is only the fast/primary path — a
+#     name-INDEPENDENT SHAPE backstop guards against a converter that names
+#     experts differently: an expert tensor is the STACKED one, ``n_dims >= 3``
+#     with the header's expert_count in its last dims slot (``dims[-1]``).
+#     Verified 2026-07-24 against the real coder-next shards (expert_count=512):
+#     all 144 ``_exps`` tensors are 3-D with dims[-1]==512, and name & shape
+#     select the IDENTICAL set. The ``nd>=3`` guard matters — 168 *2-D*
+#     non-expert tensors (router/shexp/attn_k/v) also carry 512 in dims[-1], so
+#     only the stacked-ness tells a real expert weight from a coincidental dim.
+#     is_expert = name-match OR shape-match; metadata (expert_count) is the gate;
+#     when the two methods disagree that is drift worth a log line, never silent.
 # Tensor bytes come from the header's tensor-info table (name + data offset),
 # sized by offset-difference within the data section — exact (padding included)
 # without a GGML type-size table. Parsed ONCE per file (cache keyed by
@@ -465,9 +476,36 @@ def _expert_tensor_re():
     return _MOE_EXPERT_TENSOR_RE
 
 
-def _gguf_scan_moe(model_path: str) -> dict:
+def _layer_index(name: str) -> Optional[int]:
+    """The ``<i>`` of a ``blk.<i>.…`` tensor name, for per-layer attribution, or
+    None. Used to attribute a SHAPE-matched expert tensor to its block even when
+    the name doesn't carry the ``_exps`` suffix (a nonstandard converter)."""
+    import re
+    m = re.match(r"^blk\.(\d+)\.", name)
+    return int(m.group(1)) if m else None
+
+
+def _gguf_scan_moe(model_path: str, expert_count_hint: Optional[int] = None) -> dict:
     """One-file GGUF header scan for the MoE split: KV expert counts + the
-    expert/non-expert tensor byte split. {} on any parse issue (dense path)."""
+    expert/non-expert tensor byte split, computed BOTH ways —
+
+      * NAME match: the ``_exps`` suffix (the fast path / primary bit), and
+      * SHAPE match: a STACKED tensor (``n_dims >= 3``) carrying the header's
+        ``expert_count`` in its last dims slot (``dims[-1]``) — name-independent.
+
+    The dims rule is empirical, verified 2026-07-24 against the real coder-next
+    Q4_K_M shards (expert_count=512): every one of the 144 ``ffn_*_exps`` tensors
+    is 3-D with ``dims[-1] == 512``, and the two methods select the IDENTICAL set.
+    The ``n_dims >= 3`` guard is load-bearing: on those shards 168 *2-D* tensors
+    (router ``ffn_gate_inp``, shared experts ``ffn_*_shexp``, ``attn_k/v``) also
+    happen to hold 512 in their last slot — only the STACKED expert weights are
+    3-D, so the stacked-ness is what distinguishes a real expert tensor from a
+    coincidental dimension. (GGUF stores dims reversed vs the logical shape, so
+    the stacked-expert axis lands in the last stored slot, ``dims[-1]``.)
+
+    Returns per-shard byte splits for BOTH methods plus the hit counts the
+    caller (gguf_moe_detail) needs for the cross-method consistency check.
+    {} on any parse issue (dense path)."""
     out: dict = {}
     try:
         import struct
@@ -500,12 +538,21 @@ def _gguf_scan_moe(model_path: str) -> dict:
                 raise ValueError(f"unknown gguf type {t}")
 
             alignment = 32
+            # Split GGUFs carry the full KV metadata only in shard 1; later
+            # shards have no expert_count of their own, so the hint (the count
+            # discovered from shard 1) lets the SHAPE backstop still fire on
+            # them. A shard's OWN header always wins if it has one.
+            expert_count = expert_count_hint
             for _ in range(n_kv):
                 key = read_str()
                 vtype = struct.unpack("<I", fh.read(4))[0]
                 val = read_val(vtype)
                 if key.endswith(".expert_count"):
                     out["expert_count"] = val
+                    try:
+                        expert_count = int(val)
+                    except (TypeError, ValueError):
+                        expert_count = None
                 elif key.endswith(".expert_used_count"):
                     out["expert_used_count"] = val
                 elif key == "general.alignment":
@@ -514,14 +561,14 @@ def _gguf_scan_moe(model_path: str) -> dict:
                     except (TypeError, ValueError):
                         pass
 
-            infos = []
+            infos = []                                   # (name, offset, dims)
             for _ in range(n_tensors):
                 name = read_str()
                 nd = struct.unpack("<I", fh.read(4))[0]
-                fh.read(8 * nd)                          # dims (unused: offset-diff sizing)
+                dims = struct.unpack(f"<{nd}Q", fh.read(8 * nd)) if nd else ()
                 fh.read(4)                               # ggml type
                 off = struct.unpack("<Q", fh.read(8))[0]
-                infos.append((name, off))
+                infos.append((name, off, dims))
             header_end = fh.tell()
 
         data_start = (header_end + alignment - 1) // alignment * alignment
@@ -530,24 +577,51 @@ def _gguf_scan_moe(model_path: str) -> dict:
             # A header with no tensor table (or a truncated file) can't be split.
             out["expert_bytes"] = 0
             out["non_expert_bytes"] = 0
+            out["expert_bytes_shape"] = 0
+            out["non_expert_bytes_shape"] = 0
+            out["name_expert_hits"] = 0
+            out["shape_expert_hits"] = 0
             return out
         infos.sort(key=lambda t: t[1])
+        rx = _expert_tensor_re()
+        # NAME method (primary): the _exps suffix.
         exp = nexp = 0
         by_layer: dict = {}
-        rx = _expert_tensor_re()
-        for i, (name, off) in enumerate(infos):
+        # SHAPE method (backstop): stacked (nd>=3) tensor with expert_count in the
+        # last dims slot. Off when the header carries no expert_count.
+        exp_s = nexp_s = 0
+        by_layer_s: dict = {}
+        name_hits = shape_hits = 0
+        for i, (name, off, dims) in enumerate(infos):
             end = infos[i + 1][1] if i + 1 < len(infos) else data_bytes
             size = max(0, end - off)
             m = rx.match(name)
             if m:
+                name_hits += 1
                 exp += size
                 layer = int(m.group(1))
                 by_layer[layer] = by_layer.get(layer, 0) + size
             else:
                 nexp += size
+            is_shape_expert = bool(
+                expert_count and expert_count > 0
+                and len(dims) >= 3 and dims[-1] == expert_count)
+            if is_shape_expert:
+                shape_hits += 1
+                exp_s += size
+                sl = _layer_index(name)
+                if sl is not None:
+                    by_layer_s[sl] = by_layer_s.get(sl, 0) + size
+            else:
+                nexp_s += size
         out["expert_bytes"] = int(exp)
         out["non_expert_bytes"] = int(nexp)
         out["expert_bytes_by_layer"] = by_layer
+        out["expert_bytes_shape"] = int(exp_s)
+        out["non_expert_bytes_shape"] = int(nexp_s)
+        out["expert_bytes_by_layer_shape"] = by_layer_s
+        out["name_expert_hits"] = int(name_hits)
+        out["shape_expert_hits"] = int(shape_hits)
     except Exception:  # noqa: BLE001 — unreadable header == dense path, never raise
         return {}
     return out
@@ -580,7 +654,23 @@ def gguf_moe_detail(model_path) -> dict:
     all shards of a split model). ``{"is_moe": False}`` for a dense model, a
     non-GGUF path, or ANY read failure — missing metadata degrades to the dense
     path, never raises. Cached per path by (size, mtime): the header is parsed
-    once per file version, never per beat/request."""
+    once per file version, never per beat/request.
+
+    DOCTRINE — the name is convention; the shape is ground truth; metadata is the
+    gate. Which tensors are experts is decided by NAME (the ``_exps`` suffix, the
+    fast primary bit) OR by SHAPE (a stacked ``nd>=3`` tensor carrying the
+    header's ``expert_count`` in its last dims slot — the name-independent
+    backstop, so a converter that renames experts can't silently zero the split).
+    The header's ``expert_count`` KV is the GATE: no positive count, no MoE, no
+    matter how the tensors are named — names alone never activate the split. When
+    the two methods DISAGREE that is real drift in the file, and drift is worth a
+    log line, never a silent misprice: a nonstandard-naming file logs a WARNING
+    and is served by shape; a file whose header claims MoE but shows no expert
+    tensors at all (by either method) logs a WARNING and falls back to the dense
+    split (a safe plain layer split, never a mispriced one); a file whose names
+    look like experts but whose header has no count is treated as dense with a
+    WARNING (no false MoE). The (path,size,mtime) cache makes every such warning
+    fire once per file version."""
     try:
         path = os.path.abspath(str(model_path))
         st = os.stat(path)
@@ -591,17 +681,28 @@ def gguf_moe_detail(model_path) -> dict:
     if cached is not None and cached.get("sig") == sig:
         return cached["detail"]
     expert = nexpert = 0
+    expert_s = nexpert_s = 0
+    name_hits = shape_hits = 0
     expert_count = expert_used = None
     by_layer: dict = {}
+    by_layer_s: dict = {}
     shards = _gguf_shard_paths(path)
     for shard in shards:
-        scan = _gguf_scan_moe(shard)
+        # Thread the expert_count discovered so far (shard 1 carries it; later
+        # shards don't) so the SHAPE backstop can fire on every shard.
+        scan = _gguf_scan_moe(shard, expert_count_hint=expert_count)
         if not scan:
             continue
         expert += int(scan.get("expert_bytes") or 0)
         nexpert += int(scan.get("non_expert_bytes") or 0)
+        expert_s += int(scan.get("expert_bytes_shape") or 0)
+        nexpert_s += int(scan.get("non_expert_bytes_shape") or 0)
+        name_hits += int(scan.get("name_expert_hits") or 0)
+        shape_hits += int(scan.get("shape_expert_hits") or 0)
         for layer, b in (scan.get("expert_bytes_by_layer") or {}).items():
             by_layer[layer] = by_layer.get(layer, 0) + int(b)
+        for layer, b in (scan.get("expert_bytes_by_layer_shape") or {}).items():
+            by_layer_s[layer] = by_layer_s.get(layer, 0) + int(b)
         if expert_count is None and scan.get("expert_count") is not None:
             try:
                 expert_count = int(scan["expert_count"])
@@ -612,6 +713,44 @@ def gguf_moe_detail(model_path) -> dict:
                 expert_used = int(scan["expert_used_count"])
             except (TypeError, ValueError):
                 pass
+
+    # ── Cross-method consistency: name (primary) vs shape (backstop) ──────────
+    # The header's positive expert_count is the GATE for MoE. Given the gate,
+    # reconcile the two expert-selection methods and log any disagreement ONCE
+    # (the cache below makes this per-(path,size,mtime)).
+    has_count = bool(expert_count and expert_count > 0)
+    if not has_count and name_hits > 0:
+        # REVERSE inconsistency: tensors named like experts but no metadata gate.
+        # Names alone never activate the split — treat as dense, no false MoE.
+        logger.warning(
+            "gguf MoE: %s has %d _exps-named tensor(s) but no positive "
+            "expert_count in the header — metadata is the gate, treating as "
+            "dense (no split).", path, name_hits)
+        # Fold the name-matched bytes back into non-expert so no downstream
+        # consumer that reads expert_bytes directly can misprice a dense file.
+        nexpert += expert
+        expert = 0
+        by_layer = {}
+    elif has_count and name_hits == 0:
+        if shape_hits > 0:
+            # Nonstandard converter: experts present by SHAPE, not by name.
+            # Use the shape results so the split is still priced correctly.
+            logger.warning(
+                "gguf MoE: %s — expert tensors present by shape (%d stacked "
+                "tensors with dims[-1]==expert_count=%d) but not by _exps "
+                "naming — nonstandard converter? Using shape-derived split.",
+                path, shape_hits, expert_count)
+            expert, nexpert = expert_s, nexpert_s
+            by_layer = by_layer_s
+        else:
+            # Header claims MoE but NEITHER method finds expert tensors — the
+            # safe fallback is the dense split (plain layer split), never a
+            # mispriced one. expert stays 0 -> is_moe False below.
+            logger.warning(
+                "gguf MoE: %s header claims MoE (expert_count=%d) but no expert "
+                "tensors identifiable by name or shape — treating as dense.",
+                path, expert_count)
+
     # expert_count == 0 or absent IS the definition of dense (operator
     # grounding); expert bytes must also exist for a split to mean anything.
     is_moe = bool(expert_count and expert_count > 0 and expert > 0)

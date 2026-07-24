@@ -14,8 +14,9 @@ Covers:
     ram-only, 5/24 -> max-gpu, 200/24/124 -> max-gpu (fits neither), unknown ->
     max-gpu);
   * feasible_modes matrix per engine (incl. the 68/24/124 case -> exactly
-    (ram-only,); max-gpu eliminated for oversized transformers; unknown data ->
-    ALL feasible; max-ram/explicit engine-gated for non-GGUF);
+    (ram-only, max-ram); max-gpu eliminated for oversized transformers; unknown
+    data -> coarse trio + max-ram feasible; max-ram is engine-AGNOSTIC as of
+    2026-07-24, only explicit stays engine-gated for non-GGUF);
   * an explicit persisted mode wins over derivation;
   * the emission seam: spill_for emits {"n_gpu_layers":"off"} for the oversized-
     transformers blank case, {} for the GGUF/fitting blank case, and leaves a
@@ -97,35 +98,46 @@ check("gguf 68/24/124: max-gpu, max-ram, explicit, ram-only feasible; gpu-only "
 fg2 = feasible_modes("gguf", 5 * GIB, 24 * GIB, 124 * GIB)
 check("gguf 5/24: every mode feasible (fits GPU, RAM, and combined)",
       fg2 == ALLOC_MODES)
-# THE headline: transformers 68/24/124 -> exactly (ram-only,)
+# THE headline: transformers 68/24/124 -> (ram-only, max-ram). max-ram is now
+# engine-agnostic (2026-07-24): 68 <= 24+124 GiB combined, so it is feasible for
+# a non-GGUF model too. explicit stays engine-gated off (banded leniency floor
+# has no transformers analogue).
 ft = feasible_modes("transformers", 68 * GIB, 24 * GIB, 124 * GIB)
-check("transformers 68/24/124 -> feasible EXACTLY (ram-only,) — max-gpu, "
-      "gpu-only eliminated; max-ram/explicit engine-gated off",
-      ft == ("ram-only",))
+check("transformers 68/24/124 -> feasible EXACTLY (ram-only, max-ram) — gpu-only "
+      "& max-gpu eliminated (won't fit GPU alone); max-ram fits combined; "
+      "explicit engine-gated off",
+      ft == ("ram-only", "max-ram"))
 check("=> max-gpu is NOT an offered mode for the 68/24 transformers case",
       "max-gpu" not in ft)
+check("=> explicit is NEVER offered for a non-GGUF model (stays engine-gated)",
+      "explicit" not in ft)
 ft2 = feasible_modes("transformers", 5 * GIB, 24 * GIB, 124 * GIB)
-check("transformers 5/24: gpu-only, ram-only, max-gpu feasible; max-ram/"
+check("transformers 5/24: gpu-only, ram-only, max-gpu, max-ram feasible; "
       "explicit engine-gated off",
-      set(ft2) == {"gpu-only", "ram-only", "max-gpu"})
-# fits neither GPU nor RAM: transformers 200/24/124
+      set(ft2) == {"gpu-only", "ram-only", "max-gpu", "max-ram"})
+# fits neither GPU nor RAM nor combined: transformers 200/24/124
 ft3 = feasible_modes("transformers", 200 * GIB, 24 * GIB, 124 * GIB)
-check("transformers 200/24/124 (fits neither): nothing physically lands, so the "
-      "set falls back to (max-gpu,) — honest refusal downstream, never empty",
+check("transformers 200/24/124 (fits neither, nor combined 148): nothing "
+      "physically lands, so the set falls back to (max-gpu,) — honest refusal "
+      "downstream, never empty",
       ft3 == ("max-gpu",))
-# unknown data -> ALL modes feasible (never eliminate on missing data)
-check("unknown size -> ALL modes feasible (fail-open, never eliminate on a guess)",
+# unknown data -> never eliminate on missing data. max-ram no longer engine-gated
+# so it rides through on unknown size; only explicit is dropped.
+check("unknown size -> coarse trio + max-ram feasible (fail-open); only explicit "
+      "engine-gated off",
       feasible_modes("transformers", None, 24 * GIB, 124 * GIB) ==
-      ("gpu-only", "ram-only", "max-gpu"))  # engine gate still drops max-ram/explicit
+      ("gpu-only", "ram-only", "max-gpu", "max-ram"))
 check("unknown size on GGUF -> literally every mode",
       feasible_modes("gguf", None, None, None) == ALLOC_MODES)
-check("unknown totals on transformers -> coarse trio all feasible",
+check("unknown totals on transformers -> coarse trio + max-ram feasible",
       feasible_modes("transformers", 68 * GIB, None, None) ==
-      ("gpu-only", "ram-only", "max-gpu"))
-# max-ram/explicit are ENGINE-GATED regardless of numbers (a capability fact)
-check("non-GGUF never offers max-ram/explicit (Slice C gate) even with room",
-      set(feasible_modes("transformers", 1 * GIB, 24 * GIB, 124 * GIB))
-      .isdisjoint({"max-ram", "explicit"}))
+      ("gpu-only", "ram-only", "max-gpu", "max-ram"))
+# explicit is ENGINE-GATED regardless of numbers (a capability fact); max-ram is
+# NOT — it is offered for non-GGUF whenever the numbers fit.
+check("non-GGUF never offers explicit (engine gate) even with room; max-ram IS "
+      "offered when it fits combined",
+      "explicit" not in feasible_modes("transformers", 1 * GIB, 24 * GIB, 124 * GIB)
+      and "max-ram" in feasible_modes("transformers", 1 * GIB, 24 * GIB, 124 * GIB))
 check("the default is the BEST feasible member (default in feasible set)",
       feasible_default_mode("transformers", 68 * GIB, 24 * GIB, 124 * GIB)
       in feasible_modes("transformers", 68 * GIB, 24 * GIB, 124 * GIB))
@@ -199,8 +211,9 @@ check("seam: a worker missing totals fails open to {} (max-gpu) — never a "
 # module wrappers used by the surface
 check("derived_default_for reads the RAW record -> ram-only for the 68/24 case",
       W.derived_default_for(w["id"], "tf-big") == "ram-only")
-check("feasible_modes_for -> exactly (ram-only,) for the 68/24 transformers case",
-      W.feasible_modes_for(w["id"], "tf-big") == ("ram-only",))
+check("feasible_modes_for -> (ram-only, max-ram) for the 68/24 transformers case "
+      "(max-ram opened for non-GGUF 2026-07-24; fits combined 148 GiB)",
+      W.feasible_modes_for(w["id"], "tf-big") == ("ram-only", "max-ram"))
 check("feasibility_context surfaces the raw numbers for an honest 409",
       W.feasibility_context(w["id"], "tf-big") ==
       {"engine": "transformers", "model_bytes": 68 * GIB,
@@ -245,8 +258,8 @@ d1 = store.register(name="durable-box", url="http://d:9100",
                     pkg_version="0.1.203", gpus=GPUS_24, ram_total=124 * GIB)
 did = d1["id"]
 store.assign_model(did, "tf-big")            # designate the oversized transformers
-check("durable: first register with totals -> feasibility resolves ram-only",
-      W.feasible_modes_for(did, "tf-big") == ("ram-only",))
+check("durable: first register with totals -> feasibility resolves (ram-only, max-ram)",
+      W.feasible_modes_for(did, "tf-big") == ("ram-only", "max-ram"))
 rec = store._load()[did]
 check("durable: register persisted the last-known GPU total as a durable fact",
       rec.get("gpu_total_bytes_known") == 24 * GIB
@@ -263,8 +276,8 @@ check("durable: an empty-probe re-register did NOT erase the durable totals",
 check("durable: live gpus[] IS now empty (the transient reading), proving the "
       "fallback — not stale live data — carries feasibility",
       not rec2.get("gpus"))
-check("durable: feasibility STILL resolves ram-only across the re-register window",
-      W.feasible_modes_for(did, "tf-big") == ("ram-only",))
+check("durable: feasibility STILL resolves (ram-only, max-ram) across the re-register window",
+      W.feasible_modes_for(did, "tf-big") == ("ram-only", "max-ram"))
 check("durable: the derived default STILL serves as ram-only across the window",
       W.derived_default_for(did, "tf-big") == "ram-only"
       and store.spill_for(did, "tf-big") == {"n_gpu_layers": "off"})
@@ -287,7 +300,7 @@ d3 = store.register(name="durable-box", url="http://d2:9100",
 check("durable: a returning id with a LOST row inherits totals from memory",
       store._load()[did].get("gpu_total_bytes_known") == 24 * GIB)
 check("durable: feasibility works immediately on the restored row (pre-first-beat)",
-      W.feasible_modes_for(did, "tf-big") == ("ram-only",))
+      W.feasible_modes_for(did, "tf-big") == ("ram-only", "max-ram"))
 
 # a GENUINELY-NEW worker id (never seen, no memory) still fails open + self-logs.
 import logging as _logging
@@ -305,8 +318,9 @@ try:
 finally:
     W.logger.removeHandler(_h)
 check("first-contact: a brand-new worker with NO totals fails open (all coarse "
-      "modes feasible — never eliminate on missing data)",
-      set(modes) == {"gpu-only", "ram-only", "max-gpu"})
+      "modes + max-ram feasible — never eliminate on missing data; only explicit "
+      "stays engine-gated)",
+      set(modes) == {"gpu-only", "ram-only", "max-gpu", "max-ram"})
 check("first-contact: the self-policing fail-open WARNING fired (drift signal), "
       "naming the missing data",
       any("fail-open" in m and "no gpu/ram totals" in m for m in _caplog))

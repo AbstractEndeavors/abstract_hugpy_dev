@@ -291,6 +291,40 @@ try:
     check("all-transformers/explicit: all skipped",
           body["counts"] == {"ok": 0, "error": 0, "skipped": 2, "total": 2})
 
+    # (c2b) ALL-transformers + the explicit MODE key → still all skipped. explicit
+    # stays GGUF-only whether it rides via a budget key or alloc_mode:"explicit".
+    assign_calls.clear()
+    r = client.post("/llm/workers/wid/alloc-all",
+                    json={"model_keys": ["t1", "t2"],
+                          "spill": {"alloc_mode": "explicit", "leniency_pct": 20}})
+    body = r.get_json()
+    check("all-transformers/explicit-mode: nothing written", assign_calls == [])
+    check("all-transformers/explicit-mode: all skipped",
+          body["counts"] == {"ok": 0, "error": 0, "skipped": 2, "total": 2})
+
+    # (c3) ALL-transformers + MAX-RAM (opened for non-GGUF 2026-07-24) → all APPLY.
+    # max-ram is engine-agnostic now; the transformers/diffusers loaders honor it.
+    assign_calls.clear()
+    r = client.post("/llm/workers/wid/alloc-all",
+                    json={"model_keys": ["t1", "t2"], "spill": {"alloc_mode": "max-ram"}})
+    body = r.get_json()
+    check("all-transformers/max-ram: all written (opened for non-GGUF)",
+          sorted(c[1] for c in assign_calls) == ["t1", "t2"])
+    check("all-transformers/max-ram: every assign carries the max-ram spill",
+          all(c[2] == {"alloc_mode": "max-ram"} for c in assign_calls))
+    check("all-transformers/max-ram: none skipped",
+          body["counts"] == {"ok": 2, "error": 0, "skipped": 0, "total": 2})
+
+    # (c4) MIXED + MAX-RAM → applies to BOTH gguf and transformers (engine-agnostic)
+    assign_calls.clear()
+    r = client.post("/llm/workers/wid/alloc-all",
+                    json={"model_keys": ["g1", "t1", "cf"], "spill": {"alloc_mode": "max-ram"}})
+    body = r.get_json()
+    check("mixed/max-ram: applies to gguf + transformers + comfy (engine-agnostic)",
+          sorted(c[1] for c in assign_calls) == ["cf", "g1", "t1"])
+    check("mixed/max-ram: nothing skipped",
+          body["counts"] == {"ok": 3, "error": 0, "skipped": 0, "total": 3})
+
     # (d) AUTOFIT ({}) applies to EVERYONE regardless of engine (engine-agnostic)
     assign_calls.clear()
     r = client.post("/llm/workers/wid/alloc-all",
@@ -331,17 +365,36 @@ try:
     check("gguf_only: tensor_split IS gguf-only", wr._alloc_is_gguf_only({"tensor_split": [0.5, 0.5]}) is True)
     check("gguf_only: a budget ALONGSIDE n_gpu_layers is still gguf-only",
           wr._alloc_is_gguf_only({"n_gpu_layers": -1, "gpu_mem_gib": 8}) is True)
+    # value-sensitive alloc_mode (2026-07-24): max-ram NOT gguf-only, explicit IS.
+    check("gguf_only: alloc_mode max-ram is NOT gguf-only (opened for non-GGUF)",
+          wr._alloc_is_gguf_only({"alloc_mode": "max-ram"}) is False)
+    check("gguf_only: alloc_mode explicit IS gguf-only (banded leniency floor)",
+          wr._alloc_is_gguf_only({"alloc_mode": "explicit"}) is True)
+    check("gguf_only: leniency_pct companion IS gguf-only (explicit-only key)",
+          wr._alloc_is_gguf_only({"leniency_pct": 20}) is True)
+    check("gguf_only: priority_device companion IS gguf-only (explicit-only key)",
+          wr._alloc_is_gguf_only({"priority_device": "ram"}) is True)
     ok1, r1 = wr._alloc_spill_ok_for_engine({}, "t1")
     check("single-gate: autofit ok on transformers", ok1 is True and r1 is None)
     okp, rp = wr._alloc_spill_ok_for_engine({"n_gpu_layers": -1}, "t1")
     check("single-gate: Max GPU OK on transformers now (t26)", okp is True and rp is None)
     okc, rc = wr._alloc_spill_ok_for_engine({"n_gpu_layers": "off"}, "t1")
     check("single-gate: CPU only OK on transformers now (t26)", okc is True and rc is None)
+    okmr, rmr = wr._alloc_spill_ok_for_engine({"alloc_mode": "max-ram"}, "t1")
+    check("single-gate: max-ram OK on transformers now (opened 2026-07-24)",
+          okmr is True and rmr is None)
     ok2, r2 = wr._alloc_spill_ok_for_engine({"gpu_mem_gib": 8}, "t1")
     check("single-gate: explicit budget REJECTED on transformers",
           ok2 is False and "GGUF-only" in r2 and "transformers" in r2)
+    okem, rem = wr._alloc_spill_ok_for_engine(
+        {"alloc_mode": "explicit", "leniency_pct": 20}, "t1")
+    check("single-gate: explicit MODE REJECTED on transformers, naming rationale",
+          okem is False and "GGUF-only" in rem and "explicit" in rem
+          and "analogue" in rem)
     ok3, r3 = wr._alloc_spill_ok_for_engine({"gpu_mem_gib": 8}, "g1")
     check("single-gate: explicit budget ok on a gguf model", ok3 is True and r3 is None)
+    okmrg, _ = wr._alloc_spill_ok_for_engine({"alloc_mode": "max-ram"}, "g1")
+    check("single-gate: max-ram ok on a gguf model too", okmrg is True)
 
     # (g) SINGLE-MODEL /assign route enforces the gate too (defense-in-depth).
     # A gguf-only spill on a transformers key -> 409; autofit -> allowed. (`wr`
@@ -366,6 +419,20 @@ try:
                          json={"model_key": "g1", "spill": {"n_gpu_layers": -1}})
         check("single /assign: gguf-only on a gguf model allowed",
               rr.status_code == 200)
+        # max-ram on a transformers key is now ALLOWED (opened 2026-07-24).
+        assign_calls.clear()
+        rr = client.post("/llm/workers/wid/assign",
+                         json={"model_key": "t1", "spill": {"alloc_mode": "max-ram"}})
+        check("single /assign: max-ram on transformers -> 200 (opened 2026-07-24)",
+              rr.status_code == 200
+              and assign_calls == [("wid", "t1", {"alloc_mode": "max-ram"})])
+        # explicit MODE on a transformers key STILL 409s.
+        rr = client.post("/llm/workers/wid/assign",
+                         json={"model_key": "t1",
+                               "spill": {"alloc_mode": "explicit", "leniency_pct": 20}})
+        check("single /assign: explicit on transformers -> 409 (still gated)",
+              rr.status_code == 409
+              and "GGUF-only" in (rr.get_json() or {}).get("error", ""))
     finally:
         wr._central_missing_reason = _orig_missing
         wr._disk_preflight_reason = _orig_disk

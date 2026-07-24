@@ -14,8 +14,9 @@ spec (allocation-modes-spec):
   * leniency floor math: 100% target + 30% leniency -> 70/30 floor, asserted
     against flex.band_floor (whole = THE MODEL); degrade-within-band admits,
     bust past the floor refuses naming mode + floor;
-  * engine gating: transformers may pick gpu-only/ram-only/max-gpu only;
-    max-ram/explicit on a transformers key -> honest refusal naming the mode;
+  * engine gating: transformers may pick gpu-only/ram-only/max-gpu/max-ram
+    (max-ram opened 2026-07-24); only explicit on a transformers key -> honest
+    refusal naming the mode;
   * the version gate: a spill carrying the new keys is emitted verbatim to a
     >= 0.1.203 worker and downgraded to {} (max-gpu) + logged for an older one
     (WorkerStore.spill_for end-to-end).
@@ -93,8 +94,9 @@ check("legacy 'cpu-only' still builds (resolved to ram-only)",
       A.build_spill("cpu-only", 50, 4.0, rng) == {"n_gpu_layers": "off"})
 check("legacy 'budget' still builds (resolved to explicit)",
       A.build_spill("budget", 50, 4.0, random.Random(3))["alloc_mode"] == "explicit")
-check("transformers models get exactly the three coarse modes",
-      A.NONGGUF_MODES == ("gpu-only", "ram-only", "max-gpu") ==
+check("transformers models get the four non-explicit modes (max-ram opened "
+      "2026-07-24; only explicit stays GGUF-only)",
+      A.NONGGUF_MODES == ("gpu-only", "ram-only", "max-gpu", "max-ram") ==
       NONGGUF_ALLOWED_MODES)
 check("gguf keeps the full five", A.modes_for("gguf") == ALLOC_MODES)
 
@@ -295,13 +297,18 @@ _orig_fw = wr._model_framework
 try:
     wr._model_framework = lambda mk: ("transformers" if mk.startswith("tf")
                                       else "gguf")
+    # 2026-07-24: max-ram is engine-agnostic now — a bare max-ram spill is
+    # ALLOWED for a transformers model (its loaders honor it since Slice C).
     ok1, r1 = wr._alloc_spill_ok_for_engine({"alloc_mode": "max-ram"}, "tf-m")
-    check("transformers + max-ram -> refused, naming the mode",
-          ok1 is False and "max-ram" in r1 and "GGUF-only" in r1)
+    check("transformers + max-ram -> ALLOWED (opened 2026-07-24)",
+          ok1 is True and r1 is None)
+    # explicit STAYS gated — its banded leniency floor has no transformers
+    # analogue, so it is refused with the documented reason.
     ok2, r2 = wr._alloc_spill_ok_for_engine(
         {"alloc_mode": "explicit", "leniency_pct": 30}, "tf-m")
-    check("transformers + explicit -> refused, naming the mode",
-          ok2 is False and "explicit" in r2)
+    check("transformers + explicit -> STILL refused, naming the mode + rationale",
+          ok2 is False and "explicit" in r2 and "GGUF-only" in r2
+          and "analogue" in r2)
     check("transformers + the coarse trio -> allowed (engine-agnostic intent)",
           wr._alloc_spill_ok_for_engine({}, "tf-m") == (True, None)
           and wr._alloc_spill_ok_for_engine({"n_gpu_layers": -1}, "tf-m") == (True, None)

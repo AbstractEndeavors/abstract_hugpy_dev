@@ -96,11 +96,16 @@ NEW_SPILL_KEYS = frozenset({"alloc_mode", "leniency_pct", "priority_device",
 # (Slice B2 ships in this cut). Anything older gets the max-gpu fallback.
 MODE_MIN_PKG_VERSION = "0.1.203"
 
-# Modes a non-GGUF (transformers/comfy) model may select: accelerate handles
-# the three coarse placement intents through the wired loaders; max-ram and
-# explicit need fine-grained placement the gap loaders don't wire yet
-# (Slice C) — they are refused honestly at /assign for non-GGUF models.
-NONGGUF_ALLOWED_MODES = ("gpu-only", "ram-only", "max-gpu")
+# Modes a non-GGUF (transformers/comfy) model may select. Slice C wired the gap
+# loaders to the spill seam, and this slice (2026-07-24, operator-approved)
+# OPENS the central gate for ``max-ram``: transformers honor it via
+# transformers_max_memory's RAM-priority branch, diffusers via
+# enable_model_cpu_offload — so it is a real, honest mode for non-GGUF now.
+# ``explicit`` STAYS GGUF-only: its banded leniency floor is a llama.cpp concept
+# with no transformers analogue (opening it would break the mode's promise). So
+# the non-GGUF set is the four modes that have a working non-GGUF meaning; only
+# explicit is dropped.
+NONGGUF_ALLOWED_MODES = ("gpu-only", "ram-only", "max-gpu", "max-ram")
 
 # GGUF family: the HF-canonical 'gguf' plus the llama_cpp synonym. A GGUF model
 # is ALWAYS max-gpu by default (partial offload makes any size feasible — the
@@ -166,18 +171,22 @@ def feasible_modes(engine: Any,
         cannot use the GPU and max-gpu must NOT be offered (the operator's
         68 GB-on-24 GB case).
       * ``max-ram`` — a split exists: the model fits RAM+GPU COMBINED (its
-        overflow rides the GPU). ENGINE-GATED: non-GGUF stays refused (409) until
-        Slice C wires fine-grained transformers placement, so it is dropped for
-        non-GGUF here regardless of the numbers.
+        overflow rides the GPU). Engine-agnostic as of 2026-07-24: GGUF and
+        non-GGUF both honor it (transformers RAM-priority max_memory, diffusers
+        enable_model_cpu_offload — Slice C wired the loaders, this slice opened
+        the gate). The numbers rule (fits GPU+RAM combined) applies to BOTH.
       * ``explicit`` — some split exists (``model <= gpu_total + ram_total``);
-        ENGINE-GATED the same as max-ram (non-GGUF dropped until Slice C).
+        ENGINE-GATED: non-GGUF stays dropped regardless of the numbers — its
+        banded leniency floor is a llama.cpp concept with no transformers
+        analogue, so opening it would break the mode's promise.
 
     UNKNOWN size or unknown totals -> ALL modes feasible: never eliminate on
     missing data (degrade to today's permissiveness). Specifically, if
     ``model_bytes`` is unknown, or the total a rule needs is unknown, that rule
-    does NOT eliminate its mode. The engine gate on max-ram/explicit is the ONLY
+    does NOT eliminate its mode. The engine gate on ``explicit`` is the ONLY
     elimination that fires without size/totals (it is a capability fact, not a
-    measurement).
+    measurement); ``max-ram`` is now engine-agnostic and eliminated only by the
+    numbers.
 
     ``moe_split_gpu_bytes`` (MoE, 2026-07-24): for a detected-MoE GGUF the
     caller passes the GPU-side need of the expert split (non-expert bytes —
@@ -212,8 +221,19 @@ def feasible_modes(engine: Any,
             else:
                 feasible = (unknown_size or gpu_total is None
                             or size <= _GPU_FIT_HEADROOM * gpu_total)
-        elif mode in ("max-ram", "explicit"):
-            # Engine gate (a capability fact, fires even on missing data).
+        elif mode == "max-ram":
+            # Engine-agnostic (2026-07-24): both GGUF and non-GGUF honor max-ram
+            # now, so no engine gate — only the numbers rule (fits GPU+RAM
+            # combined). Unknown size/totals -> don't eliminate.
+            combined = None
+            if gpu_total is not None or ram_total is not None:
+                combined = (gpu_total or 0) + (ram_total or 0)
+            feasible = (unknown_size or combined is None
+                        or size <= combined)
+        elif mode == "explicit":
+            # Engine gate (a capability fact, fires even on missing data): the
+            # banded leniency floor has no transformers analogue, so explicit
+            # stays GGUF-only. GGUF then also honors the numbers rule.
             if not gguf:
                 feasible = False
             else:

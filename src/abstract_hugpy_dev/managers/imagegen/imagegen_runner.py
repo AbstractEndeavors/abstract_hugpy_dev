@@ -95,6 +95,74 @@ def _evict_idle_pipelines(cache: Dict[str, Any], keep: str) -> list[str]:
     return victims
 
 
+# ---------------------------------------------------------------------------
+# Placement (Slice C) — diffusers does NOT take device_map/max_memory the
+# transformers way, so the honest spill mechanism for a t2i/i2v pipeline is
+# diffusers' own CPU-offload API, driven by the SAME placement seam the
+# transformers loaders read (spill.n_gpu_layers_intent / alloc_mode_env — no
+# parallel intent reader is invented here):
+#   * CPU-leaning intent (ram-only / n_gpu_layers "off"/0)  -> sequential CPU
+#     offload: submodules stream to the GPU one at a time and return to RAM —
+#     the smallest possible VRAM footprint (slowest), matching "keep it off the
+#     card". Binds even with a GPU present (the operator asked for RAM).
+#   * fit-and-spill (max-ram alloc_mode) -> model CPU offload: whole submodules
+#     are offloaded to RAM and pulled onto the GPU only while active — big model,
+#     one consumer card, no OOM.
+#   * default (no intent / gpu-only / auto that fits) -> today's `.to(cuda)`,
+#     BYTE-IDENTICAL when the seam is silent (defaults-are-promises).
+# A pipeline class without an offload method (genuine capability gap) is logged
+# ONCE and falls back to .to(device) rather than silently ignoring the mode.
+def _place_diffusers_pipeline(pipe, cuda: bool, model_key: str) -> str:
+    """Place a diffusers pipeline per the allocation seam. Returns a short label
+    of what was applied (for the load log). Mutates ``pipe`` in place (both
+    .to(...) and enable_*_cpu_offload() act on the object)."""
+    if not cuda:
+        pipe.to("cpu")
+        return "cpu"
+
+    # Read the placement intent from the shared seam — never a parallel reader.
+    try:
+        from ..spill import n_gpu_layers_intent, alloc_mode_env
+        intent = n_gpu_layers_intent()          # "gpu" | "cpu" | "auto"
+        alloc_mode = alloc_mode_env()           # "max-ram" | "explicit" | None
+    except Exception as exc:  # noqa: BLE001 — no seam: today's path, logged
+        logger.warning("imagegen: placement seam unavailable (%s); using "
+                       ".to(cuda)", exc)
+        pipe.to("cuda")
+        return "cuda (seam unavailable)"
+
+    def _offload(method: str, label: str) -> str:
+        fn = getattr(pipe, method, None)
+        if not callable(fn):
+            # Genuine capability gap: SAY so once, don't silently ignore the mode.
+            logger.warning(
+                "imagegen: model=%s pipeline %s has no %s() — cannot honor the "
+                "'%s' placement; loading fully on the GPU with .to(cuda) instead",
+                model_key, type(pipe).__name__, method, label,
+            )
+            pipe.to("cuda")
+            return f"cuda ({label} unsupported by this pipeline)"
+        try:
+            fn()                                # offload methods mutate in place
+            return label
+        except Exception as exc:  # noqa: BLE001 — offload failed: honest fallback
+            logger.warning(
+                "imagegen: model=%s %s() failed (%s) — falling back to .to(cuda)",
+                model_key, method, exc,
+            )
+            pipe.to("cuda")
+            return f"cuda ({label} failed)"
+
+    if intent == "cpu":
+        return _offload("enable_sequential_cpu_offload", "ram-only/sequential-offload")
+    if alloc_mode == "max-ram":
+        return _offload("enable_model_cpu_offload", "max-ram/model-offload")
+
+    # gpu-only / auto / no intent -> unchanged historical path.
+    pipe.to("cuda")
+    return "cuda"
+
+
 class ImageGenRunner:
     """Runner for diffusers text-to-image pipelines.
 
@@ -144,11 +212,11 @@ class ImageGenRunner:
                 model_dir,
                 torch_dtype=torch.float16 if cuda else torch.float32,
             )
-            pipe = pipe.to("cuda" if cuda else "cpu")
+            placement = _place_diffusers_pipeline(pipe, cuda, self.model_key)
 
             logger.info(
-                "ImageGenRunner: loaded model=%s dir=%s device=%s",
-                self.model_key, model_dir, "cuda" if cuda else "cpu",
+                "ImageGenRunner: loaded model=%s dir=%s device=%s placement=%s",
+                self.model_key, model_dir, "cuda" if cuda else "cpu", placement,
             )
             self._PIPELINES[self.model_key] = pipe
             return pipe

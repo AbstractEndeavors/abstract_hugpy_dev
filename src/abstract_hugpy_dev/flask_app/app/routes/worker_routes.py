@@ -1848,7 +1848,17 @@ _BAND_SPILL_KEYS = {"gpu_mem_gib_deviation_pct", "cpu_mem_gib_deviation_pct",
 # (normalize_spill rewrites the gpu-only/ram-only/max-gpu trio onto the
 # unchanged n_gpu_layers encoding); central version-gates their EMISSION
 # (WorkerStore.spill_for) so an old worker never sees a dead knob.
+#   • ``alloc_mode`` is VALUE-SENSITIVE for the engine gate (2026-07-24): a bare
+#     ``alloc_mode: "max-ram"`` is engine-AGNOSTIC now (transformers honor it via
+#     RAM-priority max_memory, diffusers via cpu-offload), so it is NOT part of
+#     the always-GGUF-only key set below — it is classified by VALUE in
+#     _alloc_is_gguf_only. Only ``alloc_mode: "explicit"`` is GGUF-only.
+#   • ``leniency_pct`` / ``priority_device`` only ever ride WITH explicit
+#     (mode_to_spill emits them for explicit alone), so they stay GGUF-only keys.
 _MODE_SPILL_KEYS = {"alloc_mode", "leniency_pct", "priority_device"}
+# The subset of mode keys that are ALWAYS GGUF-only by presence alone — the
+# explicit-only companions. ``alloc_mode`` is excluded (value-sensitive).
+_EXPLICIT_MODE_COMPANION_KEYS = {"leniency_pct", "priority_device"}
 # MoE expert split (2026-07-24): n_cpu_moe = N MoE layers whose expert tensors
 # stay on CPU (999 = all). GGUF-only (llama-server --n-cpu-moe); emission is
 # version-gated with the mode keys (alloc_modes.NEW_SPILL_KEYS).
@@ -1967,23 +1977,39 @@ def _validate_band_values(spill) -> "str | None":
 # t21 bands ride the explicit allocation and are GGUF-only just like the budgets
 # they band (spec: "explicit budgets are GGUF-only"; the UI gates them the same
 # way). So a spill carrying ONLY a band/priority is still classified GGUF-only.
-# k37: the allocation-mode keys join the GGUF-only class — max-ram/explicit
-# (the only modes that ride alloc_mode after normalize_spill) need fine-grained
-# placement that the transformers gap loaders don't wire yet (Slice C). The
-# coarse trio (gpu-only/ram-only/max-gpu) rides n_gpu_layers and stays
-# engine-agnostic, exactly as before.
+# k37: the allocation-mode keys joined the GGUF-only class.
+# 2026-07-24 (this slice): the gate for ``alloc_mode`` becomes VALUE-SENSITIVE —
+# ``max-ram`` is opened for non-GGUF (its loaders honor it since Slice C:
+# transformers RAM-priority max_memory, diffusers enable_model_cpu_offload), so
+# the bare key no longer forces GGUF-only. Only ``alloc_mode: "explicit"`` (and
+# its explicit-only companions leniency_pct / priority_device, and the numeric
+# budget/band/MoE keys) remain GGUF-only — explicit's banded leniency floor has
+# no transformers analogue. So ``alloc_mode`` is OUT of the by-presence set and
+# classified by value in _alloc_is_gguf_only. The coarse trio
+# (gpu-only/ram-only/max-gpu) rides n_gpu_layers and stays engine-agnostic.
 _EXPLICIT_BUDGET_KEYS = ({"gpu_mem_gib", "cpu_mem_gib", "threads", "tensor_split"}
-                         | _BAND_SPILL_KEYS | _MODE_SPILL_KEYS | _MOE_SPILL_KEYS)
+                         | _BAND_SPILL_KEYS | _EXPLICIT_MODE_COMPANION_KEYS
+                         | _MOE_SPILL_KEYS)
 
 
 def _alloc_is_gguf_only(spill) -> bool:
-    """True ONLY when this spill carries an EXPLICIT-BUDGET knob (gpu_mem_gib /
-    cpu_mem_gib / threads / tensor_split) — the sole GGUF-exclusive class (t26).
-    Autofit ({}/None) AND the placement-intent modes (Max GPU / CPU only, which
-    carry ONLY n_gpu_layers) are engine-agnostic and apply to every engine."""
+    """True when this spill is a GGUF-exclusive allocation — refused for a
+    non-GGUF model at the engine gate.
+
+    GGUF-only iff it carries any GGUF-exclusive knob (gpu_mem_gib / cpu_mem_gib /
+    threads / tensor_split, a t21 band, an MoE split, or the explicit-only
+    companions leniency_pct / priority_device) OR ``alloc_mode: "explicit"``.
+
+    ``alloc_mode: "max-ram"`` is NOT GGUF-only (2026-07-24): the transformers and
+    diffusers loaders honor max-ram since Slice C, so a bare max-ram spill is an
+    engine-agnostic mode. Autofit ({}/None) and the placement-intent modes (Max
+    GPU / CPU only, which carry ONLY n_gpu_layers) also apply to every engine."""
     if not spill:
         return False
-    return any(k in spill for k in _EXPLICIT_BUDGET_KEYS)
+    if any(k in spill for k in _EXPLICIT_BUDGET_KEYS):
+        return True
+    # alloc_mode is value-sensitive: explicit is GGUF-only, max-ram is not.
+    return str(spill.get("alloc_mode") or "").strip().lower() == "explicit"
 
 
 def _model_framework(model_key: str) -> "str | None":
@@ -2022,13 +2048,13 @@ def _alloc_spill_ok_for_engine(spill, model_key) -> "tuple[bool, str | None]":
     shown = fw or "unknown engine"
     mode = (spill or {}).get("alloc_mode")
     if mode:
-        # k37: name the refused MODE honestly. Fine-grained placement
-        # (max-ram/explicit) is GGUF-only until the accelerate loader gap
-        # closes (Slice C).
-        return False, (f"allocation mode '{mode}' is GGUF-only for now — "
-                       f"fine-grained placement needs loader wiring the "
-                       f"{shown} path doesn't have yet; '{model_key}' may use "
-                       "gpu-only, ram-only, or max-gpu")
+        # 2026-07-24: max-ram is engine-agnostic now (it never reaches here — the
+        # gate above lets it through), so the only alloc_mode that lands here is
+        # ``explicit``. Its banded leniency floor has no transformers analogue,
+        # so it stays GGUF-only; max-ram is the fine-grained mode non-GGUF may use.
+        return False, (f"allocation mode '{mode}' is GGUF-only — its banded "
+                       f"leniency floor has no {shown} analogue; '{model_key}' "
+                       "may use gpu-only, ram-only, max-gpu, or max-ram")
     return False, (f"{_alloc_label(spill)} is a GGUF-only allocation "
                    f"(explicit budget); '{model_key}' is {shown} — use "
                    "max-gpu, gpu-only, or ram-only for a non-GGUF model")

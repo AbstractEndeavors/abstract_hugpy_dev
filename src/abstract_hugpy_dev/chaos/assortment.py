@@ -12,10 +12,11 @@ and REVERSIBLE:
     keeps every trial trivially reversible);
   * alloc modes are framework-gated: a GGUF model gets the full FIVE-mode set
     (k37: gpu-only / ram-only / max-gpu / max-ram / explicit); a non-GGUF
-    (transformers) model gets only the three coarse placement intents
-    (gpu-only / ram-only / max-gpu) — max-ram/explicit need fine-grained
-    placement the gap loaders don't wire yet (Slice C) and are refused at
-    /assign by the engine gate, which the runner honours.
+    (transformers) model gets the FOUR non-explicit modes (gpu-only / ram-only
+    / max-gpu / max-ram) — max-ram was opened for non-GGUF 2026-07-24
+    (transformers RAM-priority max_memory, diffusers cpu-offload); only
+    ``explicit`` stays refused at /assign by the engine gate (its banded
+    leniency floor has no transformers analogue), which the runner honours.
 
 Nothing here talks to the network — it consumes /models + /llm/workers payloads
 so it is unit-testable with fixtures."""
@@ -30,8 +31,9 @@ CHAT_TASKS = frozenset({"text-generation", "image-text-to-text",
                         "text2text-generation"})
 
 # Framework gating (k37): GGUF gets all five modes; a transformers model is
-# engine-gated at /assign to the three coarse placement intents, so only offer
-# those (max-ram/explicit on a non-GGUF would be a guaranteed 409).
+# engine-gated at /assign to the four non-explicit modes (gpu-only / ram-only /
+# max-gpu / max-ram), so only offer those (explicit on a non-GGUF would be a
+# guaranteed 409 — its banded leniency floor has no transformers analogue).
 GGUF_MODES = ALLOC_MODES
 NONGGUF_MODES = NONGGUF_ALLOWED_MODES
 

@@ -43,10 +43,10 @@ check("n_exercisable excludes the unassigned model",
 sm = {m["model_key"]: m for m in A.servable_models(models)}
 check("gguf model gets all 5 alloc modes",
       set(A.modes_for(sm["small-gguf"]["framework"])) == set(A.ALLOC_MODES))
-check("transformers model gets the coarse trio only (k37: max-ram/explicit "
-      "are GGUF-only until Slice C)",
+check("transformers model gets the four non-explicit modes (max-ram opened for "
+      "non-GGUF 2026-07-24; only explicit stays GGUF-only)",
       A.modes_for(sm["tf-model"]["framework"])
-      == ("gpu-only", "ram-only", "max-gpu"))
+      == ("gpu-only", "ram-only", "max-gpu", "max-ram"))
 
 # ── candidate workers = already-assigned online ─────────────────────────────
 widx = A.worker_index(workers)

@@ -40,17 +40,64 @@ at its target always gets its target.
 
 ## Engine coverage
 
-| mode | GGUF (llama.cpp) | transformers / diffusers |
-|---|---|---|
-| gpu-only | ✅ | ✅ (whole model on the card) |
-| ram-only | ✅ | ✅ (CPU placement) |
-| max-gpu | ✅ | ✅ (accelerate fit-and-spill) |
-| max-ram | ✅ | ❌ for now — refused with a clear 409 |
-| explicit | ✅ | ❌ for now — refused with a clear 409 |
+Two transformers families load differently, so they honor the modes by
+different mechanisms:
 
-Fine-grained placement (max-ram/explicit) needs loader wiring the transformers
-gap loaders don't have yet; until that ships, picking one for a transformers
-model refuses honestly instead of silently doing something else.
+- **transformers TEXT** (`AutoModelFor*`: the causal-LM generator, the flan /
+  seq2seq / summarization back-ends, the vision-language coder) place weights
+  with **accelerate** — `device_map="auto"` + a `max_memory` budget map. Every
+  mode maps onto that budget map.
+- **diffusers** (text-to-image / image-to-image pipelines) do **not** take
+  `device_map`/`max_memory`. They spill via diffusers' own **CPU-offload API**
+  instead (see the note below the table).
+
+| mode | GGUF (llama.cpp) | transformers TEXT (accelerate) | diffusers (image) |
+|---|---|---|---|
+| gpu-only | ✅ | ✅ whole model on the card (no CPU budget) | ✅ `.to(cuda)` |
+| ram-only | ✅ | ✅ CPU placement (gpu budget 0) | ✅ `enable_sequential_cpu_offload()` |
+| max-gpu | ✅ | ✅ accelerate fit-and-spill | ✅ `.to(cuda)` (auto/default) |
+| max-ram | ✅ | ✅ RAM-priority `max_memory` [^purerram] | ✅ `enable_model_cpu_offload()` |
+| explicit | ✅ | ❌ GGUF-only (banded leniency floor has no transformers analogue) | ❌ GGUF-only (same rationale) |
+
+[^purerram]: **Pure-RAM caveat.** Without a resolved `model_need_bytes` the
+transformers loaders take the SAFE pure-RAM path (the whole model on the CPU) —
+they do not yet compute the RAM-first / GPU-overflow split. A follow-up may add
+overflow-to-GPU sizing; until then max-ram on a non-GGUF text model means "RAM
+first" without spilling the remainder onto the card when the size is unknown.
+
+**Loader-level vs central gate.** Slice C wired the transformers gap loaders to
+the spill seam, so at the WORKER a transformers text model honors max-ram
+(RAM-priority `max_memory`) and the gpu-only / ram-only / max-gpu placement
+intents. **Central now accepts max-ram for non-GGUF models** (operator-approved
+2026-07-24): the engine gate at `/assign` was opened for the max-ram *mode*
+because all three gap loaders honor it (text via `transformers_max_memory`'s
+RAM-priority branch, imagegen via `enable_model_cpu_offload`). **`explicit`
+stays GGUF-only at the central gate** — its banded leniency floor is a
+llama.cpp concept with no transformers analogue, so admitting it would break the
+mode's promise. The remaining GGUF-only knobs (`gpu_mem_gib` / `cpu_mem_gib` /
+`threads` / `tensor_split` / the t21 bands / MoE `n_cpu_moe`) stay refused for
+non-GGUF exactly as before.
+
+**diffusers offload mechanism.** A diffusers pipeline can't shard by a
+`max_memory` map, so the honest spill is diffusers' offload API, chosen from the
+SAME placement seam (`spill.n_gpu_layers_intent` / `alloc_mode_env`):
+- CPU-leaning intent (ram-only / `n_gpu_layers` `off`/`0`) →
+  `enable_sequential_cpu_offload()` — submodules stream one at a time,
+  smallest VRAM footprint (slowest).
+- max-ram → `enable_model_cpu_offload()` — whole submodules ride RAM, pulled to
+  the card only while active (big model, one consumer GPU, no OOM).
+- gpu-only / auto / no intent → today's `.to(cuda)` — byte-identical when the
+  seam is silent.
+- A pipeline class without the requested offload method is a **genuine
+  capability gap**: it is logged once and falls back to `.to(cuda)` rather than
+  silently ignoring the mode.
+
+`explicit`'s numeric leniency floor is a llama.cpp-only concept with no
+transformers/diffusers analogue, so `explicit` is refused for non-GGUF at the
+central gate and is not a reachable live path for transformers. (Were the gate
+opened, a transformers/diffusers model under explicit would get only the
+budgeted fit-and-spill, not the banded degrade-to-floor — which is exactly why
+the mode's promise can't be kept there and the gate stays closed.)
 
 ## MoE models — the expert split (measured, on by default)
 

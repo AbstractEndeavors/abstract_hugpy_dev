@@ -130,6 +130,62 @@ CHUNK_OVERLAP = 30
 
 
 # ---------------------------------------------------------------------------
+# Placement seam (Slice C) — shared spill wiring for the seq2seq loaders
+# ---------------------------------------------------------------------------
+# These summarizer back-ends were ALL-OR-FAIL: a bare from_pretrained(model_dir)
+# with device chosen as `0 if cuda else -1` never consulted the spill seam, so a
+# too-big model just OOM'd (or died at .to(0)) instead of spilling layers to RAM,
+# and the operator's allocation modes / placement intent (Max GPU / CPU only)
+# were silently ignored. These helpers wire the SAME seam every other
+# transformers loader uses (managers/generate/coder.py, vision_coder.py):
+# spill.transformers_max_memory(). Seq2seq models (flan-t5, falconsai bart) carry
+# `_no_split_modules`, so accelerate accepts device_map="auto"+max_memory for them.
+#
+# The seam is guarded with `if mm:` EVERYWHERE: when it returns None (no spill
+# env, no GPU, plain autofit) the loaders keep today's behavior BYTE-IDENTICAL.
+
+def _seq2seq_spill_kwargs() -> Dict[str, object]:
+    """Return {device_map, max_memory} for a seq2seq from_pretrained when the
+    spill seam has a placement answer AND a GPU is present, else {} (today's
+    plain CPU/-1 path — byte-identical).
+
+    Degrades to {} (never crashes) if accelerate is absent or the seam import
+    fails — a genuine capability gap is logged, not silently OOM'd."""
+    torch = get_torch()
+    if not torch.cuda.is_available():
+        return {}
+    try:
+        from ..spill import transformers_max_memory
+        mm = transformers_max_memory()
+    except Exception as exc:  # noqa: BLE001 — no seam: today's path, logged
+        logger.warning("summarizer spill seam unavailable (%s); loading without "
+                       "device_map/max_memory (may OOM on a too-big model)", exc)
+        return {}
+    if not mm:
+        return {}
+    try:                                    # accelerate is required for a spill map
+        import accelerate  # noqa: F401
+    except ImportError:
+        logger.warning("summarizer: spill seam produced a max_memory map but "
+                       "accelerate is not installed — cannot honor the "
+                       "allocation mode; loading on the default device instead")
+        return {}
+    return {"device_map": "auto", "max_memory": mm}
+
+
+def _pipeline_device_kwargs(spill_kwargs: Dict[str, object]) -> Dict[str, object]:
+    """pipeline() device arg to pair with a model load.
+
+    transformers RAISES if you pass BOTH device= and device_map= — so when the
+    model is device-mapped (spill active) the pipeline must NOT carry device=;
+    accelerate's hooks already place the compute. When there's no spill map, keep
+    the historical `device = 0 if cuda else -1`."""
+    if spill_kwargs.get("device_map"):
+        return {}
+    return {"device": 0 if get_torch().cuda.is_available() else -1}
+
+
+# ---------------------------------------------------------------------------
 # Backend: Flan-T5 (key: DEFAULT_SUMMARIZE_MODEL)
 # ---------------------------------------------------------------------------
 
@@ -139,11 +195,17 @@ class FlanBackend(metaclass=SingletonMeta):
         if not hasattr(self, "_ready"):
             model_dir = ensure_model(DEFAULT_SUMMARIZE_MODEL)   # was DEFAULT_PATHS["flan"] -> KeyError
             self._tokenizer = get_transformers("AutoTokenizer").from_pretrained(model_dir)
-            self._model = get_transformers("AutoModelForSeq2SeqLM").from_pretrained(model_dir)
-            device = 0 if get_torch().cuda.is_available() else -1
+            # Spill seam: device_map="auto"+max_memory when the placement seam
+            # has an answer (Slice C) — else {} keeps the historical plain load.
+            spill = _seq2seq_spill_kwargs()
+            self._model = get_transformers("AutoModelForSeq2SeqLM").from_pretrained(
+                model_dir, **spill)
+            # device= and device_map= are mutually exclusive in pipeline(); when
+            # the model is device-mapped, accelerate places compute — no device=.
             self._pipeline = get_transformers("pipeline")(
                 "text2text-generation",        # was "text-generation" — wrong head for T5
-                model=self._model, tokenizer=self._tokenizer, device=device,
+                model=self._model, tokenizer=self._tokenizer,
+                **_pipeline_device_kwargs(spill),
             )
             self._ready = True
 
@@ -167,7 +229,13 @@ class Seq2SeqChunkedBackend(metaclass=SingletonMeta):
         if not hasattr(self, "_ready"):
             model_dir = ensure_model(model_key)   # was os.path.join(MODELS_ROOT, entry.folder)
             self._tokenizer = get_transformers("AutoTokenizer").from_pretrained(model_dir)
-            self._model = get_transformers("AutoModelForSeq2SeqLM").from_pretrained(model_dir)
+            # Spill seam (Slice C): when device_map="auto" is active accelerate
+            # shards this seq2seq across GPU+CPU per the placement mode; else {}
+            # keeps the historical CPU-tensor load byte-identical.
+            spill = _seq2seq_spill_kwargs()
+            self._model = get_transformers("AutoModelForSeq2SeqLM").from_pretrained(
+                model_dir, **spill)
+            self._device_mapped = bool(spill.get("device_map"))
             self._model_key = model_key
             self._ready = True
 
@@ -177,9 +245,19 @@ class Seq2SeqChunkedBackend(metaclass=SingletonMeta):
             "summarize: " + normalize_text(text),
             return_tensors="pt", truncation=True, max_length=512,
         )
+        input_ids = inputs.input_ids
+        if getattr(self, "_device_mapped", False):
+            # Under device_map="auto" the embedding layer may live on the GPU;
+            # move input ids to the model's input device so the first op finds
+            # them there (accelerate hooks move activations, not the caller's
+            # initial tensor). No-op / CPU when unmapped -> unchanged.
+            try:
+                input_ids = input_ids.to(self._model.device)
+            except Exception:  # noqa: BLE001 — best-effort; accelerate can still route
+                pass
         with torch.no_grad():
             ids = self._model.generate(
-                inputs.input_ids,
+                input_ids,
                 min_length=int(min_len), max_length=int(max_len),
                 num_beams=4, early_stopping=True, no_repeat_ngram_size=3,
             )
@@ -226,9 +304,18 @@ class PipelineChunkedBackend(metaclass=SingletonMeta):
     def __init__(self, model_key: str):
         if not hasattr(self, "_ready"):
             model_dir = ensure_model(model_key)   # was os.path.join(MODELS_ROOT, entry.folder)
-            device = 0 if get_torch().cuda.is_available() else -1
+            # Spill seam (Slice C): pipeline() builds the model from a path here,
+            # so the placement map rides model_kwargs + a top-level device_map;
+            # device= is dropped when device_map is set (mutually exclusive).
+            spill = _seq2seq_spill_kwargs()
+            pipe_kwargs: Dict[str, object] = {}
+            if spill.get("device_map"):
+                pipe_kwargs["device_map"] = spill["device_map"]
+                pipe_kwargs["model_kwargs"] = {"max_memory": spill["max_memory"]}
+            else:
+                pipe_kwargs["device"] = 0 if get_torch().cuda.is_available() else -1
             self._pipeline = get_transformers("pipeline")(
-                "summarization", model=model_dir, device=device,
+                "summarization", model=model_dir, **pipe_kwargs,
             )
             self._ready = True
 

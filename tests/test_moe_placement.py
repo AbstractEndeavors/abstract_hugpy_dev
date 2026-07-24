@@ -49,13 +49,19 @@ GIB = 1 << 30
 
 # ═══════════ synthetic GGUF fixtures (the real reader parses these) ═════════
 def _mk_gguf(path, *, tensors=(), block_count=None, expert_count=None,
-             expert_used=None):
+             expert_used=None, dims_by_name=None):
     """A minimal-but-real GGUF v3: magic/version/counts, a KV table (uint32
     values), a tensor-info table (name/dims/type/offset), aligned data section.
     Tensor sizes are realized by consecutive offsets + real file padding, which
-    is exactly how the reader prices them (offset deltas, no type table)."""
+    is exactly how the reader prices them (offset deltas, no type table).
+
+    ``dims_by_name`` optionally supplies a real dims tuple per tensor name (e.g.
+    ``(2048, 512, 512)`` for a stacked expert weight), so the SHAPE backstop can
+    be exercised; tensors absent from the map keep the historical 1-D ``(1,)``
+    (which the shape method — needing nd>=3 — correctly ignores)."""
     import io
     buf = io.BytesIO()
+    dims_by_name = dims_by_name or {}
 
     def ws(s):
         b = s.encode()
@@ -80,8 +86,10 @@ def _mk_gguf(path, *, tensors=(), block_count=None, expert_count=None,
     off = 0
     for name, size in tensors:
         ws(name)
-        buf.write(struct.pack("<I", 1))          # n_dims
-        buf.write(struct.pack("<Q", 1))          # dims[0] (unused by the reader)
+        dims = dims_by_name.get(name, (1,))      # default 1-D (unused by name path)
+        buf.write(struct.pack("<I", len(dims)))  # n_dims
+        for d in dims:
+            buf.write(struct.pack("<Q", d))
         buf.write(struct.pack("<I", 0))          # ggml type (unused)
         buf.write(struct.pack("<Q", off))
         off += size
@@ -181,6 +189,90 @@ def test_detail_is_cached_by_path_signature(moe_gguf, monkeypatch):
     assert spill.gguf_moe_detail(moe_gguf) == first
 
 
+# ═══════════ shape-derived detection (name-independent backstop) ════════════
+# Empirically grounded 2026-07-24 against the real coder-next shards: an expert
+# tensor is the STACKED one — n_dims>=3 with expert_count in the LAST dims slot
+# (dims[-1]). These tensors are named unconventionally (NO _exps suffix) so ONLY
+# the shape method can find them; their dims carry expert_count=512 in dims[-1].
+_SHAPE_ONLY_TENSORS = (
+    ("token_embd.weight", 512),
+    ("blk.0.attn_q.weight", 1000),
+    ("blk.0.router.weight", 96),                 # router — 2-D, not an expert
+    ("blk.0.moe_up.weight", 4000),               # expert by SHAPE (nd=3), no _exps
+    ("blk.0.moe_down.weight", 4000),             # expert by SHAPE
+    ("blk.1.attn_q.weight", 1000),
+    ("blk.1.moe_gate.weight", 8000),             # expert by SHAPE
+    ("output.weight", 500),
+)
+_SHAPE_DIMS = {                                  # dims[-1]==512 == expert_count
+    "blk.0.moe_up.weight": (2048, 512, 512),
+    "blk.0.moe_down.weight": (512, 2048, 512),
+    "blk.1.moe_gate.weight": (2048, 512, 512),
+    "blk.0.router.weight": (2048, 512),          # 2-D: dims[-1]==512 but NOT nd>=3
+}
+
+
+def test_shape_detects_experts_when_naming_is_nonstandard(tmp_path, caplog):
+    """expert_count set, tensors shaped [.,.,512] but NOT named *_exps -> the
+    shape backstop finds them; a single WARNING names the nonconforming file."""
+    p = _mk_gguf(tmp_path / "shape.gguf", tensors=_SHAPE_ONLY_TENSORS,
+                 block_count=48, expert_count=512, expert_used=10,
+                 dims_by_name=_SHAPE_DIMS)
+    with caplog.at_level("WARNING"):
+        d = spill.gguf_moe_detail(p)
+    assert d["is_moe"] is True
+    assert d["expert_count"] == 512 and d["expert_used_count"] == 10
+    # experts = moe_up + moe_down + moe_gate = 4000+4000+8000; 2-D router excluded
+    assert d["expert_bytes"] == 16000
+    assert d["non_expert_bytes"] == 512 + 1000 + 96 + 1000 + 500
+    assert d["expert_bytes_by_layer"] == {0: 8000, 1: 8000}
+    assert any("nonstandard converter" in r.message for r in caplog.records)
+
+
+def test_shape_2d_dim_collision_is_not_an_expert(tmp_path):
+    """The nd>=3 guard: a 2-D tensor whose dims[-1] happens to equal
+    expert_count is NOT an expert (only stacked/3-D weights are). The router
+    here is 2-D (2048,512) -> excluded, so no false expert bytes."""
+    p = _mk_gguf(tmp_path / "shape.gguf", tensors=_SHAPE_ONLY_TENSORS,
+                 block_count=48, expert_count=512, expert_used=10,
+                 dims_by_name=_SHAPE_DIMS)
+    d = spill.gguf_moe_detail(p)
+    assert d["expert_bytes"] == 16000            # router's 96 bytes stay non-expert
+
+
+def test_count_but_no_experts_anywhere_falls_back_to_dense(tmp_path, caplog):
+    """Header claims MoE (expert_count) but NEITHER name nor shape finds an
+    expert tensor -> dense fallback (safe plain split) + one WARNING."""
+    plain = tuple((n, s) for n, s in _MOE_TENSORS if "_exps" not in n)
+    p = _mk_gguf(tmp_path / "liar.gguf", tensors=plain,
+                 block_count=48, expert_count=512, expert_used=10)
+    with caplog.at_level("WARNING"):
+        d = spill.gguf_moe_detail(p)
+    assert d["is_moe"] is False                  # safe fallback: no mispriced split
+    assert d["expert_bytes"] == 0
+    assert any("no expert tensors identifiable" in r.message
+               for r in caplog.records)
+
+
+def test_names_without_expert_count_are_dense(tmp_path, caplog):
+    """REVERSE inconsistency: _exps-named tensors but NO expert_count -> names
+    alone never activate the split; dense + one WARNING (metadata is the gate)."""
+    p = _mk_gguf(tmp_path / "names.gguf", tensors=_MOE_TENSORS, block_count=48)
+    with caplog.at_level("WARNING"):
+        d = spill.gguf_moe_detail(p)
+    assert d["is_moe"] is False
+    assert d["expert_bytes"] == 0                # metadata gate: no split
+    assert any("no positive expert_count" in r.message for r in caplog.records)
+
+
+def test_conforming_file_logs_no_warning(moe_gguf, caplog):
+    """A file where name and shape AGREE (or the standard _exps path) is silent —
+    warnings are for DRIFT only, never the happy path."""
+    with caplog.at_level("WARNING"):
+        spill.gguf_moe_detail(moe_gguf)
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
 # ═══════════ per-layer-aware split pricing ══════════════════════════════════
 def test_moe_split_need_all_and_sentinel(moe_gguf):
     d = spill.gguf_moe_detail(moe_gguf)
@@ -226,6 +318,32 @@ def test_real_coder_next_header_reconciliation():
     need = spill.moe_split_need(d)
     assert need["gpu_bytes"] == d["non_expert_bytes"]
     assert need["cpu_bytes"] == d["expert_bytes"]
+
+
+@pytest.mark.skipif(not Path(_REAL_SHARD1).is_file(),
+                    reason="real coder-next shards not present on this box")
+def test_real_shard_name_and_shape_agree_exactly():
+    """The strongest consistency proof: on the REAL file the NAME method and the
+    SHAPE backstop must select the IDENTICAL expert set (same bytes, same
+    per-layer map, same hit count). Verified 2026-07-24: 144 _exps tensors, all
+    3-D with dims[-1]==expert_count=512; a conforming file logs NO warning."""
+    shards = spill._gguf_shard_paths(_REAL_SHARD1)
+    n_name = n_shape = 0
+    b_name = b_shape = 0
+    ec = None
+    for sh in shards:
+        # Thread the count forward exactly as gguf_moe_detail does (only shard 1
+        # carries expert_count; the hint lets shape fire on later shards too).
+        scan = spill._gguf_scan_moe(sh, expert_count_hint=ec)
+        if ec is None and scan.get("expert_count") is not None:
+            ec = int(scan["expert_count"])
+        n_name += scan["name_expert_hits"]
+        n_shape += scan["shape_expert_hits"]
+        b_name += scan["expert_bytes"]
+        b_shape += scan["expert_bytes_shape"]
+    assert n_name == n_shape == 144              # identical tensor set, both ways
+    assert b_name == b_shape                     # byte-identical split
+    assert (b_name / GIB) == pytest.approx(43.59, abs=0.05)
 
 
 # ═══════════ _build_cmd — THE argv choke point (loads AND relaunches) ═══════
