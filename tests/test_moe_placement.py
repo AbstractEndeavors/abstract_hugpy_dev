@@ -378,13 +378,52 @@ def test_auto_policy_moe_hybrid_becomes_expert_split(cmd_rig):
     assert total == 48
 
 
-def test_auto_policy_moe_fits_whole_pins_experts_on_gpu(cmd_rig):
+def test_auto_policy_moe_fits_whole_STILL_SPLITS(cmd_rig):
+    """POLICY 2026-07-25: the split is the DEFAULT for every applicable GGUF.
+
+    A MoE that fits the card whole used to be pinned fully-on-GPU (moe_mode
+    "pin-gpu", --n-cpu-moe 0). The ae measurement retires that exception: the
+    split is BOTH faster (+59% tok/s) AND ~5x cheaper in VRAM, so pinning was
+    strictly worse on both axes and monopolised a card other models could use.
+    """
     cmd_rig.auto["value"] = -1                   # whole model fits
     (argv, ngl, *_rest, ncm) = sa._build_cmd("moe-model", path=cmd_rig.moe)
     pairs = _argv_pairs(argv)
-    # fully-on-GPU as today, with an explicit 0 so a transition-era
-    # LLAMA_ARG_N_CPU_MOE unit env can't silently displace the experts.
-    assert ngl == -1 and ncm == 0 and pairs["--n-cpu-moe"] == "0"
+    assert ngl == -1 and pairs["--n-gpu-layers"] == "-1"
+    assert ncm == spill.MOE_ALL_LAYERS and pairs["--n-cpu-moe"] == "999"
+
+
+def test_auto_policy_moe_splits_at_every_autofit_verdict(cmd_rig):
+    """The autofit verdict no longer gates the split at all — hybrid (17/48),
+    fits-whole (-1) and nothing-fits (0) all land on the same default."""
+    for verdict in (-1, 0, 1, 17, 47):
+        cmd_rig.auto["value"] = verdict
+        (argv, ngl, *_rest, ncm) = sa._build_cmd("moe-model", path=cmd_rig.moe)
+        assert (ngl, ncm) == (-1, spill.MOE_ALL_LAYERS), f"autofit={verdict}"
+
+
+def test_auto_policy_moe_fits_whole_degrades_when_experts_exceed_ram(cmd_rig,
+                                                                     monkeypatch):
+    """Viability is the ONE remaining condition: experts must fit budgetable
+    host RAM. When they don't, fall back to the autofit placement — never
+    refuse, never move bytes into RAM that isn't there."""
+    monkeypatch.setattr(sa, "_mem_available_bytes", lambda: 1024)  # ~1 KB free
+    monkeypatch.setattr(spill, "ram_reserve_bytes", lambda: 0)
+    cmd_rig.auto["value"] = -1                   # whole model fits the card
+    (argv, ngl, *_rest, ncm) = sa._build_cmd("moe-model", path=cmd_rig.moe)
+    assert ngl == -1 and ncm is None and "--n-cpu-moe" not in argv
+    cmd_rig.auto["value"] = 17                   # hybrid degrades to layer split
+    (argv, ngl, *_rest, ncm) = sa._build_cmd("moe-model", path=cmd_rig.moe)
+    assert ngl == 17 and ncm is None and "--n-cpu-moe" not in argv
+
+
+def test_auto_policy_unmeasurable_ram_still_splits(cmd_rig, monkeypatch):
+    """Degrade honestly: an unreadable /proc/meminfo must never block the
+    default (never refuse/downgrade on unmeasurable data)."""
+    monkeypatch.setattr(sa, "_mem_available_bytes", lambda: None)
+    cmd_rig.auto["value"] = -1
+    (_argv, ngl, *_rest, ncm) = sa._build_cmd("moe-model", path=cmd_rig.moe)
+    assert ngl == -1 and ncm == spill.MOE_ALL_LAYERS
 
 
 def test_auto_policy_dense_is_byte_identical(cmd_rig):
@@ -410,11 +449,96 @@ def test_explicit_n_cpu_moe_always_wins(cmd_rig):
     assert ngl == -1 and ncm == 12 and pairs["--n-cpu-moe"] == "12"
 
 
+def test_explicit_n_cpu_moe_zero_pins_experts_on_gpu_at_every_autofit(cmd_rig):
+    """The retired "pin-gpu" behaviour is still REACHABLE — it just stopped
+    being the default. An operator who genuinely wants the experts on the card
+    says so with n_cpu_moe=0, and that wins at every autofit verdict."""
+    for verdict in (-1, 17):
+        cmd_rig.auto["value"] = verdict
+        (argv, ngl, *_rest, ncm) = sa._build_cmd("moe-model", n_cpu_moe=0,
+                                                 path=cmd_rig.moe)
+        assert ncm == 0 and _argv_pairs(argv)["--n-cpu-moe"] == "0", verdict
+        assert ngl == verdict          # explicit 0 does NOT re-target ngl to -1
+
+
+def test_dense_is_byte_identical_at_every_autofit_verdict(cmd_rig):
+    """The default only ever touches DETECTED MoE GGUFs. A dense model must
+    emit exactly today's argv — no flag, autofit ngl untouched — whether it
+    fits whole, partially, or not at all."""
+    for verdict in (-1, 0, 17, 47):
+        cmd_rig.auto["value"] = verdict
+        (argv, ngl, *_rest, ncm) = sa._build_cmd("dense-model",
+                                                 path=cmd_rig.dense)
+        assert ngl == verdict and ncm is None, verdict
+        assert "--n-cpu-moe" not in argv
+
+
 def test_k37_mode_engine_disables_the_auto_split(cmd_rig, monkeypatch):
     monkeypatch.setenv("HUGPY_ALLOC_MODE", "max-ram")
     cmd_rig.auto["value"] = 17
     (argv, ngl, *_rest, ncm) = sa._build_cmd("moe-model", path=cmd_rig.moe)
     assert ngl == 17 and ncm is None and "--n-cpu-moe" not in argv
+
+
+# ═══ THE PER-MODE DECISION TABLE (k37 alloc modes x the default split) ══════
+# The five modes are operator levers. mode_to_spill encodes them onto the wire
+# the worker reads, so a mode's split behaviour is a CONSEQUENCE of the wire it
+# produces — these tests pin the whole table end-to-end so an encoding change
+# can't silently flip a mode's placement.
+#
+#   max-gpu   -> {}                     -> split   (blank default; wants speed)
+#   gpu-only  -> {"n_gpu_layers": -1}   -> NO      (demands GPU residency)
+#   ram-only  -> {"n_gpu_layers": "off"}-> NO      (demands CPU residency)
+#   max-ram   -> {"alloc_mode":"max-ram"}->NO      (operator drives the numbers)
+#   explicit  -> {"alloc_mode":"explicit"}->NO     (operator drives the numbers)
+@pytest.mark.parametrize("mode,wants_split", [
+    ("max-gpu", True), ("gpu-only", False), ("ram-only", False),
+    ("max-ram", False), ("explicit", False)])
+def test_alloc_mode_decision_table(cmd_rig, monkeypatch, mode, wants_split):
+    wire = AM.mode_to_spill(mode)
+    # _apply_spill's mapping, applied by hand (the agent sets these envs before
+    # the load; slot_agent reads them through spill.*_env()).
+    ngl_wire = wire.get("n_gpu_layers")
+    monkeypatch.delenv("HUGPY_ALLOC_MODE", raising=False)
+    if wire.get("alloc_mode"):
+        monkeypatch.setenv("HUGPY_ALLOC_MODE", str(wire["alloc_mode"]))
+    # The n_gpu_layers wire reaches _build_cmd as a real argument, not an env.
+    kwargs = {}
+    if ngl_wire is not None:
+        kwargs["n_gpu_layers"] = 0 if str(ngl_wire) == "off" else int(ngl_wire)
+    cmd_rig.auto["value"] = 17
+    (argv, ngl, *_rest, ncm) = sa._build_cmd("moe-model", path=cmd_rig.moe,
+                                             **kwargs)
+    if wants_split:
+        assert ngl == -1 and ncm == spill.MOE_ALL_LAYERS, mode
+    else:
+        assert ncm is None and "--n-cpu-moe" not in argv, mode
+
+
+def test_max_gpu_is_the_blank_default_and_therefore_splits(cmd_rig):
+    """max-gpu is what an unconfigured model resolves to (derive_alloc_mode's
+    fallthrough) AND what mode_to_spill encodes as the empty wire — so "the
+    default is the MoE split" and "max-gpu splits" are the same statement."""
+    assert AM.derive_alloc_mode({}) == "max-gpu"
+    assert AM.mode_to_spill("max-gpu") == {}
+    cmd_rig.auto["value"] = 17
+    (_argv, ngl, *_rest, ncm) = sa._build_cmd("moe-model", path=cmd_rig.moe)
+    assert (ngl, ncm) == (-1, spill.MOE_ALL_LAYERS)
+
+
+@pytest.mark.parametrize("mode", ["max-ram", "explicit"])
+def test_mode_engine_modes_suppress_the_split_at_every_autofit(cmd_rig,
+                                                               monkeypatch, mode):
+    """max-ram / explicit are the only modes that reach the worker as
+    HUGPY_ALLOC_MODE. Both put the operator in charge of the placement numbers,
+    so the auto split stays out of the way regardless of the autofit verdict —
+    including fits-whole, where the old policy also declined."""
+    monkeypatch.setenv("HUGPY_ALLOC_MODE", mode)
+    for verdict in (-1, 0, 17):
+        cmd_rig.auto["value"] = verdict
+        (argv, ngl, *_rest, ncm) = sa._build_cmd("moe-model", path=cmd_rig.moe)
+        assert ncm is None and "--n-cpu-moe" not in argv, (mode, verdict)
+        assert ngl == verdict
 
 
 def test_old_llama_server_degrades_to_layer_split(cmd_rig, monkeypatch):
@@ -433,6 +557,125 @@ def test_python_child_degrades_to_layer_split(cmd_rig, monkeypatch):
         "moe-model", path=cmd_rig.moe)
     assert kind == "python" and ngl == 17 and ncm is None
     assert "--n-cpu-moe" not in argv
+
+
+# ═══ DEFAULTED vs EXPLICIT -1 (the ae 2026-07-25 dead-GPU-slot regression) ═══
+# -1 is overloaded: it is BOTH the fill-in default (serve.DEFAULT_LLAMA_NGL,
+# materialized into ServeSpec.n_gpu_layers because the field is typed int) AND a
+# load-bearing explicit force ("Max GPU" — runners.get, alloc_modes gpu-only,
+# chaos/sweep, chaos/assortment, the worker MoE commit, overrides). The MoE auto
+# policy gated on `n_gpu_layers is None`, so a DEFAULTED -1 read as "the operator
+# demanded all 48 layers on the card" and coder-next (48.4 GB MoE) launched onto
+# a 24 GB 3090 with no --n-cpu-moe, stalled, hard-capped, and backed off 600s.
+#
+# The fix is a provenance marker (slot_agent._NglDefaulted, an int subclass), so
+# these two cases MUST diverge in policy while staying identical in value.
+def test_defaulted_minus_one_still_gets_the_moe_auto_split(cmd_rig):
+    """(a) UNSET (a fill-in -1 nobody asked for) -> the auto MoE split fires."""
+    cmd_rig.auto["value"] = 17                   # hybrid: partial layer split
+    defaulted = sa._NglDefaulted(-1)
+    (argv, ngl, _c, _t, _cp, _kind, total, ncm) = sa._build_cmd(
+        "moe-model", n_gpu_layers=defaulted, path=cmd_rig.moe)
+    pairs = _argv_pairs(argv)
+    # Exactly the same outcome as passing nothing at all.
+    assert ngl == -1 and pairs["--n-gpu-layers"] == "-1"
+    assert ncm == spill.MOE_ALL_LAYERS and pairs["--n-cpu-moe"] == "999"
+    assert total == 48
+
+
+def test_explicit_minus_one_forces_all_layers_and_never_auto_splits(cmd_rig):
+    """(b) EXPLICIT -1 (runners.get / gpu-only / chaos) -> forced, policy silent.
+
+    This is the k14 override-wins path the offload sweep depends on; it must be
+    byte-identical to before the provenance marker existed."""
+    cmd_rig.auto["value"] = 17
+    (argv, ngl, *_rest, ncm) = sa._build_cmd("moe-model", n_gpu_layers=-1,
+                                             path=cmd_rig.moe)
+    assert ngl == -1
+    assert ncm is None and "--n-cpu-moe" not in argv
+
+
+def test_defaulted_marker_is_value_identical_to_the_plain_int():
+    """The marker may only carry PROVENANCE — never change the value. Every
+    existing consumer (argv formatting, comparisons, json) must be unaffected."""
+    import json
+    d = sa._NglDefaulted(-1)
+    assert d == -1 and int(d) == -1 and str(d) == "-1"
+    assert json.dumps({"n": d}) == '{"n": -1}'
+    assert isinstance(d, int)
+    # ...and the unset predicate separates it from a plain int of equal value.
+    assert sa._ngl_is_unset(d) is True
+    assert sa._ngl_is_unset(None) is True
+    assert sa._ngl_is_unset(-1) is False
+    assert sa._ngl_is_unset(0) is False
+    assert sa._ngl_is_unset(20) is False
+
+
+def test_defaulted_zero_autofits_rather_than_pinning_cpu(cmd_rig):
+    """A defaulted value is unset WHATEVER the int is: a box whose
+    DEFAULT_LLAMA_NGL is 0 must still autofit, not silently serve on CPU."""
+    cmd_rig.auto["value"] = 17
+    (argv, ngl, *_rest) = sa._build_cmd("dense-model",
+                                        n_gpu_layers=sa._NglDefaulted(0),
+                                        path=cmd_rig.dense)
+    assert ngl == 17                              # autofit won, not the 0
+
+
+def test_explicit_zero_still_pins_cpu(cmd_rig):
+    """The counterpart: an explicit 0 ('CPU only') is still honored."""
+    cmd_rig.auto["value"] = 17
+    (argv, ngl, *_rest) = sa._build_cmd("dense-model", n_gpu_layers=0,
+                                        path=cmd_rig.dense)
+    assert ngl == 0
+
+
+def test_serve_spec_marks_the_fill_in_default_as_not_explicit(monkeypatch):
+    """serve_spec_for must record WHETHER anyone chose a layer placement.
+    ``slot_n_gpu_layers`` then carries that provenance to the slot while
+    ``n_gpu_layers`` (unit/swap/supervisor argv) stays an ordinary int."""
+    serve = importlib.import_module("abstract_hugpy_dev.managers.serve.serve")
+
+    # Nothing persisted -> the spec's ngl is only DEFAULT_LLAMA_NGL.
+    blank = serve.ServeSpec(model_key="m", mode=serve.ServeMode.OFF)
+    assert blank.ngl_explicit is False
+    assert blank.n_gpu_layers == serve.DEFAULT_LLAMA_NGL
+    assert sa._ngl_is_unset(blank.slot_n_gpu_layers) is True
+    assert int(blank.slot_n_gpu_layers) == serve.DEFAULT_LLAMA_NGL
+    # The plain field is untouched — argv builders keep seeing an int.
+    assert not isinstance(blank.n_gpu_layers, sa._NglDefaulted)
+
+    # Someone chose -1 ("Max GPU") -> explicit, policy must not override it.
+    chosen = serve.ServeSpec(model_key="m", mode=serve.ServeMode.OFF,
+                             n_gpu_layers=-1, ngl_explicit=True)
+    assert sa._ngl_is_unset(chosen.slot_n_gpu_layers) is False
+    assert chosen.slot_n_gpu_layers == -1
+
+
+def test_slot_load_route_honors_the_ngl_defaulted_flag(monkeypatch):
+    """The /load wire: ``ngl_defaulted: true`` marks the accompanying
+    n_gpu_layers as a fill-in. Omitting it (every pre-existing caller) keeps the
+    value explicit — byte-identical to before."""
+    seen = {}
+
+    class _FakeSlot:
+        model_key = None
+
+        def load(self, model_key, n_gpu_layers=None, *a, **kw):
+            seen["ngl"] = n_gpu_layers
+            return {"ok": True}
+
+    # build_app() constructs its slot in a closure — swap the class it builds.
+    monkeypatch.setattr(sa, "Slot", _FakeSlot)
+    monkeypatch.delenv("HUGPY_NO_LOCAL_SERVING", raising=False)
+    app, _slot = sa.build_app()
+    client = app.test_client()
+
+    client.post("/load", json={"model_key": "m", "n_gpu_layers": -1,
+                               "ngl_defaulted": True})
+    assert sa._ngl_is_unset(seen["ngl"]) is True and seen["ngl"] == -1
+
+    client.post("/load", json={"model_key": "m", "n_gpu_layers": -1})
+    assert sa._ngl_is_unset(seen["ngl"]) is False and seen["ngl"] == -1
 
 
 # ═══════════ relaunch threads n_cpu_moe (k14 lever) ═════════════════════════
@@ -514,6 +757,40 @@ def test_slot_fit_check_moe_respects_ram_guard(monkeypatch):
     assert A._worker_slot_fit_check("coder-next") is False       # experts > RAM
     monkeypatch.setattr(A, "_free_ram_bytes", lambda: None)
     assert A._worker_slot_fit_check("coder-next") is True        # unmeasurable: open
+
+
+def test_slot_fit_check_prices_the_split_even_when_the_whole_thing_fits(monkeypatch):
+    """"need-calc prices experts as GPU" (keeper note), fixed for the fit checks.
+
+    A MoE that fits whole is now SERVED as a split, so the fit checks must ask
+    the split's question first. Here the full 41.6G need breaches a 46G card's
+    ~90% ceiling with only 44G free (44 - 41.6 = 2.4G < the 4.6G reserve); the
+    typed 2.9G share clears it comfortably."""
+    monkeypatch.setattr(A, "_total_vram_bytes", lambda: int(46 * GIB))
+    monkeypatch.setattr(A, "_free_vram_bytes", lambda: int(44 * GIB))
+    monkeypatch.setattr(A, "_free_ram_bytes", lambda: int(60 * GIB))
+    monkeypatch.setattr(A, "_incoming_need_detail", lambda mk: dict(_EMPTY_CARD_DET))
+    assert A._worker_slot_fit_check("coder-next") is True
+
+
+def test_slot_fit_check_falls_back_to_full_need_when_experts_dont_fit_ram(monkeypatch):
+    """Experts that can't fit RAM mean the split degrades to the autofit layer
+    placement — so the check must fall THROUGH to the full need rather than
+    return False outright. A roomy card still passes."""
+    monkeypatch.setattr(A, "_total_vram_bytes", lambda: int(64 * GIB))
+    monkeypatch.setattr(A, "_free_vram_bytes", lambda: int(64 * GIB))
+    monkeypatch.setattr(A, "_free_ram_bytes", lambda: int(10 * GIB))   # < 43.5G
+    monkeypatch.setattr(A, "_incoming_need_detail", lambda mk: dict(_EMPTY_CARD_DET))
+    assert A._worker_slot_fit_check("coder-next") is True   # full need fits 64G
+
+
+def test_contention_fit_check_prices_the_split_first(monkeypatch):
+    """Same for the contention check: the typed share passes the ceiling gate
+    on a card the opaque full need would fail."""
+    monkeypatch.setattr(A, "_free_vram_bytes", lambda: int(8 * GIB))
+    monkeypatch.setattr(A, "_free_ram_bytes", lambda: int(60 * GIB))
+    monkeypatch.setattr(A, "_incoming_need_detail", lambda mk: dict(_EMPTY_CARD_DET))
+    assert A._worker_fit_check("coder-next") is True
 
 
 def test_contention_fit_check_uses_split_need(monkeypatch):
@@ -606,26 +883,39 @@ def test_admission_moe_ram_guard_keeps_full_need(evict_rig):
     assert verdict["reason"]["moe_split"]["was_plan"] is False
 
 
-def test_admission_fits_whole_after_evict_stays_full_gpu(evict_rig):
-    # need 18G <= 24G - 2.4G reserve: full fit is possible -> today's
-    # evict-to-fit-full, NOT the split (whole-model-fits keeps fully-on-GPU).
-    evict_rig.card["need"] = 18 * GIB
-    evict_rig.card["free"] = 1 * GIB
-    calls = []
+def test_admission_fits_whole_ALSO_SPLITS_and_evicts_nobody(evict_rig):
+    """POLICY 2026-07-25 (the admission half of the same change).
 
-    def _fake_evict(state, mk, force=False):
-        calls.append(mk)
-        freed = evict_rig.residents.pop(mk)
-        evict_rig.card["free"] += freed
-        return {"model_key": mk, "evicted": True, "vram_freed": freed,
-                "host_mode": "subprocess"}
-    A._evict_model, orig = _fake_evict, A._evict_model
+    A MoE whose FULL weights (18G) would fit only AFTER an eviction used to be
+    admitted fully-on-GPU, evicting a 21G innocent to make room. The split is
+    now the default placement, so admission prices the 2.875G GPU share the
+    child will ACTUALLY take — which fits the free 6G (over the 2.4G ceiling
+    reserve) outright, so nobody is evicted. Admission MUST agree with
+    slot_agent._build_cmd: pricing the full 18G would reserve ~6x the VRAM the
+    child takes and evict a neighbour for bytes that never land on the card."""
+    evict_rig.card["need"] = 18 * GIB
+    evict_rig.card["free"] = 6 * GIB              # 6 - 2.875 > 2.4G reserve
+    A._evict_model, orig = (lambda *a, **k: pytest.fail("evicted an innocent"),
+                            A._evict_model)
     try:
         evict_rig.residents["idle"] = 21 * GIB
         verdict = A._vram_evict_to_fit(_State(), "coder-next")
     finally:
         A._evict_model = orig
-    assert verdict["action"] == "evicted"
+    assert verdict["action"] == "partial"
+    assert verdict["n_gpu_layers"] == -1 and verdict["n_cpu_moe"] == 999
+    assert verdict["evicted"] == []               # the innocent 21G resident stays
+    assert A._MOE_SPLIT["coder-next"]["n_cpu_moe"] == 999
+
+
+def test_admission_fits_whole_but_experts_exceed_ram_keeps_full_need(evict_rig):
+    """The viability guard holds on the admission side too: experts that can't
+    fit RAM mean no re-target, and the full-need path stands unchanged."""
+    evict_rig.card["need"] = 18 * GIB
+    evict_rig.card["free"] = 22 * GIB             # 22 - 18 > 2.4G reserve
+    evict_rig.card["ram"] = 20 * GIB              # experts are 43.5G
+    verdict = A._vram_evict_to_fit(_State(), "coder-next")
+    assert verdict["action"] == "proceed"
     assert verdict.get("n_cpu_moe") is None
     assert "coder-next" not in A._MOE_SPLIT
 

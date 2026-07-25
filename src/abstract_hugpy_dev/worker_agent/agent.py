@@ -1254,6 +1254,71 @@ def _slot_total_layers_fallback(model_key: str) -> "int | None":
 _TOTAL_LAYERS_CACHE: dict = {}   # model_key -> int | None (misses cached too)
 
 
+def _inferred_device(n_gpu_layers, gpu_pct=None) -> "str | None":
+    """Device inferred from DECLARED placement when nothing measured it.
+
+    The residency doctrine is "measured, never inferred from membership" — so
+    this is NOT a substitute for measurement, and every row that uses it is
+    stamped ``device_source: "inferred"`` so the console can render it as the
+    weaker claim it is. It exists because a box whose nvidia-smi is broken
+    (computron: "Failed to initialize NVML: Driver/library version mismatch")
+    reported ``device: null`` for a live GPU seat — an omission that reads as
+    "missing", which is LESS honest than a labeled inference.
+
+    This is placement the worker ITSELF declared when it launched the child /
+    loaded the model, not a guess from cache membership:
+      n_gpu_layers > 0 or -1 (all layers)  → 'cuda'
+      n_gpu_layers == 0                    → 'cpu'
+      gpu_pct > 0 / == 0                   → same, for engines with no ngl
+      anything unknown                     → None (still correct to say nothing)
+    """
+    try:
+        ngl = int(n_gpu_layers) if n_gpu_layers is not None else None
+    except (TypeError, ValueError):
+        ngl = None
+    if ngl is not None:
+        if ngl == 0:
+            return "cpu"
+        return "cuda"          # >0 partial offload, -1 all layers
+    try:
+        pct = float(gpu_pct) if gpu_pct is not None else None
+    except (TypeError, ValueError):
+        pct = None
+    if pct is not None:
+        return "cuda" if pct > 0 else "cpu"
+    return None                # no basis — null stays the honest answer
+
+
+def _slot_last_used(s: dict) -> "float | None":
+    """A slot's last_used as epoch seconds, or None when never used / unreported.
+
+    The slot seeds ``last_used = 0.0`` at construction and stamps it on each
+    request, so 0.0 means "seated but never answered" — that is None on the
+    wire, matching the ram rows' ``last_used`` (None = never)."""
+    lu = (s or {}).get("last_used")
+    try:
+        lu = float(lu) if lu is not None else None
+    except (TypeError, ValueError):
+        return None
+    return lu if lu else None          # 0.0 / 0 → never used
+
+
+def _slot_serving(s: dict, now: "float | None" = None) -> bool:
+    """Whether a SLOT allocation is serving, on the SAME terms as a ram row.
+
+    A slot with in-flight work (``busy``) is answering right now — measured
+    directly, no window needed. Otherwise it counts as serving if it answered
+    within ``_SERVING_WINDOW_S``, so a slot that has sat cold since yesterday's
+    test churn reads idle exactly like an idle in-process resident does."""
+    s = s or {}
+    if s.get("busy"):
+        return True
+    lu = _slot_last_used(s)
+    if lu is None:
+        return False
+    return (time.time() if now is None else now) - lu < _SERVING_WINDOW_S
+
+
 def _allocations(slot_statuses: "list | None" = None) -> list:
     """Unified, engine-agnostic view of every resource allocation on this
     worker — one entry per SLOT-seated model and one per in-RAM (in-process)
@@ -1266,15 +1331,31 @@ def _allocations(slot_statuses: "list | None" = None) -> list:
       ``vram_bytes`` (int bytes | null) — actual VRAM the model occupies now.
       ``device``     ('cuda' | 'cpu' | null) — the device the weights live on.
     SLOT rows join nvidia-smi against the slot's child_pid (exact per-model);
-    RAM rows split the worker python's nvidia-smi lump per-model via torch. Both
-    are null on a box with no GPU / no nvidia-smi — identical to today. VRAM is
-    NEVER written into model_bytes/weight_bytes (those stay on-disk *size*).
+    RAM rows split the worker python's nvidia-smi lump per-model via torch. VRAM
+    is NEVER written into model_bytes/weight_bytes (those stay on-disk *size*).
+
+    Measured-vs-inferred (2026-07-25). When neither read can see the model —
+    computron's nvidia-smi fails outright ("Failed to initialize NVML"), and
+    torch cannot introspect an in-process GGUF ``Llama`` handle — ``device`` used
+    to be null for a demonstrably live GPU seat, which the console rendered as
+    "missing". Such a row now falls back to the placement the worker ITSELF
+    declared at launch (n_gpu_layers / gpu_pct) and carries:
+      ``device_source`` ('measured' | 'inferred', OMITTED when there is no
+        device claim at all) — so a consumer can hold measured and inferred to
+        different standards and NEVER launder a guess into a measurement. The
+        residency doctrine still stands: only a 'measured' device (plus
+        vram_bytes / rss_bytes) is evidence of residency.
+    ``vram_bytes`` is never inferred — placement is knowable without nvidia-smi,
+    a byte count is not, so it stays null rather than becoming a fiction.
+    ``device`` is null (and device_source absent) when there is genuinely no
+    basis, exactly as before.
 
     ``slot_statuses`` may be passed in to avoid a second slot round-trip when
     the heartbeat already computed it."""
     out: list = []
     seen: set = set()
     gpu_procs = _gpu_process_vram()            # {} when no GPU / no nvidia-smi
+    now = time.time()
     rows = slot_statuses if slot_statuses is not None else _slot_statuses()
     for s in (rows or []):
         mk = (s or {}).get("model_key")
@@ -1283,18 +1364,30 @@ def _allocations(slot_statuses: "list | None" = None) -> list:
         seen.add(mk)
         # Join nvidia-smi on the slot's llama-server CHILD pid (the process that
         # actually holds the weights). Absent child_pid (old slot build) or empty
-        # gpu_procs (no nvidia-smi) → null, exactly today's shape.
+        # gpu_procs (no nvidia-smi) → fall back to the DECLARED placement below,
+        # labeled as inferred — never a silent null for a live GPU seat.
         vram_bytes = None
         device = None
+        device_source = None
         if gpu_procs:
             cp = s.get("child_pid")
             info = gpu_procs.get(cp) if cp is not None else None
             if info is not None:
                 vram_bytes = int(info["mib"]) * _MIB
                 device = "cuda" if vram_bytes > 0 else "cpu"
+                device_source = "measured"
             elif cp is not None:
                 # Child is alive but not a GPU compute app → CPU-resident (ngl=0).
                 vram_bytes, device = 0, "cpu"
+                device_source = "measured"
+        if device is None:
+            # No per-process accounting on this box (broken/absent nvidia-smi).
+            # Say what the worker KNOWS it launched, stamped inferred. vram_bytes
+            # stays NULL — placement is knowable, byte count is not, and a made-up
+            # number would be the dishonest half of this.
+            device = _inferred_device(s.get("n_gpu_layers"))
+            if device is not None:
+                device_source = "inferred"
         row = {
             "kind": "slot", "model_key": mk,
             "slot_id": s.get("slot_id"), "healthy": s.get("healthy"),
@@ -1302,7 +1395,21 @@ def _allocations(slot_statuses: "list | None" = None) -> list:
             "rss_bytes": s.get("rss_bytes"),
             "n_gpu_layers": s.get("n_gpu_layers"), "ctx": s.get("ctx"),
             "vram_bytes": vram_bytes, "device": device,
+            # Idle-vs-serving for SLOT rows, same semantics as the ram rows
+            # below (_SERVING_WINDOW_S against the worker's OWN clock). Before
+            # this, slot rows never set `serving` at all, so a slot that had
+            # just answered an inference reported serving:null — the operator's
+            # "shows missing for nearly everything, even models it's serving".
+            # A busy slot is answering RIGHT NOW: serving is true by observation,
+            # no clock involved. The slot reports last_used (epoch seconds, 0.0 =
+            # never used since seat).
+            "last_used": _slot_last_used(s),
+            "serving": _slot_serving(s, now),
         }
+        if device_source is not None:
+            # omit-when-unset: an old central/UI never sees the key, and a row
+            # with no device basis at all carries no provenance to mislabel.
+            row["device_source"] = device_source
         # Honest allocation accuracy (2026-07-22), omit-when-unset so the wire
         # shape is unchanged for old slots/central:
         #  * total_layers — GGUF block_count so "17/48" renders instead of
@@ -1336,7 +1443,6 @@ def _allocations(slot_statuses: "list | None" = None) -> list:
         last_used = last_used_snapshot() or {}
     except Exception:
         last_used = {}
-    now = time.time()
     for mk in loaded_model_keys():
         if mk in seen:
             continue                       # already counted as a slot allocation
@@ -1350,20 +1456,28 @@ def _allocations(slot_statuses: "list | None" = None) -> list:
             continue
         d = detail.get(mk) or {}
         ip = inproc.get(mk) or {}
-        out.append({
+        # REAL GPU residency from torch introspection: a cuda-resident
+        # transformers/vision model reports vram_bytes>0 + device='cuda' and
+        # stops reading as host RAM. torch can't see an in-process GGUF Llama
+        # handle (not a torch module) — that used to leave device null even
+        # though the load DECLARED its placement in n_gpu_layers/gpu_pct. Fall
+        # back to that declared placement, stamped inferred; vram_bytes stays
+        # null because nothing measured the bytes.
+        ram_device = ip.get("device")
+        ram_device_source = "measured" if ram_device is not None else None
+        if ram_device is None:
+            ram_device = _inferred_device(d.get("n_gpu_layers"), d.get("gpu_pct"))
+            if ram_device is not None:
+                ram_device_source = "inferred"
+        ram_row = {
             "kind": "ram", "model_key": mk,
             "model_bytes": d.get("model_bytes"),
             "weight_bytes": d.get("weight_bytes"),
             "gpu_pct": d.get("gpu_pct"),
             "n_gpu_layers": d.get("n_gpu_layers"),
             "total_layers": d.get("total_layers"),
-            # REAL GPU residency from torch introspection: a cuda-resident
-            # transformers/vision model reports vram_bytes>0 + device='cuda' and
-            # stops reading as host RAM. None when torch can't see it (e.g. an
-            # in-process GGUF Llama handle, not a torch module — its GPU share is
-            # still described by n_gpu_layers/gpu_pct above).
             "vram_bytes": ip.get("vram_bytes"),
-            "device": ip.get("device"),
+            "device": ram_device,
             # Idle-vs-serving: the console shows 🔥 only for genuinely-active
             # residents (recently-used in-process), the rest as idle-resident —
             # so a pool of test-churn leftovers never reads as "all serving".
@@ -1372,7 +1486,10 @@ def _allocations(slot_statuses: "list | None" = None) -> list:
             "last_used": last_used.get(mk),
             "serving": (last_used.get(mk) is not None
                         and (now - last_used[mk]) < _SERVING_WINDOW_S),
-        })
+        }
+        if ram_device_source is not None:
+            ram_row["device_source"] = ram_device_source   # omit-when-unset
+        out.append(ram_row)
     return out
 
 
@@ -3266,6 +3383,17 @@ def build_app(state: "WorkerState") -> Flask:
         # Live VRAM-fit check: actually load the model on this worker's GPU and
         # report whether it fit, plus before/after free VRAM. Loading is cached
         # by dispatch, so a probe also warms the model for the first real chat.
+        #
+        # Optional POST body: {"spill": {...}} — TASK C (2026-07-25): the ONLY
+        # path central's workers_load warm call has to seat an explicit
+        # n_gpu_layers/n_cpu_moe (e.g. re-seating a crashed MoE slot with a
+        # split instead of repeating the ngl=-1-no-split stall). Applied via
+        # the SAME _apply_spill /infer already uses, so it takes effect before
+        # the runner is built (the model loads lazily on first access below).
+        # GET carries no body (a probe with no override, today's behavior
+        # unchanged); an absent/empty body on POST is likewise a no-op spill.
+        body = request.get_json(silent=True) or {}
+        _apply_spill(body.get("spill"))
         return jsonify(_probe_model(model_key, state))
 
     @app.route("/models/unload", methods=["POST"])
@@ -3416,6 +3544,74 @@ def build_app(state: "WorkerState") -> Flask:
             "healthy": (data or {}).get("healthy"),
             "allocation": data,
         }), r.status_code
+
+    @app.route("/slots/<slot_id>/unload", methods=["POST"])
+    def slot_unload(slot_id):
+        # THE STRANDED-SLOT FIX (operator ask "all pids need to be able to be
+        # unseated, even from ram", 2026-07-25): every other eviction verb is
+        # model_key-ADDRESSED (see /ops/evict's comment on why: PIDs are
+        # per-box and recycled, so central should never send one). That
+        # design has one hole — a slot whose child_pid is alive and holding
+        # VRAM/RAM but whose model_key has gone None/stale (the claim itself
+        # is broken, e.g. a load that half-failed) can't be RESOLVED by
+        # model_key at all: _resolve_slot_handle can't find it (nothing
+        # matches model_key==None), /slots/<id>/relaunch refuses on an empty
+        # claim (409 EmptySlot), and /ops/reap-orphans deliberately treats
+        # "child_pid still referenced by a slot status" as CLAIMED (not an
+        # orphan) regardless of whether model_key is set — so none of the
+        # three existing unseat paths reach it. This is what stranded ae for
+        # 5.5h. Addressed by SLOT ID (not PID) — slot_id is a stable local
+        # identifier (1..SLOT_COUNT), never recycled/foreign the way a PID
+        # is, so this does not reintroduce the PID-addressing problem the
+        # other verbs avoid. Unconditional: Slot.unload() kills the child
+        # (SIGTERM->wait->SIGKILL) and clears the claim regardless of what
+        # model_key (if any) it holds — the same mechanism /ops/evict's slot
+        # branch already uses, just reached by slot_id instead of a resolved
+        # model_key. 404 = no such slot on this worker.
+        try:
+            from ..managers.serve.slots import SlotPool
+            statuses = SlotPool().statuses()
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"ok": False, "error": {
+                "code": type(exc).__name__,
+                "message": f"slot pool unavailable: {exc}"}}), 502
+        target = None
+        for s in (statuses or []):
+            if str(s.get("slot_id")) == str(slot_id):
+                target = s
+                break
+        if target is None:
+            return jsonify({"ok": False, "slot_id": slot_id, "error": {
+                "code": "UnknownSlot",
+                "message": f"no slot {slot_id} on this worker"}}), 404
+        model_key_before = target.get("model_key")
+        pid_before = target.get("child_pid")
+        footprint = None
+        if model_key_before:
+            # Best-effort honest footprint for a slot that DID have an
+            # attributable model_key — same measurement /ops/evict uses.
+            try:
+                footprint = _model_footprint_before_evict(
+                    model_key_before, "slot",
+                    {"child_pid": pid_before, "control_url": target.get("_control")})
+            except Exception:  # noqa: BLE001
+                footprint = None
+        control = target.get("_control")
+        try:
+            SlotPool().unload(control)
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"ok": False, "slot_id": slot_id, "error": {
+                "code": type(exc).__name__,
+                "message": f"slot unload failed: {exc}"}}), 502
+        _trim_host_ram()
+        return jsonify({
+            "ok": True, "slot_id": slot_id,
+            "model_key_before": model_key_before,
+            "child_pid_before": pid_before,
+            "freed": footprint,
+            "reason": f"slot {slot_id} unconditionally unloaded "
+                      f"(pid={pid_before} model_key={model_key_before!r})",
+        })
 
     @app.route("/models/redownload", methods=["POST"])
     def redownload():
@@ -4807,10 +5003,14 @@ def _moe_plan_for(model_key: str) -> "dict | None":
         split is priced per-layer-exactly at that N (spill.moe_split_need);
       * else AUTO-ELIGIBLE: a detected-MoE GGUF with NO explicit layer
         designation (HUGPY_N_GPU_LAYERS unset/auto) and no k37 mode engine
-        active — priced at all-experts-on-CPU (MOE_ALL_LAYERS). Whether the
-        auto split is ACTUALLY APPLIED is the caller's budget question (it only
-        replaces the plan when the whole model can't fit — fits-whole stays
-        fully-on-GPU, byte-identical to today).
+        active — priced at all-experts-on-CPU (MOE_ALL_LAYERS). As of
+        2026-07-25 this IS the default placement for such a model (operator:
+        "the default needs to be the MoE split for all GGUFs that it applies
+        to"); the only remaining question at the caller is VIABILITY — the
+        experts must fit budgetable host RAM. Fits-whole no longer exempts a
+        MoE from the split: the ae measurement makes the split both faster and
+        ~5x cheaper in VRAM, so pinning a fits-whole MoE onto the card was
+        strictly worse AND monopolised the card.
     Explicit n_gpu_layers / gpu-only / ram-only / max-ram / explicit-mode all
     return None here: explicit operator placement always wins over auto."""
     det = _moe_detail_for(model_key)
@@ -4967,10 +5167,12 @@ def _incoming_need_detail(model_key: str) -> dict:
     # the TYPED need alongside the opaque total: GPU-side = non-expert weights
     # (x the same 1.15 headroom the weights term uses) + the WHOLE KV (all
     # layers stay on the GPU under the split); CPU-side = the expert bytes
-    # (RAM/page-cache, mirroring cpu_resident_bytes accounting). Fit paths use
-    # ``total`` first (fits-whole stays fully-on-GPU) and fall back to
-    # ``moe_split.gpu_total`` when the whole model can't fit — the hybrid
-    # situation the split was measured to win. No calibration correction on the
+    # (RAM/page-cache, mirroring cpu_resident_bytes accounting). Since
+    # 2026-07-25 fit paths PREFER ``moe_split.gpu_total`` whenever it is present
+    # and the experts fit RAM — the split is the default placement, so pricing
+    # ``total`` would reserve VRAM the child never takes. ``total`` remains the
+    # figure for dense models and for any explicitly-designated placement (which
+    # produces no ``moe_split`` at all). No calibration correction on the
     # split figure: corrections are learned from FULL loads only (a MoE-split
     # residency reports verdict "partial" and never feeds the ratio).
     try:
@@ -5187,25 +5389,31 @@ def _worker_fit_check(model_key: str) -> bool:
     discovered at OOM. _incoming_need_detail is the ONE authoritative need; kv is
     0 when ctx_pct is unset (byte-identical to today).
 
-    MoE (2026-07-24): when the full model doesn't fit but a MoE split governs
-    the plan, the GPU-side need is the TYPED non-expert share (+KV) — the split
-    is what will actually load, so pricing the full file would misjudge exactly
-    the case the split wins (a 41.6GB MoE on an empty 23.6GiB card fits FINE).
+    MoE: when a MoE split governs the plan, the GPU-side need is the TYPED
+    non-expert share (+KV) — the split is what will actually load, so pricing
+    the full file misjudges exactly the case the split wins (a 41.6GB MoE on an
+    empty 23.6GiB card fits FINE). Since 2026-07-25 the split is the DEFAULT
+    placement, so the typed need is consulted FIRST rather than only as a
+    fallback after the full need fails — otherwise a fits-whole MoE is priced at
+    ~5x the VRAM the child actually takes ("need-calc prices experts as GPU").
     The expert (CPU) share is checked against free RAM, failing open when RAM
     is unmeasurable."""
     det = _incoming_need_detail(model_key)
     need = det.get("total")
     if not need:
         return True
+    ms = det.get("moe_split")
     fv = _free_vram_bytes()
     if fv is not None:
-        if fv >= need:
-            return True
-        ms = det.get("moe_split")
-        if ms and fv >= int(ms.get("gpu_total") or 0):
+        if ms:
             fr = _free_ram_bytes()
-            return fr is None or fr >= int(ms.get("cpu_bytes") or 0)
-        return False
+            experts_fit = fr is None or fr >= int(ms.get("cpu_bytes") or 0)
+            if experts_fit and fv >= int(ms.get("gpu_total") or 0):
+                return True
+            # Experts can't fit RAM (or even the split's GPU share doesn't fit):
+            # fall through to the full-need question — the split degrades to the
+            # autofit layer placement, which is what `need` prices.
+        return fv >= need
     fr = _free_ram_bytes()
     if fr is not None:
         return fr >= need
@@ -5276,18 +5484,20 @@ def _worker_slot_fit_check(model_key: str) -> bool:
     headroom = int(total * (1.0 - _vram_ceiling_frac()))
     # Loading consumes ~need; the card is OK if free-after-load still leaves the
     # (1 - ceiling) reserve. Equivalent to "post-load fill <= ceiling".
-    if (fv - need) >= headroom:
-        return True
-    # MoE (2026-07-24): the full model breaches the ceiling, but when a MoE
-    # split governs the plan the load actually lands only the non-expert share
-    # (+KV) on the card — gate on THAT typed need (expert share vs free RAM,
-    # failing open when RAM is unmeasurable). This is what lets the /probe and
-    # the boot star of a 41.6GB MoE pass on an empty 23.6GiB card.
+    # MoE: when a split governs the plan the load lands only the non-expert
+    # share (+KV) on the card — gate on THAT typed need (expert share vs free
+    # RAM, failing open when RAM is unmeasurable). This is what lets the /probe
+    # and the boot star of a 41.6GB MoE pass on an empty 23.6GiB card. Checked
+    # BEFORE the full-need gate since 2026-07-25 (the split is the DEFAULT
+    # placement, so the full need is not what will be reserved).
     ms = det.get("moe_split")
     if ms and (fv - int(ms.get("gpu_total") or 0)) >= headroom:
         fr = _free_ram_bytes()
-        return fr is None or fr >= int(ms.get("cpu_bytes") or 0)
-    return False
+        if fr is None or fr >= int(ms.get("cpu_bytes") or 0):
+            return True
+        # Experts don't fit RAM -> the split degrades to the autofit layer
+        # placement, which is what the full need below prices.
+    return (fv - need) >= headroom
 
 
 def _worker_evictable(model_key: str) -> bool:
@@ -5470,6 +5680,101 @@ def _comfy_base_url(state: "WorkerState") -> str:
     return (os.environ.get("COMFY_URL") or "http://127.0.0.1:8188").rstrip("/")
 
 
+def _model_footprint_before_evict(model_key: str, host_mode: str,
+                                  handle: "dict | None" = None) -> dict:
+    """A per-MODEL, honestly-measured footprint captured BEFORE eviction acts —
+    the fix for the ram_freed/vram_freed LIE. The old ``_result()`` inferred
+    freed bytes from a whole-box MemAvailable-style delta (_free_vram_bytes /
+    _free_ram_bytes before vs after). That is structurally wrong for a GGUF:
+    llama.cpp mmaps the weights, so dropping refs returns FILE-BACKED pages to
+    the page cache — the box's free-RAM delta barely moves (observed on ae:
+    44 GB model, ram_freed reported 35.6 MB, i.e. ~0.08% of the truth) even
+    though the eviction was completely real. See rss_anon_bytes doctrine
+    (managers/serve/slot_agent._proc_rss_detail): VmRSS/MemAvailable-style
+    deltas overstate/understate by ~28x on mmap'd GGUF.
+
+    Instead of a box-wide delta, measure THIS model's own resident bytes,
+    broken out honestly by kind, using whichever ground truth its hosting mode
+    actually offers:
+      * slot       — the child pid's REAL nvidia-smi VRAM (joined on
+                     child_pid, same join _allocation_rows uses) + its
+                     rss_anon_bytes (the truly-pinned host RAM; rss_file_bytes
+                     is mmap'd page cache, reported separately, NEVER folded
+                     into "freed").
+      * in_process — GGUF: model_bytes from the file the runner opened
+                     (loaded_runner_detail) as the file-backed weights size
+                     (labeled, not claimed as pinned anon RAM — llama-cpp-
+                     python's in-process handle doesn't expose a per-model
+                     anon/file split). torch/diffusers: vram_bytes from
+                     _inprocess_gpu_bytes(), which is a REAL per-model sum of
+                     tensor bytes on a cuda device (not a delta) — the
+                     honest figure, not an estimate.
+      * comfy      — comfy manages its own resident set across an unknown
+                     number of checkpoints; there is no way to attribute
+                     freed bytes to ONE model_key from outside. Reported
+                     null with a reason, not a guess.
+      * not-resident — nothing to measure; zeros, not null (there is
+                     genuinely nothing to free).
+
+    Returns {"vram_bytes", "ram_anon_bytes", "ram_file_bytes", "measured_from"}
+    — every key may be None when that quantity cannot be honestly attributed
+    to this one model_key from this hosting mode; never a fabricated number."""
+    out = {"vram_bytes": None, "ram_anon_bytes": None, "ram_file_bytes": None,
+           "measured_from": None}
+    if host_mode == "slot" and handle:
+        pid = handle.get("child_pid")
+        if pid is not None:
+            try:
+                gpu_procs = _gpu_process_vram() or {}
+                info = gpu_procs.get(pid)
+                if info is not None:
+                    out["vram_bytes"] = int(info.get("mib") or 0) * _MIB
+            except Exception:  # noqa: BLE001 — nvidia-smi unavailable -> stays None
+                pass
+            try:
+                from ..managers.serve.slot_agent import _proc_rss_detail
+                detail = _proc_rss_detail(pid) or {}
+                out["ram_anon_bytes"] = detail.get("rss_anon_bytes")
+                out["ram_file_bytes"] = detail.get("rss_file_bytes")
+            except Exception:  # noqa: BLE001 — /proc unreadable -> stays None
+                pass
+            out["measured_from"] = "slot child pid nvidia-smi + /proc rss split"
+        return out
+    if host_mode == "in_process":
+        try:
+            detail = (_loaded_detail() or {}).get(model_key) or {}
+            mb = detail.get("model_bytes")
+            if mb is not None:
+                out["ram_file_bytes"] = int(mb)
+                out["measured_from"] = "GGUF file size (mmap'd, file-backed — " \
+                    "NOT pinned anon RAM; llama-cpp-python exposes no " \
+                    "per-model anon/file split)"
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            ip = (_inprocess_gpu_bytes() or {}).get(model_key) or {}
+            vb = ip.get("vram_bytes")
+            if vb:
+                out["vram_bytes"] = int(vb)
+                out["measured_from"] = (
+                    (out["measured_from"] + " + " if out["measured_from"] else "")
+                    + "torch tensor bytes on cuda device (real per-model sum, "
+                      "not a delta)")
+        except Exception:  # noqa: BLE001
+            pass
+        return out
+    if host_mode == "comfy":
+        out["measured_from"] = (
+            "comfy manages its own resident set across an unknown number of "
+            "checkpoints — no per-model_key attribution is possible from "
+            "outside; reporting null rather than a box-wide guess")
+        return out
+    # not resident: genuinely nothing to free.
+    out.update(vram_bytes=0, ram_anon_bytes=0, ram_file_bytes=0,
+               measured_from="not resident — nothing to free")
+    return out
+
+
 def _evict_model(state: "WorkerState", model_key: str,
                  force: bool = False) -> dict:
     """Resolve ``model_key`` to its LIVE hosting handle and free it with the
@@ -5485,7 +5790,17 @@ def _evict_model(state: "WorkerState", model_key: str,
                                                (owner does SIGTERM->wait->SIGKILL)
       3. in-process — weights in our PID     -> drop refs + torch empty_cache + trim
       4. not resident                        -> idempotent no-op
-    """
+
+    ram_freed/vram_freed ACCOUNTING (fixed 2026-07-25 — see
+    _model_footprint_before_evict): the historical fields are whole-box
+    MemAvailable-style before/after deltas, which page-cache behavior makes
+    structurally dishonest for an mmap'd GGUF (a 44 GB eviction reported
+    ram_freed=35.6 MB on ae — the eviction was real, the number was noise).
+    They are KEPT for wire back-compat (older fleet workers/consoles read
+    them) but are no longer the headline truth. The new ``freed`` block
+    reports what was actually attributable to THIS model, honestly, with
+    nulls where nothing can be honestly attributed — never a confidently
+    wrong number."""
     if not isinstance(model_key, str) or not model_key.strip():
         return {"model_key": model_key, "host_mode": "unknown", "evicted": False,
                 "vram_freed": None, "ram_freed": None,
@@ -5498,7 +5813,7 @@ def _evict_model(state: "WorkerState", model_key: str,
     vram_before = _free_vram_bytes()
     ram_before = _free_ram_bytes()
 
-    def _result(host_mode, evicted, reason, **extra):
+    def _result(host_mode, evicted, reason, footprint=None, **extra):
         vram_after = _free_vram_bytes()
         ram_after = _free_ram_bytes()
         vram_freed = (vram_after - vram_before) if (
@@ -5507,10 +5822,20 @@ def _evict_model(state: "WorkerState", model_key: str,
             ram_before is not None and ram_after is not None) else None
         out = {"model_key": model_key, "host_mode": host_mode,
                "evicted": bool(evicted), "reason": reason,
+               # LEGACY (wire back-compat only — see docstring): whole-box
+               # delta, unreliable for mmap'd weights. Do not treat as truth.
                "vram_freed": vram_freed, "ram_freed": ram_freed,
                "vram_free_before": vram_before, "vram_free_after": vram_after,
                "ram_free_before": ram_before, "ram_free_after": ram_after,
                "forced": bool(force), "loaded_models": loaded_model_keys()}
+        # HONEST per-model breakdown (optional, omit-when-unset — new field,
+        # older released workers/central pydantic models with extra=forbid
+        # never see it unless they opt in by reading this key). Only attached
+        # when the eviction attempt actually resolved a footprint measurement
+        # (i.e. footprint dict was computed) so an unrelated failure path
+        # (missing model_key) doesn't grow a new key by accident.
+        if footprint is not None:
+            out["freed"] = footprint
         out.update(extra)
         return out
 
@@ -5522,8 +5847,9 @@ def _evict_model(state: "WorkerState", model_key: str,
         allowed, why = (True, "") if force else _evict_gate(model_key)
         if not allowed:
             return _result("comfy", False, f"eviction gated: {why}")
+        footprint = _model_footprint_before_evict(model_key, "comfy")
         freed_ok, note = _comfy_free_models(state)
-        return _result("comfy", freed_ok, note)
+        return _result("comfy", freed_ok, note, footprint=footprint)
 
     # 2. Subprocess-hosted (slot child / worker-spawned llama-server). Resolve the
     #    model_key -> its CURRENT slot handle from a LIVE status read.
@@ -5545,6 +5871,9 @@ def _evict_model(state: "WorkerState", model_key: str,
             return _result("slot", False,
                            "slot handle changed before evict (recycled/swapped) "
                            "— not evicted", child_pid=pid)
+        # Capture the footprint BEFORE the kill — the pid must still be alive
+        # and holding VRAM/RAM for nvidia-smi + /proc to measure it honestly.
+        footprint = _model_footprint_before_evict(model_key, "slot", handle)
         # Free via the slot's OWN /unload: the slot supervisor owns the child, so
         # it performs the SIGTERM -> short wait -> SIGKILL itself (Slot._kill:
         # terminate, wait 15s, kill) and clears its own model_key claim atomically
@@ -5560,10 +5889,10 @@ def _evict_model(state: "WorkerState", model_key: str,
         _trim_host_ram()
         if err is not None:
             return _result("slot", False, f"slot unload failed: {err}",
-                           child_pid=pid)
+                           footprint=footprint, child_pid=pid)
         return _result("slot", True,
                        f"slot child pid={pid} terminated (SIGTERM->SIGKILL) via "
-                       "its supervisor", child_pid=pid)
+                       "its supervisor", footprint=footprint, child_pid=pid)
 
     # 3. In-process torch/GGUF model sharing THIS worker's python PID. Never kill
     #    the PID (that kills the worker + every sibling model) — drop the refs.
@@ -5571,16 +5900,21 @@ def _evict_model(state: "WorkerState", model_key: str,
         allowed, why = (True, "") if force else _evict_gate(model_key)
         if not allowed:
             return _result("in_process", False, f"eviction gated: {why}")
+        # Capture BEFORE dropping refs — model_bytes/vram_bytes both read
+        # already-materialized state, so this is safe to call right before.
+        footprint = _model_footprint_before_evict(model_key, "in_process")
         dropped = _drop_inprocess_model(model_key)
         return _result("in_process", dropped,
                        "in-process refs dropped + CUDA cache/host arena trimmed"
-                       if dropped else "in-process handle already gone")
+                       if dropped else "in-process handle already gone",
+                       footprint=footprint)
 
     # 4. Nothing here holds it. This ALSO covers the foreign/rogue case: a model
     #    that resolves only to a process the agent did not spawn (and isn't comfy)
     #    is OUT OF SCOPE for this slice — we never os.kill an arbitrary PID, so
     #    such a model simply reads as not-resident here. Idempotent no-op, HTTP 200.
-    return _result("none", False, "not resident on this worker")
+    return _result("none", False, "not resident on this worker",
+                   footprint=_model_footprint_before_evict(model_key, "none"))
 
 
 # ── GPU orphan reaper (p27, 2026-07-23) ─────────────────────────────────────
@@ -6088,21 +6422,33 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
                 "reason": None, "note": "unknown weight size — fail open"}
     ceiling_reserve = int(total * (1.0 - _vram_ceiling_frac()))
 
-    # ── MoE re-target (2026-07-24): typed bytes over the opaque byte-bag ─────
-    # When a MoE split governs this model AND its FULL weights can never fit
-    # this card even empty (need > card - reserve), the plan that will actually
-    # load is the split — so the whole admission (flex, eviction, fit checks)
-    # prices ITS GPU need (non-expert + KV) instead of chasing an impossible
-    # full fit (which would evict every innocent resident and then refuse
-    # anyway). RAM-guarded: experts must fit budgetable host RAM (fail open on
+    # ── MoE re-target: typed bytes over the opaque byte-bag ─────────────────
+    # When a MoE split governs this model, the plan that will ACTUALLY load is
+    # the split (slot_agent._build_cmd applies it), so the whole admission
+    # (flex, eviction, fit checks) must price ITS GPU need (non-expert + KV)
+    # rather than the opaque full-file total. Pricing the full file would evict
+    # innocent residents to make room for bytes that are never going to land on
+    # the card — and, when the model is bigger than the card, refuse anyway.
+    #
+    # POLICY CHANGE (operator, 2026-07-25 — "the default needs to be the MoE
+    # split for all GGUFs that it applies to"): this used to re-target ONLY when
+    # the full weights could never fit the card even empty (need > card -
+    # reserve); a MoE that fit whole was admitted, and served, fully on the GPU.
+    # The ae measurement retires that exception (+59% tok/s at 5x less VRAM), so
+    # the split is now the default whenever a plan exists — and admission MUST
+    # agree with _build_cmd or it would reserve ~5x the VRAM the child actually
+    # takes and evict neighbours for nothing.
+    #
+    # RAM-guarded: experts must fit budgetable host RAM (fail open on
     # unmeasurable). Only when `need` came from the authoritative detail — an
     # explicit caller-passed need is a test/pre-priced figure and stands.
     moe_commit = None
     if need == _det.get("total"):
         ms = _det.get("moe_split")
-        if ms and int(need) > max(0, int(total) - ceiling_reserve):
+        if ms:
             fr_now = _free_ram_bytes()
             exp_bytes = int(ms.get("cpu_bytes") or 0)
+            impossible_full = int(need) > max(0, int(total) - ceiling_reserve)
             if fr_now is not None and exp_bytes > fr_now * 0.95:
                 logger.info(
                     "MoE split for %s skipped: expert tensors (~%s) exceed "
@@ -6112,10 +6458,11 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
                 need = int(ms["gpu_total"])
                 moe_commit = dict(ms)
                 logger.info(
-                    "MoE re-target for %s: full weights can never fit this card "
-                    "— admission prices the expert split instead (GPU need %s, "
-                    "experts ~%s to CPU)", model_key, _human_bytes(need),
-                    _human_bytes(exp_bytes))
+                    "MoE re-target for %s: %s — admission prices the expert "
+                    "split (GPU need %s, experts ~%s to CPU)", model_key,
+                    ("full weights can never fit this card" if impossible_full
+                     else "the expert split is the default placement"),
+                    _human_bytes(need), _human_bytes(exp_bytes))
 
     def _moe_admit_verdict(evicted_list, freed_bytes) -> dict:
         """Commit + emit the MoE-split admit: n_gpu_layers=-1 + --n-cpu-moe

@@ -267,6 +267,22 @@ class ServeSpec:
     ctx_size: int = DEFAULT_LLAMA_CTX
     threads: int = DEFAULT_LLAMA_THREADS
     n_gpu_layers: int = DEFAULT_LLAMA_NGL
+    # Was ``n_gpu_layers`` ACTUALLY SPECIFIED by someone (persisted override /
+    # cfg.extra / a materialized k37 alloc_mode), or is the value above merely
+    # the fill-in default (DEFAULT_LLAMA_NGL, historically -1)?
+    #
+    # This matters because -1 is overloaded: it is BOTH the historical fill-in
+    # default AND a load-bearing explicit force ("Max GPU" — put every layer on
+    # the card; see slot_agent._effective_ngl). Downstream placement policies
+    # (notably the detected-MoE auto expert split in slot_agent._build_cmd) must
+    # fire when nobody asked for a layer count, and must NOT fire when a caller
+    # explicitly demanded -1. Collapsing the two made a 48 GB MoE launch with
+    # --n-gpu-layers -1 and no --n-cpu-moe onto a 24 GB card (ae, 2026-07-25).
+    #
+    # Wire note: this is a LOCAL spec field only. It is never serialized to a
+    # worker (central->worker relay ships model_dump()s of OTHER models under
+    # extra=forbid), so it cannot break the frozen relay schema.
+    ngl_explicit: bool = False
     always_on: bool = False   # modern default: on-demand, not a pinned unit
     ttl_seconds: Optional[int] = None
     user: str = LLAMA_SERVICE_USER
@@ -296,6 +312,25 @@ class ServeSpec:
     @property
     def swap_name(self) -> str:
         return _unit_slug(self.model_key)
+
+    @property
+    def slot_n_gpu_layers(self):
+        """``n_gpu_layers`` for a SLOT load, carrying its provenance.
+
+        Identical in value to :attr:`n_gpu_layers` (same int, same ``str()``,
+        same JSON), but when the value is only the fill-in default it is wrapped
+        in ``slot_agent._NglDefaulted`` so the slot's placement policy still
+        treats it as unset — which is what lets the detected-MoE auto expert
+        split fire instead of launching all 48 layers onto a 24 GB card.
+
+        Unit/swap/supervisor argv keep using :attr:`n_gpu_layers` unchanged."""
+        if self.ngl_explicit:
+            return self.n_gpu_layers
+        try:
+            from .slot_agent import _NglDefaulted
+        except Exception:  # noqa: BLE001 — slot module optional; degrade to the int
+            return self.n_gpu_layers
+        return _NglDefaulted(self.n_gpu_layers)
 
 
 def _ngl_for_alloc_mode(alloc_mode, model_file, extra) -> "int | None":
@@ -379,6 +414,13 @@ def serve_spec_for(model_key=None, *, cfg=None) -> ServeSpec:
     # byte-identical.
     mode_ngl = _ngl_for_alloc_mode(extra.get("alloc_mode"), model_file, extra)
 
+    # "Explicit" == somebody actually chose a layer placement: a materialized
+    # k37 alloc_mode, or a persisted/registry n_gpu_layers. Absent both, the
+    # spec's n_gpu_layers below is only DEFAULT_LLAMA_NGL — a fill-in, not a
+    # demand — and downstream policy (MoE auto-split) is free to override it.
+    ngl_explicit = (mode_ngl is not None
+                    or extra.get("n_gpu_layers") not in (None, ""))
+
     return ServeSpec(
         model_key=model_key,
         mode=mode,
@@ -389,6 +431,7 @@ def serve_spec_for(model_key=None, *, cfg=None) -> ServeSpec:
         threads=int(extra.get("threads") or DEFAULT_LLAMA_THREADS),
         n_gpu_layers=(int(mode_ngl) if mode_ngl is not None
                       else int(extra.get("n_gpu_layers", DEFAULT_LLAMA_NGL))),
+        ngl_explicit=ngl_explicit,
         always_on=bool(extra.get("always_on", False)),
         ttl_seconds=extra.get("ttl_seconds") or (None if extra.get("always_on", False) else LLAMA_SWAP_TTL),
         extra_args=tuple(extra_args),

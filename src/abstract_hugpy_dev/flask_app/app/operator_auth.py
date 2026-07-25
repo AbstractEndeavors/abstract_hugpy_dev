@@ -71,7 +71,7 @@ _SENSITIVE = [
     # dispatch-eligible, so gating it closes anonymous self-admission → SSRF.
     # (alloc-all = bulk GPU-allocation write for a selection of a worker's models
     #  — worker_routes._apply_alloc_map; same registry-write privilege as assign.)
-    ({"POST"},                   re.compile(r"^/llm/workers/[^/]+/(admit|block|admission|assign|unassign|alloc-all|unload|probe|pool|limits)$")),
+    ({"POST"},                   re.compile(r"^/llm/workers/[^/]+/(admit|block|admission|assign|unassign|alloc-all|unload|probe|pool|limits|load)$")),
     # Per-worker KEEP-WARM STAR ("star") — operator intent that projects onto the
     # fleet (which model a worker keeps warm; reconcile-kept every beat), same
     # registry-write privilege tier as assign. The GET map
@@ -151,13 +151,24 @@ _SENSITIVE = [
     # evict = targeted per-model RAM+VRAM reclaim (slot child kill / in-process
     # ref-drop / comfy /free) — a privileged destructive executor op on the box,
     # same operator-only tier as unload/free-ram.
-    ({"POST"},                   re.compile(r"^/llm/workers/[^/]+/(restart|update|pip|config|reap|reap-approve|pin-all|unpin-all|residency-all|free-ram|evict)$")),
+    # reap-orphans (k32) = kill a worker's own-venv GPU children whose slot
+    # claim cleared but whose process never exited — the ONE place central
+    # reaches a worker's raw PIDs (agent._reap_gpu_orphans, fail-closed 4-gate
+    # admission). Same operator-only, destructive-executor tier as evict/reap;
+    # dry_run defaults true so a bare POST previews before it ever kills.
+    ({"POST"},                   re.compile(r"^/llm/workers/[^/]+/(restart|update|pip|config|reap|reap-approve|reap-orphans|pin-all|unpin-all|residency-all|free-ram|evict)$")),
     # k14: relaunch a worker's slot child with a new GPU-offload depth / context
     # (the offload speed-cliff sweep lever). A privileged executor op on the box —
     # it STOP->RESPAWNs a llama-server child — so it sits in the same operator-only
     # tier as the other worker ops above. Two path segments (slot id + verb), so it
     # needs its own rule (the single-segment worker-verb rule does not match it).
     ({"POST"},                   re.compile(r"^/llm/workers/[^/]+/slots/[^/]+/relaunch$")),
+    # stranded-slot fix (2026-07-25): unconditional slot-id-addressed unload —
+    # kills whatever a slot's child currently is regardless of its model_key
+    # claim (the gap /evict's model_key-addressing and /reap-orphans' claimed-
+    # pid gate both miss). Same privileged-executor, operator-only tier as
+    # relaunch/evict; sibling rule (same two-segment shape as relaunch above).
+    ({"POST"},                   re.compile(r"^/llm/workers/[^/]+/slots/[^/]+/unload$")),
     # P3.1 agent-node fleet: the operator-facing routes only. GET /agent/nodes
     # (the fleet roster) and POST /agent/<id>/dispatch (queue a task on a node)
     # are operator intent — gated here too, belt-and-suspenders with the

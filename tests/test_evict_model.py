@@ -22,6 +22,18 @@ Covered here:
       never killed (no in-process drop, no slot unload);
   (6) an unknown/missing model_key is an idempotent no-op at HTTP 200 (never 500);
   (7) central relay POST /llm/workers/<id>/evict forwards to /ops/evict verbatim.
+  (8) HONEST accounting (2026-07-25 fix — the ae 44GB/35.6MB lie): the new
+      ``freed`` breakdown is measured PER-MODEL from ground truth (nvidia-smi
+      joined on child_pid + /proc rss split for slot; torch tensor bytes /
+      GGUF file size for in-process), never a box-wide MemAvailable delta.
+      comfy reports freed=None with a reason (no per-model attribution is
+      possible); not-resident reports zeros (nothing to free); the legacy
+      vram_freed/ram_freed keys stay present for wire back-compat.
+  (9) central relay POST /llm/workers/<id>/reap-orphans (k32 gap) forwards to
+      /ops/reap-orphans verbatim, and is operator-gated the same as evict.
+  (10) the stranded-slot fix: POST /slots/<slot_id>/unload unconditionally
+      tears down a slot's child regardless of its model_key claim (including
+      None/stale), and its central relay + operator gate exist.
 
 Runs like the other tests here: venv/bin/python tests/test_evict_model.py
 """
@@ -31,6 +43,9 @@ import types
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from worker_store_isolation import swap_worker_store
 
 # See test_residency_contention.py: managers/__init__ star-imports shadow the
 # subpackage attrs, so import_module to bind the REAL modules the agent uses.
@@ -292,6 +307,216 @@ try:
               and relayed.get("worker_id") == "ae")
     finally:
         wr._relay_worker_op = _relay_was
+
+    # --- (8) HONEST per-model accounting (fixes the ae 44GB/35.6MB lie) ---------
+    print("\n[8] honest _model_footprint_before_evict per host_mode")
+    _fp_save = {
+        "gpu": agent._gpu_process_vram,
+        "inproc": agent._inprocess_gpu_bytes,
+        "detail": agent._loaded_detail,
+    }
+    try:
+        # 8a: slot — nvidia-smi joined on child_pid + /proc rss split.
+        agent._gpu_process_vram = lambda: {4242: {"name": "llama-server", "mib": 42000}}
+        _sa = importlib.import_module("abstract_hugpy_dev.managers.serve.slot_agent")
+        _proc_rss_save = _sa._proc_rss_detail
+        _sa._proc_rss_detail = lambda pid: (
+            {"rss_anon_bytes": 1_500_000_000, "rss_file_bytes": 43_600_000_000}
+            if pid == 4242 else {})
+        try:
+            fp = agent._model_footprint_before_evict(
+                "slotmodel", "slot", {"child_pid": 4242, "control_url": "x"})
+        finally:
+            _sa._proc_rss_detail = _proc_rss_save
+        check("(8a) slot vram_bytes = nvidia-smi mib joined on child_pid",
+              fp["vram_bytes"] == 42000 * agent._MIB)
+        check("(8a) slot ram_anon_bytes = the HONEST pinned figure (rss_anon)",
+              fp["ram_anon_bytes"] == 1_500_000_000)
+        check("(8a) slot ram_file_bytes carried separately, never folded into anon",
+              fp["ram_file_bytes"] == 43_600_000_000)
+        check("(8a) measured_from names the real source", "nvidia-smi" in fp["measured_from"])
+
+        # 8b: slot — pid absent from nvidia-smi / /proc unreadable -> nulls, not 0s.
+        agent._gpu_process_vram = lambda: {}
+        _sa._proc_rss_detail = lambda pid: {}
+        fp = agent._model_footprint_before_evict(
+            "slotmodel", "slot", {"child_pid": 9999, "control_url": "x"})
+        check("(8b) unmeasurable slot vram -> None, never a fabricated number",
+              fp["vram_bytes"] is None)
+        check("(8b) unmeasurable slot ram -> None", fp["ram_anon_bytes"] is None
+              and fp["ram_file_bytes"] is None)
+
+        # 8c: in_process GGUF — file-backed bytes labeled, NOT claimed as anon RAM.
+        agent._loaded_detail = lambda: {"gguf-model": {"model_bytes": 44_000_000_000}}
+        agent._inprocess_gpu_bytes = lambda: {}
+        fp = agent._model_footprint_before_evict("gguf-model", "in_process")
+        check("(8c) in-process GGUF -> ram_file_bytes = the on-disk/mmap'd size",
+              fp["ram_file_bytes"] == 44_000_000_000)
+        check("(8c) in-process GGUF -> vram_bytes stays None (no GPU claim made)",
+              fp["vram_bytes"] is None)
+        check("(8c) measured_from documents it's file-backed, not pinned anon RAM",
+              "NOT pinned anon RAM" in fp["measured_from"])
+
+        # 8d: in_process torch — REAL per-model tensor sum, not a delta.
+        agent._loaded_detail = lambda: {}
+        agent._inprocess_gpu_bytes = lambda: {
+            "torch-model": {"vram_bytes": 8_000_000_000, "device": "cuda"}}
+        fp = agent._model_footprint_before_evict("torch-model", "in_process")
+        check("(8d) in-process torch -> vram_bytes = real per-model tensor sum",
+              fp["vram_bytes"] == 8_000_000_000)
+        check("(8d) measured_from cites torch tensor introspection, not a delta",
+              "not a delta" in fp["measured_from"])
+
+        # 8e: comfy — no per-model attribution is possible; None + reason, never a guess.
+        fp = agent._model_footprint_before_evict("comfy-model", "comfy")
+        check("(8e) comfy -> every byte field stays None (no fabricated box-wide guess)",
+              fp["vram_bytes"] is None and fp["ram_anon_bytes"] is None
+              and fp["ram_file_bytes"] is None)
+        check("(8e) comfy reason explains WHY (no per-model_key attribution possible)",
+              "no per-model_key attribution" in fp["measured_from"])
+
+        # 8f: not-resident -> zeros (genuinely nothing to free), not None.
+        fp = agent._model_footprint_before_evict("ghost", "none")
+        check("(8f) not-resident -> zeros, not null (there IS a definite answer: none)",
+              fp == {"vram_bytes": 0, "ram_anon_bytes": 0, "ram_file_bytes": 0,
+                     "measured_from": "not resident — nothing to free"})
+    finally:
+        agent._gpu_process_vram = _fp_save["gpu"]
+        agent._inprocess_gpu_bytes = _fp_save["inproc"]
+        agent._loaded_detail = _fp_save["detail"]
+
+    # --- (8g) end-to-end: /ops/evict's slot branch carries "freed" + legacy keys -
+    print("\n[8g] /ops/evict response carries BOTH the new 'freed' block and the "
+          "legacy vram_freed/ram_freed (wire back-compat)")
+    _restore_mem2 = _fixed_mem()
+    try:
+        agent._gpu_process_vram = lambda: {4242: {"name": "llama-server", "mib": 42000}}
+        _sa2 = importlib.import_module("abstract_hugpy_dev.managers.serve.slot_agent")
+        _sa2._proc_rss_detail = lambda pid: {"rss_anon_bytes": 1_500_000_000,
+                                             "rss_file_bytes": 43_600_000_000}
+        FakeSlotPool.calls.clear()
+        handle = {"control_url": "http://127.0.0.1:8101", "child_pid": 4242,
+                  "endpoint": "http://127.0.0.1:8101"}
+        agent._resolve_slot_handle = lambda mk: dict(handle) if mk == "slotmodel" else None
+        client, _ = new_client()
+        r = client.post("/ops/evict", json={"model_key": "slotmodel"})
+        b = r.get_json()
+        check("(8g) legacy vram_freed/ram_freed keys still present (wire back-compat)",
+              b["vram_freed"] == 4000 and b["ram_freed"] == 7000)
+        check("(8g) new 'freed' block present with the honest per-model figures",
+              b["freed"]["vram_bytes"] == 42000 * agent._MIB
+              and b["freed"]["ram_anon_bytes"] == 1_500_000_000)
+        agent._resolve_slot_handle = lambda mk: None
+    finally:
+        _restore_mem2()
+        agent._gpu_process_vram = _fp_save["gpu"]
+
+    # --- (9) central relay: POST /llm/workers/<id>/reap-orphans (k32 gap) -------
+    print("\n[9] central relay for reap-orphans (k32) + operator gate")
+    relayed.clear()
+    wr._relay_worker_op = _fake_relay
+    try:
+        _a = Flask(__name__)
+        _a.register_blueprint(wr.worker_bp)
+        c = _a.test_client()
+        r = c.post("/llm/workers/ae/reap-orphans", json={"dry_run": False})
+        check("(9a) relay route forwards to worker /ops/reap-orphans",
+              relayed.get("op_path") == "/ops/reap-orphans"
+              and relayed.get("action") == "reap-orphans")
+        check("(9a) relay passes dry_run through unchanged",
+              relayed.get("body") == {"dry_run": False}
+              and relayed.get("worker_id") == "ae")
+    finally:
+        wr._relay_worker_op = _relay_was
+
+    oa = importlib.import_module("abstract_hugpy_dev.flask_app.app.operator_auth")
+    import os as _os2
+    _auth_mode_was = _os2.environ.get("HUGPY_AUTH_MODE")
+    _token_was = _os2.environ.get("HUGPY_OPERATOR_TOKEN")
+    _os2.environ["HUGPY_AUTH_MODE"] = "open"
+    _os2.environ["HUGPY_OPERATOR_TOKEN"] = "s3cret"
+    try:
+        _gate_app = Flask(__name__)
+        _gate_app.register_blueprint(wr.worker_bp)
+        oa.install_operator_gate(_gate_app)
+        gc = _gate_app.test_client()
+        r = gc.post("/llm/workers/ae/reap-orphans", json={})
+        check("(9b) reap-orphans WITHOUT operator token -> 401 (operator-gated)",
+              r.status_code == 401)
+    finally:
+        if _auth_mode_was is None:
+            _os2.environ.pop("HUGPY_AUTH_MODE", None)
+        else:
+            _os2.environ["HUGPY_AUTH_MODE"] = _auth_mode_was
+        if _token_was is None:
+            _os2.environ.pop("HUGPY_OPERATOR_TOKEN", None)
+        else:
+            _os2.environ["HUGPY_OPERATOR_TOKEN"] = _token_was
+
+    # --- (10) stranded-slot fix: unconditional /slots/<id>/unload ---------------
+    print("\n[10] stranded-slot fix: POST /slots/<slot_id>/unload (model_key-independent)")
+    FakeSlotPool.calls.clear()
+    _statuses_save = None
+    try:
+        class _StatusSlotPool(FakeSlotPool):
+            def statuses(self):
+                return [{"slot_id": "1", "model_key": None, "child_pid": 7777,
+                         "_control": "http://127.0.0.1:8101"}]
+        slots.SlotPool = _StatusSlotPool
+        client, _ = new_client()
+        r = client.post("/slots/1/unload", json={})
+        b = r.get_json()
+        check("(10a) unload fires even though model_key is None (the stranding case)",
+              r.status_code == 200 and b["ok"] is True
+              and b["model_key_before"] is None and b["child_pid_before"] == 7777)
+        check("(10a) the slot's control url actually got .unload()'d",
+              FakeSlotPool.calls == ["http://127.0.0.1:8101"])
+
+        # unknown slot id -> 404, never a silent no-op
+        client, _ = new_client()
+        r = client.post("/slots/99/unload", json={})
+        check("(10b) unknown slot id -> 404", r.status_code == 404)
+    finally:
+        slots.SlotPool = FakeSlotPool
+
+    # central relay + operator gate for the new route
+    relayed.clear()
+    wr._relay_worker_op = _fake_relay
+    try:
+        with swap_worker_store(prefix="hugpy-evict-workers-"):
+            Wm = importlib.import_module(
+                "abstract_hugpy_dev.flask_app.app.functions.imports.utils.workers")
+            Wm.worker_store.register(name="ae", url="http://192.0.2.9:9100",
+                                     worker_id="ae")
+            _a = Flask(__name__)
+            _a.register_blueprint(wr.worker_bp)
+            c = _a.test_client()
+            r = c.post("/llm/workers/ae/slots/1/unload", json={})
+            check("(10c) relay route forwards to worker /slots/<id>/unload",
+                  relayed.get("op_path") == "/slots/1/unload"
+                  and relayed.get("action") == "slot-unload")
+    finally:
+        wr._relay_worker_op = _relay_was
+
+    _os2.environ["HUGPY_AUTH_MODE"] = "open"
+    _os2.environ["HUGPY_OPERATOR_TOKEN"] = "s3cret"
+    try:
+        _gate_app2 = Flask(__name__)
+        _gate_app2.register_blueprint(wr.worker_bp)
+        oa.install_operator_gate(_gate_app2)
+        gc2 = _gate_app2.test_client()
+        r = gc2.post("/llm/workers/ae/slots/1/unload", json={})
+        check("(10d) slot unload WITHOUT operator token -> 401 (operator-gated)",
+              r.status_code == 401)
+    finally:
+        if _auth_mode_was is None:
+            _os2.environ.pop("HUGPY_AUTH_MODE", None)
+        else:
+            _os2.environ["HUGPY_AUTH_MODE"] = _auth_mode_was
+        if _token_was is None:
+            _os2.environ.pop("HUGPY_OPERATOR_TOKEN", None)
+        else:
+            _os2.environ["HUGPY_OPERATOR_TOKEN"] = _token_was
 
 finally:
     agent._model_framework = _SAVE["framework"]

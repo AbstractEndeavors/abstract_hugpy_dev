@@ -26,6 +26,8 @@ public-vs-internal curation the /endpoints inspector surfaces:
         GET    /agent/install/<link_id>        one-time templated .py download (link capability)
         GET    /agent/install/<link_id>.sh     POSIX wrapper (free fetch; .py is the use)
         GET    /agent/install/<link_id>.ps1    Windows wrapper (free fetch; .py is the use)
+        GET    /agent/install/<link_id>.zip    macOS double-click archive (free fetch; .py is the use)
+        GET    /agent/install/<link_id>.pkg    macOS Installer package (free fetch; .py is the use)
 
 Gates, all fail-closed:
   * ``register`` is the unauthenticated bootstrap (a node has no credential
@@ -370,10 +372,19 @@ def agent_client_sh():
 # same structural rule as the video-share links). The download GET itself is
 # gated by the link_id (an unguessable secrets.token_urlsafe capability).
 #
-# Use counting: only the .py fetch consumes a use. The .sh/.ps1 wrappers are
-# free (audited but not decremented) so the one-liner
+# Use counting: only the .py fetch consumes a use. The .sh/.ps1/.zip/.pkg
+# wrappers are free (audited but not decremented) so the one-liner
 #     curl -fsSL <base>/agent/install/<link_id>.sh | bash
-# — which fetches the wrapper AND then the .py — costs exactly ONE use.
+# — which fetches the wrapper AND then the .py — costs exactly ONE use. The
+# .zip (2026-07-25, field report: a macOS tester downloaded the raw .sh from
+# a browser and hit "Permission denied" — browsers strip +x on download) is
+# the SAME free pattern: it's an archive containing an already-executable
+# .command file that, when double-clicked LATER, runs the identical .sh
+# one-liner — so downloading the zip itself never consumes the link either.
+# The .pkg (tier 2, 2026-07-25) is the same rule for the same reason: the
+# package installs nothing itself, its postinstall runs that identical .sh
+# one-liner at install time — a use-eating download would break the very
+# install it exists to enable.
 
 def _install_links_mod():
     from ..functions.imports.utils import install_links
@@ -407,16 +418,25 @@ def _find_installer_py() -> "str | None":
 
 
 _EMBED_LINE = 'EMBEDDED_API_KEY = ""'
+_ICON_BASE_LINE = 'EMBEDDED_ICON_BASE = ""'
 
 
-def _template_installer(source: str, raw_key: str) -> "str | None":
-    """Replace the installer's EMBEDDED_API_KEY slot with the raw key.
-    Returns None if the slot line is missing (installer drifted — refuse to
-    serve an un-keyed download from a one-time link)."""
+def _template_installer(source: str, raw_key: str,
+                        icon_base: str = "") -> "str | None":
+    """Replace the installer's EMBEDDED_API_KEY slot with the raw key, and (if
+    present) the EMBEDDED_ICON_BASE slot with this deployment's public base so
+    the launcher step can fetch the mark. Returns None if the KEY slot is
+    missing (installer drifted — refuse to serve an un-keyed download from a
+    one-time link). The icon slot is OPTIONAL: an older installer without it
+    still serves fine (iconless launcher), so its absence never fails."""
     if _EMBED_LINE not in source:
         return None
-    # repr() the key so any quoting is safe; the slot is a plain assignment.
-    return source.replace(_EMBED_LINE, f"EMBEDDED_API_KEY = {raw_key!r}", 1)
+    # repr() so any quoting is safe; each slot is a plain assignment.
+    out = source.replace(_EMBED_LINE, f"EMBEDDED_API_KEY = {raw_key!r}", 1)
+    if _ICON_BASE_LINE in out:
+        out = out.replace(_ICON_BASE_LINE,
+                          f"EMBEDDED_ICON_BASE = {(icon_base or '')!r}", 1)
+    return out
 
 
 @agent_bp.route("/agent/install-links", methods=["POST"])
@@ -425,7 +445,14 @@ def install_link_create():
     Body: {label (required), scopes (default ["v1"]), key_expires_at? (epoch s
     or ISO-8601), link_ttl_s (default 86400), max_uses (default 1)}.
     Returns {url, link_id, label, scopes, expires_at, max_uses, uses_left,
-    key_id, status} — NEVER the raw key."""
+    key_id, status, commands: {linux, macos, windows},
+    downloads: {macos_zip, macos_pkg?}} — NEVER the raw key.
+    ``macos_pkg`` appears only where central can build one (see
+    ``_install_downloads`` / ``_pkg_missing_tools``).
+    ``commands`` is a ready-to-paste string per platform built from ``url``
+    (see ``_install_commands``) — additive, 2026-07-25. ``downloads`` is the
+    downloadable-archive counterpart for the double-click flow (see
+    ``_install_downloads``) — additive, 2026-07-25."""
     _require_operator_strict()
     body = request.get_json(silent=True) or {}
     label = (body.get("label") or "").strip()
@@ -456,7 +483,71 @@ def install_link_create():
     except ValueError as exc:
         abort(400, description=str(exc))
     link["url"] = f"{_install_public_base()}/agent/install/{link['link_id']}"
+    link["commands"] = _install_commands(link["url"])
+    link["downloads"] = _install_downloads(link["url"])
     return jsonify(link), 201
+
+
+def _install_commands(url: str, posix_args: str = "") -> dict:
+    """Ready-to-paste command per platform, built HERE from the link's own
+    url — so no consumer (console UI, a script, an operator's shell history)
+    ever hand-builds these strings itself.
+
+    ``linux`` and ``macos`` are the IDENTICAL ``curl | bash`` one-liner: the
+    ``.sh`` wrapper (``_SH_WRAPPER`` above) is plain POSIX sh that locates
+    python3 generically and works unmodified on both. macOS gets its own map
+    key purely for DISCOVERABILITY in the console (a mac operator scanning
+    for "mac" should find a command without having to know Linux and macOS
+    share a wrapper) — not because the command differs.
+    ``windows`` uses the ``.ps1`` wrapper via PowerShell's ``irm | iex``
+    idiom, the Windows-native equivalent of ``curl | bash``.
+
+    ``posix_args`` (additive, 2026-07-25, default "" = byte-identical to the
+    previous behavior) appends arguments to the POSIX one-liner via
+    ``bash -s -- <args>`` — the only way to pass arguments THROUGH the
+    ``curl | bash`` idiom (the ``.sh`` wrapper forwards ``"$@"`` to the .py).
+    Its one caller today is the ``.pkg`` postinstall, which must pass
+    ``--no-launch``: an Installer package has no terminal to hand the
+    interactive console TUI to. The mint's copy-paste ``commands`` never pass
+    args, so what the console shows is unchanged. Windows is deliberately
+    untouched — ``irm | iex`` has no equivalent arg pass-through and no caller
+    needs one."""
+    posix_one_liner = f"curl -fsSL {url}.sh | bash"
+    if posix_args:
+        posix_one_liner += f" -s -- {posix_args}"
+    return {
+        "linux": posix_one_liner,
+        "macos": posix_one_liner,
+        "windows": f"irm {url}.ps1 | iex",
+    }
+
+
+def _install_downloads(url: str) -> dict:
+    """Ready-to-use downloadable-archive URL(s), built HERE from the link's
+    own url — the same "no consumer hand-builds this" rule ``_install_commands``
+    follows.
+
+    ``macos_zip`` (tier 1) is the double-click counterpart to the ``.sh``
+    one-liner for operators who'd rather hand a field tester a file than a
+    terminal command. Field report 2026-07-25: a macOS tester downloaded the
+    raw ``.sh`` from a browser and hit "Permission denied" (browsers strip the
+    executable bit on download), then fumbled a chmod before the curl one-liner
+    worked. An archive preserves +x on extraction — see ``_serve_install_zip``
+    for the ``.command`` payload that URL serves.
+
+    ``macos_pkg`` (tier 2) is the native Installer package — an installer
+    WINDOW instead of a Terminal. It is OMITTED, not merely broken, on a
+    central host without the build toolchain (``_pkg_missing_tools``): prod
+    central runs on ``ae``, which has no mkbom/xar, and the console must not
+    offer a button that cannot work. Availability is therefore
+    deployment-dependent — consumers must check for the key rather than
+    hand-building the URL."""
+    downloads = {
+        "macos_zip": f"{url}.zip",
+    }
+    if not _pkg_missing_tools():
+        downloads["macos_pkg"] = f"{url}.pkg"
+    return downloads
 
 
 def _install_public_base() -> str:
@@ -534,7 +625,7 @@ def _serve_install_py(link_id: str):
         abort(410, description=(
             "This install link is no longer valid — it was used up, expired, "
             "or revoked. Ask the console owner to mint a fresh one."))
-    body = _template_installer(source, raw_key)
+    body = _template_installer(source, raw_key, icon_base=_install_public_base())
     if body is None:
         # The slot line drifted out of the installer: refuse rather than serve
         # an un-keyed installer from a link that just consumed a use.
@@ -634,15 +725,458 @@ def _serve_install_wrapper(link_id: str, kind: str):
     return resp
 
 
+_COMMAND_WRAPPER = """#!/bin/sh
+# hugpy Agent installer (double-click launcher).
+# Double-clicking this file installs hugpy Agent on this Mac. It just runs
+# the same one-liner the console also offers to paste into a terminal — the
+# archive around it exists only so Finder preserves the executable bit that
+# browsers strip from a bare downloaded .sh (field report 2026-07-25).
+{one_liner}
+ec=$?
+echo
+echo "[hugpy installer exited with status $ec]"
+printf "Press Enter to close..."
+read -r _
+exit "$ec"
+"""
+
+
+def _serve_install_zip(link_id: str):
+    """The macOS double-click archive: a .zip containing ONE already-executable
+    ``.command`` file. FREE fetch — identical gate/audit pattern to
+    ``_serve_install_wrapper`` (``peek_active`` -> 410 if dead,
+    ``note_wrapper_fetch(..., kind="zip")`` audits without decrementing). The
+    archive itself installs nothing; the ``.command`` inside still calls the
+    ``.sh`` wrapper (which fetches the ``.py``) when the user actually
+    double-clicks it later — THAT later fetch is the one use-consuming step,
+    exactly like the curl one-liner offered alongside it.
+
+    Archives (unlike a bare file download) preserve the +x bit on extraction,
+    so double-clicking the extracted ``.command`` just works in Finder/Terminal
+    instead of "Permission denied" — the fix for the 2026-07-25 macOS field
+    report. Shipped as a .zip rather than a .dmg: this VM has no image tooling
+    (genisoimage/xorriso/hdiutil/mkfs.hfsplus all verified absent) and a .zip
+    is functionally identical for this purpose (keeper decision, 2026-07-25)."""
+    import io
+    import zipfile
+    from flask import Response
+    mod = _install_links_mod()
+    if not mod.peek_active(link_id):
+        abort(410, description=(
+            "This install link is no longer valid — it was used up, expired, "
+            "or revoked. Ask the console owner to mint a fresh one."))
+    remote = (request.headers.get("X-Forwarded-For") or
+              request.remote_addr or "").split(",")[0].strip()
+    mod.note_wrapper_fetch(link_id, remote_addr=remote, kind="zip")
+    # Same py_url derivation every wrapper uses — never hand-rolled.
+    url = f"{_install_public_base()}/agent/install/{link_id}"
+    one_liner = _install_commands(url)["macos"]
+    command_body = _COMMAND_WRAPPER.format(one_liner=one_liner)
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        info = zipfile.ZipInfo("Install hugpy Agent.command")
+        info.external_attr = (0o100755 << 16)  # mode 0755, regular file, executable
+        info.compress_type = zipfile.ZIP_DEFLATED
+        zf.writestr(info, command_body)
+    zip_bytes = buf.getvalue()
+
+    resp = Response(zip_bytes, mimetype="application/zip")
+    resp.headers["Content-Disposition"] = (
+        'attachment; filename="hugpy-agent-installer.zip"')
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+# ── macOS .pkg installer (tier 2, 2026-07-25) ──────────────────────────────
+# Tier 1 (.zip → .command) still shows the user a Terminal. Tier 2 gives them
+# the native macOS experience: double-click → an Installer WINDOW. The package
+# is a flat, scripts-only COMPONENT package (PackageInfo at the xar root, no
+# Distribution / product archive — fewer moving parts, and Installer.app opens
+# a component package directly). It ships ZERO payload: all it does is run a
+# postinstall that executes the same one-liner as every other tier.
+#
+# UNSIGNED, by operator decision (no $99 Apple Developer ID): the first run
+# needs right-click → Open, or System Settings → Privacy & Security → "Open
+# Anyway" on macOS 15+. Nothing here can change that; the console copy says so.
+#
+# PROD PARITY: building a .pkg needs bomutils' mkbom and xar, neither of which
+# is packaged for the distro — they were compiled from source on the dev VM.
+# Prod central (host ae) does NOT have them, so this route degrades honestly:
+# ``_pkg_missing_tools`` is probed ONCE per process, the route 501s with the
+# missing binaries named (never a 500, never a truncated file), and the mint's
+# ``downloads`` map omits ``macos_pkg`` entirely so the console never renders a
+# button that cannot work.
+_PKG_IDENTIFIER = "ai.hugpy.agent.installer"
+_PKG_VERSION = "1.0"
+
+# mkbom + xar are the two that must be built from source (the real prod-parity
+# gate). cpio is listed because the canonical recipe pipes the payload through
+# it: a host without cpio genuinely cannot build a package either, and omitting
+# it from the probe would turn that into a 500 instead of an honest 501.
+_PKG_TOOL_BINARIES = ("mkbom", "xar", "cpio")
+_pkg_missing_tools_cache = None
+
+
+def _pkg_missing_tools() -> list:
+    """Which of the .pkg build binaries are absent from this host's PATH.
+
+    Probed ONCE per process and cached — never a shell-out per request. The
+    empty list means "this central can build .pkg installers"; anything else is
+    the reason it cannot, verbatim, for the 501 body and for the mint's
+    decision to omit ``macos_pkg``."""
+    global _pkg_missing_tools_cache
+    if _pkg_missing_tools_cache is None:
+        import shutil
+        _pkg_missing_tools_cache = tuple(
+            b for b in _PKG_TOOL_BINARIES if shutil.which(b) is None)
+    return list(_pkg_missing_tools_cache)
+
+
+_PKG_INFO_XML = f"""<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<pkg-info format-version="2" identifier="{_PKG_IDENTIFIER}" \
+version="{_PKG_VERSION}" install-location="/" auth="root">
+    <payload numberOfFiles="0" installKBytes="0"/>
+    <scripts>
+        <postinstall file="postinstall"/>
+    </scripts>
+</pkg-info>
+"""
+
+# The one-liner is substituted with .replace(), NOT .format(): this is a shell
+# script full of ``${...}`` expansions and ``{ ...; }`` groups, and doubling
+# every brace to survive str.format is exactly the kind of transcription bug a
+# package with no visible output would hide.
+_ONE_LINER_TOKEN = "__HUGPY_INSTALL_ONE_LINER__"
+
+# RAW string: the script's trailing ``\`` line continuations and printf's
+# literal ``\n`` must reach the shell as written.
+_PKG_POSTINSTALL = r"""#!/bin/sh
+# hugpy Agent installer — macOS .pkg postinstall (generated per install link).
+#
+# Installer runs this as ROOT, so nothing may land in root's home: the console
+# (logged-in) user is derived first and the whole install runs as them.
+#
+# DIAGNOSTICS: a .pkg hides all output — postinstall stdout goes to the
+# invisible installer log, and terminal output is what diagnosed every field
+# bug this installer has had. So everything below is tee'd to
+# <home>/hugpy-agent/install.log (beside the venv and .env the installer
+# writes), and any failure exits NONZERO so Installer reports a failure instead
+# of a false success.
+set -u
+
+TOOL="hugpy Agent installer (.pkg)"
+# The install itself: the SAME one-liner the console offers for macOS and the
+# tier-1 .command runs, for THIS link — plus --no-launch, because an Installer
+# package has no terminal to hand the interactive console TUI to. The GUI way
+# in is the ~/Applications launcher the installer writes.
+ONE_LINER=__HUGPY_INSTALL_ONE_LINER__
+
+fail() {
+    echo "$TOOL: $1" >&2
+    exit 1
+}
+
+# ── 1. install FOR the logged-in user, never for root ──────────────────────
+u=$(/usr/bin/stat -f%Su /dev/console 2>/dev/null || true)
+if [ -z "$u" ] || [ "$u" = "root" ]; then
+    u=${SUDO_USER-}
+fi
+if [ -z "$u" ] || [ "$u" = "root" ]; then
+    echo "$TOOL: no logged-in user found (console owner: root/unknown)." >&2
+    echo "Nobody is signed in at this Mac's GUI, so there is no home directory" >&2
+    echo "to install into. Install from a terminal instead:" >&2
+    echo "  $ONE_LINER" >&2
+    exit 1
+fi
+
+home=$(/usr/bin/dscl . -read "/Users/$u" NFSHomeDirectory 2>/dev/null \
+       | /usr/bin/sed -n 's/^NFSHomeDirectory: //p')
+if [ -z "$home" ] || [ ! -d "$home" ]; then
+    home="/Users/$u"
+fi
+[ -d "$home" ] || fail "home directory for '$u' not found ($home)."
+[ -x /usr/bin/script ] || fail "/usr/bin/script is missing from this Mac (it is what gives the installer a terminal)."
+[ -x /bin/bash ] || fail "/bin/bash is missing from this Mac (the install one-liner pipes into bash)."
+
+# ── 2. the log — the whole point, since a .pkg shows the user nothing ──────
+ws="$home/hugpy-agent"
+mkdir -p "$ws" || fail "cannot create $ws"
+chown "$u" "$ws" 2>/dev/null || true
+LOG="$ws/install.log"
+touch "$LOG" 2>/dev/null || fail "cannot write $LOG"
+chown "$u" "$LOG" 2>/dev/null || true
+
+# ── 3. run it as that user, on a pty, teeing every byte to the log ─────────
+tmp=$(mktemp -d /tmp/hugpy-agent-pkg.XXXXXX) || fail "mktemp failed"
+trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+chown "$u" "$tmp" 2>/dev/null || true
+run="$tmp/run.sh"
+{
+    echo '#!/bin/bash'
+    # pipefail: `curl … | bash` reports BASH's status, so a curl that fails
+    # (dead link, no network) would otherwise look like a clean install —
+    # bash just gets an empty script and exits 0. bash is not a new
+    # dependency here: the one-liner itself pipes into bash.
+    # NOT `set -o pipefail 2>/dev/null || true`: on a shell without pipefail
+    # a failed `set` is fatal to the whole script (dash exits 2 outright,
+    # measured) and a .pkg would show nobody why. Hence an explicit bash.
+    echo 'set -o pipefail'
+    printf '%s\n' "$ONE_LINER"
+    echo 'echo "$?" > "$0.rc"'
+} > "$run" || fail "cannot write $run"
+chmod 755 "$run"
+chown "$u" "$run" 2>/dev/null || true
+
+{
+    echo "=== $TOOL === $(date)"
+    echo "user      : $u"
+    echo "home      : $home"
+    echo "workspace : $ws"
+    echo "command   : $ONE_LINER"
+    echo
+    # /usr/bin/script gives the child a CONTROLLING TERMINAL. The shared .sh
+    # wrapper re-attaches stdin to /dev/tty whenever stdin is not a tty (under
+    # `curl | bash` it is the curl pipe, always); with no controlling terminal
+    # that redirect fails ENXIO and NOTHING would install. A pty makes it
+    # succeed, and puts the install in the same terminal-ish environment the
+    # .command tier runs in.
+    # sudo -u -H: run as the console user with THEIR home (the installer keys
+    # everything off ~). Chosen over `launchctl asuser <uid>` because it also
+    # works with no GUI session (`installer -pkg …` over ssh, a supported
+    # route) and nothing here needs the user's Aqua bootstrap namespace — it is
+    # venv + pip + files under ~ and a `sips` icon convert, no window server.
+    /usr/bin/sudo -u "$u" -H /usr/bin/script -q /dev/null /bin/bash "$run"
+    echo
+} 2>&1 | tee -a "$LOG"
+
+# The status of the INSTALL, not of tee: run.sh writes its own rc beside
+# itself, so nothing here depends on `script` propagating an exit code.
+rc=$(cat "$run.rc" 2>/dev/null || true)
+case "${rc:-}" in
+    ''|*[!0-9]*) rc=1 ;;
+esac
+chown "$u" "$LOG" 2>/dev/null || true
+
+if [ "$rc" -ne 0 ]; then
+    echo "$TOOL: FAILED (status $rc) — full output: $LOG" | tee -a "$LOG" >&2
+    exit "$rc"
+fi
+echo "$TOOL: done — open 'hugpy Agent' from ~/Applications (log: $LOG)." \
+    | tee -a "$LOG"
+exit 0
+"""
+
+
+def _cpio_odc_gz(src_dir, dest: str) -> None:
+    """``(cd src_dir && find . | cpio -o --format odc --owner 0:80 | gzip -c)
+    > dest`` — the canonical recipe's payload pipeline, run without a shell.
+
+    ``src_dir=None`` writes an EMPTY archive (cpio fed nothing, i.e. the cpio
+    trailer only). That is the zero-payload Payload: it matches
+    ``numberOfFiles="0"`` and, deliberately, carries not even a ``.`` entry —
+    with ``install-location="/"`` a ``.`` owned 0:80 would be an ownership
+    change applied to the root of the target volume."""
+    import gzip as _gzip
+    import subprocess
+    listing = b""
+    if src_dir is not None:
+        listing = subprocess.run(["find", "."], cwd=src_dir, check=True,
+                                 capture_output=True).stdout
+    archive = subprocess.run(
+        ["cpio", "-o", "--format", "odc", "--owner", "0:80"],
+        cwd=(src_dir or "/"), input=listing, check=True,
+        capture_output=True).stdout
+    with open(dest, "wb") as fh:
+        fh.write(_gzip.compress(archive))
+
+
+def _build_component_pkg(postinstall: str) -> bytes:
+    """Assemble the flat scripts-only component package and return its BYTES.
+
+    Everything happens inside one mkdtemp that is removed in ``finally`` — the
+    route streams bytes, never a file path, so a concurrent fetch, an aborted
+    download or a build failure can't leave anything behind.
+
+    The bomutils canonical linux recipe, followed exactly:
+        mkbom -u 0 -g 80 <root> Bom
+        (cd <root> && find . | cpio -o --format odc --owner 0:80 | gzip -c) > Payload
+        xar --compression none -cf out.pkg PackageInfo Bom Payload Scripts
+    with ``<root>`` an EMPTY directory (mkbom over an empty tree yields the
+    0-path Bom that ``pkgbuild --nopayload`` also produces) and ``Scripts`` the
+    same cpio.gz pipeline over a directory holding just ``postinstall`` at 0755.
+
+    Raises RuntimeError on any tool failure — the route turns that into a 501,
+    never a 500 and never a half-written package."""
+    import shutil
+    import subprocess
+    import tempfile
+    missing = _pkg_missing_tools()
+    if missing:
+        raise RuntimeError(f"missing build tools: {', '.join(missing)}")
+    tmp = tempfile.mkdtemp(prefix="hugpy-agent-pkg-")
+    try:
+        payload_root = os.path.join(tmp, "payload_root")   # stays empty
+        scripts_root = os.path.join(tmp, "scripts")
+        pkg_root = os.path.join(tmp, "pkgroot")
+        for d in (payload_root, scripts_root, pkg_root):
+            os.makedirs(d, exist_ok=True)
+
+        with open(os.path.join(pkg_root, "PackageInfo"), "w",
+                  encoding="utf-8") as fh:
+            fh.write(_PKG_INFO_XML)
+        script_path = os.path.join(scripts_root, "postinstall")
+        with open(script_path, "w", encoding="utf-8") as fh:
+            fh.write(postinstall)
+        os.chmod(script_path, 0o755)
+
+        try:
+            subprocess.run(
+                [shutil.which("mkbom") or "mkbom", "-u", "0", "-g", "80",
+                 payload_root, os.path.join(pkg_root, "Bom")],
+                check=True, capture_output=True)
+            _cpio_odc_gz(None, os.path.join(pkg_root, "Payload"))
+            _cpio_odc_gz(scripts_root, os.path.join(pkg_root, "Scripts"))
+            out = os.path.join(tmp, "hugpy-agent-installer.pkg")
+            subprocess.run(
+                [shutil.which("xar") or "xar", "--compression", "none",
+                 "-cf", out, "PackageInfo", "Bom", "Payload", "Scripts"],
+                cwd=pkg_root, check=True, capture_output=True)
+        except (subprocess.CalledProcessError, OSError) as exc:
+            detail = getattr(exc, "stderr", None) or b""
+            if isinstance(detail, bytes):
+                detail = detail.decode("utf-8", "replace")
+            raise RuntimeError(f"{exc}: {detail[:400]}") from exc
+        with open(out, "rb") as fh:
+            data = fh.read()
+        # "Never a corrupt file": the only thing that leaves this function is a
+        # buffer that starts with the xar magic. Anything else is a 501.
+        if data[:4] != b"xar!":
+            raise RuntimeError(
+                f"xar wrote no archive (got {len(data)} bytes, bad magic)")
+        return data
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _serve_install_pkg(link_id: str):
+    """The macOS Installer package (tier 2): double-click → an installer
+    window, no Terminal. FREE fetch — the identical gate/audit pattern as
+    ``_serve_install_wrapper``/``_serve_install_zip`` (``peek_active`` -> 410 if
+    dead, ``note_wrapper_fetch(..., kind="pkg")`` audits without decrementing).
+    LOAD-BEARING: the package's postinstall fetches the ``.sh`` wrapper (which
+    fetches the ``.py``) at INSTALL time, so a use-eating download here would
+    consume the only use and break the install it exists to enable.
+
+    Content type is ``application/octet-stream``: with an explicit attachment
+    disposition every browser just saves the file, and nothing tries to be
+    clever about it (the historical ``application/x-newton-compatible-pkg``
+    exists only to stop very old Safari from auto-expanding — the disposition
+    header covers that, and octet-stream is what curl/wget/every proxy expect).
+
+    Order of checks is deliberate: link validity first, so a revoked link 410s
+    identically on every deployment; then the toolchain, so a host that cannot
+    build one says 501 BEFORE any wrapper fetch is audited (an audit line means
+    a wrapper was actually delivered)."""
+    import shlex
+    from flask import Response
+    mod = _install_links_mod()
+    if not mod.peek_active(link_id):
+        abort(410, description=(
+            "This install link is no longer valid — it was used up, expired, "
+            "or revoked. Ask the console owner to mint a fresh one."))
+    missing = _pkg_missing_tools()
+    if missing:
+        abort(501, description=(
+            "This central cannot build the macOS .pkg installer: "
+            + ", ".join(missing) + " not installed on the central host "
+            "(mkbom comes from bomutils, xar must be built from source). "
+            "Use the .zip download or the macOS curl one-liner instead — both "
+            "install exactly the same thing."))
+    remote = (request.headers.get("X-Forwarded-For") or
+              request.remote_addr or "").split(",")[0].strip()
+    mod.note_wrapper_fetch(link_id, remote_addr=remote, kind="pkg")
+    # Same url derivation every wrapper uses — never hand-rolled. --no-launch:
+    # there is no terminal for the console TUI inside an Installer run.
+    url = f"{_install_public_base()}/agent/install/{link_id}"
+    one_liner = _install_commands(url, posix_args="--no-launch")["macos"]
+    # shlex.quote: the one-liner carries a url built partly from request
+    # headers, and it is about to become a shell assignment on someone's Mac.
+    postinstall = _PKG_POSTINSTALL.replace(_ONE_LINER_TOKEN,
+                                           shlex.quote(one_liner))
+    try:
+        pkg_bytes = _build_component_pkg(postinstall)
+    except Exception as exc:                       # tools present but failed
+        logger.error("install link %s…: .pkg build failed: %s",
+                     link_id[:8], exc)
+        abort(501, description=(
+            f"The macOS .pkg build failed on this central host ({exc}). "
+            "Use the .zip download or the macOS curl one-liner instead."))
+    resp = Response(pkg_bytes, mimetype="application/octet-stream")
+    resp.headers["Content-Disposition"] = (
+        'attachment; filename="hugpy-agent-installer.pkg"')
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+# ── installer launcher icons (public, keyless) ─────────────────────────────
+# The installer's desktop/start-menu launcher decorates itself with the hugpy
+# mark, fetched from central at install time (not shipped as package data — no
+# PyPI churn, refreshes on a link re-run, degrades to iconless on any failure).
+# Public GETs, same posture as /agent/client.sh and the /agent/install/<id>
+# download (NOT in operator_auth._SENSITIVE): an icon carries no secret.
+# Stable committed assets (see installer_assets/generate_icons.py); served as
+# static bytes, open-per-request like the .py/.sh download neighbors.
+_ICON_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "installer_assets")
+
+
+def _serve_installer_icon(filename: str, mimetype: str):
+    from flask import Response
+    path = os.path.join(_ICON_DIR, filename)
+    if not os.path.isfile(path):
+        abort(404, description=f"Installer icon {filename} not on this deployment.")
+    with open(path, "rb") as fh:
+        data = fh.read()
+    resp = Response(data, mimetype=mimetype)
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
+
+
+@agent_bp.route("/agent/install/icon.png", methods=["GET"])
+def install_icon_png():
+    """Public: the hugpy mark as a PNG for the Linux .desktop Icon=."""
+    return _serve_installer_icon("hugpy-icon.png", "image/png")
+
+
+@agent_bp.route("/agent/install/icon.ico", methods=["GET"])
+def install_icon_ico():
+    """Public: the hugpy mark as a multi-size .ico for the Windows .lnk
+    IconLocation."""
+    return _serve_installer_icon("hugpy-icon.ico", "image/x-icon")
+
+
 @agent_bp.route("/agent/install/<link_id>", methods=["GET"])
 def install_download(link_id):
     """The one-time download. ``<link_id>`` bare serves the templated .py
-    (consumes a use); ``<link_id>.sh`` / ``<link_id>.ps1`` serve the platform
-    wrappers (free — they fetch the .py themselves, which is the one use)."""
+    (consumes a use); ``<link_id>.sh`` / ``<link_id>.ps1`` / ``<link_id>.zip``
+    / ``<link_id>.pkg`` serve the platform wrappers/archives/installer (free —
+    they fetch the .py themselves, which is the one use)."""
+    # Defensive: the dedicated icon routes above win by Flask's static-over-
+    # dynamic ranking, but never let the icon names fall through to the
+    # link-consuming .py path if that ordering ever changes.
+    if link_id == "icon.png":
+        return install_icon_png()
+    if link_id == "icon.ico":
+        return install_icon_ico()
     if link_id.endswith(".sh"):
         return _serve_install_wrapper(link_id[:-3], "sh")
     if link_id.endswith(".ps1"):
         return _serve_install_wrapper(link_id[:-4], "ps1")
+    if link_id.endswith(".zip"):
+        return _serve_install_zip(link_id[:-4])
+    if link_id.endswith(".pkg"):
+        return _serve_install_pkg(link_id[:-4])
     return _serve_install_py(link_id)
 
 

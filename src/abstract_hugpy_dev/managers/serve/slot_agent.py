@@ -270,6 +270,53 @@ def _log_moe_degrade_once(key, msg):
         logger.warning(msg)
 
 
+class _NglDefaulted(int):
+    """An ``n_gpu_layers`` value that NOBODY ASKED FOR — a fill-in default that
+    a caller (serve.ServeSpec / the worker's spill env) materialized only
+    because the field had to hold *some* int.
+
+    Why a subclass of ``int`` and not ``None``: ``-1`` is overloaded. It is the
+    historical fill-in default (``DEFAULT_LLAMA_NGL``) AND a load-bearing
+    explicit force ("Max GPU": ``managers.llama.runners.get``, ``alloc_modes``
+    gpu-only, ``chaos/sweep``, ``chaos/assortment``, ``worker_agent`` MoE
+    commit, ``overrides``). Aliasing ``-1`` to "unset" would silently regress
+    every one of those. Passing ``None`` instead is not always available either
+    — ``ServeSpec.n_gpu_layers`` is typed ``int`` and several consumers format
+    it straight into argv.
+
+    So: the VALUE still behaves exactly like the int it wraps (arithmetic,
+    comparison, ``str()``, ``int()``, argv formatting — all identical, so every
+    existing consumer is byte-for-byte unaffected), while carrying one extra
+    bit of provenance that placement policy can read via :func:`_ngl_is_unset`.
+    Nothing serializes this type: ``json.dumps`` renders it as the plain int,
+    so the central->worker relay wire (extra=forbid) is untouched.
+    """
+    __slots__ = ()
+
+    def __repr__(self):  # pragma: no cover - debugging aid only
+        return f"<defaulted ngl {int(self)}>"
+
+    # int() has no distinct __str__ — it falls back to __repr__. Without this,
+    # str(_NglDefaulted(-1)) would render "<defaulted ngl -1>" and _build_cmd
+    # formats ngl straight into argv (`"--n-gpu-layers", str(ngl)`), which would
+    # launch llama-server with a garbage flag value. _effective_ngl() int()s
+    # before argv today, so this is defence-in-depth — but the whole premise of
+    # this subclass is that the VALUE behaves exactly like the int it wraps.
+    def __str__(self):
+        return str(int(self))
+
+
+def _ngl_is_unset(requested) -> bool:
+    """True when no caller actually DEMANDED a layer placement — either nothing
+    was passed at all (``None``) or the value is a :class:`_NglDefaulted`
+    fill-in. This — not ``requested is None`` — is the gate that auto placement
+    policy (the detected-MoE expert split) must consult; otherwise a spec whose
+    n_gpu_layers is merely ``DEFAULT_LLAMA_NGL`` reads as "operator demanded all
+    layers on the GPU" and a 48 GB MoE launches onto a 24 GB card with no
+    ``--n-cpu-moe`` (ae, 2026-07-25)."""
+    return requested is None or isinstance(requested, _NglDefaulted)
+
+
 def _effective_ngl(requested, auto):
     """Override-wins-over-autofit (k14). An EXPLICIT ``n_gpu_layers`` request WINS
     over the autofit — that is the lever the offload speed-cliff sweep (k7) needs:
@@ -282,8 +329,13 @@ def _effective_ngl(requested, auto):
     ships ``n_gpu_layers=-1`` to the slot precisely to FORCE all layers; aliasing
     it to autofit would silently regress that path). The sweep therefore asks for
     autofit with ``None`` at the top of the ramp and explicit non-negative counts
-    below it — it never needs ``-1`` to mean autofit."""
-    return auto if requested is None else int(requested)
+    below it — it never needs ``-1`` to mean autofit.
+
+    ADDENDUM (2026-07-25): a ``_NglDefaulted`` value is a fill-in nobody asked
+    for, so it too resolves to autofit here. The VALUE of a defaulted -1 and an
+    explicit -1 is the same int; only the provenance differs, and only the
+    unset kind may be overridden by autofit / the MoE auto-split."""
+    return auto if _ngl_is_unset(requested) else int(requested)
 
 
 def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None,
@@ -291,18 +343,21 @@ def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None,
                n_cpu_moe=None):
     """argv for the child llama-server + the resolved (ngl, ctx, threads, cpus).
 
-    ``n_cpu_moe`` (MoE expert split, 2026-07-24): number of MoE layers whose
-    EXPERT tensors stay on CPU (999/spill.MOE_ALL_LAYERS = all), emitted as
-    llama-server ``--n-cpu-moe``. Explicit (per-load opts / persisted override)
-    always wins. Absent -> the AUTO policy: a detected-MoE GGUF whose autofit
-    verdict is a HYBRID (partial layer split — the whole model doesn't fit VRAM)
-    is served with n_gpu_layers=-1 + --n-cpu-moe 999 INSTEAD of the layer split
-    (measured strictly better on ae: +59% tok/s at 5x less VRAM). Whole-model-
-    fits -> fully-on-GPU exactly as today (with an explicit ``--n-cpu-moe 0`` so
-    a unit-level LLAMA_ARG_N_CPU_MOE env hack can't silently displace the
-    experts); dense -> byte-identical to today (no flag). This function is THE
-    choke point for every slot child spawn — /load, k14 /relaunch, and direct
-    slot loads all funnel through here — so the policy holds for all of them.
+    ``n_cpu_moe`` (MoE expert split, 2026-07-24; DEFAULT since 2026-07-25):
+    number of MoE layers whose EXPERT tensors stay on CPU (999/
+    spill.MOE_ALL_LAYERS = all), emitted as llama-server ``--n-cpu-moe``.
+    Explicit (per-load opts / persisted override) always wins. Absent -> the
+    AUTO policy, which is now THE DEFAULT for every applicable GGUF: a detected
+    MoE whose expert tensors fit budgetable host RAM is served with
+    n_gpu_layers=-1 + --n-cpu-moe 999, whether or not the whole model would have
+    fit the card (measured strictly better on ae: +59% tok/s at 5x less VRAM —
+    so a fits-whole MoE pinned fully on the GPU was slower AND monopolised the
+    card). Experts that can't fit RAM -> degrade to the autofit layer placement.
+    Explicit n_gpu_layers (incl. an explicit -1 "Max GPU"), a k37 alloc_mode
+    (max-ram/explicit), and dense models -> byte-identical to today (no flag).
+    This function is THE choke point for every slot child spawn — /load, k14
+    /relaunch, and direct slot loads all funnel through here — so the policy
+    holds for all of them.
 
     ``profile_bin`` (env-profiles stage 1): when the agent seats a model
     attributed to a dependency profile, it hands the profile venv's bin dir here.
@@ -395,14 +450,38 @@ def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None,
     except Exception:  # noqa: BLE001 — never block a load on header metadata
         total_layers = None
 
-    # ── MoE expert split (measured win, 2026-07-24) ─────────────────────────
+    # ── MoE expert split — THE DEFAULT for applicable GGUFs (2026-07-25) ────
     # Decide the effective --n-cpu-moe BEFORE the engine branch so both child
     # kinds can degrade honestly. moe_mode: "explicit" (per-load opts/override —
-    # always wins), "auto" (detected-MoE hybrid -> -1 + all experts on CPU
-    # instead of the layer split), "pin-gpu" (detected-MoE that fully fits under
-    # autofit -> explicit 0 so an inherited LLAMA_ARG_N_CPU_MOE env can't
-    # silently displace the experts), or None (dense / explicit layer
-    # designation / k37 mode engine active — byte-identical to before).
+    # always wins), "auto" (detected-MoE, split applied: ngl=-1 + all experts on
+    # CPU), or None (dense / explicit layer designation / k37 mode engine active
+    # / experts don't fit RAM — byte-identical to the pre-MoE behaviour).
+    #
+    # POLICY CHANGE (operator, 2026-07-25): "the default needs to be the MoE
+    # split for all GGUFs that it applies to". APPLIES-TO = detected MoE AND the
+    # expert tensors physically fit budgetable host RAM. The old policy only
+    # split in the HYBRID case (autofit wanted a partial layer split) and PINNED
+    # the experts onto the card whenever the whole model fit (moe_mode
+    # "pin-gpu"). The ae measurement retires that exception: the split is BOTH
+    # faster (+59% tok/s: 24.1 vs 15.2) AND ~5x cheaper in VRAM (3.2 vs 16.6
+    # GiB) on coder-next. Pinning a fits-whole MoE was therefore strictly worse
+    # on both axes AND monopolised a card that could have seated other models —
+    # the whole point of the fleet. defaults-are-promises: the default is now
+    # the measured success path, not the historical one.
+    #
+    # NOT changed (deliberate, each an operator DEMAND about placement):
+    #   * explicit n_cpu_moe (incl. an explicit 0 = "experts on GPU") — wins;
+    #   * explicit n_gpu_layers, INCLUDING an explicit -1 ("Max GPU" /
+    #     alloc_modes gpu-only / runners.get / chaos sweep). A DEFAULTED -1
+    #     (_NglDefaulted — a fill-in nobody asked for) is still unset and does
+    #     get the split;
+    #   * a k37 alloc_mode on the env wire. Only max-ram and explicit ever reach
+    #     the worker as HUGPY_ALLOC_MODE (mode_to_spill encodes gpu-only as
+    #     n_gpu_layers=-1, ram-only as "off", max-gpu as {}), so this gate reads
+    #     exactly as: max-ram/explicit -> no auto split (the operator is driving
+    #     the placement numbers themselves); max-gpu -> SPLIT (it wants
+    #     throughput and it is the blank default); gpu-only -> no split (it
+    #     demands GPU residency, and arrives as an explicit -1 anyway).
     eff_n_cpu_moe = None
     moe_mode = None
     moe_fallback_ngl = ngl                   # what we revert to if we must degrade
@@ -419,37 +498,29 @@ def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None,
             # AUTO policy only when nothing explicit governs placement: no
             # explicit n_gpu_layers request and no k37 mode engine in play.
             if (moe.get("is_moe") and alloc_mode_env() is None
-                    and n_gpu_layers is None):
-                if total_layers and 0 < auto < int(total_layers):
-                    # The HYBRID situation — autofit would do a partial layer
-                    # split. MoE-aware split is strictly better (ae, coder-next:
-                    # 24.1 vs 15.2 tok/s at 3.2 vs 16.6 GiB VRAM) UNLESS the
-                    # expert tensors clearly cannot live in host RAM — then the
-                    # layer split (whose CPU share is smaller) stays the
-                    # success path (defaults-are-promises: only ever improve).
-                    exp = int(moe.get("expert_bytes") or 0)
-                    avail = _mem_available_bytes()
-                    if avail:
-                        from ..spill import ram_reserve_bytes
-                        avail = max(0, avail - ram_reserve_bytes())
-                    if exp and avail and exp > avail * 0.95:
-                        _log_moe_degrade_once(
-                            ("ram", model_key),
-                            f"slot {SLOT_ID}: {model_key} is MoE but its expert "
-                            f"tensors (~{exp / 1e9:.1f} GB) exceed budgetable RAM "
-                            f"(~{avail / 1e9:.1f} GB) — keeping the layer-split "
-                            "hybrid instead of the MoE split")
-                    else:
-                        ngl = -1
-                        eff_n_cpu_moe = MOE_ALL_LAYERS
-                        moe_mode = "auto"
-                elif auto == -1:
-                    # Whole model fits -> fully-on-GPU as today, but pin the
-                    # experts ON the GPU explicitly (argv beats env in
-                    # llama-server) so a transition-era LLAMA_ARG_N_CPU_MOE
-                    # unit env can't silently push them to CPU.
-                    eff_n_cpu_moe = 0
-                    moe_mode = "pin-gpu"
+                    and _ngl_is_unset(n_gpu_layers)):
+                # Viability, the ONE remaining condition: the expert tensors
+                # must fit budgetable host RAM. When they clearly don't, degrade
+                # to whatever autofit decided (layer-split hybrid, or full GPU
+                # when the model fits whole) — never refuse, and never move
+                # bytes into RAM that isn't there. Unmeasurable RAM -> proceed
+                # (degrade honestly: never block on missing data).
+                exp = int(moe.get("expert_bytes") or 0)
+                avail = _mem_available_bytes()
+                if avail:
+                    from ..spill import ram_reserve_bytes
+                    avail = max(0, avail - ram_reserve_bytes())
+                if exp and avail and exp > avail * 0.95:
+                    _log_moe_degrade_once(
+                        ("ram", model_key),
+                        f"slot {SLOT_ID}: {model_key} is MoE but its expert "
+                        f"tensors (~{exp / 1e9:.1f} GB) exceed budgetable RAM "
+                        f"(~{avail / 1e9:.1f} GB) — keeping the autofit layer "
+                        "placement instead of the MoE split")
+                else:
+                    ngl = -1
+                    eff_n_cpu_moe = MOE_ALL_LAYERS
+                    moe_mode = "auto"
         except Exception:  # noqa: BLE001 — MoE policy must never block a load
             eff_n_cpu_moe = None
             moe_mode = None
@@ -483,9 +554,11 @@ def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None,
         except (TypeError, ValueError):
             pass
 
-    if ngl <= 0:                             # effective ngl, not raw autofit —
+    if ngl == 0:                              # effective ngl, not raw autofit —
         # an explicit n_gpu_layers=-1 ("max GPU") that overrode a broken auto=0
-        # is GPU-resident and must skip the CPU-RAM refusal below.
+        # is GPU-resident (not CPU-RAM-resident), so it must skip this refusal
+        # and fall through to the inverse VRAM preflight below instead — the
+        # comment above predates that guard; -1 is excluded here for real now.
         need = _total_gguf_bytes(path)
         avail = _mem_available_bytes()
         if avail:
@@ -498,6 +571,76 @@ def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None,
                 f"{model_key}: needs ~{need / 1e9:.1f} GB RAM (all shards) but only "
                 f"{avail / 1e9:.1f} GB budgetable (after reserve) with no GPU offload "
                 f"on this node — free RAM (recycle the API worker) or pick a smaller quant")
+
+    # Expert-RAM preflight for an EXPLICIT split (2026-07-25). The auto branch
+    # above checks that the expert tensors actually fit host RAM before it
+    # chooses the MoE split (and degrades to the layer split when they don't),
+    # but an explicit operator/central-supplied ``n_cpu_moe`` skips that branch
+    # entirely — and the per-model ``cpu_mem_gib`` preflight only runs when a
+    # budget is set (ae's slot carries None). Narrowing the RAM guard below from
+    # ``ngl <= 0`` to ``ngl == 0`` (correct: -1 is GPU-resident) means an
+    # explicit split with oversized experts would otherwise reach llama-server
+    # unchecked and OOM mid-load — the same silent stall this whole preflight
+    # block exists to prevent, just via RAM instead of VRAM. Same honest-degrade
+    # doctrine: only refuse when BOTH numbers are actually measurable.
+    if eff_n_cpu_moe and moe_mode == "explicit":
+        try:
+            from ..spill import gguf_moe_detail, ram_reserve_bytes
+            _exp = int(gguf_moe_detail(path).get("expert_bytes") or 0)
+            _avail = _mem_available_bytes()
+            if _avail:
+                _avail = max(0, _avail - ram_reserve_bytes())
+            if _exp and _avail and _exp > _avail * 0.95:
+                raise RuntimeError(
+                    f"{model_key}: the requested MoE expert split (--n-cpu-moe "
+                    f"{eff_n_cpu_moe}) puts ~{_exp / 1e9:.1f} GB of expert tensors in "
+                    f"host RAM, but only ~{_avail / 1e9:.1f} GB is budgetable (after "
+                    "reserve) — lower n_cpu_moe to keep more experts on the GPU, "
+                    "free RAM, or pick a smaller quant")
+        except RuntimeError:
+            raise
+        except Exception:  # noqa: BLE001 — never block a load on a probe failure
+            pass
+
+    # Inverse preflight (2026-07-25): ngl==-1 with NO MoE/expert offload means
+    # every layer's weights are meant to land on the GPU. If the model's total
+    # bytes (ALL shards) clearly exceed the card's VRAM, this is not a slow
+    # load — it is an impossible one, and the child would hang health-checking
+    # for ~10 minutes across retries before falling back (the coder-next/ae
+    # incident this preflight exists to catch: 48.4GB MoE model, -1 with no
+    # --n-cpu-moe, on a 24GB 3090). Fail fast with the same tone as the RAM
+    # refusal above, INSTEAD of the stall.
+    #
+    # Deliberately narrow: only fires when (a) effective ngl is -1 (full GPU
+    # residency requested/decided), (b) no MoE split is configured — an expert
+    # split changes what "total bytes" means (a large chunk is meant for CPU,
+    # so total-vs-VRAM is the wrong comparison; the MoE branches above already
+    # own that math), and (c) both total-bytes and VRAM are actually
+    # measurable — an unmeasurable card (no GPU visibility, no nvidia-smi,
+    # etc.) must never block a load on missing data (degrade honestly, same
+    # doctrine as every other best-effort probe in this module).
+    if ngl == -1 and not eff_n_cpu_moe:
+        need_vram = _total_gguf_bytes(path)
+        try:
+            from ..spill import total_vram_bytes as _tvb, free_vram_bytes as _fvb
+            card_total = _tvb()
+            card_free = _fvb()
+        except Exception:  # noqa: BLE001 — never block a load on a probe failure
+            card_total = card_free = None
+        # Use whichever VRAM figure is available (prefer free — the live
+        # budget — falling back to total when free is unmeasurable but total
+        # isn't); either is sufficient to catch "model is multiples of the
+        # whole card". A clear margin (>1.15x) avoids false refusals from
+        # measurement noise/reserve slop right at the boundary.
+        card_vram = card_free if card_free is not None else card_total
+        if need_vram and card_vram and need_vram > card_vram * 1.15:
+            raise RuntimeError(
+                f"{model_key}: needs ~{need_vram / 1e9:.1f} GB VRAM (all shards, "
+                f"n_gpu_layers=-1 with no MoE expert split) but this node's GPU "
+                f"has only ~{card_vram / 1e9:.1f} GB {'free' if card_free is not None else 'total'} "
+                "— this would stall for minutes before falling back. Configure "
+                "an MoE expert split (n_cpu_moe) for this model, offload fewer "
+                "layers, or pick a smaller quant")
 
     import shutil
     server_bin = LLAMA_SERVER_BIN if (LLAMA_SERVER_BIN and (
@@ -1022,8 +1165,21 @@ def build_app():
             return jsonify({"error": local_serving_error(
                 body.get("model_key"),
                 detail="slot serving disabled on this box")}), 403
+        # "This n_gpu_layers is a FILL-IN DEFAULT, not a demand" (2026-07-25).
+        # Callers that materialize DEFAULT_LLAMA_NGL into an int field (the
+        # serve spec / spill env path) set this so placement policy still sees
+        # the value as unset — see _NglDefaulted. Omitted (the overwhelmingly
+        # common case, and every pre-existing caller) == explicit, byte-identical
+        # to before. Optional additive body key: nothing rejects unknown keys on
+        # this local control plane, and central->worker relay never touches it.
+        _ngl_body = body.get("n_gpu_layers")
+        if body.get("ngl_defaulted") and _ngl_body not in (None, ""):
+            try:
+                _ngl_body = _NglDefaulted(int(_ngl_body))
+            except (TypeError, ValueError):
+                pass
         try:
-            return jsonify(slot.load(body["model_key"], body.get("n_gpu_layers"),
+            return jsonify(slot.load(body["model_key"], _ngl_body,
                                      body.get("ctx"), body.get("threads"),
                                      body.get("cpus"), body.get("gpu"),
                                      path=body.get("path"),

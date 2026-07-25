@@ -1563,6 +1563,27 @@ def workers_evict(worker_id):
                             timeout=45.0, action="evict")
 
 
+@worker_bp.route("/llm/workers/<worker_id>/reap-orphans", methods=["POST"])
+def workers_reap_orphans(worker_id):
+    """p27/k32: kill ORPHANED GPU children a worker itself leaked — own-venv
+    llama-server processes whose slot claim cleared but whose child never
+    exited, holding VRAM with no model_key any eviction verb can key on
+    (/evict above is model_key-addressed and can't touch them; this is the
+    one place central reaches a worker's raw PIDs, and only via the worker's
+    own fail-closed gate — see agent._reap_gpu_orphans). Relays to the
+    worker's /ops/reap-orphans, which existed worker-side (c34199e/p27) but
+    had NO central relay until now — the gap the board tracked as k32.
+
+    Body: {"dry_run"?: bool} — DEFAULTS TO TRUE (preview) when absent, same
+    default as the worker route. Returns the worker JSON verbatim: per-pid
+    rows ({pid, name, vram_bytes, action: reaped|term_failed|skipped, reason})
+    plus reaped_count/term_failed_count/skipped_count/reapable_vram_bytes.
+    """
+    return _relay_worker_op(worker_id, "/ops/reap-orphans",
+                            request.get_json(silent=True) or {},
+                            timeout=30.0, action="reap-orphans")
+
+
 @worker_bp.route("/llm/workers/<worker_id>/slots/<slot_id>/relaunch",
                  methods=["POST"])
 def workers_slot_relaunch(worker_id, slot_id):
@@ -1599,6 +1620,40 @@ def workers_slot_relaunch(worker_id, slot_id):
                if body.get(k) not in (None, "")}
     return _relay_worker_op(worker_id, f"/slots/{slot_id}/relaunch", payload,
                             timeout=900.0, action="slot-relaunch")
+
+
+@worker_bp.route("/llm/workers/<worker_id>/slots/<slot_id>/unload",
+                 methods=["POST"])
+def workers_slot_unload(worker_id, slot_id):
+    """The STRANDED-SLOT fix (operator ask "all pids need to be able to be
+    unseated, even from ram", 2026-07-25 — closes the gap that stranded ae
+    for 5.5h). Every other eviction verb (/evict) is model_key-ADDRESSED, by
+    design (PIDs are per-box and recycled — see /evict's docstring). That
+    design has one hole: a slot whose child_pid is alive and holding
+    VRAM/RAM but whose claim has gone model_key=None (or stale) can't be
+    resolved by model_key at all, so /evict, /slots/.../relaunch (which
+    refuses an empty claim), AND /reap-orphans (which treats any
+    still-referenced child_pid as claimed, regardless of model_key) all miss
+    it. This route is addressed by SLOT ID instead — a stable, never-
+    recycled local identifier (1..SLOT_COUNT), not a raw PID, so it doesn't
+    reintroduce the PID-addressing problem the other verbs avoid — and
+    relays to the worker's UNCONDITIONAL /slots/<slot_id>/unload, which kills
+    whatever the slot's child currently is (SIGTERM->wait->SIGKILL) and
+    clears the claim regardless of what model_key it holds.
+
+    404 unknown worker id; 409 offline; the worker itself answers 404 for an
+    unknown slot, both propagated verbatim. Operator-gated (same tier as
+    evict/relaunch), audited like every other worker op."""
+    worker = get_worker(worker_id)
+    if worker is None:
+        abort(404, description="Unknown worker id.")
+    if worker.get("status") != "online":
+        return jsonify({"ok": False, "error": {
+            "code": "WorkerOffline",
+            "message": f"worker {worker_id} is offline — cannot unload its "
+                       "slot until it is back online"}}), 409
+    return _relay_worker_op(worker_id, f"/slots/{slot_id}/unload", {},
+                            timeout=30.0, action="slot-unload")
 
 
 @worker_bp.route("/llm/workers/<worker_id>/config", methods=["POST"])
@@ -2944,7 +2999,19 @@ def workers_load(worker_id):
     Body: {model_key, spill?, force?, redownload?}. force=true skips the preflight
     (still bounded by the worker's own limits). redownload=true first wipes the
     model's files on the worker and re-pulls them from central before warming —
-    for a corrupt/stale on-disk copy (a plain load only downloads when MISSING)."""
+    for a corrupt/stale on-disk copy (a plain load only downloads when MISSING).
+
+    ``spill`` (same recognized keys as /assign — see AssignRequest, notably
+    n_gpu_layers and n_cpu_moe) is the lever to seat an EMPTY slot with an
+    explicit GPU-offload depth / MoE expert split (TASK C, 2026-07-25): before
+    this, an operator recovering a crashed MoE slot (ngl=-1, no --n-cpu-moe,
+    stuck stalling per TASK D's new preflight) had no way to load it with a
+    split — relaunch requires an ALREADY-loaded model_key and 409s on an empty
+    slot, which is exactly a crashed slot's state. Persisted the same way a
+    plain /assign spill is (assign_model → spill_by_model, read by /infer's
+    _apply_spill on every call), AND additionally forwarded on THIS warm's
+    /probe POST so the seat that happens right here honors it immediately
+    instead of waiting for the first real inference call to apply it."""
     import httpx
     import threading
 
@@ -2952,6 +3019,20 @@ def workers_load(worker_id):
     body = AssignRequest(**raw)
     force = bool(raw.get("force"))
     redownload = bool(raw.get("redownload"))
+    # Same shape/range/legacy-name validation /assign applies to its spill —
+    # this warm actually SEATS the model with it (not just registers it for a
+    # later call), so a malformed n_gpu_layers/n_cpu_moe etc. is caught here
+    # rather than surfacing as an opaque worker-side failure. Only validate
+    # when a spill was actually SUPPLIED: _validate_alloc_spill(None) returns
+    # {} (autofit), and normalizing an omitted spill to {} here would make a
+    # plain `/load {"model_key": ...}` call CLEAR any spill override already
+    # persisted for this model — a silent behavior change from today (and
+    # from /assign's own omit-means-leave-untouched convention). Omitted
+    # stays None; only a caller-supplied dict runs through validation.
+    if body.spill is not None:
+        body.spill, _spill_err = _validate_alloc_spill(body.spill)
+        if _spill_err is not None:
+            return jsonify({"error": _spill_err}), 400
     if body.model_key not in get_models_dict(dict_return=True):
         # JSON (not abort's HTML) so allocateMany's refusal note is a clean line,
         # never a raw <!doctype> 404 page dumped into the UI.
@@ -3002,7 +3083,15 @@ def workers_load(worker_id):
                 # background thread — the request never blocks.
                 httpx.post(base + "/models/redownload",
                            json={"model_key": body.model_key}, timeout=3600.0)
-            r = httpx.post(url, timeout=900.0)  # worker loads synchronously; can be slow
+            # Forward the spill override (n_gpu_layers / n_cpu_moe / …) on the
+            # probe itself so an explicit split is honored on THIS seat, not
+            # just on some later /infer call. Older workers (pre this change)
+            # simply ignore an unrecognized JSON body on /probe — this stays
+            # additive/optional, never a required field, so it can't break a
+            # worker that hasn't picked up the matching agent code yet.
+            probe_body = {"spill": body.spill} if body.spill else {}
+            r = httpx.post(url, json=probe_body,
+                           timeout=900.0)  # worker loads synchronously; can be slow
             try:
                 report.update(r.json())
             except Exception:
