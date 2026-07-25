@@ -509,19 +509,19 @@ def _free_bytes() -> int:
         return 0
 
 
-def _is_pinned(key: str) -> bool:
-    """Best-effort: a pinned model is evictable from HOT only LAST (its shared
-    copy is safe, so hot eviction is safe too — just wasteful). Maps the entry's
-    repo basename to the worker's pinned settings; any failure -> not pinned."""
-    try:
-        from ...worker_agent.agent import _pinned  # lazy: worker-side only
-    except Exception:  # noqa: BLE001
-        return False
-    base = os.path.basename(key.rstrip(os.sep))
-    try:
-        return bool(_pinned(key) or _pinned(base))
-    except Exception:  # noqa: BLE001
-        return False
+# NOTE (operator ruling, 2026-07-25): 📌 PIN HAS NOTHING TO DO WITH EVICTION.
+# Pin means exactly two things and no more:
+#   1) this model is ALLOCATED to this worker, and
+#   2) that allocation SURVIVES a restart ("or nuclear war") — which is its
+#      actual purpose: routing persistence.
+# It is not a residency lock, not a hot-tier reservation, not a priority. The
+# hot tier is an LRU CACHE of the shared store, so its eviction order is
+# least-recently-called, full stop. There was previously an `_is_pinned()`
+# helper here used as the PRIMARY eviction sort key ("unpinned before pinned"),
+# which quietly made pin a protection: on ae that froze ~321 GiB of the 600 GiB
+# hot budget behind 15 pinned models of which only 2 had EVER been called,
+# while genuinely-hot models competed for the remainder. Deleted, not softened
+# — a weaker version of the same idea is the same bug.
 
 
 # --------------------------------------------------------------------------- #
@@ -564,9 +564,9 @@ def _make_room(need: int, keep_key: str) -> bool:
         eligible = [(k, v) for (k, v) in candidates
                     if (now - float(v.get("last_called", 0) or 0)) >= residency]
         fresh = len(candidates) - len(eligible)
-        # Order: unpinned before pinned, then least-recently-called first.
-        eligible.sort(key=lambda kv: (_is_pinned(kv[0]),
-                                      float(kv[1].get("last_called", 0) or 0)))
+        # Order: least-recently-called first. PURE LRU — pin is routing
+        # persistence, never an eviction input (see the note above _free_bytes).
+        eligible.sort(key=lambda kv: float(kv[1].get("last_called", 0) or 0))
         for k, v in eligible:
             idle = now - float(v.get("last_called", 0) or 0)
             freed = _evict_locked(k)

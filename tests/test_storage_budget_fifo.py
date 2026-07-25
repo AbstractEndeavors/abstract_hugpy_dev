@@ -151,19 +151,34 @@ def test_pinned_model_is_a_candidate_and_evicts_when_fifo_reaches_it():
     assert plan["reason"] is None
 
 
-def test_pin_is_only_a_trivial_tiebreak_unpinned_evicts_first():
-    """Pin's ONLY eviction role (operator called it "trivial and likely
-    unnecessary"): at an EXACT last_picked tie, the UNPINNED candidate is evicted
-    before the pinned one. Same size + same last_picked isolates the tiebreak."""
+def test_pin_is_not_an_eviction_input_at_all():
+    """Pin has NO eviction role whatsoever (operator ruling, 2026-07-25).
+
+    This previously asserted the opposite — that at an exact last_picked tie the
+    unpinned candidate evicts first — a tiebreak the operator had already called
+    "trivial and likely unnecessary" on 2026-07-17. It is now GONE, not softened:
+    _"pin routing has nothing to do with eviction... the only eviction protection
+    is 'static' residency"_. Pin means exactly two things — this model is
+    ALLOCATED to this worker, and that allocation SURVIVES a restart.
+
+    A vestigial pin term is worse than none: it keeps teaching readers that pin
+    is an eviction input, which is how the hot tier ended up freezing ~321 GiB of
+    ae's 600 GiB NVMe budget behind pinned models that had never been called.
+
+    With size and last_picked identical, the ONLY remaining tiebreak is the
+    stable model-key sort — so "pinned" (alphabetically first) is chosen, i.e.
+    being pinned demonstrably does not shield it.
+    """
     storage = _storage([_model("pinned", 20, pinned=True),
                         _model("plain", 20, pinned=False)])
-    # identical last_picked -> only the pin flag breaks the tie.
     plan = budget.fit_plan("caller", 15 * GIB, storage,
                            {"disk_cache_gib": 50},
                            {"pinned": 100, "plain": 100})
     assert plan["action"] == "evict"
-    assert plan["evict"] == ["plain"]        # unpinned goes first
-    assert "pinned" not in plan["evict"]
+    # Pin confers nothing: the pinned model is evicted here purely because the
+    # key tiebreak lands on it. The assertion that matters is that pin did NOT
+    # move it to the back of the queue.
+    assert plan["evict"] == ["pinned"]
 
 
 def test_the_model_being_provisioned_is_never_evicted():

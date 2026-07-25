@@ -7,7 +7,8 @@ Covers the operator's doctrine end to end, on tmpdirs (no real NVMe needed):
   * promote-on-call is async (background promoter thread) + atomic (.part ->
     rename, no leftover temp) and produces a complete, resolvable hot copy.
   * eviction order = least-recently-CALLED first, freeing enough space; budget
-    respected; pinned entries evict last.
+    respected. PURE LRU — 📌pin is not an eviction input (operator, 2026-07-25:
+    pin is routing persistence only; 🔒static residency is the sole protection).
   * ANTI-THRASH: two big models alternating do NOT churn — the second does NOT
     evict the first within the residency window, but DOES once it expires.
   * gguf file-set semantics (quant + shards + mmproj) promote as one entry.
@@ -197,8 +198,21 @@ shutil.rmtree(tmp, ignore_errors=True)
 
 
 # --------------------------------------------------------------------------- #
-# 6. pinned entries evict LAST (even when they are the LRU)
+# 6. eviction is PURE LRU — 📌pin is NOT an input (operator ruling 2026-07-25)
 # --------------------------------------------------------------------------- #
+# This case previously asserted the OPPOSITE ("pinned entries evict LAST"), and
+# an `_is_pinned()` helper existed solely to make that true. The operator ruled
+# that out: _"pin routing has nothing to do with eviction... the only eviction
+# protection is 'static' residency"_. Pin means exactly two things — this model
+# is ALLOCATED to this worker, and that allocation SURVIVES a restart. It is
+# routing persistence, never a resource lock.
+#
+# Why it mattered: on ae the pinned-last order froze ~321 GiB of the 600 GiB hot
+# NVMe budget behind 15 pinned models of which only 2 had EVER been called,
+# while genuinely-hot models fought over the remainder. The fast drive was being
+# spent on weight nobody asked for.
+#
+# So: A is the LRU and is ALSO pinned. Pure LRU must evict A anyway.
 tmp, shared, hot = _reset(budget=2500, residency=0.0)
 a = _mk(shared, "fam/txt/acme/PA", {"w.safetensors": 1000})
 b = _mk(shared, "fam/txt/acme/PB", {"w.safetensors": 1000})
@@ -210,15 +224,15 @@ with hc._INDEX_LOCK:
     hc._INDEX["entries"][ka]["last_called"] = 100.0   # A is the LRU
     hc._INDEX["entries"][kb]["last_called"] = 200.0
     hc._save_index_locked()
-_saved_pin = hc._is_pinned
-hc._is_pinned = lambda k: k == ka                     # pin the LRU (A)
-try:
-    _promote_sync(c)
-finally:
-    hc._is_pinned = _saved_pin
-check("pinned-last: pinned LRU (A) kept", hc.is_complete(a) is True)
-check("pinned-last: unpinned (B) evicted instead", hc.is_complete(b) is False)
-check("pinned-last: C promoted", hc.is_complete(c) is True)
+# No pin monkeypatch: there is no longer a pin hook to patch. Even if the worker
+# considered A pinned, eviction must not consult it.
+_promote_sync(c)
+check("pure-LRU: the LRU (A) is evicted even though it is pinned",
+      hc.is_complete(a) is False)
+check("pure-LRU: the more-recently-called (B) is kept", hc.is_complete(b) is True)
+check("pure-LRU: C promoted", hc.is_complete(c) is True)
+check("pure-LRU: no pin hook survives in the eviction path",
+      not hasattr(hc, "_is_pinned"))
 shutil.rmtree(tmp, ignore_errors=True)
 
 

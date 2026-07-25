@@ -1170,7 +1170,7 @@ def storage_proposal(worker: Dict[str, Any]) -> Dict[str, Any]:
             "assigned": bool(m.get("assigned")),
         })
         if not protected:
-            candidates.append((lp, is_pinned, b, mk))
+            candidates.append((lp, b, mk))
 
     # ── reclaimable-count trace (operator ask, 2026-07-17): "yell out the
     # course of the reclaimable count". The worker half is traced by
@@ -1190,15 +1190,20 @@ def storage_proposal(worker: Dict[str, Any]) -> Dict[str, Any]:
     proposed: List[Dict[str, Any]] = []
     proposed_free = 0
     if over_budget and need_bytes > 0 and candidates:
-        # LRU oldest-first (ascending last_picked). Then a TRIVIAL 📌pin tiebreak
-        # (operator called it "trivial and likely unnecessary", 2026-07-17):
-        # among equally-stale candidates, propose UNPINNED before PINNED (False
-        # sorts first) — a pinned model gets a hair of extra precedence only at
-        # an exact last_picked tie. Then largest-first so the budget clears in
-        # the fewest deletes; stable key tiebreak. IDENTICAL to budget.fit_plan,
-        # so central's preview and the worker's auto-evict agree on what goes.
-        candidates.sort(key=lambda c: (c[0], c[1], -c[2], c[3]))
-        for lp, _pin, b, mk in candidates:
+        # LRU oldest-first (ascending last_picked), then largest-first so the
+        # budget clears in the fewest deletes; stable key tiebreak. IDENTICAL to
+        # budget.fit_plan, so central's preview and the worker's auto-evict
+        # agree on what goes.
+        #
+        # 📌pin is NOT in this key (operator ruling, 2026-07-25: "pin routing has
+        # nothing to do with eviction... the only eviction protection is 'static'
+        # residency"). It previously sat at position 2 as a tiebreak the operator
+        # had already called "trivial and likely unnecessary" on 2026-07-17 —
+        # removed rather than kept, because a vestigial pin term keeps teaching
+        # readers that pin is an eviction input. Pin means only: allocated to
+        # this worker, and that allocation survives a restart.
+        candidates.sort(key=lambda c: (c[0], -c[1], c[2]))
+        for lp, b, mk in candidates:
             if proposed_free >= need_bytes:
                 break
             proposed.append({"model_key": mk, "bytes": b,

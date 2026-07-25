@@ -537,24 +537,28 @@ def fit_plan(model_key: str, need_bytes: int, storage: dict,
         if why:
             blocked[why] = blocked.get(why, 0) + 1
             continue
-        candidates.append((_lp(mk, r), bool(r.get("pinned")),
-                           int(r.get("bytes") or 0), mk))
+        candidates.append((_lp(mk, r), int(r.get("bytes") or 0), mk))
 
-    # Oldest-first (primary key = central last_picked). Then a TRIVIAL pin
-    # tiebreak: among equally-stale candidates, evict UNPINNED before PINNED
-    # (False sorts before True). The operator called this "trivial and likely
-    # unnecessary" (2026-07-17) — implemented only because it costs nothing and
-    # gives a pinned model a hair of extra precedence at an exact last_picked
-    # tie. Then largest-first among the rest so the budget clears in the fewest
-    # deletes; stable key tiebreak. IDENTICAL primary order to storage_proposal.
-    candidates.sort(key=lambda c: (c[0], c[1], -c[2], c[3]))
+    # Oldest-first (primary key = central last_picked), then largest-first so the
+    # budget clears in the fewest deletes; stable key tiebreak. IDENTICAL primary
+    # order to storage_proposal — the two MUST agree or central's preview and
+    # this auto-evict propose different victims.
+    #
+    # 📌pin is NOT in this key (operator ruling, 2026-07-25: "pin routing has
+    # nothing to do with eviction... the only eviction protection is 'static'
+    # residency"). It was a tiebreak the operator had already called "trivial and
+    # likely unnecessary" (2026-07-17); removed rather than retained, because a
+    # vestigial pin term keeps teaching readers that pin is an eviction input.
+    # Pin means only: allocated to this worker, and that allocation survives a
+    # restart. Protection is decided solely by _is_protected() (🔒static).
+    candidates.sort(key=lambda c: (c[0], -c[1], c[2]))
 
     must_free = used + delta - cap
-    reclaimable_total = sum(b for _lp_, _pin_, b, _mk in candidates)
+    reclaimable_total = sum(b for _lp_, b, _mk in candidates)
 
     evict: list[str] = []
     freed = 0
-    for _lp_, _pin_, b, mk in candidates:
+    for _lp_, b, mk in candidates:
         if freed >= must_free:
             break
         evict.append(mk)
