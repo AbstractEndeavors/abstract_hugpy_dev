@@ -1329,19 +1329,98 @@ def workers_assign(worker_id):
         if _mode_note:
             logger.info("assign %s: %s", body.model_key, _mode_note)
     if body.model_key not in get_models_dict(dict_return=True):
-        # JSON (not abort's HTML) so the UI surfaces a clean reason instead of a
-        # raw 404 page. A key that isn't in the manifest is usually a name-vs-key
-        # slip (e.g. "Wan2.1-VACE-1.3B" the display name vs the "Wan-AI~..." key).
-        return jsonify({"error": f"unknown model key '{body.model_key}' — it is "
-                        "not in central's manifest"}), 404
+        # CASE B ESCAPE HATCH (operator ruling 2026-07-25): a CLEAR of an
+        # ALREADY-DESIGNATED key is cleanup, never a new assignment, so the
+        # manifest gate must not trap it.
+        #
+        # The trap it fixes: ae holds designation + spill rows for
+        # comfy-dreamshaper-8-pruned-1 / comfy-qwen-3-4b /
+        # comfy-z-image-turbo-bf16-1 — models that left the manifest. Routing can
+        # never reach them, and the console's "reset to autofit" control (a POST
+        # /assign with spill {}) 404s on exactly the rows most in need of
+        # clearing. A row you can neither use nor clear is a permanent lie in the
+        # registry.
+        #
+        # THE RELAXATION IS DELIBERATELY TWO-CONDITIONED, and both halves matter:
+        #   * ``spill`` is falsey — an EMPTY spill only ever REMOVES a
+        #     spill_by_model row (assign_model: "an empty dict clears any
+        #     override"). It cannot write a contract, so it cannot be abused to
+        #     smuggle a knob onto a phantom key.
+        #   * the key is ALREADY in this worker's ``models`` — so nothing new is
+        #     designated. A genuinely-unknown key (the name-vs-key slip this gate
+        #     was written for) is not designated anywhere and still 404s with the
+        #     original message.
+        # Together they make the only reachable effect "clear a row that already
+        # exists", which is unambiguously cleanup.
+        #
+        # WHY RELAX RATHER THAN ADD A VERB: /unassign already clears such a row
+        # (it has no manifest gate), so a new cleanup verb would be a THIRD way
+        # to do the same registry write — more surface, another operator-gate
+        # rule, and one more thing to keep consistent. The actual defect is that
+        # ONE existing path refuses the cleanup its sibling permits; fixing the
+        # inconsistency is smaller than papering over it. (Full removal stays
+        # /unassign — this only unsticks the alloc-reset control.)
+        _wclear = get_worker(worker_id)
+        _clearing = (not body.spill) and _wclear is not None and \
+            body.model_key in (_wclear.get("models") or [])
+        if not _clearing:
+            # JSON (not abort's HTML) so the UI surfaces a clean reason instead
+            # of a raw 404 page. A key that isn't in the manifest is usually a
+            # name-vs-key slip (e.g. "Wan2.1-VACE-1.3B" the display name vs the
+            # "Wan-AI~..." key).
+            return jsonify({"error": f"unknown model key '{body.model_key}' — it is "
+                            "not in central's manifest"}), 404
+        logger.warning("assign: clearing allocation row for manifest-orphan "
+                       "'%s' on %s (cleanup path — empty spill on an existing "
+                       "designation)", body.model_key,
+                       _wclear.get("name") or worker_id)
+        worker = assign_model(worker_id, body.model_key, spill={})
+        if worker is None:
+            abort(404, description="Unknown worker id.")
+        return jsonify(worker)
+    # CASE A AUTO-BLOCK (operator ruling 2026-07-25): "models that … simply will
+    # not fit on a worker no matter what, if allocated, should be blocked. the
+    # user will be forced to acknowledge it and act or not."
+    #
+    # ALLOCATION IS THE TRIGGER — the operator's own words ("IF ALLOCATED"), and
+    # the one moment a human is present to be told. A background sweep would
+    # block models nobody asked for, on a schedule, out of sight; here the
+    # verdict lands as the immediate answer to a deliberate action.
+    #
+    # It runs BEFORE the block gate below on purpose: the auto-block writes the
+    # record, then the existing gate produces the refusal, so an infeasible
+    # model and an already-blocked one refuse through exactly ONE code path with
+    # one message shape. Arithmetic-only, fleet-wide, and it declines on missing
+    # data or a prior operator unblock (see blocklist.auto_block).
+    try:
+        from ..functions.imports.utils.workers import maybe_auto_block
+        maybe_auto_block(body.model_key)
+    except Exception:  # noqa: BLE001 — never let the auto-blocker break /assign
+        logger.debug("auto-block hook failed for %s", body.model_key,
+                     exc_info=True)
     # Operator BLOCK gate: a blocked model may not be (re)designated to any
     # worker. Clear 409 with the fix, same shape as the disk/engine refusals
     # below. Existing designations are left recorded (inert) — block does not
     # auto-unassign — so this only stops NEW assignments while blocked.
     if _model_blocked(body.model_key):
+        # HONEST AUTHORSHIP: an auto-block must not claim the operator did it.
+        # Same 409, same fix, but the note carries the arithmetic that chose it
+        # so the console can show WHY and the operator can act (or unblock).
+        _bi = {}
+        try:
+            from abstract_hugpy_dev.comms.blocklist import block_info
+            _bi = block_info(body.model_key) or {}
+        except Exception:  # noqa: BLE001
+            _bi = {}
+        if _bi.get("by") == "auto":
+            return jsonify({
+                "error": f"'{body.model_key}' is blocked from the serving pool "
+                         f"— {_bi.get('note') or 'it fits no worker'}",
+                "blocked_by": "auto", "block": _bi}), 409
         return jsonify({"error": f"'{body.model_key}' is blocked from the serving "
                         "pool by the operator — unblock it (Models tab) before "
-                        "assigning it to a worker"}), 409
+                        "assigning it to a worker",
+                        "blocked_by": _bi.get("by") or "operator"}), 409
     # Item 4 guard: a model can't be designated unless central itself holds the
     # files — otherwise the worker silently pulls ~50GB from HF at internet
     # speed (the 2026-07-03 sdxl-turbo saga). Clear 409 with the fix.
@@ -2842,12 +2921,17 @@ def model_block(model_key):
 def model_unblock(model_key):
     """Operator UNBLOCK a model — return it to the serving pool. The undo for
     /block. Idempotent (unblocking a non-blocked model is a no-op that reports
-    ``was_blocked: false``). Operator-gated like /block."""
+    ``was_blocked: false``). Operator-gated like /block.
+
+    STICKY (2026-07-25): this is a HUMAN overruling the machine, so it leaves an
+    ``operator_unblocked`` marker that permanently suppresses the CASE-A
+    auto-blocker for this key. Without it the auto-blocker would re-block the
+    model on the very next /assign and the unblock button would appear broken."""
     if model_key not in get_models_dict(dict_return=True):
         return jsonify({"error": f"unknown model key '{model_key}' — it is not in "
                         "central's manifest"}), 404
     from abstract_hugpy_dev.comms.blocklist import unblock as _unblock
-    was = _unblock(model_key)
+    was = _unblock(model_key, by="operator")
     try:
         from .comms_routes import audit
         audit("model.unblock", {"model_key": model_key, "was_blocked": was})

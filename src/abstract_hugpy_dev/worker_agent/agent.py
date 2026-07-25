@@ -6382,6 +6382,273 @@ def _vram_residents(state: "WorkerState") -> "list[dict]":
     return out
 
 
+def _partition_residents(state: "WorkerState", model_key: str) -> "tuple[list, list]":
+    """Split the measured VRAM residents into ``(candidates, protected)`` for an
+    admission of ``model_key``. THE single definition of "what may be evicted".
+
+    Protection (operator ruling, INVIOLABLE): never a 🔒static resident, never one
+    ACTIVELY REPLYING, never one with work QUEUED AHEAD of the subject, never
+    comfy (its own headroom path), never the subject itself. Each protected row
+    carries a ``why`` for the honest refusal.
+
+    Extracted so the eviction-aware autofit's RECLAIMABLE estimate is computed
+    from exactly the rows this admission would really be willing to evict — a
+    parallel estimator would be free to drift from the protections and turn the
+    optimistic layer target into a lie."""
+    busy_slots = _busy_slot_models()
+    queued_ahead = _queued_ahead_of(model_key)
+    candidates: list[dict] = []
+    protected: list[dict] = []
+    for r in _vram_residents(state):
+        mk = r["model_key"]
+        if mk == model_key:
+            continue
+        if str(r.get("host_mode")) == "comfy":
+            protected.append({**r, "why": "comfy (own headroom path; excluded "
+                                          "from allocations — 0.1.137)"})
+            continue
+        if _residency(mk) == "static":
+            protected.append({**r, "why": "static (locked residency)"})
+            continue
+        if _actively_replying(mk, busy_slots):
+            protected.append({**r, "why": "actively replying (in-flight/busy)"})
+            continue
+        if mk in queued_ahead:
+            protected.append({**r, "why": "queued ahead of the subject"})
+            continue
+        candidates.append(r)
+    return candidates, protected
+
+
+def _reclaimable_vram_bytes(candidates: "list[dict]") -> "int | None":
+    """VRAM the admission could plausibly reclaim = the summed measured footprint
+    of the UNPROTECTED residents (``_partition_residents``' candidates).
+
+    Returns None when the estimate cannot be made CONFIDENTLY, which — per the
+    degrade-not-guess doctrine — is the signal to keep today's plan-against-actual
+    behaviour rather than size up on a number we invented:
+
+      * no candidates at all -> None (nothing to reclaim; today's path exactly);
+      * ANY candidate whose measured ``vram_bytes`` is 0/absent -> None. A row we
+        could not join to nvidia-smi is a real occupant of unknown size; counting
+        it as 0 would understate reclaimable (harmless) but counting the SET as
+        complete would overstate our confidence. We refuse to guess either way.
+
+    This is a TARGET, never a promise: between planning and executing a candidate
+    can become static/busy/replying, so the caller MUST re-measure after the
+    eviction and re-plan from what was actually freed."""
+    if not candidates:
+        return None
+    total = 0
+    for r in candidates:
+        try:
+            vb = int(r.get("vram_bytes") or 0)
+        except (TypeError, ValueError):
+            return None
+        if vb <= 0:
+            return None                      # unmeasurable occupant -> don't guess
+        total += vb
+    return total or None
+
+
+def _autofit_layers_for(path: str, free_vram: "int | None",
+                        extra_reserve: int = 0) -> "int | None":
+    """``autofit_gpu_layers`` against an EXPLICIT free-VRAM figure, or None when it
+    can't be evaluated. Thin wrapper so the eviction-aware planner and the slot
+    child agree on one layer-fitting formula (no parallel estimator)."""
+    if not path or not free_vram or free_vram <= 0:
+        return None
+    try:
+        from ..managers import spill as _spill
+        return _spill.autofit_gpu_layers(path, free_vram=int(free_vram),
+                                         extra_reserve_bytes=int(extra_reserve or 0))
+    except Exception:  # noqa: BLE001 — unmeasurable -> caller keeps today's path
+        return None
+
+
+def _plan_autofit_against_reclaimable(state: "WorkerState", model_key: str,
+                                      candidates: "list[dict]",
+                                      free_now: "int | None") -> "dict | None":
+    """EVICTION-AWARE AUTOFIT (operator, 2026-07-25): "size up for eviction; spill
+    based on the theoretical eviction's success".
+
+    The defect this closes: autofit plans the child's layer count against the VRAM
+    free AT THAT INSTANT, and the count is then fixed for the life of the child.
+    A model seated while the card is MOMENTARILY busy is crippled PERMANENTLY —
+    flux2-klein-9b sat at 21/36 layers on computron with 3.1 GiB still free, a ~4x
+    throughput loss (a dense GGUF measured ~135 tok/s fully resident vs ~36 the
+    moment one layer spills) that looks perfectly healthy from central.
+
+    The inversion: plan against free + RECLAIMABLE rather than free alone. Returns
+    a proposal ``{"target_layers", "free_now", "reclaimable", "path",
+    "extra_reserve", "layers_now"}`` when sizing up is BOTH possible and useful,
+    else None (caller keeps today's behaviour, byte-identical):
+
+      * non-GGUF / unresolvable geometry            -> None
+      * reclaimable unmeasurable or nothing evictable -> None (degrade-not-guess)
+      * autofit against free-now already returns -1 (all layers)  -> None
+      * the optimistic plan is no better than the current one     -> None
+
+    The returned ``target_layers`` is a TARGET. The caller evicts, RE-MEASURES and
+    RE-PLANS; it must never launch this number against VRAM that did not
+    materialise (that is `vram-admission-no-evict`, admit-then-crash)."""
+    # AUTO path only: an explicit operator n_gpu_layers still wins absolutely.
+    intent, requested = _gguf_ngl_intent(model_key)
+    if intent != "auto" or requested is not None:
+        return None
+    path, total_layers = _served_gguf_geometry(model_key)
+    if not path or not total_layers:
+        return None                          # non-GGUF / no geometry -> today
+    reclaimable = _reclaimable_vram_bytes(candidates)
+    if not reclaimable or not free_now:
+        return None                          # degrade-not-guess
+    try:
+        from ..managers.spill import vision_projector_bytes as _vpb
+        extra_reserve = int(_vpb(path) or 0)
+    except Exception:  # noqa: BLE001
+        extra_reserve = 0
+    layers_now = _autofit_layers_for(path, free_now, extra_reserve)
+    if layers_now is None or layers_now == -1:
+        return None                          # already plans every layer -> today
+    target = _autofit_layers_for(path, int(free_now) + int(reclaimable), extra_reserve)
+    if target is None:
+        return None
+    if target != -1 and target <= layers_now:
+        return None                          # eviction buys nothing -> today
+    return {"target_layers": target, "layers_now": layers_now,
+            "free_now": int(free_now), "reclaimable": int(reclaimable),
+            "path": path, "total_layers": int(total_layers),
+            "extra_reserve": extra_reserve}
+
+
+def _size_up_for_eviction(state: "WorkerState", model_key: str, plan: dict,
+                          lru: "dict | None" = None) -> dict:
+    """Realise an eviction-aware autofit proposal, then **RE-PLAN**.
+
+    THE HARD REQUIREMENT. ``plan["target_layers"]`` was sized against a
+    THEORETICAL figure (free + reclaimable). Between planning and executing, a
+    candidate can go static / start replying / take work queued ahead, so the
+    eviction may UNDER-DELIVER. Launching the optimistic count against VRAM we
+    did not get is exactly ``vram-admission-no-evict`` (admit-then-crash), a
+    recorded landmine. So we evict coldest-first, then RE-MEASURE the device and
+    RE-PLAN the layer count from what was ACTUALLY freed, and emit THAT.
+
+    The optimistic number is a target, never a promise: the emitted
+    ``n_gpu_layers`` is always the re-planned one, and it can only ever be >= the
+    count the child would have autofitted for itself (we never make a seat worse
+    than today — a shortfall degrades back toward today's plan, and an eviction
+    that delivers nothing returns the plain ``proceed`` today would have given).
+    """
+    path = plan["path"]
+    extra = plan.get("extra_reserve") or 0
+    if lru is None:
+        try:
+            from ..managers.dispatch.dispatch import last_used_snapshot as _lus
+            lru = _lus()
+        except Exception:  # noqa: BLE001
+            lru = {}
+
+    # Re-partition at EXECUTION time (not from the planning snapshot) so a
+    # resident that just became protected is never touched. Protections are
+    # never overridden to make a plan fit.
+    candidates, _protected = _partition_residents(state, model_key)
+    from .flex import flex_priority_key as _fpk
+    candidates.sort(key=lambda r: (_fpk(_flex_alloc(r["model_key"])),
+                                   lru.get(r["model_key"], 0.0),
+                                   -int(r.get("vram_bytes") or 0)))
+
+    evicted: list[str] = []
+    freed = 0
+    target = plan["target_layers"]
+    for r in candidates:
+        # Stop as soon as the layer target is ACHIEVED — the minimum eviction
+        # set, same discipline as the fit loop. Re-planned from the device each
+        # round, so we never evict past what the plan actually needs.
+        cur = _autofit_layers_for(path, _free_vram_bytes(), extra)
+        if cur == -1 or (target != -1 and cur is not None and cur >= target):
+            break
+        mk = r["model_key"]
+        # RE-CHECK protection immediately before acting. The partition above is
+        # a snapshot; a resident can go static / start replying / take work
+        # queued ahead DURING this loop, and protections are inviolable — a
+        # size-up (which nothing forces us to do at all) must never be the thing
+        # that evicts a now-protected model. Its bytes simply drop out of the
+        # reclaim, and the re-plan below absorbs the shortfall.
+        if mk not in {c["model_key"] for c in _partition_residents(state, model_key)[0]}:
+            logger.info("size-up autofit: %s became protected mid-plan — "
+                        "skipping it (the re-plan absorbs the shortfall)", mk)
+            continue
+        res = _evict_model(state, mk)
+        if res.get("evicted"):
+            fb = res.get("vram_freed")
+            freed += int(fb) if fb else 0
+            evicted.append(mk)
+            _note_vram_eviction(mk, model_key, fb, res.get("host_mode") or "")
+            _trim_host_ram()                 # so the next re-measure sees the room
+        else:
+            logger.warning("size-up autofit: eviction of %s did not free it "
+                           "(%s: %s)", mk, res.get("host_mode"), res.get("reason"))
+
+    # ── THE RE-PLAN. Measure the device again and size the layer count against
+    #    what MATERIALISED, never against the theoretical figure we planned with.
+    final_free = _free_vram_bytes()
+    final = _autofit_layers_for(path, final_free, extra)
+    if final is None:
+        # Lost the measurement mid-flight -> emit nothing; the child autofits for
+        # itself exactly as today (degrade-not-guess).
+        return {"action": "proceed" if not evicted else "evicted",
+                "evicted": evicted, "freed_bytes": freed, "reason": None,
+                "note": "size-up autofit abandoned: free VRAM unmeasurable after "
+                        "eviction — the child autofits itself (today's behaviour)"}
+    if final != -1 and final <= plan["layers_now"]:
+        # The eviction under-delivered so badly it bought no layers. Say so, and
+        # emit no plan rather than a number that isn't better than the default.
+        return {"action": "proceed" if not evicted else "evicted",
+                "evicted": evicted, "freed_bytes": freed, "reason": None,
+                "note": (f"size-up autofit under-delivered: planned {plan['target_layers']} "
+                         f"layers against {_human_bytes(plan['free_now'] + plan['reclaimable'])} "
+                         f"(free + reclaimable), got {_human_bytes(final_free)} free -> "
+                         f"{final} layers; keeping the default autofit")}
+    if final != target:
+        logger.info(
+            "size-up autofit RE-PLANNED for %s: target was %s layers against "
+            "~%s (free + reclaimable), eviction delivered ~%s free -> serving %s "
+            "layers (never the optimistic count against VRAM we didn't get)",
+            model_key, target, _human_bytes(plan["free_now"] + plan["reclaimable"]),
+            _human_bytes(final_free), final)
+    else:
+        logger.info(
+            "size-up autofit for %s: %s/%s layers (was planning %s against %s "
+            "free) after evicting %d reclaimable resident(s) freeing %s",
+            model_key, ("all" if final == -1 else final), plan["total_layers"],
+            plan["layers_now"], _human_bytes(plan["free_now"]), len(evicted),
+            _human_bytes(freed))
+
+    # Pin the re-planned count for the in-process llama_cpp load AND carry it in
+    # the verdict so the slot child launches with exactly this --n-gpu-layers
+    # instead of re-autofitting against a number that may have moved again.
+    try:
+        from ..managers import spill as _spill
+        _spill.set_ngl_override(path, final)
+    except Exception:  # noqa: BLE001 — the verdict still carries N
+        pass
+    _PARTIAL_NGL[model_key] = {"path": path, "n": final}
+    return {"action": "partial", "evicted": evicted, "freed_bytes": freed,
+            "reason": None, "n_gpu_layers": final,
+            "size_up": {"target_layers": target, "planned_layers": final,
+                        "layers_without_eviction": plan["layers_now"],
+                        "total_layers": plan["total_layers"],
+                        "free_before_bytes": plan["free_now"],
+                        "reclaimable_bytes": plan["reclaimable"],
+                        "free_after_bytes": final_free,
+                        "evicted": list(evicted), "freed_bytes": freed},
+            "note": (f"eviction-aware autofit: "
+                     f"{'all' if final == -1 else final}/{plan['total_layers']} "
+                     f"layers on GPU (default autofit would have seated "
+                     f"{plan['layers_now']}) after reclaiming "
+                     f"{_human_bytes(freed)} from {len(evicted)} idle resident(s)")}
+
+
 def _vram_evict_to_fit(state: "WorkerState", model_key: str,
                        need: "int | None" = None) -> dict:
     """THE VRAM admission choke point. Make room for ``model_key`` to land on the
@@ -6494,38 +6761,29 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
     if ok:
         if moe_commit is not None:
             return _moe_admit_verdict([], 0)
+        # ── stage 0.5: EVICTION-AWARE AUTOFIT (operator, 2026-07-25) ─────────
+        # The full need fits, so nothing MUST be evicted — but "fits" is a
+        # ceiling test, not a placement. The slot child will still autofit its
+        # layer count against the VRAM free at THAT instant, and a card that is
+        # momentarily busy cripples the seat PERMANENTLY (flux2-klein-9b: 21/36
+        # layers with 3.1 GiB free; re-seating put all 36 on the card). Size up
+        # for the eviction instead: plan against free + reclaimable, evict to
+        # realise it, then RE-PLAN from what was actually freed.
+        _up = _plan_autofit_against_reclaimable(
+            state, model_key, _partition_residents(state, model_key)[0],
+            _free_vram_bytes())
+        if _up is not None:
+            return _size_up_for_eviction(state, model_key, _up, lru=None)
         return {"action": "proceed", "evicted": [], "freed_bytes": 0, "reason": None}
 
     # Over the ceiling — plan the minimum eviction set.
-    busy_slots = _busy_slot_models()
-    queued_ahead = _queued_ahead_of(model_key)
     try:
         from ..managers.dispatch.dispatch import last_used_snapshot as _lus
         lru = _lus()
     except Exception:  # noqa: BLE001
         lru = {}
 
-    residents = _vram_residents(state)
-    candidates: list[dict] = []
-    protected: list[dict] = []
-    for r in residents:
-        mk = r["model_key"]
-        if mk == model_key:
-            continue
-        if str(r.get("host_mode")) == "comfy":
-            protected.append({**r, "why": "comfy (own headroom path; excluded "
-                                          "from allocations — 0.1.137)"})
-            continue
-        if _residency(mk) == "static":
-            protected.append({**r, "why": "static (locked residency)"})
-            continue
-        if _actively_replying(mk, busy_slots):
-            protected.append({**r, "why": "actively replying (in-flight/busy)"})
-            continue
-        if mk in queued_ahead:
-            protected.append({**r, "why": "queued ahead of the subject"})
-            continue
-        candidates.append(r)
+    candidates, protected = _partition_residents(state, model_key)
 
     # ── t21 tolerance-band FLEX before evict (stage 1) ──────────────────────
     # Try to fit WITHIN bands before evicting anyone. ctx is the CHEAPEST flex,

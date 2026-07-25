@@ -520,6 +520,14 @@ _PLACEMENT_SPILL_KEYS = frozenset({
     "cpu_mem_gib_deviation_pct", "tensor_split", "threads",
 })
 
+# Mirror of managers.alloc_modes.NEW_SPILL_KEYS, used only to decide whether a
+# DERIVED spill needs the version gate at all (a ram-only derive is the legacy
+# n_gpu_layers wire and every worker version honors it — gating it would
+# needlessly downgrade an old worker's correct default). Kept as a literal so
+# this hot read-path stays import-free; asserted equal in tests.
+_NEW_SPILL_KEYS_LOCAL = frozenset({"alloc_mode", "leniency_pct",
+                                   "priority_device", "n_cpu_moe"})
+
 
 def _limit_bytes(worker: Dict[str, Any], key: str) -> Optional[int]:
     """A central limit (limits.<key> in GiB) as bytes, or None if unset."""
@@ -763,6 +771,38 @@ def _model_moe_gpu_bytes(model_key: str) -> Optional[int]:
         return None
 
 
+def _model_moe_detail(model_key: str) -> Optional[Dict[str, Any]]:
+    """The MoE STRUCTURE of a GGUF model — ``{is_moe, expert_bytes,
+    non_expert_bytes, ...}`` — or None for dense/non-GGUF/unresolvable.
+
+    Same enrichment source as ``_model_moe_gpu_bytes`` (the registry row's
+    ``moe`` field, which rides gguf_variants_detail; spill.gguf_moe_detail
+    caches the header parse per file, so this costs no extra I/O). Where that
+    helper flattens the structure to ONE number for the feasibility eliminator,
+    this returns the whole detail: deriving the split needs BOTH sides (the
+    non-expert share to price the GPU, the expert share to price RAM).
+
+    None is a first-class "central cannot say" — the caller must degrade to the
+    dense path, never guess a split."""
+    if not model_key:
+        return None
+    try:
+        from ....routes.llm_storage_routes import _annotate_gguf_size
+        from ......imports.config.models.models_config import get_models_dict
+        manifest = get_models_dict(dict_return=True) or {}
+        entry = manifest.get(model_key)
+        if not isinstance(entry, dict):
+            return None
+        model = dict(entry)                     # copy: annotators mutate
+        _annotate_gguf_size(model, model_key)
+        moe = model.get("moe")
+        if not isinstance(moe, dict) or not moe.get("is_moe"):
+            return None
+        return moe
+    except Exception:  # noqa: BLE001 — unknown structure degrades to dense
+        return None
+
+
 def _model_engine(model_key: str) -> Optional[str]:
     """One model's engine/framework from central's registry, lowercased, or None
     when unresolvable. Used to pick the FEASIBLE blank default (GGUF is always
@@ -874,9 +914,36 @@ def derived_default_mode(worker: Dict[str, Any], model_key: str) -> str:
             _model_engine(model_key),
             _model_size_bytes(model_key),
             _worker_gpu_total_bytes(worker),
-            _worker_ram_total_bytes(worker))
+            _worker_ram_total_bytes(worker),
+            moe=_model_moe_detail(model_key))
     except Exception:  # noqa: BLE001 — a derivation must never break a read/relay
         return "max-gpu"
+
+
+def derived_default_allocation(worker: Dict[str, Any],
+                               model_key: str) -> Dict[str, Any]:
+    """The full DERIVED initial allocation for one (worker, model) —
+    ``{"mode", "spill", "why"}`` — per the operator's decision tree
+    (2026-07-25). The allocation-shaped sibling of ``derived_default_mode``:
+    that one returns the NAME for surfaces, this one returns the WIRE ENCODING
+    for the places that PERSIST an allocation, so a MoE's derived split
+    (n_cpu_moe + the budgets) survives instead of being flattened to a name.
+
+    Pure glue over ``managers.alloc_modes.default_allocation``: resolves engine,
+    effective size, MoE structure, and the box's measured GPU/RAM totals from
+    central's authoritative sources and asks the shared math. ANY lookup miss
+    degrades to max-gpu / {} — never a 500, never a guess."""
+    try:
+        from ......managers.alloc_modes import default_allocation
+        return default_allocation(
+            _model_engine(model_key),
+            _model_size_bytes(model_key),
+            _worker_gpu_total_bytes(worker),
+            _worker_ram_total_bytes(worker),
+            moe=_model_moe_detail(model_key))
+    except Exception:  # noqa: BLE001 — a derivation must never break a read/relay
+        return {"mode": "max-gpu", "spill": {},
+                "why": "derivation unavailable — kept the max-gpu default"}
 
 
 def allocated_totals(worker: Dict[str, Any]) -> Dict[str, Any]:
@@ -2148,17 +2215,41 @@ class WorkerStore:
         # ever touches the BLANK case; an explicit persisted contract is left
         # exactly as-is. The emitted encoding is the LEGACY n_gpu_layers key —
         # no version gate needed (every worker version honors it).
+        #
+        # STRUCTURE-DERIVED (2026-07-25): the derivation is now the operator's
+        # FULL decision tree, so a blank MoE GGUF resolves to its own split
+        # (explicit + n_cpu_moe + the two budgets) instead of the blanket stamp.
+        # The MoE case is the reason this returns a whole spill rather than a
+        # mode name — see alloc_modes.default_allocation for the wire rationale.
+        # The derived spill goes through the SAME version gate as a persisted
+        # one: a pre-0.1.203 worker gets {} (max-gpu), whose own load-time auto
+        # MoE policy reaches the right placement anyway.
         if not (set(spill) & _PLACEMENT_SPILL_KEYS):
             try:
-                mode = derived_default_mode(worker, model_key)
+                derived = derived_default_allocation(worker, model_key)
+                mode = derived.get("mode") or "max-gpu"
+                out = dict(derived.get("spill") or {})
             except Exception:  # noqa: BLE001 — never break the relay over a derive
-                mode = "max-gpu"
-            if mode == "ram-only":
-                logger.info("blank default for %s on %s derived to ram-only "
-                            "(feasibility: oversized for GPU, fits RAM)",
-                            model_key, worker.get("name") or worker_id)
-                return {"n_gpu_layers": "off"}
-            return {}                            # max-gpu: today's blank ({})
+                mode, out = "max-gpu", {}
+            if mode == "max-gpu" or not out:
+                return {}                        # max-gpu: today's blank ({})
+            logger.info("blank default for %s on %s derived to %s (%s)",
+                        model_key, worker.get("name") or worker_id, mode,
+                        derived.get("why") or "structure-derived")
+            if not (set(out) & _NEW_SPILL_KEYS_LOCAL):
+                return out                       # legacy wire: no gate needed
+            try:
+                from ......managers.alloc_modes import gate_spill_for_worker
+                gated, note = gate_spill_for_worker(
+                    out, worker.get("pkg_version"),
+                    worker.get("name") or worker_id)
+                if note:
+                    logger.warning(
+                        "derived default for %s on %s downgraded: %s",
+                        model_key, worker.get("name") or worker_id, note)
+                return gated
+            except Exception:  # noqa: BLE001 — the gate must never break relaying
+                return {}                        # fail SAFE: unproven -> max-gpu
         try:
             from ......managers.alloc_modes import gate_spill_for_worker
             gated, note = gate_spill_for_worker(
@@ -2657,6 +2748,87 @@ def derived_default_for(worker_id: str, model_key: str) -> Optional[str]:
     if worker is None:
         return None
     return derived_default_mode(worker, model_key)
+
+
+def derived_allocation_for(worker_id: str, model_key: str) -> Optional[Dict[str, Any]]:
+    """The full derived initial allocation ``{"mode","spill","why"}`` for
+    (worker, model) from the RAW worker record, or None if the worker is
+    unknown. The allocation-shaped companion of ``derived_default_for`` — used
+    by surfaces that want to SHOW the derived split (and its ``why``), and by
+    any caller that needs the wire encoding rather than the mode name."""
+    worker = worker_store._load().get(worker_id)
+    if worker is None:
+        return None
+    return derived_default_allocation(worker, model_key)
+
+
+def fleet_fit_for_model(model_key: str,
+                        workers: Optional[List[Dict[str, Any]]] = None
+                        ) -> Dict[str, Any]:
+    """Can ``model_key`` land ANYWHERE on the fleet, in ANY mode? (CASE A glue.)
+
+    Resolves each ONLINE worker's measured GPU/RAM totals and the model's
+    effective size from central's authoritative sources, then hands the pure
+    arithmetic to ``alloc_modes.fleet_fit_verdict``. Returns that function's
+    dict — the caller acts on ``blockable`` and nothing else.
+
+    ONLINE-ONLY IS DELIBERATE. An offline box's totals are last-known and its
+    return is not in central's gift; counting it as a confident "cannot fit"
+    would let a box being rebooted vote a model out of the pool. It also cannot
+    vote "fits" — a model is not placeable on a worker that is not there. So an
+    offline worker simply does not appear, which (per fleet_fit_verdict) makes
+    an all-offline fleet unblockable rather than universally-refusing.
+
+    Degrades to a NON-blockable verdict on ANY error: an exception here must
+    never manufacture a block."""
+    try:
+        from ......managers.alloc_modes import fleet_fit_verdict
+        engine = _model_engine(model_key)
+        size = _model_size_bytes(model_key)
+        rows = workers if workers is not None else list_workers()
+        boxes = []
+        for w in (rows or []):
+            if (w.get("status") or "").lower() != "online":
+                continue
+            boxes.append({
+                "name": w.get("name") or w.get("id"),
+                "engine": engine,
+                "model_bytes": size,
+                "gpu_total_bytes": _worker_gpu_total_bytes(w),
+                "ram_total_bytes": _worker_ram_total_bytes(w),
+            })
+        return fleet_fit_verdict(boxes)
+    except Exception as exc:  # noqa: BLE001 — never manufacture a block
+        logger.debug("fleet fit verdict failed for %s: %s", model_key, exc)
+        return {"fits_somewhere": None, "blockable": False, "fits_on": [],
+                "refused_by": [], "unknown": [],
+                "why": f"fleet fit could not be evaluated ({exc}) — not blocked"}
+
+
+def maybe_auto_block(model_key: str,
+                     workers: Optional[List[Dict[str, Any]]] = None
+                     ) -> Optional[Dict[str, Any]]:
+    """CASE A action: auto-block ``model_key`` iff it fits NO online worker in
+    ANY mode. Returns the block record when it blocked, else None.
+
+    Composes ``fleet_fit_for_model`` (the arithmetic) with
+    ``blocklist.auto_block`` (which enforces operator-unblock stickiness and
+    never overwrites an operator-authored block). Best-effort by design — any
+    failure is swallowed, because a broken auto-blocker must degrade to today's
+    behavior (a late honest load-time refusal), never to a spurious block."""
+    try:
+        verdict = fleet_fit_for_model(model_key, workers)
+        if not verdict.get("blockable"):
+            return None
+        from abstract_hugpy_dev.comms.blocklist import auto_block
+        rec = auto_block(model_key, verdict.get("why") or "auto: fits no worker")
+        if rec:
+            logger.warning("AUTO-BLOCKED %s — %s", model_key, verdict.get("why"))
+        return rec
+    except Exception:  # noqa: BLE001
+        logger.debug("auto-block evaluation failed for %s", model_key,
+                     exc_info=True)
+        return None
 
 
 _FEAS_FAILOPEN_SEEN: set = set()

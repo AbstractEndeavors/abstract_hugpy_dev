@@ -595,6 +595,51 @@ def test_explicit_minus_one_forces_all_layers_and_never_auto_splits(cmd_rig):
     assert ncm is None and "--n-cpu-moe" not in argv
 
 
+def test_explicit_minus_one_DOES_split_when_it_cannot_possibly_fit(cmd_rig,
+                                                                   monkeypatch):
+    """The one exception (2026-07-25): -1 wins whenever it is ACHIEVABLE, but a
+    model that cannot fit the card is not a placement — it is a stall.
+
+    A bare {"n_gpu_layers": -1} is the ROUTINE stamp here (40 of 43 persisted
+    allocations on ae), applied by the console's Max GPU button / bulk-allocate
+    / reconcile. Obeying it on an oversized MoE is exactly what stranded ae for
+    5.5h: 48.4 GB of weights at a 24 GB card, --n-cpu-moe absent, 9 failed
+    attempts, silent fallback. So when the weights are multiples of the card,
+    the split applies instead of the stall.
+
+    The sibling test above pins the other half: -1 on a model that DOES fit is
+    still forced, byte-identical. Both must hold.
+    """
+    monkeypatch.setattr(sa, "_total_gguf_bytes", lambda _p: 48 * 2 ** 30)
+    monkeypatch.setattr("abstract_hugpy_dev.managers.spill.free_vram_bytes",
+                        lambda: 24 * 2 ** 30)
+    cmd_rig.auto["value"] = 17
+    (argv, ngl, *_rest, ncm) = sa._build_cmd("moe-model", n_gpu_layers=-1,
+                                             path=cmd_rig.moe)
+    assert ncm, "an impossible forced -1 must fall back to the expert split"
+    assert "--n-cpu-moe" in argv and ngl == -1
+
+
+def test_explicit_n_cpu_moe_zero_on_an_impossible_fit_REFUSES_loudly(cmd_rig,
+                                                                     monkeypatch):
+    """n_cpu_moe=0 ("experts on the card") on a model that cannot fit the card
+    is refused with an actionable error — it is NOT silently attempted, and it
+    is NOT quietly overridden into a split.
+
+    The distinction from the sibling test matters. A bare -1 is an AMBIGUOUS
+    stamp applied in bulk, so when it is impossible we reinterpret it. An
+    explicit n_cpu_moe=0 is an UNAMBIGUOUS demand, so when it is impossible we
+    tell the operator instead of second-guessing them. Both avoid the stall;
+    only one of them overrides a human.
+    """
+    monkeypatch.setattr(sa, "_total_gguf_bytes", lambda _p: 48 * 2 ** 30)
+    monkeypatch.setattr("abstract_hugpy_dev.managers.spill.free_vram_bytes",
+                        lambda: 24 * 2 ** 30)
+    with pytest.raises(RuntimeError, match="n_cpu_moe|VRAM"):
+        sa._build_cmd("moe-model", n_gpu_layers=-1, n_cpu_moe=0,
+                      path=cmd_rig.moe)
+
+
 def test_defaulted_marker_is_value_identical_to_the_plain_int():
     """The marker may only carry PROVENANCE — never change the value. Every
     existing consumer (argv formatting, comparisons, json) must be unaffected."""
@@ -1029,3 +1074,280 @@ def test_plan_dense_is_none(monkeypatch, dense_gguf):
     for env in ("HUGPY_N_GPU_LAYERS", "HUGPY_N_CPU_MOE", "HUGPY_ALLOC_MODE"):
         monkeypatch.delenv(env, raising=False)
     assert A._moe_plan_for("m") is None
+
+
+# ═══════════ THE DERIVED INITIAL ALLOCATION (operator's decision tree) ═══════
+# Every model ALLOCATED to a worker gets an initial default derived from its own
+# STRUCTURE, replacing the blanket stamp. The live bug this closes: on ae, 40 of
+# 43 persisted allocations were a bare {"n_gpu_layers": -1}. None are MoE today,
+# so it is currently harmless — but that stamp on a MoE reproduces the incident
+# that stranded ae for 5.5h (a 48.4GB MoE launching -1 with no --n-cpu-moe onto
+# a 24GB card, stalling 9 times). Derivation makes that stamp underivable.
+#
+# MEASURED ground truth used below (real files, this store):
+#   coder-next Q4_K_M : non_expert 1.49 GiB / expert 43.59 GiB / 512 exp / 48 L
+#   A3B-Genesis-APEX  : non_expert 1.90 GiB / expert 21.95 GiB / 256 exp / 40 L
+#   A3B Q8_K_P        : non_expert 2.63 GiB / expert 37.97 GiB / 256 exp
+#   Fable-5 q8_0      : non_expert 2.56 GiB / expert 33.38 GiB / 256 exp
+_MEASURED = {
+    "coder-next-Q4_K_M":  {"non_expert": 1.49, "expert": 43.59, "count": 512},
+    "A3B-Genesis-APEX":   {"non_expert": 1.90, "expert": 21.95, "count": 256},
+    "A3B-Q8_K_P":         {"non_expert": 2.63, "expert": 37.97, "count": 256},
+    "Fable-5-q8_0":       {"non_expert": 2.56, "expert": 33.38, "count": 256},
+}
+
+
+def _moe_detail(name):
+    """A gguf_moe_detail-shaped dict from the MEASURED numbers above."""
+    m = _MEASURED[name]
+    return {"is_moe": True, "expert_count": m["count"], "expert_used_count": 10,
+            "expert_bytes": int(m["expert"] * GIB),
+            "non_expert_bytes": int(m["non_expert"] * GIB),
+            "expert_bytes_by_layer": {}, "files": 4}
+
+
+def _total(name):
+    m = _MEASURED[name]
+    return int((m["non_expert"] + m["expert"]) * GIB)
+
+
+# ── the MoE leaf: the split IS the allocation ────────────────────────────────
+@pytest.mark.parametrize("name", sorted(_MEASURED))
+def test_moe_default_is_the_derived_split_on_a_3090(name):
+    """THE headline. Every measured MoE, on ae's real box (24 GiB 3090 /
+    128 GiB RAM): the non-expert share fits the card with room to spare and the
+    experts fit RAM, so the derived default is the SPLIT — never max-gpu, and
+    never the bare -1 stamp."""
+    got = AM.default_allocation("gguf", _total(name), 24 * GIB, 128 * GIB,
+                                moe=_moe_detail(name))
+    assert got["mode"] == "explicit"
+    s = got["spill"]
+    assert s["alloc_mode"] == "explicit"
+    assert s["n_cpu_moe"] == AM.MOE_ALL_LAYERS   # experts to CPU
+    assert s["n_gpu_layers"] == -1               # everything else on the card
+    # the budgets DECLARE the two sides of the split, in GiB
+    assert s["gpu_mem_gib"] == pytest.approx(_MEASURED[name]["non_expert"], abs=0.01)
+    assert s["cpu_mem_gib"] == pytest.approx(_MEASURED[name]["expert"], abs=0.01)
+    assert "MoE split" in got["why"]
+
+
+def test_moe_45gib_model_needs_only_1_49gib_of_vram():
+    """The entire point, stated as one assertion: a 45 GiB model whose derived
+    GPU budget is 1.49 GiB. Priced WHOLE it 'cannot fit' a 24 GiB card and gets
+    stamped; priced by STRUCTURE it fits with 22 GiB to spare."""
+    d = _moe_detail("coder-next-Q4_K_M")
+    total = _total("coder-next-Q4_K_M")
+    assert total / GIB == pytest.approx(45.08, abs=0.05)   # 'cannot fit' 24 GiB
+    got = AM.default_allocation("gguf", total, 24 * GIB, 128 * GIB, moe=d)
+    assert got["spill"]["gpu_mem_gib"] == pytest.approx(1.49, abs=0.01)
+    assert got["mode"] == "explicit"
+
+
+def test_the_bare_minus_one_stamp_is_never_derived_for_a_moe():
+    """The regression guard for the live bug: whatever the tree derives for a
+    MoE, it is NEVER the bare {'n_gpu_layers': -1} that disables the load-time
+    auto policy. If a -1 is present, the expert split MUST ride with it."""
+    for name in _MEASURED:
+        for gpu, ram in ((24 * GIB, 128 * GIB), (8 * GIB, 128 * GIB),
+                         (24 * GIB, 16 * GIB), (4 * GIB, 8 * GIB)):
+            s = AM.default_allocation("gguf", _total(name), gpu, ram,
+                                      moe=_moe_detail(name))["spill"]
+            assert s != {"n_gpu_layers": -1}
+            if s.get("n_gpu_layers") == -1:
+                assert s.get("n_cpu_moe"), (
+                    "a derived -1 without an expert split is the ae incident")
+
+
+def test_moe_experts_do_not_fit_ram_falls_through():
+    """Tree leaf: the non-expert share fits the GPU but the experts do NOT fit
+    RAM -> the operator's tree FALLS THROUGH rather than breaking, and the
+    dense tail decides on the whole file.
+
+    Note the arithmetic that constrains this leaf: experts < total, so any box
+    whose RAM cannot hold the experts cannot hold the whole file either. The
+    fall-through therefore always lands on the break leaf (max-gpu, honest
+    refusal at the worker) — never on ram-only, and never on a split encoded
+    from RAM that isn't there."""
+    d = _moe_detail("coder-next-Q4_K_M")
+    total = _total("coder-next-Q4_K_M")
+    # 43.59 GiB of experts still fit a 46 GiB box, so this one DOES split
+    assert AM.default_allocation("gguf", total, 24 * GIB, 46 * GIB,
+                                 moe=d)["mode"] == "explicit"
+    # 20 GiB of RAM holds neither the experts nor the file -> fall through
+    got = AM.default_allocation("gguf", total, 24 * GIB, 20 * GIB, moe=d)
+    assert got["mode"] == "max-gpu" and got["spill"] == {}
+    assert "refuses honestly" in got["why"]
+
+
+def test_moe_non_expert_share_too_big_for_the_card_but_fits_ram():
+    """Tree leaf: even the non-expert share won't fit the GPU, whole fits RAM.
+
+    Derives **max-ram**, not ram-only (operator, 2026-07-25: _"the 'max'
+    settings were intended to be indicative of a preference for spill... the
+    'only' designations are the truly stringent ones"_). A GGUF still keeps the
+    layers that fit, so forbidding the card outright would cost ~5x throughput
+    by today's cliff measurement (~36 tok/s partial vs ~7.5 at ngl=0). A
+    default must never promise that.
+
+    A tiny 1 GiB card against coder-next's 1.49 GiB of non-expert tensors."""
+    got = AM.default_allocation("gguf", _total("coder-next-Q4_K_M"),
+                                1 * GIB, 128 * GIB,
+                                moe=_moe_detail("coder-next-Q4_K_M"))
+    assert got["mode"] == "max-ram"
+    assert got["spill"] == {"alloc_mode": "max-ram"}
+
+
+def test_moe_fits_nothing_is_the_break_leaf():
+    """Tree leaf '-- break': fits neither the GPU nor RAM. No fourth state is
+    invented — max-gpu/{} so the WORKER refuses honestly with the real numbers
+    at load, where the refusal can actually be explained."""
+    got = AM.default_allocation("gguf", _total("coder-next-Q4_K_M"),
+                                1 * GIB, 4 * GIB,
+                                moe=_moe_detail("coder-next-Q4_K_M"))
+    assert got["mode"] == "max-gpu" and got["spill"] == {}
+    assert "refuses honestly" in got["why"]
+
+
+# ── the dense / transformers leaves stay exactly as they were ────────────────
+def test_dense_gguf_leaves_are_unchanged():
+    fits = AM.default_allocation("gguf", 5 * GIB, 24 * GIB, 128 * GIB)
+    assert fits["mode"] == "max-gpu" and fits["spill"] == {}
+    big = AM.default_allocation("gguf", 68 * GIB, 24 * GIB, 128 * GIB)
+    assert big["mode"] == "max-ram"
+    huge = AM.default_allocation("gguf", 400 * GIB, 24 * GIB, 128 * GIB)
+    assert huge["mode"] == "max-gpu" and huge["spill"] == {}
+
+
+def test_transformers_leaves_match_the_established_behaviour():
+    """The transformers branch was already correct; the tree must not move it."""
+    for size, gpu, ram, want in ((5 * GIB, 24 * GIB, 124 * GIB, "max-gpu"),
+                                 (68 * GIB, 24 * GIB, 124 * GIB, "ram-only"),
+                                 (200 * GIB, 24 * GIB, 124 * GIB, "max-gpu")):
+        got = AM.default_allocation("transformers", size, gpu, ram)
+        assert got["mode"] == want
+        assert got["mode"] == AM.feasible_default_mode("transformers", size,
+                                                       gpu, ram)
+
+
+def test_fitting_model_derives_max_gpu_not_gpu_only():
+    """The one deliberate departure from the sketch's literal words, pinned so
+    it cannot be 'fixed' by accident: the 'gpu large enough' leaf derives
+    max-gpu (fit-and-spill), NOT gpu-only (all-or-bust). A DEFAULT must never
+    promise a bust — the fit test is a headroom heuristic against TOTAL
+    capacity, not a measurement of what is free right now. gpu-only stays
+    reachable by explicit operator choice."""
+    for engine in ("transformers", "gguf"):
+        got = AM.default_allocation(engine, 5 * GIB, 24 * GIB, 128 * GIB)
+        assert got["mode"] == "max-gpu"
+        assert got["spill"] == {}                # never {"n_gpu_layers": -1}
+
+
+# ── degrade-not-guess: a default is never derived from a guessed number ──────
+@pytest.mark.parametrize("size,gpu,ram", [
+    (None, 24 * GIB, 128 * GIB),                 # unknown size
+    (_total("coder-next-Q4_K_M"), None, 128 * GIB),   # unknown GPU total
+])
+def test_missing_measurements_degrade_to_todays_behaviour(size, gpu, ram):
+    got = AM.default_allocation("gguf", size, gpu, ram,
+                                moe=_moe_detail("coder-next-Q4_K_M"))
+    assert got["mode"] == "max-gpu" and got["spill"] == {}
+    assert "degrade-not-guess" in got["why"]
+
+
+def test_unknown_ram_never_derives_a_split_or_a_ram_only():
+    """RAM unknown: the split's CPU side is unpriceable and ram-only is
+    unjustifiable, so both are off the table — max-gpu, and the worker's own
+    auto policy still reaches the right placement."""
+    got = AM.default_allocation("gguf", _total("coder-next-Q4_K_M"),
+                                24 * GIB, None,
+                                moe=_moe_detail("coder-next-Q4_K_M"))
+    assert got["mode"] == "max-gpu" and got["spill"] == {}
+
+
+def test_unreadable_moe_detail_degrades_to_the_dense_path():
+    """A detected MoE whose split is unpriceable (missing byte counts) must not
+    encode a split from numbers we don't have — it falls to the dense tail."""
+    broken = {"is_moe": True, "expert_bytes": 0, "non_expert_bytes": 0}
+    got = AM.default_allocation("gguf", 45 * GIB, 24 * GIB, 128 * GIB, moe=broken)
+    assert got["mode"] == "max-ram"              # 45 GiB: dense tail, fits RAM
+    assert "unpriceable" in got["why"]
+    # no moe detail supplied at all -> pure dense path
+    assert AM.default_allocation("gguf", 45 * GIB, 24 * GIB, 128 * GIB
+                                 )["mode"] == "max-ram"
+    # is_moe False is dense too
+    assert AM.default_allocation("gguf", 5 * GIB, 24 * GIB, 128 * GIB,
+                                 moe={"is_moe": False})["mode"] == "max-gpu"
+
+
+# ── the two views agree; the mirrored constant cannot drift ──────────────────
+def test_feasible_default_mode_agrees_with_the_allocation_view():
+    """feasible_default_mode is the NAME view of the same tree — it delegates
+    for MoE, so the two can never disagree about one model."""
+    d = _moe_detail("coder-next-Q4_K_M")
+    t = _total("coder-next-Q4_K_M")
+    for gpu, ram in ((24 * GIB, 128 * GIB), (1 * GIB, 128 * GIB),
+                     (1 * GIB, 4 * GIB), (24 * GIB, None)):
+        assert (AM.feasible_default_mode("gguf", t, gpu, ram, moe=d)
+                == AM.default_allocation("gguf", t, gpu, ram, moe=d)["mode"])
+    # without a moe detail the name view is byte-identical to before (max-gpu)
+    assert AM.feasible_default_mode("gguf", t, 24 * GIB, 128 * GIB) == "max-gpu"
+
+
+def test_moe_all_layers_mirror_matches_spill():
+    """alloc_modes stays stdlib-pure, so it mirrors the sentinel rather than
+    importing the GGUF reader. Assert the mirror so it cannot drift silently."""
+    assert AM.MOE_ALL_LAYERS == spill.MOE_ALL_LAYERS
+
+
+def test_derived_moe_spill_rides_the_existing_version_gate():
+    """No new wire contract: every key the MoE leaf emits is already honored by
+    a released worker, and the pair that needs gating is already in
+    NEW_SPILL_KEYS. An old worker gets {} (max-gpu) — whose own auto MoE policy
+    reaches the right placement anyway, so the downgrade is not a dud."""
+    s = AM.default_allocation("gguf", _total("coder-next-Q4_K_M"), 24 * GIB,
+                              128 * GIB, moe=_moe_detail("coder-next-Q4_K_M")
+                              )["spill"]
+    assert set(s) & AM.NEW_SPILL_KEYS            # gated by construction
+    old, note = AM.gate_spill_for_worker(s, "0.1.150", "old-box")
+    assert old == {} and note
+    new, note2 = AM.gate_spill_for_worker(s, "0.1.208", "ae")   # the live fleet
+    assert new == s and note2 is None
+    # every emitted key is one the released worker actually reads
+    assert set(s) <= set(A._SPILL_ENV)
+
+
+def test_derived_moe_spill_reproduces_the_auto_policy_argv(cmd_rig, monkeypatch):
+    """END-TO-END, the promise check: feed the DERIVED spill through the real
+    worker seam (_apply_spill -> env -> the load opts the slot child gets) and
+    assert _build_cmd emits the SAME argv the measured auto policy produces
+    (--n-gpu-layers -1 --n-cpu-moe 999). This is what proves the derived
+    default is a success path and not a plausible-looking dud — in particular
+    that setting alloc_mode did not silence the split."""
+    d = spill.gguf_moe_detail(cmd_rig.moe)
+    got = AM.default_allocation("gguf", 45 * GIB, 24 * GIB, 128 * GIB, moe=d)
+    A._apply_spill(got["spill"])
+    try:
+        # what llama.runners.get forwards to the slot child from that env
+        assert os.environ["HUGPY_N_CPU_MOE"] == str(AM.MOE_ALL_LAYERS)
+        assert os.environ["HUGPY_N_GPU_LAYERS"] == "-1"
+        cmd_rig.auto["value"] = 17               # autofit would have said 17/48
+        (argv, ngl, *_rest, ncm) = sa._build_cmd(
+            "moe-model", path=cmd_rig.moe,
+            n_gpu_layers=int(os.environ["HUGPY_N_GPU_LAYERS"]),
+            n_cpu_moe=os.environ["HUGPY_N_CPU_MOE"])
+        pairs = _argv_pairs(argv)
+        assert ngl == -1 and pairs["--n-gpu-layers"] == "-1"
+        assert ncm == AM.MOE_ALL_LAYERS and pairs["--n-cpu-moe"] == "999"
+    finally:
+        A._apply_spill({})
+
+
+def test_derived_split_matches_moe_split_need():
+    """The derived budgets must equal what spill.moe_split_need prices for the
+    all-experts-on-CPU split — one source of truth for the two sides."""
+    d = _moe_detail("A3B-Genesis-APEX")
+    need = spill.moe_split_need(d)
+    s = AM.default_allocation("gguf", _total("A3B-Genesis-APEX"), 24 * GIB,
+                              128 * GIB, moe=d)["spill"]
+    assert s["gpu_mem_gib"] == pytest.approx(need["gpu_bytes"] / GIB, abs=0.01)
+    assert s["cpu_mem_gib"] == pytest.approx(need["cpu_bytes"] / GIB, abs=0.01)

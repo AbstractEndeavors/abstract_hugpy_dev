@@ -322,6 +322,32 @@ class SlotPool:
                     "under the real-VRAM ceiling", victim["model_key"],
                     victim["_control"], model_key)
                 statuses = self.statuses()   # re-read: the seat is now free
+        elif _MAKE_ROOM is not None and "n_gpu_layers" not in eff_opts:
+            # EVICTION-AWARE AUTOFIT (2026-07-25). The ceiling gate PASSED, so
+            # nothing must be evicted — but "fits" is not a placement. Left alone,
+            # the slot child autofits its layer count against the VRAM free at
+            # that instant, and a momentarily-busy card cripples the seat for the
+            # life of the child (flux2-klein-9b: 21/36 layers with 3.1 GiB free —
+            # a ~4x throughput loss that reads as healthy from central).
+            #
+            # So consult the admission anyway: it sizes the plan against free +
+            # RECLAIMABLE, evicts to realise it, and RE-PLANS from what was
+            # actually freed. It answers "partial" with an explicit layer count
+            # ONLY when that beats the default autofit; otherwise it answers
+            # "proceed" and we thread nothing (byte-identical to before). An
+            # explicit operator n_gpu_layers in opts skips this entirely.
+            try:
+                verdict = _MAKE_ROOM(model_key)
+            except Exception:  # noqa: BLE001 — never hang a request
+                verdict = None
+            if (isinstance(verdict, dict) and verdict.get("action") == "partial"
+                    and verdict.get("n_gpu_layers") is not None
+                    and verdict.get("size_up")):
+                eff_opts["n_gpu_layers"] = verdict["n_gpu_layers"]
+                logger.info("eviction-aware autofit: %s seats with "
+                            "--n-gpu-layers %s — %s", model_key,
+                            verdict["n_gpu_layers"], verdict.get("note"))
+                statuses = self.statuses()   # any eviction changed the pool
 
         # 2. an idle slot (reachable, nothing loaded)
         for s in statuses:

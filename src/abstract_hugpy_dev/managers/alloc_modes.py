@@ -126,7 +126,34 @@ GGUF_ENGINES = frozenset({"gguf", "llama_cpp"})
 # only picks the read-time DEFAULT so a doomed max-gpu is never the blank
 # promise). Above 0.9× GPU but within RAM -> ram-only; above RAM too -> leave
 # max-gpu and let the worker refuse honestly (no invented fourth state).
-_GPU_FIT_HEADROOM = 0.9
+#
+# LIFTED 0.9 -> 0.98 (operator, 2026-07-25). Quant sizes are chosen against REAL
+# card capacities, so a 23.5 GiB release IS the "fits a 24 GiB card" build. At
+# 0.9 the cutoff was 21.6 GiB, so a 23.5 GiB model on a 24 GiB 3090 derived
+# **ram-only** — never touching the card it was published for, at the ~7 tok/s
+# floor the cliff sweep measured, when the alternative was ~135. Rejecting the
+# top tier of every card in the fleet is a worse failure than an occasional
+# honest load-time refusal.
+#
+# Why this is the safe one of the two margins lifted today: the derived mode is
+# only a PREFERENCE. The real placement still runs autofit/accelerate, and the
+# ~90% admission ceiling still gates the load — so a wrong guess here degrades
+# to a clear refusal, never a crash. 0.98 rather than 1.0 keeps a token margin
+# for the CUDA context itself.
+_GPU_FIT_HEADROOM = 0.98
+
+# Bytes per GiB, as a float, for the human-readable ``why`` lines and the
+# gpu_mem_gib/cpu_mem_gib budget conversion in default_allocation.
+_GIB_F = float(1 << 30)
+
+# n_cpu_moe value meaning "ALL expert layers on CPU". MIRRORS
+# ``managers.spill.MOE_ALL_LAYERS`` (999 — llama-server caps it to the model's
+# layer count, so any large sentinel works). Duplicated as a literal ON PURPOSE:
+# this module is PURE stdlib so chaos, the routes, overrides and the worker can
+# share ONE vocabulary without import weight, and importing spill here would
+# drag the GGUF reader (struct/glob/os.stat) into every one of those callers.
+# The two are asserted equal in tests so the mirror can never drift silently.
+MOE_ALL_LAYERS = 999
 
 
 def is_gguf_engine(engine: Any) -> bool:
@@ -256,15 +283,29 @@ def feasible_modes(engine: Any,
 def feasible_default_mode(engine: Any,
                           model_bytes: "Optional[int]",
                           gpu_total_bytes: "Optional[int]",
-                          ram_total_bytes: "Optional[int]") -> str:
+                          ram_total_bytes: "Optional[int]",
+                          moe: "Optional[dict]" = None) -> str:
     """The BLANK default alloc mode derived by FEASIBILITY for one (model x
     worker), engine-aware (operator ruling 2026-07-24). This ONLY supplies the
     default when NOTHING is persisted — an explicit alloc_mode always wins
     upstream; this is never consulted for a model that has one.
 
-      * GGUF (any size) -> ``max-gpu`` ALWAYS. Partial offload makes every size
-        feasible on any GPU (spill the rest to RAM), so this is today's blank
-        default, unchanged, and independent of the box totals.
+    NAME-ONLY VIEW: this returns the mode NAME, for the surfaces that reason in
+    names (console dropdown, the /assign feasibility gate). The MoE leaf's
+    content is a SPLIT — a pair of numbers plus a knob — which a ``str`` cannot
+    carry, so callers that PERSIST an allocation must use
+    :func:`default_allocation` instead. The two agree by construction: the MoE
+    branch below delegates to it.
+
+      * GGUF DENSE (any size) -> ``max-gpu`` ALWAYS. Partial offload makes every
+        size feasible on any GPU (spill the rest to RAM), so this is today's
+        blank default, unchanged, and independent of the box totals.
+      * GGUF MoE (``moe`` supplied and is_moe, 2026-07-25) -> the operator's MoE
+        branch via ``default_allocation``: ``explicit`` when the non-expert
+        share fits the GPU and the experts fit RAM, else that function's
+        fall-through. Absent a ``moe`` detail this is byte-identical to the
+        dense path — the caller simply didn't price the structure, and
+        degrade-not-guess says don't invent it.
       * transformers/comfy:
           - if the footprint CLEARLY cannot fit the GPU
             (``model_bytes > _GPU_FIT_HEADROOM * gpu_total_bytes``) but DOES fit
@@ -281,6 +322,12 @@ def feasible_default_mode(engine: Any,
     for the ram-only decision — unknown RAM total) falls back to ``max-gpu``,
     today's behavior. A default is never derived from a guessed number."""
     if is_gguf_engine(engine):
+        # MoE: the ONE GGUF case whose default is derived from structure rather
+        # than stamped. Delegating keeps this name-view and the allocation-view
+        # from ever disagreeing about the same model.
+        if isinstance(moe, dict) and moe.get("is_moe"):
+            return default_allocation(engine, model_bytes, gpu_total_bytes,
+                                      ram_total_bytes, moe=moe)["mode"]
         return "max-gpu"
     # Non-GGUF: need a real size and a real GPU total to say anything.
     if not model_bytes or not gpu_total_bytes:
@@ -303,6 +350,408 @@ def feasible_default_mode(engine: Any,
     if size <= ram_total:
         return "ram-only"                      # the only feasible landing
     return "max-gpu"                           # fits neither -> honest refusal downstream
+
+
+def default_allocation(engine: Any,
+                       model_bytes: "Optional[int]",
+                       gpu_total_bytes: "Optional[int]",
+                       ram_total_bytes: "Optional[int]",
+                       *,
+                       moe: "Optional[dict]" = None) -> dict:
+    """THE full operator decision tree (2026-07-25) for a model's INITIAL
+    DEFAULT allocation, DERIVED from its own structure instead of a blanket
+    stamp. Returns ``{"mode": <one of ALLOC_MODES>, "spill": {...}, "why": str}``
+    — the mode, the wire encoding to persist, and one honest line naming the
+    numbers that chose it.
+
+    This is a SIBLING of :func:`feasible_default_mode`, not a replacement. That
+    function answers "which of the five NAMES is the blank default" and is
+    consumed by surfaces (the console dropdown, the /assign gate) that reason in
+    mode names only. The MoE leaf of this tree cannot be expressed as a name:
+    its whole content is a SPLIT — a pair of numbers plus a knob — so a function
+    returning ``str`` structurally cannot carry it. Rather than widen the return
+    type of a function with several call sites that index it as a string, the
+    tree lives here and ``feasible_default_mode`` stays the name-only view
+    (it now delegates, so the two can never disagree).
+
+    THE TREE (operator, verbatim structure):
+
+        transformers ── gpu large enough? ─ yes ──────────────► max-gpu*
+                                          └ no ─ ram large? ─ yes ► ram-only
+                                                            └ no ► break
+        gguf ─ is_moe? ─ yes ─ gpu large enough for the NON-EXPERT share?
+                        │        ├ yes ─ ram large enough for the EXPERTS?
+                        │        │        ├ yes ────────────► explicit (SPLIT)
+                        │        │        └ no ─────────────► (fall through)
+                        │        └ no ── ram large enough? ─ yes ► ram-only
+                        │                                   └ no ► break
+                        └ no (dense) ─ gpu large enough? ─ yes ─► max-gpu*
+                                                          └ no ─ ram? ─► ram-only
+                                                                       └► break
+
+    (*) the tree's "-- gpu only" leaf is implemented as ``max-gpu``, not
+    ``gpu-only``. Both are GPU placement; max-gpu spills a miss instead of
+    busting, which is the only honest spelling for a DEFAULT nobody chose (and
+    it keeps this leaf byte-identical to today). The full reasoning is on
+    ``_gpu_else_ram`` below — it is the one deliberate departure from the
+    sketch's literal words, and it is called out rather than done silently.
+
+    THE MoE LEAF IS THE POINT. coder-next Q4_K_M is 45 GiB of file but only
+    1.49 GiB of NON-EXPERT tensors; the 43.59 GiB of experts are meant for RAM.
+    Priced whole it "doesn't fit" a 24 GiB card and would be stamped max-gpu;
+    priced by STRUCTURE it fits with 22 GiB to spare, and the split is the
+    measured success path (+59%% tok/s at 5x less VRAM on ae). The default must
+    therefore be the split, DERIVED — never a blanket stamp.
+
+    WIRE ENCODING FOR THE MoE LEAF — ``{"alloc_mode": "explicit",
+    "n_cpu_moe": MOE_ALL_LAYERS, "n_gpu_layers": -1, "gpu_mem_gib":
+    <non-expert>, "cpu_mem_gib": <experts>}``. Both the knob AND the -1 are
+    load-bearing, and omitting either produces a plausible-looking dud:
+
+      * ``n_cpu_moe`` alone is NOT enough. Setting ``alloc_mode: "explicit"``
+        makes ``spill.alloc_mode_env()`` non-None on the worker, which is
+        exactly the gate that DISABLES ``slot_agent._build_cmd``'s auto MoE
+        policy ("a k37 alloc_mode -> no auto split; the operator is driving the
+        numbers themselves"). A derived default that silences the very policy
+        that would have produced the right answer is the incident in miniature.
+        Carrying the knob explicitly re-supplies what the gate suppressed —
+        ``_build_cmd`` reads ``n_cpu_moe`` BEFORE the auto branch, so an
+        explicit value wins regardless of the mode.
+      * ``n_gpu_layers: -1`` is NOT redundant with it. On the SLOT path the
+        agent ships only budgets / n_cpu_moe / an explicit n_gpu_layers to the
+        child (``llama.runners.get``) — ``HUGPY_ALLOC_MODE`` is deliberately not
+        forwarded. So without the -1 the slot child autofits a LAYER split and
+        then adds an expert split on top: a hybrid, not the measured
+        configuration. With both, the child takes the ``moe_mode="explicit"``
+        branch at ngl=-1 — byte-identical argv to what the auto policy emits
+        (``--n-gpu-layers -1 --n-cpu-moe 999``), which is the point.
+      * the -1 is SAFE here precisely because the knob rides with it: the
+        inverse VRAM preflight that catches "-1 onto a card that can't hold it"
+        (the 5.5-hour ae stall) is explicitly skipped when an expert split is
+        configured, because total-bytes-vs-VRAM is the wrong comparison for a
+        split model. A bare -1 is the bug; -1 WITH the split is the fix.
+      * the budgets (``gpu_mem_gib`` / ``cpu_mem_gib``) are the honest
+        DECLARATION of the split's two sides — what the console shows and what
+        the worker's RAM-budget preflight prices the CPU share against. They
+        make the allocation self-describing rather than an opaque pair of flags.
+
+    VERSION GATE: ``alloc_mode`` and ``n_cpu_moe`` are both in NEW_SPILL_KEYS,
+    so this spill is gated by ``gate_spill_for_worker`` at the emission seam
+    like any other mode spill — a pre-0.1.203 worker gets {} (max-gpu autofit),
+    whose own auto MoE policy then does the right thing anyway. The fleet runs
+    0.1.208, so the gate passes today. NOTHING new needed on the wire: every key
+    used here is already in ``_SPILL_ENV`` on the released worker (verified:
+    ``n_cpu_moe -> HUGPY_N_CPU_MOE``, cleared-when-absent so it cannot leak to
+    the next model).
+
+    DEGRADE-NOT-GUESS: every leaf requires MEASURED inputs. A missing size, a
+    missing GPU/RAM total, or an unreadable MoE detail falls back to today's
+    behavior (``max-gpu`` / ``{}``) — a default is NEVER derived from a guessed
+    number. Note the asymmetry that makes this safe: falling back COSTS nothing
+    (max-gpu on a GGUF still gets the worker's own auto split), whereas guessing
+    could persist a stamp that suppresses it.
+
+    THE "break" LEAVES (fits neither GPU nor RAM) return ``max-gpu`` / ``{}``
+    — deliberately NOT a fourth state. There is no "infeasible" allocation to
+    persist: the contract is that the worker refuses HONESTLY at load time with
+    a message naming the real numbers, and a blank max-gpu is what lets it get
+    that far. Inventing a refusal here would move the refusal away from the
+    place that can explain it.
+    """
+    size = _as_int(model_bytes)
+    gpu_total = _as_int(gpu_total_bytes)
+    ram_total = _as_int(ram_total_bytes)
+
+    def _plain(mode: str, why: str) -> dict:
+        return {"mode": mode, "spill": mode_to_spill(mode), "why": why}
+
+    # DEGRADE-NOT-GUESS gate, shared by every branch: without a measured size
+    # and a measured GPU total there is no tree to walk.
+    if size is None or gpu_total is None:
+        return _plain("max-gpu",
+                      "size or GPU total unknown — kept the max-gpu default "
+                      "(degrade-not-guess: a default is never derived from a "
+                      "guessed number)")
+
+    gpu_fits = size <= _GPU_FIT_HEADROOM * gpu_total
+    ram_fits = ram_total is not None and size <= ram_total
+
+    def _gpu_else_ram(label: str) -> dict:
+        """The shared 'gpu large enough? else ram large enough? else break'
+        tail — identical for transformers and for dense GGUF.
+
+        THE "gpu large enough -> gpu only" LEAF READS AS ``max-gpu``, NOT
+        ``gpu-only``. This is a deliberate, doctrine-driven reading of the
+        operator's tree, and the one place this implementation does not take
+        the sketch's words literally — flagged here because it is a judgement
+        call, not an oversight:
+
+          * the tree's leaf label means "put it on the GPU" — a PLACEMENT
+            intent. In the five-mode vocabulary that intent has two spellings:
+            ``gpu-only`` (all layers on the card, no spill, OOM if wrong) and
+            ``max-gpu`` (as much GPU as fits, spill the remainder). Both put it
+            on the GPU; they differ only in what happens when the estimate is
+            slightly off.
+          * this is a DEFAULT, and defaults-are-promises. The fit test is a
+            headroom heuristic against TOTAL capacity, not a live measurement of
+            what is free right now — another model may already hold the card.
+            ``gpu-only`` turns every such miss into a hard OOM; ``max-gpu``
+            spills the remainder and still serves. A default must be a success
+            path on the real fleet, so the non-busting spelling is the only
+            honest one for a value nobody chose.
+          * ``gpu-only`` remains fully reachable — the operator selects it
+            explicitly when they want all-or-bust, and that choice always wins.
+            Deriving it would be central quietly making a bust-on-error promise
+            on the operator's behalf.
+          * it also keeps this leaf byte-identical to today's shipped behavior
+            ({} on the wire), so the tree changes ONLY the MoE case it was
+            written to fix.
+        """
+        if gpu_fits:
+            return _plain("max-gpu",
+                          f"{label}: {size / _GIB_F:.2f} GiB fits the "
+                          f"{gpu_total / _GIB_F:.2f} GiB GPU "
+                          f"(<= {_GPU_FIT_HEADROOM:.0%} headroom) -> max-gpu "
+                          "(GPU placement, fit-and-spill rather than "
+                          "all-or-bust: a DEFAULT must never promise a bust)")
+        if ram_total is None:
+            return _plain("max-gpu",
+                          f"{label}: too big for the GPU but RAM total is "
+                          "unknown — kept max-gpu (never derive ram-only from "
+                          "a guess)")
+        if ram_fits:
+            # PREFERENCE vs PROHIBITION (operator, 2026-07-25): "the 'max'
+            # settings were intended to be indicative of a PREFERENCE for
+            # spill... the 'only' designations are the truly stringent ones."
+            #
+            # A large DENSE GGUF that overflows the card is the case where that
+            # distinction pays. It CAN use the GPU — it just cannot fit whole —
+            # so llama.cpp keeps the layers that fit and spills the rest.
+            # Deriving `ram-only` would FORBID the card entirely, and today's
+            # cliff sweep prices that mistake: a spilled dense model runs ~36
+            # tok/s with partial GPU vs ~7.5 tok/s at ngl=0. Defaulting to
+            # ram-only would be a ~5x self-inflicted loss, i.e. a default that
+            # promises dross.
+            #
+            # TRANSFORMERS ARE DIFFERENT and keep ram-only: the three
+            # all-or-fail loaders cannot partially offload, so "doesn't fit the
+            # GPU" really does mean RAM or nothing. Same leaf, two engines, two
+            # honest answers.
+            if is_gguf_engine(engine):
+                return _plain("max-ram",
+                              f"{label}: {size / _GIB_F:.2f} GiB exceeds the "
+                              f"GPU's usable "
+                              f"{_GPU_FIT_HEADROOM * gpu_total / _GIB_F:.2f} "
+                              f"GiB but fits {ram_total / _GIB_F:.2f} GiB RAM "
+                              "-> max-ram (RAM-first PREFERENCE; a GGUF still "
+                              "keeps the layers that fit — ram-only would "
+                              "forbid the card and cost ~5x throughput)")
+            return _plain("ram-only",
+                          f"{label}: {size / _GIB_F:.2f} GiB exceeds the GPU's "
+                          f"usable {_GPU_FIT_HEADROOM * gpu_total / _GIB_F:.2f} "
+                          f"GiB but fits {ram_total / _GIB_F:.2f} GiB RAM "
+                          "-> ram-only (this loader is all-or-fail; it cannot "
+                          "partially offload, so RAM is the only landing)")
+        return _plain("max-gpu",
+                      f"{label}: {size / _GIB_F:.2f} GiB fits NEITHER the GPU "
+                      f"({gpu_total / _GIB_F:.2f} GiB) nor RAM "
+                      f"({ram_total / _GIB_F:.2f} GiB) — no feasible mode; kept "
+                      "max-gpu so the worker refuses honestly at load with the "
+                      "real numbers (no invented fourth state)")
+
+    if not is_gguf_engine(engine):
+        # ── transformers / comfy: whole-tensor placement, no split exists ────
+        return _gpu_else_ram("transformers")
+
+    # ── GGUF ─────────────────────────────────────────────────────────────────
+    detail = moe if isinstance(moe, dict) else None
+    if not (detail and detail.get("is_moe")):
+        return _gpu_else_ram("dense gguf")
+
+    non_expert = _as_int(detail.get("non_expert_bytes"))
+    experts = _as_int(detail.get("expert_bytes"))
+    if not non_expert or not experts:
+        # Detected MoE but the split is unpriceable — degrade to the dense tail
+        # rather than encode a split from numbers we don't have.
+        return _gpu_else_ram("gguf (MoE detected but split unpriceable)")
+
+    # "gpu large enough" for a MoE prices the NON-EXPERT share — the only part
+    # the card ever holds under the split. This is the whole derivation.
+    if non_expert <= _GPU_FIT_HEADROOM * gpu_total:
+        if ram_total is not None and experts <= ram_total:
+            spill = mode_to_spill(
+                "explicit",
+                gpu_mem_gib=round(non_expert / _GIB_F, 3),
+                cpu_mem_gib=round(experts / _GIB_F, 3))
+            # The two keys that make this a SPLIT rather than a label. See the
+            # docstring: n_cpu_moe re-supplies the auto policy that alloc_mode
+            # suppresses; the -1 is what the slot path actually forwards, and
+            # is safe only because the knob rides with it.
+            spill["n_cpu_moe"] = MOE_ALL_LAYERS
+            spill["n_gpu_layers"] = -1
+            return {
+                "mode": "explicit", "spill": spill,
+                "why": (f"MoE split: {non_expert / _GIB_F:.2f} GiB of "
+                        f"non-expert tensors on the "
+                        f"{gpu_total / _GIB_F:.2f} GiB GPU, "
+                        f"{experts / _GIB_F:.2f} GiB of experts in "
+                        f"{ram_total / _GIB_F:.2f} GiB RAM "
+                        f"(--n-cpu-moe {MOE_ALL_LAYERS}, n_gpu_layers=-1) "
+                        "-> explicit; the split IS the allocation"),
+            }
+        # Experts don't fit RAM (or RAM unknown) — the operator's tree falls
+        # THROUGH here rather than breaking, so the dense tail decides on the
+        # whole file. It will not choose gpu-only (the full model is far bigger
+        # than the non-expert share that just fit), so this lands on ram-only
+        # or the honest-refusal max-gpu.
+        return _gpu_else_ram(
+            "gguf MoE (non-expert fits GPU but experts exceed RAM)")
+
+    # Non-expert share alone won't fit the card: no split is worth encoding.
+    if ram_total is None:
+        return _plain("max-gpu",
+                      "gguf MoE: non-expert share exceeds the GPU and RAM total "
+                      "is unknown — kept max-gpu (degrade-not-guess)")
+    if ram_fits:
+        # max-ram, not ram-only: this is still a GGUF, so even when the
+        # non-expert share alone overflows the card the loader keeps whatever
+        # layers fit. Prefer RAM; do not FORBID the GPU. (See the dense leaf:
+        # ram-only on a spillable GGUF costs ~5x throughput.)
+        return _plain("max-ram",
+                      f"gguf MoE: even the {non_expert / _GIB_F:.2f} GiB "
+                      f"non-expert share exceeds the GPU's usable "
+                      f"{_GPU_FIT_HEADROOM * gpu_total / _GIB_F:.2f} GiB, but "
+                      f"the whole {size / _GIB_F:.2f} GiB fits "
+                      f"{ram_total / _GIB_F:.2f} GiB RAM -> max-ram "
+                      "(RAM-first preference; the loader still keeps the "
+                      "layers that fit)")
+    return _plain("max-gpu",
+                  f"gguf MoE: neither the non-expert share nor the whole "
+                  f"{size / _GIB_F:.2f} GiB fits this box — no feasible mode; "
+                  "kept max-gpu so the worker refuses honestly at load")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CASE A — "will not fit ANY worker, in ANY mode" (operator ruling 2026-07-25)
+# ─────────────────────────────────────────────────────────────────────────────
+# The operator: "models that … simply will not fit on a worker no matter what,
+# if allocated, should be blocked. the user will be forced to acknowledge it and
+# act or not". This is ARITHMETIC, not judgement, so it is automatic — with the
+# existing /unblock as the escape hatch.
+#
+# WHY IT IS WORTH DOING AT ALL: today the "fits neither" leaf of
+# ``default_allocation`` returns a soft max-gpu "so the worker refuses honestly
+# at load". That refusal is real, but it arrives MINUTES LATER as a failed
+# request rather than as visible state. Blocking makes the same fact loud, at
+# the moment of allocation, with the numbers attached.
+#
+# THREE-VALUED BY CONSTRUCTION. ``worker_fit_verdict`` returns:
+#     True   — a mode exists on this worker that can physically hold the model
+#     False  — CONFIDENTLY cannot: measured size > measured GPU AND > measured RAM
+#     None   — UNKNOWN: some input was missing, so this worker has NO OPINION
+# DEGRADE-NOT-GUESS is the whole safety property here: only a False from at
+# least one worker, and NO True from any worker, can block. A fleet of Nones
+# blocks nothing — "defaults are promises", and a wrong auto-block takes a
+# WORKING model out of the pool, which is strictly worse than a late refusal.
+
+
+def worker_fit_verdict(engine: Any,
+                       model_bytes: "Optional[int]",
+                       gpu_total_bytes: "Optional[int]",
+                       ram_total_bytes: "Optional[int]") -> "Optional[bool]":
+    """Can ``model_bytes`` land on THIS one worker in SOME allocation mode?
+
+    ``True`` = yes (some mode fits), ``False`` = confidently no, ``None`` =
+    unknown (missing data — this worker gets no vote).
+
+    THE TEST IS DELIBERATELY THE LOOSEST ONE THAT IS STILL TRUE. A model "fits
+    somewhere" if it fits the GPU **or** RAM **or** the two COMBINED — because
+    max-gpu/max-ram spill across both, so combined capacity is the real
+    physical ceiling, and refusing anything below it would be central inventing
+    a limit the loader does not have. No headroom factor is applied here (unlike
+    ``_GPU_FIT_HEADROOM`` in the DEFAULT-picking path): a headroom fudge is the
+    right conservatism when choosing a default that must SUCCEED, and exactly
+    the wrong one when deciding to take a model out of the pool. Erring loose
+    means the worst case is a late honest load-time refusal — today's behavior —
+    instead of a working model being blocked.
+
+    NOTE the engine is accepted (and ignored) for signature parity with the rest
+    of this module: combined GPU+RAM is the ceiling for GGUF (partial offload)
+    and for transformers (accelerate's cpu/disk offload) alike, so no engine
+    distinction is defensible at THIS question's granularity."""
+    size = _as_int(model_bytes)
+    gpu_total = _as_int(gpu_total_bytes)
+    ram_total = _as_int(ram_total_bytes)
+    if size is None:
+        return None                     # unsizable model: nobody may vote
+    if gpu_total is None and ram_total is None:
+        return None                     # unmeasured box: it has no opinion
+    capacity = (gpu_total or 0) + (ram_total or 0)
+    return size <= capacity
+
+
+def fleet_fit_verdict(boxes: Any) -> dict:
+    """Roll per-worker verdicts up into the FLEET answer.
+
+    ``boxes`` is an iterable of dicts, each ``{"name", "engine", "model_bytes",
+    "gpu_total_bytes", "ram_total_bytes"}`` (the caller resolves them; this
+    stays pure). Returns::
+
+        {"fits_somewhere": bool|None,   # True / False / None(=no confident data)
+         "blockable": bool,             # True IFF it is safe to auto-block
+         "fits_on": [name, ...],        # workers that CAN hold it
+         "refused_by": [name, ...],     # workers that confidently CANNOT
+         "unknown": [name, ...],        # workers with no opinion
+         "why": str}                    # the operator-facing reasoning line
+
+    ``blockable`` is the ONLY field a caller should act on, and it is True only
+    when **at least one** worker returned a confident False and **no** worker
+    returned True. An empty fleet, an all-unknown fleet, or a single confident
+    "fits" anywhere all yield ``blockable=False``. That asymmetry is the
+    operator's "no matter what": a model that fits SOME worker must never be
+    blocked, and missing data is never evidence of anything."""
+    fits_on, refused_by, unknown = [], [], []
+    worst_gpu = worst_ram = 0
+    size_seen = None
+    for box in (boxes or []):
+        if not isinstance(box, dict):
+            continue
+        name = str(box.get("name") or box.get("id") or "?")
+        verdict = worker_fit_verdict(box.get("engine"), box.get("model_bytes"),
+                                     box.get("gpu_total_bytes"),
+                                     box.get("ram_total_bytes"))
+        if verdict is True:
+            fits_on.append(name)
+        elif verdict is False:
+            refused_by.append(name)
+            worst_gpu = max(worst_gpu, _as_int(box.get("gpu_total_bytes")) or 0)
+            worst_ram = max(worst_ram, _as_int(box.get("ram_total_bytes")) or 0)
+            size_seen = size_seen or _as_int(box.get("model_bytes"))
+        else:
+            unknown.append(name)
+
+    if fits_on:
+        return {"fits_somewhere": True, "blockable": False, "fits_on": fits_on,
+                "refused_by": refused_by, "unknown": unknown,
+                "why": (f"fits {fits_on[0]}" + (f" (+{len(fits_on) - 1} more)"
+                                                if len(fits_on) > 1 else "")
+                        + " — never blocked while ANY worker can hold it")}
+    if not refused_by:
+        return {"fits_somewhere": None, "blockable": False, "fits_on": [],
+                "refused_by": [], "unknown": unknown,
+                "why": ("no worker could return a confident verdict "
+                        f"({len(unknown)} unknown) — degrade-not-guess: "
+                        "never block on missing data")}
+    return {
+        "fits_somewhere": False, "blockable": True, "fits_on": [],
+        "refused_by": refused_by, "unknown": unknown,
+        "why": (f"auto: {(size_seen or 0) / _GIB_F:.1f} GiB exceeds every "
+                f"worker's GPU ({worst_gpu / _GIB_F:.1f}) and RAM "
+                f"({worst_ram / _GIB_F:.1f}) — refused by "
+                f"{', '.join(refused_by)}"
+                + (f"; {len(unknown)} worker(s) had no data" if unknown else "")
+                + " — unblock to override"),
+    }
 
 
 def resolve_alloc_mode(name: Any) -> "tuple[Optional[str], bool]":

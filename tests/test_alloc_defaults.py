@@ -334,4 +334,82 @@ finally:
 check("first-contact: the fail-open log is once-per-(model,worker) (no spam)",
       not any("fail-open" in m for m in _caplog))
 
+# ── STRUCTURE-DERIVED DEFAULTS: the MoE split at the emission seam ───────────
+# The operator's decision tree (2026-07-25) end-to-end through central: a blank
+# MoE allocation must emit its own DERIVED split, not the blanket stamp. The
+# tree's own leaf matrix is proven in test_moe_placement.py against the measured
+# files; this covers the CENTRAL WIRING — engine/size/MoE/totals resolution, the
+# version gate, and "an operator's choice always wins".
+_CODER_NEXT_MOE = {"is_moe": True, "expert_count": 512, "expert_used_count": 10,
+                   "expert_bytes": int(43.59 * GIB),
+                   "non_expert_bytes": int(1.49 * GIB),
+                   "expert_bytes_by_layer": {}, "files": 4}
+_SIZES["moe-big"] = int(45.08 * GIB)     # coder-next Q4_K_M, measured
+_ENGINES["moe-big"] = "gguf"
+_SIZES["gguf-dense"] = 5 * GIB
+_ENGINES["gguf-dense"] = "gguf"
+_MOE = {"moe-big": _CODER_NEXT_MOE}
+W._model_moe_detail = lambda mk: _MOE.get(mk)
+
+for mk in ("moe-big", "gguf-dense"):
+    store.assign_model(w["id"], mk)      # blank spill (no alloc contract)
+
+_derived = store.spill_for(w["id"], "moe-big")
+check("seam: a blank MoE allocation emits its DERIVED split, not a blanket stamp",
+      _derived.get("alloc_mode") == "explicit"
+      and _derived.get("n_cpu_moe") == 999
+      and _derived.get("n_gpu_layers") == -1)
+check("seam: the derived split DECLARES both sides — 1.49 GiB of non-expert "
+      "tensors on the card, 43.59 GiB of experts in RAM",
+      abs(_derived.get("gpu_mem_gib", 0) - 1.49) < 0.01
+      and abs(_derived.get("cpu_mem_gib", 0) - 43.59) < 0.01)
+check("seam: THE LIVE BUG — a MoE never receives the bare {'n_gpu_layers': -1} "
+      "stamp that would disable the load-time auto split",
+      _derived != {"n_gpu_layers": -1})
+check("seam: a DENSE gguf is untouched by the tree -> {} (max-gpu, unchanged)",
+      store.spill_for(w["id"], "gguf-dense") == {})
+
+# an operator's explicit choice ALWAYS wins — derivation is blank-only.
+store.assign_model(w["id"], "moe-big", spill={"n_gpu_layers": -1})
+check("seam: an operator's explicit allocation on a MoE is honored verbatim — "
+      "derivation never overrides a choice (even a questionable one)",
+      store.spill_for(w["id"], "moe-big") == {"n_gpu_layers": -1})
+store.assign_model(w["id"], "moe-big", spill={})
+check("seam: clearing back to blank restores the derived split",
+      store.spill_for(w["id"], "moe-big").get("alloc_mode") == "explicit")
+
+# the version gate: the derived split carries NEW keys, so a pre-0.1.203 worker
+# gets {} — whose own load-time auto MoE policy reaches the right placement.
+w_old = store.register(name="old-box", url="http://o:9100", pkg_version="0.1.150")
+with store._transaction() as wk:
+    wk[w_old["id"]]["gpus"] = [{"name": "RTX 3090", "memory_total": 24 * GIB,
+                                "memory_free": 20 * GIB}]
+    wk[w_old["id"]]["ram_total"] = 128 * GIB
+store.assign_model(w_old["id"], "moe-big")
+check("seam: a pre-0.1.203 worker gets {} (max-gpu) — never a silent dead knob; "
+      "its own auto MoE policy still lands the split",
+      store.spill_for(w_old["id"], "moe-big") == {})
+
+# degrade-not-guess at the seam: no measured totals -> no derived split.
+store.assign_model(w2["id"], "moe-big")          # w2 has no gpu/ram totals
+check("seam: a worker with NO measured totals never derives a split -> {} "
+      "(degrade-not-guess)",
+      store.spill_for(w2["id"], "moe-big") == {})
+
+# the mode-name view agrees with the allocation view at the wrapper level.
+check("derived_default_for names the MoE leaf 'explicit'",
+      W.derived_default_for(w["id"], "moe-big") == "explicit")
+_alloc = W.derived_allocation_for(w["id"], "moe-big")
+check("derived_allocation_for returns mode+spill+why, and the why names the "
+      "numbers that chose it",
+      _alloc["mode"] == "explicit" and "MoE split" in _alloc["why"]
+      and "1.49" in _alloc["why"] and "43.59" in _alloc["why"])
+check("derived_allocation_for on an unknown worker -> None",
+      W.derived_allocation_for("no-such-worker", "moe-big") is None)
+
+# the local mirror of NEW_SPILL_KEYS must not drift from the real one.
+from abstract_hugpy_dev.managers.alloc_modes import NEW_SPILL_KEYS as _NSK
+check("the workers.py NEW_SPILL_KEYS mirror matches alloc_modes (no drift)",
+      W._NEW_SPILL_KEYS_LOCAL == _NSK)
+
 print(f"\nALL {ok} capability-aware-default checks passed")

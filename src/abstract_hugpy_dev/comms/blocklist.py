@@ -119,9 +119,71 @@ def block(model_key: str, *, by: Optional[str] = None,
     return rec
 
 
-def unblock(model_key: str) -> bool:
-    """Unblock ``model_key`` (delete its record). Returns whether it was blocked."""
-    existed = settings_store.delete(NS, str(model_key))
-    if existed:
-        logger.info("model UNBLOCKED (returned to serving pool): %s", model_key)
-    return existed
+def unblock(model_key: str, *, by: Optional[str] = None) -> bool:
+    """Unblock ``model_key``. Returns whether it was blocked.
+
+    OPERATOR-UNBLOCK STICKINESS (operator ruling 2026-07-25). An OPERATOR unblock
+    does not merely delete the record — it leaves a tombstone
+    ``{"blocked": False, "operator_unblocked": True, "by", "ts"}``. That marker
+    is what makes ``auto_block`` a no-op for this key forever after: a human
+    looked at the machine's arithmetic and overruled it, and a re-block on the
+    next sweep would silently undo a human decision every few seconds.
+
+    WHY A TOMBSTONE RATHER THAN A SECOND NAMESPACE: this namespace ALREADY
+    stores an extensible dict per key and ``is_blocked`` already reads only
+    ``rec["blocked"]``, so a falsey record is inert everywhere by construction —
+    no migration, no second store to keep consistent, and the audit trail
+    ("who released it, when") lands in the same place an auditor already looks.
+    The cost is that a key can hold an inert record; ``blocked_keys`` filters on
+    the flag, so nothing downstream sees it.
+
+    ``by="auto"`` (the machine retracting its OWN block — e.g. the fleet grew a
+    box that now fits) DELETES instead, leaving no marker: only a human's
+    override earns stickiness, and an auto-retraction must not immunize a key
+    against a future, genuinely-correct auto-block."""
+    rec = _record(model_key)
+    was = bool(rec.get("blocked"))
+    who = (by or "operator")
+    if who == "auto":
+        settings_store.delete(NS, str(model_key))
+        if was:
+            logger.info("model auto-unblocked (fits again): %s", model_key)
+        return was
+    settings_store.set(NS, str(model_key), {
+        "blocked": False, "operator_unblocked": True, "by": who,
+        "ts": time.time()})
+    logger.info("model UNBLOCKED by %s (returned to serving pool, auto-block "
+                "suppressed for this key): %s", who, model_key)
+    return was
+
+
+def operator_unblocked(model_key: Optional[str]) -> bool:
+    """True iff an OPERATOR explicitly released ``model_key`` — the sticky
+    marker the auto-blocker must honor (never re-block a human's override)."""
+    if not model_key:
+        return False
+    return bool(_record(model_key).get("operator_unblocked"))
+
+
+def auto_block(model_key: str, note: str) -> Optional[dict]:
+    """Machine-authored block (``by="auto"``), the CASE-A entry point.
+
+    Returns the record, or ``None`` when the block was DECLINED. It declines in
+    exactly two situations, both deliberate:
+
+      * an operator already released this key (``operator_unblocked``) — the
+        stickiness rule above; a human's decision outranks the arithmetic;
+      * the key is already blocked BY THE OPERATOR — an auto re-stamp would
+        rewrite a human's note/authorship with a machine's.
+
+    Re-stamping an existing ``by="auto"`` record IS allowed: it refreshes the
+    numbers in the note when the fleet's capacity changes."""
+    rec = _record(model_key)
+    if rec.get("operator_unblocked"):
+        logger.debug("auto-block declined for %s: operator released it", model_key)
+        return None
+    if rec.get("blocked") and rec.get("by") not in (None, "auto"):
+        logger.debug("auto-block declined for %s: already blocked by %s",
+                     model_key, rec.get("by"))
+        return None
+    return block(model_key, by="auto", note=note)

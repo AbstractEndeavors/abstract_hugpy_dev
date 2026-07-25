@@ -114,12 +114,18 @@ def test_reserve_zero_is_backward_compatible():
     _fixed_ctx_reserve("1.0")
     d = tempfile.mkdtemp()
     main = _sparse(os.path.join(d, "m.gguf"), 7 * GIB)   # 7 GiB, 28 layers -> 0.25/layer
+    # NOTE the arithmetic below has no ``* 0.85``: _VRAM_SAFETY was lifted to
+    # 1.0 (2026-07-25) because it double-counted the EXPLICIT ctx reserve —
+    # measured 2.59 GiB of real KV+compute against a 2.5 GiB reserve, so the
+    # multiplier was a second margin for a risk already covered. free_vram here
+    # dropped 8 -> 6.75 GiB so the case still exercises PARTIAL fit; at 8 GiB
+    # the model now (correctly) fits whole.
     with _patched(_gguf_layer_count=lambda p: 28):
-        # budget = 10*0.85 - 1.0 = 7.5 GiB >= 7 GiB -> all fit
+        # budget = 10 - 1.0 = 9.0 GiB >= 7 GiB -> all fit
         assert spill.autofit_gpu_layers(main, free_vram=10 * GIB) == -1
         assert spill.autofit_gpu_layers(main, free_vram=10 * GIB, extra_reserve_bytes=0) == -1
-        # partial: budget = 8*0.85 - 1.0 = 5.8 GiB ; 5.8/0.25 = 23
-        assert spill.autofit_gpu_layers(main, free_vram=8 * GIB) == 23
+        # partial: budget = 6.75 - 1.0 = 5.75 GiB ; 5.75/0.25 = 23
+        assert spill.autofit_gpu_layers(main, free_vram=int(6.75 * GIB)) == 23
 
 
 def test_reserve_flips_all_fit_to_partial():
@@ -127,13 +133,14 @@ def test_reserve_flips_all_fit_to_partial():
     d = tempfile.mkdtemp()
     main = _sparse(os.path.join(d, "m.gguf"), 7 * GIB)
     with _patched(_gguf_layer_count=lambda p: 28):
-        # no reserve -> all fit (-1)
-        assert spill.autofit_gpu_layers(main, free_vram=10 * GIB) == -1
-        # a 1.35 GiB projector reserve: budget = 8.5 - 1.0 - 1.35 = 6.15 GiB < 7
-        # -> partial; 6.15/0.25 = 24
-        n = spill.autofit_gpu_layers(main, free_vram=10 * GIB,
+        # no projector -> all fit (-1).  (_VRAM_SAFETY is 1.0 since 2026-07-25,
+        # so the budget is free_vram minus the reserves, with no multiplier.)
+        assert spill.autofit_gpu_layers(main, free_vram=8 * GIB) == -1
+        # a 1.35 GiB projector reserve: budget = 8 - 1.0 - 1.35 = 5.65 GiB < 7
+        # -> partial; 5.65/0.25 = 22
+        n = spill.autofit_gpu_layers(main, free_vram=8 * GIB,
                                      extra_reserve_bytes=int(1.35 * GIB))
-        assert n == 24, n
+        assert n == 22, n
         assert n != -1                       # the whole point: no longer "all"
 
 

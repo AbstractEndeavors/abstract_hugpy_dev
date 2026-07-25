@@ -497,8 +497,46 @@ def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None,
             moe = gguf_moe_detail(path)
             # AUTO policy only when nothing explicit governs placement: no
             # explicit n_gpu_layers request and no k37 mode engine in play.
+            # An explicit -1 ("Max GPU") normally WINS and suppresses the split.
+            # ONE exception (2026-07-25): when the model physically cannot fit
+            # the card, -1 is not a placement — it is a stall. Obeying it means
+            # launching --n-gpu-layers -1 with no --n-cpu-moe onto a card that
+            # is multiples too small, which is precisely what stranded ae for
+            # 5.5h (48.4 GB MoE, 24 GB 3090, 9 failed attempts, silent fallback).
+            #
+            # This matters because a bare {"n_gpu_layers": -1} is the ROUTINE
+            # stamp here: 40 of 43 persisted allocations on ae carry exactly
+            # that, applied by the console's Max GPU button / bulk-allocate /
+            # reconcile across comfy checkpoints, video models and LLMs alike.
+            # None are MoE today, so it is currently harmless — but one such
+            # stamp on a MoE model reproduces the incident.
+            #
+            # Deliberately NARROW. -1 still wins whenever it is ACHIEVABLE, so
+            # the dense fit-entirely case (measured 135 tok/s, vs 36 the moment
+            # one layer spills) is untouched. An operator who truly wants
+            # experts pinned to the card says n_cpu_moe=0 — unambiguous, unlike
+            # a bare -1 — and that still wins absolutely, above.
+            _forced_all_gpu = (n_gpu_layers == -1
+                               and not _ngl_is_unset(n_gpu_layers))
+            _impossible = False
+            if _forced_all_gpu and moe.get("is_moe"):
+                try:
+                    from ..spill import free_vram_bytes as _fvb
+                    _need = _total_gguf_bytes(path)
+                    _have = _fvb()
+                    _impossible = bool(_need and _have and _need > _have * 1.15)
+                except Exception:  # noqa: BLE001 — unmeasurable -> obey the -1
+                    _impossible = False
+                if _impossible:
+                    _log_moe_degrade_once(
+                        ("forced", model_key),
+                        f"slot {SLOT_ID}: {model_key} was requested "
+                        "n_gpu_layers=-1 but its weights cannot fit this card — "
+                        "applying the MoE expert split instead of stalling "
+                        "(pass n_cpu_moe=0 to pin experts on the GPU anyway)")
+
             if (moe.get("is_moe") and alloc_mode_env() is None
-                    and _ngl_is_unset(n_gpu_layers)):
+                    and (_ngl_is_unset(n_gpu_layers) or _impossible)):
                 # Viability, the ONE remaining condition: the expert tensors
                 # must fit budgetable host RAM. When they clearly don't, degrade
                 # to whatever autofit decided (layer-split hybrid, or full GPU

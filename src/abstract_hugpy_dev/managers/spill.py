@@ -33,8 +33,31 @@ from typing import Any, Optional
 
 logger = logging.getLogger("abstract_hugpy_dev.spill")
 
-# Keep some VRAM headroom for the KV-cache + activations; never budget 100%.
-_VRAM_SAFETY = 0.85
+# VRAM headroom multiplier, applied on top of the EXPLICIT ctx reserve below.
+#
+# LIFTED 0.85 -> 1.0 (operator, 2026-07-25). It was double-counting: its own
+# comment said it existed for "the KV-cache + activations", which is precisely
+# what ``HUGPY_VRAM_CTX_RESERVE_GIB`` reserves — and that reserve is ACCURATE.
+# Measured on computron (flux2-klein-9b q4_k_m, all 36 layers, ctx 16384):
+# 7441 MiB on the card, 4.68 GiB of weights, so 2.59 GiB of KV+compute+ctx
+# against a 2.5 GiB reserve. The safety factor is the older, cruder margin for
+# the same risk; the reserve superseded it and nobody removed the multiplier.
+#
+# What it cost, and why the operator called it: quant sizes are chosen against
+# REAL card capacities, so a 23.5 GiB release IS the "fits a 24 GiB card" build.
+# Stacking 1 GiB reserve + 15% + 2.5 GiB ctx left a 24 GiB 3090 with a 17.05 GiB
+# budget — 29% of the card gone, and the model refused on the hardware it was
+# published for. Operator: "i've accepted lack of safety simply due to the
+# 23.5 GB transformers that obviously are for a 3090".
+#
+# STILL IN FORCE, so this is not "no safety": the explicit ctx reserve (2.5 GiB,
+# measured-accurate), HUGPY_VRAM_RESERVE_GIB (1.0 GiB, for consumers central
+# cannot see), and the ~90% admission ceiling (HUGPY_VRAM_CEILING_FRAC) which is
+# the real OOM backstop. This removes a redundant fourth margin, not the floor.
+# Tunable if it bites: set HUGPY_VRAM_SAFETY below 1.0 (read at CALL time by
+# _vram_safety(), not here — _env_float is defined further down this module and
+# a module-level call would NameError on import, taking every worker with it).
+_VRAM_SAFETY = 1.0
 # When we can't read a GGUF's real layer count, assume a 7B-ish 32-layer model.
 _ASSUMED_LAYERS = 32
 
@@ -70,6 +93,24 @@ def _env_int(name: str) -> Optional[int]:
     except ValueError:
         logger.warning("ignoring non-integer %s=%r", name, raw)
         return None
+
+
+def _vram_safety() -> float:
+    """The VRAM headroom multiplier, read at CALL time (see _VRAM_SAFETY).
+
+    Default 1.0 — the explicit ctx reserve carries this job now. Env override
+    HUGPY_VRAM_SAFETY for a box that wants the old cushion back; clamped to
+    (0, 1] so a typo can only ever be MORE conservative, never budget past the
+    card.
+    """
+    v = _env_float("HUGPY_VRAM_SAFETY")
+    if v is None:
+        return _VRAM_SAFETY
+    if not (0 < v <= 1):
+        logger.warning("ignoring HUGPY_VRAM_SAFETY=%r (want 0 < x <= 1); "
+                       "using %s", v, _VRAM_SAFETY)
+        return _VRAM_SAFETY
+    return v
 
 
 # ---------------------------------------------------------------------------
@@ -1026,7 +1067,7 @@ def autofit_gpu_layers(model_path: str,
     # llama_context". Reserve an explicit context allowance under the margin.
     ctx_reserve = int((_env_float("HUGPY_VRAM_CTX_RESERVE_GIB") or 2.5) * 2**30)
     reserve = ctx_reserve + max(0, int(extra_reserve_bytes))
-    budget = int(free_vram * _VRAM_SAFETY) - reserve
+    budget = int(free_vram * _vram_safety()) - reserve
     if budget <= 0:
         return 0
     if budget >= file_bytes:
@@ -1356,7 +1397,7 @@ def transformers_max_memory(model_need_bytes: Optional[int] = None) -> Optional[
         fv = free_vram_bytes()
         if not fv:
             return None                     # no GPU -> no spill map
-        gpu_gib = (fv * _VRAM_SAFETY) / 2**30
+        gpu_gib = (fv * _vram_safety()) / 2**30
 
     # All-on-GPU intent: no CPU budget so accelerate keeps the whole model on the
     # card. Skip the CPU-spill fallback below (a bare gpu-only max_memory). An

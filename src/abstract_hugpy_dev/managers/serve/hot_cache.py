@@ -545,10 +545,19 @@ def _evict_locked(key: str) -> int:
 
 def _make_room(need: int, keep_key: str) -> bool:
     """Evict least-recently-CALLED entries until `need` fits under the budget AND
-    on the filesystem. Anti-thrash: an entry idle < min_residency is protected
-    (not a candidate). Pinned entries evict last. Returns True if room was made,
-    False if the model can't fit even after evicting every eligible entry (then
-    the caller SKIPS promotion)."""
+    on the filesystem.
+
+    ONLY WHEN THE LIMIT IS HIT (operator, 2026-07-25): ``fits()`` is checked
+    first and returns immediately when the incoming model already has room —
+    nothing is evicted just because the cache is large. A hot drive sitting at
+    580 of 600 GiB is doing its job; it only sheds when a call needs the space.
+    When a model that ISN'T on the hot drive is called and there is no room, the
+    oldest-called entries go until it fits.
+
+    Anti-thrash: an entry idle < min_residency is not a candidate. 📌pin is NOT
+    consulted — it is routing persistence, not a residency lock; 🔒static is the
+    only protection. Returns True if room was made, False if the model can't fit
+    even after evicting every eligible entry (then the caller SKIPS promotion)."""
     budget = _budget_bytes()
     residency = _min_residency_s()
     now = time.time()
