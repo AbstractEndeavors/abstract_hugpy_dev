@@ -1320,9 +1320,16 @@ def workers_assign(worker_id):
     band_reason = _validate_band_values(body.spill)
     if band_reason is not None:
         return jsonify({"error": band_reason}), 400
-    # k37: resolve legacy alloc_mode names + rewrite the coarse trio onto the
-    # unchanged n_gpu_layers wire; alloc_mode only persists for max-ram/
-    # explicit (accepted on input, canonical on disk, never emitted back).
+    # k37: resolve legacy alloc_mode names + rewrite the coarse PAIR
+    # (gpu-only/ram-only) onto the unchanged n_gpu_layers wire. alloc_mode
+    # persists for max-ram / explicit and — since 2026-07-25 — for an explicitly
+    # chosen max-gpu, whose {} encoding used to collide with the CLEAR signal and
+    # silently delete the row the operator was trying to write. That key is
+    # central-side bookkeeping only; spill_for strips it before any worker sees
+    # it, so the wire is unchanged.
+    #
+    # NOTE this branch is entered only when the client SENT an alloc_mode. A bare
+    # POST with spill {} carries no mode and is untouched — it stays a CLEAR.
     if isinstance(body.spill, dict) and "alloc_mode" in body.spill:
         from ....managers.alloc_modes import normalize_spill
         body.spill, _mode_note = normalize_spill(body.spill)
@@ -1458,6 +1465,16 @@ def workers_assign(worker_id):
     worker = assign_model(worker_id, body.model_key, spill=body.spill)
     if worker is None:
         abort(404, description="Unknown worker id.")
+    # SAY WHAT WAS ACTUALLY PERSISTED (2026-07-25). The max-gpu incident was not
+    # only that the write was lost — it was that the response said nothing was
+    # wrong. The operator picked a mode, got a 200 with an approved-looking body,
+    # and had no way to tell their choice had been discarded. So the response now
+    # REPORTS THE REGISTRY, read back after the write rather than echoed from the
+    # request: what row exists for this (worker, model), and the effective mode
+    # that row derives to. A future silent-drop shows up here as a mismatch
+    # between what was asked and what came back, instead of hiding behind a 200.
+    worker["allocation"] = _assign_allocation_result(worker, body.model_key,
+                                                     body.spill)
     # Lazy doctrine (operator 2026-07-16/17): assignment is ATTRIBUTION, never
     # a transfer order — and the worker's /probe DOWNLOADS an absent model, so
     # an unconditional assign-warm was a hidden pull. Warm only when the files
@@ -2305,9 +2322,14 @@ def _apply_alloc_map(worker_id, model_keys, spill):
             skipN += 1
             continue
         try:
-            # assign_model writes spill_by_model[mk] = spill ({} clears it). The
-            # model is already designated (we filtered to `designated`), so this
-            # only rewrites the contract — it never newly-adds a model.
+            # assign_model writes spill_by_model[mk] = spill ({} clears it — the
+            # "Default (derived)" bulk entry). An explicit max-gpu now arrives as
+            # {"alloc_mode": "max-gpu"} and takes the WRITE branch; it used to
+            # arrive as {} and silently clear instead (the 2026-07-25 bug — this
+            # broadcast path shared the single path's truthiness assumption via
+            # normalize_spill, so it is fixed by the same change).
+            # The model is already designated (we filtered to `designated`), so
+            # this only rewrites the contract — it never newly-adds a model.
             w = assign_model(worker_id, mk, spill=spill)
             if w is None:
                 results[mk] = "worker vanished mid-apply"
@@ -2334,6 +2356,14 @@ def _apply_alloc_map(worker_id, model_keys, spill):
     out = {"ok": errN == 0, "alloc": label, "results": results,
            "counts": {"ok": okN, "error": errN, "skipped": skipN, "total": len(keys)},
            "restarting": False}
+    # SAY WHAT WAS PERSISTED (2026-07-25), read back from the registry — the bulk
+    # analogue of /assign's `allocation`. `results` keeps its established
+    # per-key string shape ("ok" gates the warm re-seat below and the UI reads
+    # it), so this rides ALONGSIDE it rather than changing it: for each key that
+    # reported ok, whether a contract now exists and the mode it derives to. A
+    # write that silently didn't stick is visible here instead of hiding behind
+    # a uniform "ok".
+    out["allocation"] = _alloc_persisted_summary(worker_id, keys, results, spill)
     if off_worker:
         # off-worker staleness is surfaced separately from the engine skips (which
         # live in results with their reason) so the two never conflate.
@@ -2424,9 +2454,142 @@ def _apply_alloc_map_multi(worker_id, model_keys, spills_by_key):
     out = {"ok": errN == 0, "alloc": "per-model", "results": results,
            "counts": {"ok": okN, "error": errN, "skipped": skipN, "total": len(keys)},
            "restarting": False}
+    # Registry read-back, same contract as the broadcast path (each key against
+    # its OWN requested spill, since this path fans a different one per model).
+    out["allocation"] = _alloc_persisted_summary(
+        worker_id, keys, results, None, spills_by_key=spills_by_key)
     if off_worker:
         out["off_worker"] = off_worker
     return jsonify(out)
+
+
+def _alloc_persisted_summary(worker_id, keys, results, spill,
+                             spills_by_key=None) -> dict:
+    """Registry read-back for a BULK alloc apply — ``{model_key: {...}}`` for
+    every key that reported "ok", plus a rollup.
+
+    Deliberately read AFTER the writes from a fresh worker view: the point is to
+    report the registry's state, not to restate the request. Best-effort — a
+    lookup failure returns an empty map rather than failing a completed write."""
+    try:
+        w = get_worker(worker_id) or {}
+        by_model = w.get("spill_by_model") or {}
+        per_key, persisted_n, derived_n = {}, 0, 0
+        for mk in keys:
+            if results.get(mk) != "ok":
+                continue
+            req = (spills_by_key or {}).get(mk) if spills_by_key is not None else spill
+            row = by_model.get(mk) or None
+            entry = _allocation_state(row, req, worker_id=worker_id,
+                                      model_key=mk)
+            per_key[mk] = entry
+            if entry["persisted"]:
+                persisted_n += 1
+            else:
+                derived_n += 1
+        return {"by_model": per_key,
+                "counts": {"persisted": persisted_n, "derived": derived_n},
+                "note": (f"{persisted_n} model(s) now carry a persisted "
+                         f"allocation; {derived_n} track the derived default")}
+    except Exception:  # noqa: BLE001 — never fail a completed write over reporting
+        logger.debug("alloc read-back summary failed for %s", worker_id,
+                     exc_info=True)
+        return {}
+
+
+def _allocation_state(stored, requested_spill, worker_id=None,
+                      model_key=None) -> dict:
+    """The shared shape behind /assign's ``allocation`` and the bulk read-back:
+    what row exists, the mode it derives to, whether it is an operator contract
+    or the derived default, and whether that matches what was asked.
+
+    When NOTHING is persisted, ``mode`` must be the mode this (worker, model)
+    ACTUALLY falls back to — the per-worker derivation, not the k37 blank
+    fallback. Reporting a flat "max-gpu" for every cleared row would reproduce
+    the original lie in a new place: the live case clears to **max-ram**, and an
+    operator told "max-gpu" would again be reading a mode the system is not
+    using. Resolved via derived_allocation_for (the ALLOCATION view, which is
+    what spill_for emits from) whenever the ids are available."""
+    from ....managers.alloc_modes import derive_alloc_mode
+
+    stored = stored or None
+    persisted = bool(stored)
+    mode = derive_alloc_mode(stored or {})
+    if not persisted and worker_id and model_key:
+        try:
+            from ..functions.imports.utils.workers import derived_allocation_for
+            derived = derived_allocation_for(worker_id, model_key) or {}
+            mode = derived.get("mode") or mode
+        except Exception:  # noqa: BLE001 — reporting must never break a write
+            pass
+    requested_mode = None
+    asked_for_contract = bool(isinstance(requested_spill, dict)
+                              and requested_spill)
+    if asked_for_contract:
+        requested_mode = derive_alloc_mode(requested_spill)
+    # HONORED has TWO failure shapes, and the second is the one the max-gpu bug
+    # wore. (a) the stored row derives to a DIFFERENT mode than asked. (b) a
+    # non-empty spill was requested but NOTHING was persisted — the request
+    # asked to pin a contract and no contract exists. Checking only the mode
+    # would call (b) "honored" whenever the vanished row's fallback happens to
+    # match what was asked, which is precisely how "I picked max-gpu and it
+    # silently cleared" passed for success for so long.
+    honored = True
+    if asked_for_contract:
+        honored = persisted and requested_mode == mode
+    if persisted:
+        note = (f"'{mode}' persisted for this model on this worker — it will "
+                "not change as derived defaults change")
+    else:
+        note = (f"no contract persisted; this model tracks the derived default "
+                f"(currently '{mode}') and re-derives as conditions change")
+    if not honored:
+        if not persisted:
+            note = (f"requested '{requested_mode}' but NOTHING was persisted — "
+                    f"the selection was NOT applied; this model still tracks "
+                    f"the derived default ('{mode}')")
+        else:
+            note = (f"requested '{requested_mode}' but the stored allocation "
+                    f"derives to '{mode}' — the selection was NOT applied as "
+                    "asked")
+    return {"persisted": persisted, "spill": stored, "mode": mode,
+            "source": "operator" if persisted else "derived",
+            "requested_mode": requested_mode, "honored": honored, "note": note}
+
+
+def _assign_allocation_result(worker, model_key, requested_spill) -> dict:
+    """What /assign ACTUALLY did to this (worker, model)'s allocation row.
+
+    Read back from the post-write registry view, never echoed from the request —
+    an echo would have reported success for the very bug this exists to expose
+    (the max-gpu selection that was silently discarded, behind a 200).
+
+    Returns::
+
+        {"persisted": bool,     # is there a spill_by_model row now?
+         "spill": {...}|None,   # the row as stored ({} / absent -> None)
+         "mode": str,           # the EFFECTIVE mode (derive_alloc_mode)
+         "source": "operator"|"derived",
+         "requested_mode": str|None,   # what the request asked for, if it said
+         "honored": bool,       # requested_mode is None or == mode
+         "note": str}
+
+    ``source`` is the persistence distinction the fix turns on: "operator" means
+    a row exists and pins the mode against future derivation changes; "derived"
+    means nothing is persisted and the model tracks the read-time derivation
+    (the correct state after a deliberate CLEAR, and the state max-gpu used to be
+    forced into by accident)."""
+    stored = ((worker.get("spill_by_model") or {}).get(model_key)) or None
+    state = _allocation_state(stored, requested_spill,
+                              worker_id=worker.get("id"), model_key=model_key)
+    if not state["honored"]:
+        # Belt-and-braces: this should now be unreachable. If it ever fires, the
+        # response says so plainly AND it is logged as an error, rather than the
+        # request quietly reporting success the way the max-gpu bug did.
+        logger.error("assign %s: requested mode %r but persisted row derives to "
+                     "%r (stored=%r)", model_key, state["requested_mode"],
+                     state["mode"], stored)
+    return state
 
 
 def _alloc_label(spill) -> str:

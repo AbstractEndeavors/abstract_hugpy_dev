@@ -871,6 +871,30 @@ def _adopt_storage_inputs(state: "WorkerState", worker: dict | None) -> None:
     lp = worker.get("model_last_picked")
     if isinstance(lp, dict):
         state.model_last_picked = dict(lp)
+    # ── THE ONE LEDGER, second + third columns (eviction flow, 2026-07-25) ───
+    # ``model_call_stats`` ({model_key: {"calls": n}}) is key ③ of the shared
+    # eviction sort; ``model_alloc_modes`` ({model_key: mode}) is the PREFERENCE
+    # behind key ① (the cliff order). Both are central-owned for exactly the
+    # reason last_picked is: the worker cannot know them (central routes the
+    # calls and holds the persisted allocations), and the spec requires BOTH
+    # sides to rank from the SAME numbers or their victim sets diverge.
+    #
+    # Adopted into _RUNTIME_SETTINGS rather than onto `state` so the readers
+    # (_model_alloc_mode / _model_call_stats) match the established shape
+    # central already uses for ctx_pct / priority / residency projections.
+    #
+    # ABSENT keys leave the previous values untouched, and an absent map simply
+    # means every model degrades to zero calls / the blank max-gpu preference —
+    # which makes key ① a constant and key ③ a tie, i.e. exactly today's
+    # idle-first ordering. A pre-ledger central therefore changes nothing.
+    cs = worker.get("model_call_stats")
+    if isinstance(cs, dict):
+        _RUNTIME_SETTINGS["model_calls"] = {
+            k: (v or {}).get("calls") or 0 for k, v in cs.items()
+            if isinstance(v, dict)}
+    am = worker.get("model_alloc_modes")
+    if isinstance(am, dict):
+        _RUNTIME_SETTINGS["alloc_mode"] = {k: str(v) for k, v in am.items() if v}
     storage = worker.get("storage")
     if isinstance(storage, dict) and storage.get("allocated_count") is not None:
         state.allocated = {
@@ -6420,6 +6444,143 @@ def _partition_residents(state: "WorkerState", model_key: str) -> "tuple[list, l
     return candidates, protected
 
 
+def _model_alloc_mode(model_key: str) -> "str | None":
+    """The per-model allocation MODE as the operator persisted (or central
+    derived) it — the PREFERENCE input to the shared eviction sort's key ①.
+
+    Central projects a ``{model_key: mode}`` map into the worker settings the
+    same way it projects ``ctx_pct`` / ``priority`` (the release-time bridge);
+    tests populate it directly. Absent -> None, which
+    ``eviction.preferred_device`` degrades to VRAM — i.e. the blank max-gpu
+    default, which makes key ① a constant and leaves the order byte-identical
+    to the idle/calls/key ordering. DEGRADE-NOT-GUESS: an unknown preference
+    never invents a cliff-order verdict.
+
+    ⚠ BOTH ``{}`` (derived max-gpu) and ``{"alloc_mode": "max-gpu"}`` (explicit,
+    b0e02ff) mean max-gpu FOR PREFERENCE PURPOSES — they differ in provenance
+    only. That is why this reads the resolved mode NAME and never a raw spill."""
+    val = (_RUNTIME_SETTINGS.get("alloc_mode") or {}).get(model_key)
+    return str(val) if val else None
+
+
+def _model_call_stats(state: "WorkerState | None",
+                      model_key: str) -> "tuple[float | None, int]":
+    """``(last_activity_epoch, total_calls)`` for one model, from THE ONE LEDGER.
+
+    PARITY: idle times must come from central's call log, shipped at emission
+    (``state.model_last_picked``, adopted in _adopt_storage_inputs), never from
+    this box's own clock — the spec names divergent victim sets as the failure
+    mode that rule prevents. The worker's local dispatch LRU is used only as a
+    FALLBACK for a model central has no entry for (a locally-loaded model that
+    never routed through central); a local clock is better than 0 there, and it
+    cannot cause divergence because central has no opinion to diverge from.
+
+    ENACTED PROPOSAL 1 (spec "Open"): the last-activity figure is
+    ``max(request start, last token emitted)``, not bare request start — a long
+    stream must not read as idle. ``dispatch.note_used`` is called on token
+    flow, so the local snapshot already carries the token side; central's stamp
+    carries the request-start side; the max of the two is the honest answer."""
+    lp = None
+    try:
+        lp = (getattr(state, "model_last_picked", None) or {}).get(model_key)
+    except Exception:  # noqa: BLE001
+        lp = None
+    local = None
+    try:
+        from ..managers.dispatch.dispatch import last_used_snapshot as _lus
+        local = (_lus() or {}).get(model_key)
+    except Exception:  # noqa: BLE001
+        local = None
+    vals = [float(v) for v in (lp, local) if v]
+    last = max(vals) if vals else None
+    calls = 0
+    try:
+        calls = int((_RUNTIME_SETTINGS.get("model_calls") or {}).get(model_key) or 0)
+    except (TypeError, ValueError):
+        calls = 0
+    return last, calls
+
+
+def _evict_residents(state: "WorkerState", candidates: "list[dict]",
+                     model_key: str) -> list:
+    """Build the shared-eviction ``Resident`` rows for a VRAM admission.
+
+    ``candidates`` is ``_partition_residents``' UNPROTECTED half, so the
+    operator's inviolable protections (🔒static / actively replying / queued
+    ahead / comfy / the subject) have ALREADY removed their rows — that ruling
+    outranks the spec's "pool minus static" and is applied upstream, not here.
+    What this adds is the spec's own inputs: the preference (key ①), the one
+    ledger's idle + call count (keys ②③), and the two enacted proposals
+    (in-flight, resident_since for the thrash floor)."""
+    from ..managers import eviction as _ev
+    busy = _busy_slot_models()
+    rows = []
+    for r in candidates:
+        mk = r["model_key"]
+        last, calls = _model_call_stats(state, mk)
+        rows.append(_ev.Resident(
+            model_key=mk,
+            bytes=(int(r.get("vram_bytes") or 0) or None),
+            pref=_ev.preferred_device(_model_alloc_mode(mk)),
+            last_call=last, calls=calls,
+            # `_partition_residents` already excludes actively-replying, so this
+            # is belt-and-braces for a row that became busy since the snapshot.
+            in_flight=_actively_replying(mk, busy),
+            resident_since=r.get("resident_since") or r.get("loaded_at")))
+    return rows
+
+
+def _shared_evict_order(rows: list, need: "int | None",
+                        priority: "dict | None" = None) -> "list[str]":
+    """Model keys to evict, in order — via THE shared function, with the
+    operator's flex priority as the OUTER key.
+
+    ``need`` None (unmeasurable free VRAM) -> DEGRADE-NOT-GUESS: return the
+    full pool in shared-key order and let the caller's incremental ``_fits()``
+    loop stop it, which is exactly today's behaviour. A guessed need would
+    produce a guessed victim set, and the whole point of walk-then-drop is that
+    the set is derivable from real numbers.
+
+    Priority grouping is what keeps least-reaping honest under an override: the
+    drop pass runs WITHIN a priority band, so a high-priority resident is never
+    spared by a low-priority one covering the need (which would silently invert
+    the operator's ordering) — the bands are walked in order and each is
+    planned against the need that REMAINS."""
+    from ..managers import eviction as _ev
+    pri = priority or {}
+    now = time.time()
+    if need is None:
+        ordered = sorted(rows, key=lambda r: (pri.get(r.model_key, 0),
+                                              _ev.sort_key(r, _ev.VRAM, now)))
+        return [r.model_key for r in ordered]
+    out: list[str] = []
+    remaining = int(need)
+    for band in sorted({pri.get(r.model_key, 0) for r in rows}):
+        if remaining <= 0:
+            break
+        members = [r for r in rows if pri.get(r.model_key, 0) == band]
+        plan = _ev.evict_plan(_ev.VRAM, remaining, members, now=now,
+                              min_residency_s=_evict_min_residency_s())
+        out.extend(plan.victims)
+        remaining -= plan.freed
+    return out
+
+
+# Enacted proposal 2 (spec "Open" — thrash floor). Seconds a model must have
+# been resident before it is an eviction candidate at all. Env-tunable and
+# defaulting to the shared module's constant, which mirrors the hot tier's
+# window; 0 disables the floor and restores the pre-spec behaviour exactly.
+def _evict_min_residency_s() -> float:
+    from ..managers import eviction as _ev
+    raw = os.environ.get("HUGPY_EVICT_MIN_RESIDENCY_S")
+    if raw in (None, ""):
+        return _ev.DEFAULT_MIN_RESIDENCY_S
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return _ev.DEFAULT_MIN_RESIDENCY_S
+
+
 def _reclaimable_vram_bytes(candidates: "list[dict]") -> "int | None":
     """VRAM the admission could plausibly reclaim = the summed measured footprint
     of the UNPROTECTED residents (``_partition_residents``' candidates).
@@ -6553,9 +6714,18 @@ def _size_up_for_eviction(state: "WorkerState", model_key: str, plan: dict,
     # never overridden to make a plan fit.
     candidates, _protected = _partition_residents(state, model_key)
     from .flex import flex_priority_key as _fpk
-    candidates.sort(key=lambda r: (_fpk(_flex_alloc(r["model_key"])),
-                                   lru.get(r["model_key"], 0.0),
-                                   -int(r.get("vram_bytes") or 0)))
+    # THE SHARED EVICT ORDER (spec assets/evictionflow.html). Same function and
+    # same key as the admission path — a size-up that ranked victims differently
+    # from the admission it is optimising would be a second, divergent policy.
+    # need=None: this loop's stopping rule is a LAYER TARGET re-measured per
+    # round, not a byte need, so it takes the ordering and does its own walk
+    # (degrade-not-guess — no invented byte figure to plan a drop pass against).
+    _sz_order = _shared_evict_order(
+        _evict_residents(state, candidates, model_key), need=None,
+        priority={r["model_key"]: _fpk(_flex_alloc(r["model_key"]))
+                  for r in candidates})
+    _sz_by_mk = {r["model_key"]: r for r in candidates}
+    candidates = [_sz_by_mk[mk] for mk in _sz_order if mk in _sz_by_mk]
 
     evicted: list[str] = []
     freed = 0
@@ -6852,15 +7022,34 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
                     "flex": plan.as_dict()}
         flex_note = plan.note
 
-    # ── stage 2: EVICT, lowest flex-priority first, then today's LRU order ───
-    # Priority-ascending so a higher-priority subject yields lower-priority
-    # neighbours BEFORE higher ones (the operator's "explicit priorities"); then
-    # coldest-first (LRU), then largest-first among equal age. With no priorities
-    # set (the default, priority==0 everywhere) this is byte-identical to the
-    # prior pure-LRU order.
-    candidates.sort(key=lambda r: (_fpk(_flex_alloc(r["model_key"])),
-                                   lru.get(r["model_key"], 0.0),
-                                   -int(r.get("vram_bytes") or 0)))
+    # ── stage 2: EVICT — the SHARED function (spec assets/evictionflow.html) ─
+    # THIS is the site where key ① actually bites: these are DEVICE residents,
+    # so a resident whose preference names RAM is already off the cliff by
+    # design and yields BEFORE one that asked for this card (whose loss is the
+    # measured 135->36 tok/s drop). That is the cliff order, and it is why the
+    # old key's largest-first term had to go: size is not a measure of cost.
+    #
+    # Flex priority stays the OUTER key. It is the operator's explicit
+    # per-model override ("explicit priorities"), and an override that the
+    # spec's derived ordering could outvote would not be an override. With no
+    # priorities set (the default, 0 everywhere) it is a constant and the order
+    # is the spec's, exactly.
+    #
+    # WALK-THEN-DROP is delegated: `_shared_evict_order` returns the walked-and-
+    # dropped victim list, so least reaping and the frontier rule hold here as
+    # they do in the preview. The loop below still re-tests `_fits()` and
+    # re-proves protection per victim (the device moves for reasons no plan
+    # models), so the PLAN chooses and the LOOP verifies.
+    _fv_for_need = _free_vram_bytes()
+    _ev_need = (max(0, ceiling_reserve - (_fv_for_need - need))
+                if _fv_for_need is not None else None)
+    _ev_rows = _evict_residents(state, candidates, model_key)
+    _ev_order = _shared_evict_order(
+        _ev_rows, need=_ev_need,
+        priority={r["model_key"]: _fpk(_flex_alloc(r["model_key"]))
+                  for r in candidates})
+    _by_mk = {r["model_key"]: r for r in candidates}
+    candidates = [_by_mk[mk] for mk in _ev_order if mk in _by_mk]
 
     evicted: list[str] = []
     evict_failed: list[dict] = []            # attempted but not freed — carried

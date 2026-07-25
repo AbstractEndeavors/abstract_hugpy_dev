@@ -510,3 +510,118 @@ def test_k30_failed_eviction_is_counted_in_the_refusal(rig, monkeypatch):
     ef = plan["reason"]["evict_failed"]
     assert len(ef) == 1 and ef[0]["model_key"] == "stuck"
     assert "eviction attempt(s) failed" in plan["reason"]["reason"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# THE EVICTION FLOW SPEC ON THE REAL VRAM PATH (assets/evictionflow.html).
+#
+# tests/test_eviction_flow.py asserts the shared function in isolation. These
+# assert it is genuinely WIRED INTO _vram_evict_to_fit — the admission choke
+# point — because a correct helper nobody calls is the failure mode this repo
+# has shipped before.
+# ─────────────────────────────────────────────────────────────────────────────
+def test_cliff_order_a_ram_preferring_resident_yields_before_a_gpu_one(rig, monkeypatch):
+    """KEY ①, on the device where it bites. The RAM-preferring resident is
+    HOTTER and MORE CALLED, and still goes first: it is on this card only
+    opportunistically (already off the cliff by design), whereas the max-gpu
+    resident losing residency is the measured 135->36 tok/s drop."""
+    rig.card["free"] = 0
+    rig.card["need"] = 4 * GIB
+    rig.residents["wants-ram"] = {"vram_bytes": 5 * GIB, "host_mode": "subprocess"}
+    rig.residents["wants-gpu"] = {"vram_bytes": 5 * GIB, "host_mode": "subprocess"}
+    rig.lru.update({"wants-ram": 9999.0, "wants-gpu": 1.0})   # ram one is HOTTER
+    monkeypatch.setitem(A._RUNTIME_SETTINGS, "alloc_mode",
+                        {"wants-ram": "max-ram", "wants-gpu": "max-gpu"})
+    plan = A._vram_evict_to_fit(_State(), "subject")
+    # ORDER is the assertion (the ~90% ceiling reserve means the need exceeds
+    # either resident alone, so both go — but the SEQUENCE is the cliff order).
+    assert plan["evicted"][0] == "wants-ram", (
+        "cliff order: the mismatched (RAM-preferring) resident must yield "
+        "before the one whose preference names this card")
+
+
+def test_without_a_known_mode_the_order_is_todays_idle_first(rig, monkeypatch):
+    """DEGRADE-NOT-GUESS: with no persisted alloc_mode every resident degrades
+    to the blank max-gpu default, key ① becomes a constant, and the order is
+    the honest idle-first one — byte-identical to today. An unknown preference
+    must never invent a cliff-order verdict."""
+    rig.card["free"] = 0
+    rig.card["need"] = 4 * GIB
+    rig.residents["hot"] = {"vram_bytes": 5 * GIB, "host_mode": "subprocess"}
+    rig.residents["cold"] = {"vram_bytes": 5 * GIB, "host_mode": "subprocess"}
+    rig.lru.update({"hot": 9999.0, "cold": 1.0})
+    monkeypatch.setitem(A._RUNTIME_SETTINGS, "alloc_mode", {})
+    assert A._vram_evict_to_fit(_State(), "subject")["evicted"][0] == "cold"
+
+
+def test_least_reaping_on_the_vram_path_spares_the_redundant_victim(rig):
+    """Walk-then-drop, on the real admission. need 12: the walk takes
+    small(5) then big(20) because 5 was short; the drop pass then removes
+    'small' since 'big' alone covers 12. ONE model unloaded, not two."""
+    rig.card["free"] = 0
+    rig.card["need"] = 12 * GIB
+    rig.residents["small"] = {"vram_bytes": 5 * GIB, "host_mode": "subprocess"}
+    rig.residents["big"] = {"vram_bytes": 20 * GIB, "host_mode": "subprocess"}
+    rig.lru.update({"small": 1.0, "big": 2.0})     # small is colder -> walked first
+    plan = A._vram_evict_to_fit(_State(), "subject")
+    assert plan["evicted"] == ["big"]
+    assert "small" not in plan["evicted"], "least reaping: y1 spared"
+
+
+def test_the_frontier_rule_holds_on_the_vram_path(rig):
+    """A hot resident that is a PERFECT fit for the need is never pulled in:
+    the walk stops before it, and the drop pass only removes."""
+    rig.card["free"] = 0
+    rig.card["need"] = 12 * GIB
+    rig.residents["c1"] = {"vram_bytes": 5 * GIB, "host_mode": "subprocess"}
+    rig.residents["c2"] = {"vram_bytes": 10 * GIB, "host_mode": "subprocess"}
+    rig.residents["perfect-but-hot"] = {"vram_bytes": 12 * GIB,
+                                        "host_mode": "subprocess"}
+    rig.lru.update({"c1": 1.0, "c2": 2.0, "perfect-but-hot": 9999.0})
+    plan = A._vram_evict_to_fit(_State(), "subject")
+    assert "perfect-but-hot" not in plan["evicted"]
+    assert set(plan["evicted"]) == {"c1", "c2"}
+
+
+def test_the_thrash_floor_protects_a_freshly_loaded_resident(rig, monkeypatch):
+    """ENACTED PROPOSAL 2, on the real path. 'fresh' is the coldest thing on
+    the card by idle anchor (loaded 10s ago, never called) and would be evicted
+    immediately — load, evict, reload. The floor REMOVES it from the pool."""
+    import time as _t
+    rig.card["free"] = 0
+    rig.card["need"] = 4 * GIB
+    now = _t.time()
+    rig.residents["fresh"] = {"vram_bytes": 5 * GIB, "host_mode": "subprocess",
+                              "resident_since": now - 10}
+    rig.residents["settled"] = {"vram_bytes": 5 * GIB, "host_mode": "subprocess",
+                                "resident_since": now - 99_999}
+    rig.lru.update({"settled": now - 5})           # settled answered 5s ago
+    monkeypatch.setattr(
+        A, "_vram_residents",
+        lambda s: [{"model_key": k, **v, "alive": True}
+                   for k, v in rig.residents.items()])
+    monkeypatch.setenv("HUGPY_EVICT_MIN_RESIDENCY_S", "300")
+    assert A._vram_evict_to_fit(_State(), "subject")["evicted"][0] == "settled", (
+        "the floored fresh load must not be the FIRST thing taken")
+    # Floor OFF -> the thrash reproduces (the fresh load is taken).
+    monkeypatch.setenv("HUGPY_EVICT_MIN_RESIDENCY_S", "0")
+    rig.residents["fresh"] = {"vram_bytes": 5 * GIB, "host_mode": "subprocess",
+                              "resident_since": now - 10}
+    rig.residents["settled"] = {"vram_bytes": 5 * GIB, "host_mode": "subprocess",
+                                "resident_since": now - 99_999}
+    rig.card["free"] = 0
+    assert A._vram_evict_to_fit(_State(), "subject")["evicted"][0] == "fresh", (
+        "with the floor off the thrash reproduces: the fresh load leads")
+
+
+def test_static_still_outranks_everything_the_spec_says(rig, monkeypatch):
+    """The operator's protection ruling is applied UPSTREAM of the shared pool
+    (in _partition_residents) and is not weakened by any of this: a 🔒static
+    resident is not a victim even when it is the only thing that could fit."""
+    rig.card["free"] = 0
+    rig.card["need"] = 4 * GIB
+    rig.residents["locked"] = {"vram_bytes": 20 * GIB, "host_mode": "subprocess"}
+    rig.static.add("locked")
+    monkeypatch.setattr(A, "_served_gguf_geometry", lambda mk: (None, None))
+    plan = A._vram_evict_to_fit(_State(), "subject")
+    assert plan["action"] == "refuse" and plan["evicted"] == []

@@ -325,6 +325,151 @@ def _is_online(worker: Dict[str, Any]) -> bool:
     return (_now() - last) <= HEARTBEAT_TIMEOUT_SECONDS
 
 
+# ── THE ONE LEDGER: derived columns (operator, 2026-07-25) ───────────────────
+# "in the end it is about maximizing tok/s ... lets start recording this".
+#
+# Two signals, both stamped onto the SAME ``model_call_stats[model_key]`` row
+# that already carries ``calls``/``last_call``, because the Parity invariant
+# (spec assets/evictionflow.html) is specifically that central's preview and the
+# worker's auto-evict rank from ONE ledger. A second store — however tidy —
+# would be the exact failure the spec exists to prevent.
+#
+# ⚠ NOTHING READS EITHER OF THESE YET, BY DESIGN. ``eviction.sort_key`` is
+# untouched, so recording cannot change which model is evicted or placed. These
+# are inert columns being accumulated so that a future policy has a history to
+# rank on; a distribution you never wrote down cannot be reconstructed later.
+#
+# Both writers are pure functions over the row dict + the new sample, so the
+# arithmetic is testable without a store, a worker, or a clock.
+
+_EWMA_ALPHA = 0.3   # recent behaviour dominates within ~3 samples, while a
+                    # single outlier cannot swing the estimate.
+
+
+def _ewma(prev: Any, sample: float, alpha: float = _EWMA_ALPHA) -> float:
+    """One EWMA step, FIRST-SAMPLE SEEDED.
+
+    A None/garbage ``prev`` seeds at the sample itself rather than at 0 — seeding
+    at zero would make every model's first observation read as half its true
+    value and take ~10 samples to recover, which is precisely the kind of quiet
+    wrongness a recording-only slice must not bake into the history.
+    """
+    try:
+        p = float(prev)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return float(sample)
+    return alpha * float(sample) + (1.0 - alpha) * p
+
+
+def _record_interval(row: Dict[str, Any], prev_call: Any, now: float) -> None:
+    """Stamp the CALL-INTERVAL columns onto a ledger row. Fail-open.
+
+    "Time since last call" is a POINT ESTIMATE of a distribution: a model called
+    every 30s for an hour and one called once yesterday can both read 5 minutes
+    idle, and they are not remotely the same eviction risk. What actually ranks
+    them is EXPECTED TIME UNTIL NEXT CALL, which is estimable from the history —
+    but only if the history is kept. So keep it here, on the line that already
+    stamps the clock: one subtraction, one float, no second ledger.
+
+    LOG SPACE because call intervals are heavy-tailed (mostly short gaps, the
+    occasional very long one), so an arithmetic mean is dominated by outliers.
+    An exponentially-weighted mean of log-intervals is stable, costs one float
+    per model, needs no training and no model artifact, and stays DERIVABLE —
+    which is the property the eviction spec exists to protect. Whether a learned
+    estimator ever earns its complexity is a decision to make against this data,
+    not before it.
+
+    The FIRST call for a model records no interval at all (there is no previous
+    call to difference against) — deliberately absent rather than stamped zero,
+    since a fabricated 0s gap would read as the hottest possible model.
+    """
+    if not prev_call:
+        return
+    try:
+        gap = float(now) - float(prev_call)
+    except (TypeError, ValueError):
+        return
+    if gap <= 0:
+        # Clock skew / same-instant re-pick. Recording a non-positive interval
+        # would put -inf into log space and poison the EWMA permanently.
+        return
+    try:
+        import math
+        lg = math.log(max(gap, 1e-3))
+        row["log_interval_ewma"] = _ewma(row.get("log_interval_ewma"), lg)
+        row["last_interval_s"] = round(gap, 3)
+        row["interval_samples"] = int(row.get("interval_samples") or 0) + 1
+    except (TypeError, ValueError):   # noqa: BLE001 — never break a pick
+        pass
+
+
+def _record_tok_s(row: Dict[str, Any], tok_s: Any) -> bool:
+    """Stamp the DECODE-RATE columns onto a ledger row. Fail-open.
+
+    PLAIN (not log) EWMA, unlike the interval above, and the difference is not
+    stylistic. Intervals are heavy-tailed over orders of magnitude (seconds to
+    days), so their arithmetic mean is meaningless. Decode rate for a FIXED
+    (model, worker, placement) pair is tightly clustered — 115 tok/s stays 115
+    tok/s until the placement changes — so a plain mean is both meaningful and
+    directly comparable, which is exactly the property "maximize tok/s" needs.
+    The one thing that genuinely moves it is a placement change (the MoE split
+    measured +59%, the offload cliff 135->36), and a plain alpha-0.3 EWMA tracks
+    such a step change within a few calls instead of smearing it in log space.
+
+    Returns True when a sample was recorded, so callers can log/test the seam
+    without re-deriving the validity rules.
+    """
+    try:
+        v = float(tok_s)
+    except (TypeError, ValueError):
+        return False
+    # Reject the impossible rather than average it in: a non-finite or
+    # non-positive rate is a broken measurement, and a zero-token generation
+    # (predicted_n == 0) reports 0.0 tok/s while saying nothing about how fast
+    # the model decodes. Recording it would drag the mean toward zero and make a
+    # fast model look slow — degrade-not-guess.
+    if not (v > 0.0) or v != v or v in (float("inf"), float("-inf")):
+        return False
+    row["tok_s_last"] = round(v, 3)
+    row["tok_s_ewma"] = round(_ewma(row.get("tok_s_ewma"), v), 3)
+    row["tok_s_samples"] = int(row.get("tok_s_samples") or 0) + 1
+    return True
+
+
+def tok_s_from_timings(payload: Any) -> Optional[float]:
+    """Pull the engine's OWN decode rate out of a llama-server reply. Fail-open.
+
+    llama-server returns a ``timings`` block on EVERY /v1/chat/completions
+    response, and its ``predicted_per_second`` is authoritative decode tok/s
+    measured by the engine itself — no instrumentation in the serving path, no
+    wall-clock arithmetic of ours to be wrong. It was simply being discarded.
+
+    Falls back to ``predicted_n / predicted_ms`` when a build reports the raw
+    counters but not the rate. Returns None for anything unrecognizable: the
+    serving path is live, and a relay that raises because a ``timings`` key is
+    missing is a far worse bug than not recording.
+    """
+    if not isinstance(payload, dict):
+        return None
+    t = payload.get("timings")
+    if not isinstance(t, dict):
+        return None
+    try:
+        rate = t.get("predicted_per_second")
+        if rate is not None:
+            f = float(rate)
+            return f if f > 0 else None
+        n, ms = t.get("predicted_n"), t.get("predicted_ms")
+        if n is None or ms is None:
+            return None
+        n_f, ms_f = float(n), float(ms)
+        if n_f <= 0 or ms_f <= 0:
+            return None
+        return (n_f * 1000.0) / ms_f
+    except (TypeError, ValueError):
+        return None
+
+
 def _public_view(worker: Dict[str, Any]) -> Dict[str, Any]:
     """The shape returned to API callers — derived ``status`` included.
 
@@ -359,7 +504,49 @@ def _public_view(worker: Dict[str, Any]) -> Dict[str, Any]:
         # absence-of-feature; always surface the (possibly empty) dict so
         # console/tests can see grants land and clear.
         "grants": dict(worker.get("grants") or {}),
+        # THE PREFERENCE MAP — key ① of the shared eviction sort (spec
+        # assets/evictionflow.html, 2026-07-25). ``{model_key: mode_name}`` for
+        # every model with a persisted allocation on this worker, derived
+        # read-time from the SAME spill dict the emission seam reads, so the
+        # mode the console shows, the mode the worker serves under, and the
+        # preference that decides which resident dies are one value.
+        #
+        # Rides _public_view (like storage/status) so it reaches the worker on
+        # the heartbeat reply and is adopted in _adopt_storage_inputs. A model
+        # with nothing persisted is deliberately ABSENT rather than stamped
+        # max-gpu: absent degrades to the blank max-gpu default at the reader,
+        # which is the same answer without asserting a preference nobody chose.
+        "model_alloc_modes": _model_alloc_modes(worker),
     }
+
+
+def _model_alloc_modes(worker: Dict[str, Any]) -> Dict[str, str]:
+    """``{model_key: alloc mode name}`` from this worker's persisted spills.
+
+    PURE and read-time, like every other _public_view derivation. Uses
+    ``alloc_modes.derive_alloc_mode`` — the ONE reader of a persisted spill —
+    so this can never disagree with what ``spill_for`` emits or what the
+    console dropdown displays.
+
+    ⚠ ``{}`` (derived max-gpu) and ``{"alloc_mode": "max-gpu"}`` (explicit,
+    b0e02ff) BOTH resolve to "max-gpu" here, which is correct: they differ in
+    provenance, not in preference, and preference is all key ① consumes.
+
+    Never raises into a worker read: an unparseable spill is simply omitted
+    (degrade-not-guess — the reader then uses the blank default)."""
+    out: Dict[str, str] = {}
+    try:
+        from ......managers.alloc_modes import derive_alloc_mode
+    except Exception:  # noqa: BLE001
+        return out
+    for mk, spill in (worker.get("spill_by_model") or {}).items():
+        if not isinstance(spill, dict) or not spill:
+            continue
+        try:
+            out[str(mk)] = derive_alloc_mode(spill)
+        except Exception:  # noqa: BLE001
+            continue
+    return out
 
 
 def _clamp_limits(limits: Dict[str, Any], caps: Dict[str, Any]) -> Dict[str, Any]:
@@ -527,6 +714,40 @@ _PLACEMENT_SPILL_KEYS = frozenset({
 # this hot read-path stays import-free; asserted equal in tests.
 _NEW_SPILL_KEYS_LOCAL = frozenset({"alloc_mode", "leniency_pct",
                                    "priority_device", "n_cpu_moe"})
+
+# alloc_mode VALUES that are PERSISTENCE-ONLY: they record an operator's choice
+# in the registry but must NEVER ride the wire, because their behavior on the
+# worker IS the absence of any mode key.
+#
+# ``max-gpu`` is the only member, and it exists because of the 2026-07-25 bug:
+# max-gpu's natural encoding ({}) is indistinguishable from the "clear this
+# override" signal, so an explicitly-chosen max-gpu was deleting its own row.
+# It now persists as {"alloc_mode": "max-gpu"} and is stripped HERE, at the one
+# seam where central hands a spill to a worker.
+#
+# THE STRIP IS LOAD-BEARING, not tidiness. Sending a literal
+# HUGPY_ALLOC_MODE=max-gpu to a worker would change behavior for the worse:
+# slot_agent's auto MoE policy bails out whenever ANY k37 alloc_mode is set
+# ("the operator is driving the numbers themselves"), so an explicit max-gpu
+# would SUPPRESS the automatic expert split that a blank max-gpu gets for free —
+# the +59%-tok/s split, silently lost by picking the mode that means "do the
+# normal thing". Every other worker branch (gguf_gpu_layers, the admission band
+# engine, transformers_max_memory) tests only for max-ram/explicit and would
+# ignore it, so stripping costs nothing and protects the MoE path.
+_WIRE_INERT_MODES = frozenset({"max-gpu"})
+
+
+def _strip_wire_inert_mode(spill: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop a persistence-only alloc_mode so the emitted wire is byte-identical
+    to the blank ({}) encoding of the same mode. Returns a spill safe to send to
+    ANY worker version; other keys (a stray ctx_pct, etc.) are preserved."""
+    if not spill:
+        return spill if isinstance(spill, dict) else {}
+    mode = str(spill.get("alloc_mode") or "").strip().lower()
+    if mode not in _WIRE_INERT_MODES:
+        return spill
+    out = {k: v for k, v in spill.items() if k != "alloc_mode"}
+    return out
 
 
 def _limit_bytes(worker: Dict[str, Any], key: str) -> Optional[int]:
@@ -1257,22 +1478,51 @@ def storage_proposal(worker: Dict[str, Any]) -> Dict[str, Any]:
     proposed: List[Dict[str, Any]] = []
     proposed_free = 0
     if over_budget and need_bytes > 0 and candidates:
-        # LRU oldest-first (ascending last_picked), then largest-first so the
-        # budget clears in the fewest deletes; stable key tiebreak. IDENTICAL to
-        # budget.fit_plan, so central's preview and the worker's auto-evict
-        # agree on what goes.
+        # ── THE SHARED EVICT FUNCTION (spec assets/evictionflow.html, box 2) ──
+        # PARITY IS THE WHOLE POINT of this call. This preview and the worker's
+        # ``budget.fit_plan`` auto-evict now run the IDENTICAL function over the
+        # identical inputs, so they can never propose different victims — the
+        # spec names divergence as the failure mode. Neither side spells the
+        # sort key; both import it.
         #
-        # 📌pin is NOT in this key (operator ruling, 2026-07-25: "pin routing has
-        # nothing to do with eviction... the only eviction protection is 'static'
-        # residency"). It previously sat at position 2 as a tiebreak the operator
-        # had already called "trivial and likely unnecessary" on 2026-07-17 —
-        # removed rather than kept, because a vestigial pin term keeps teaching
-        # readers that pin is an eviction input. Pin means only: allocated to
-        # this worker, and that allocation survives a restart.
-        candidates.sort(key=lambda c: (c[0], -c[1], c[2]))
-        for lp, b, mk in candidates:
-            if proposed_free >= need_bytes:
-                break
+        # ONE LEDGER: the idle times below are central's own call log
+        # (``model_last_picked``, stamped in pick_for_model) and the call counts
+        # are ``model_call_stats`` from the same place — and BOTH are shipped to
+        # the worker on the heartbeat reply, so the worker measures from
+        # central's clock rather than its own. That shipping is what makes the
+        # parity real rather than coincidental.
+        #
+        # This REPLACES oldest-first-then-LARGEST-first. Largest-first cleared a
+        # budget in the fewest deletes but had no relationship to what the
+        # admission needed; walk-then-drop is the spec's answer (least reaping).
+        # Device = the disk (see the same note in budget.fit_plan: key ① is a
+        # residency concept and degenerates to a constant here, leaving the
+        # honest storage order ②/③/④).
+        from ......managers import eviction as _ev
+        _stats = worker.get("model_call_stats") or {}
+        _modes = worker.get("model_alloc_modes") or {}
+
+        def _calls_for(mk):
+            try:
+                return int((_stats.get(mk) or {}).get("calls") or 0)
+            except (TypeError, ValueError, AttributeError):
+                return 0
+
+        _by_key = {mk: (lp, b) for lp, b, mk in candidates}
+        # min_residency_s=0 — the thrash floor guards a freshly LOADED model
+        # (a residency concept); a freshly downloaded FILE has no load clock
+        # here, and inventing one from mtime would protect the cold leftovers
+        # this budget exists to clear. Same choice as the worker half, so the
+        # two stay identical.
+        _plan = _ev.evict_plan(
+            "disk", need_bytes,
+            [_ev.Resident(model_key=mk, bytes=b,
+                          pref=_ev.preferred_device(_modes.get(mk)),
+                          last_call=(lp or None), calls=_calls_for(mk))
+             for lp, b, mk in candidates],
+            now=_now(), min_residency_s=0.0)
+        for mk in _plan.victims:
+            lp, b = _by_key.get(mk, (None, 0))
             proposed.append({"model_key": mk, "bytes": b,
                              "last_picked": lp or None})
             proposed_free += b
@@ -2125,6 +2375,20 @@ class WorkerStore:
         ``spill`` is an opaque dict of GPU/CPU knobs (e.g. n_gpu_layers,
         gpu_mem_gib, cpu_mem_gib) the worker applies when it loads the model.
         Omitted / None means "use the worker's autofit default."
+
+        THE ``{}`` CONTRACT IS UNCHANGED AND LOAD-BEARING: an empty spill CLEARS
+        any persisted override, so the model reverts to the read-time derivation.
+        Two callers depend on that exact meaning — the console's "↺ Auto —
+        derived" control, and worker_routes' manifest-orphan cleanup, whose
+        safety argument is precisely that an empty spill is STRUCTURALLY
+        incapable of writing a contract onto a phantom key. Neither may regress.
+
+        What DID change (2026-07-25): an explicitly-chosen max-gpu no longer
+        arrives here as ``{}``. It carries ``{"alloc_mode": "max-gpu"}``, so it
+        is a normal non-empty contract and takes the write branch like any other
+        mode. Before this, max-gpu was the ONE mode that could not be saved: its
+        encoding collided with the clear signal, so choosing it deleted the row
+        and the model silently fell through to whatever the derivation said.
         """
         with self._transaction() as workers:
             worker = workers.get(worker_id)
@@ -2250,6 +2514,16 @@ class WorkerStore:
                 return gated
             except Exception:  # noqa: BLE001 — the gate must never break relaying
                 return {}                        # fail SAFE: unproven -> max-gpu
+        # PERSISTENCE-ONLY MODES (2026-07-25): an explicitly-chosen max-gpu is
+        # persisted as {"alloc_mode": "max-gpu"} so it is distinguishable from a
+        # CLEAR ({}), but that key is central's bookkeeping — never the worker's.
+        # Strip it BEFORE the version gate so the emitted wire is byte-identical
+        # to a blank max-gpu on every worker version, and so the gate is not
+        # engaged by a key that carries no instruction (an old worker would
+        # otherwise be "downgraded" from max-gpu to max-gpu, logging a scary and
+        # entirely fictional note). See _WIRE_INERT_MODES for why sending it
+        # would actively regress the MoE auto-split.
+        spill = _strip_wire_inert_mode(spill)
         try:
             from ......managers.alloc_modes import gate_spill_for_worker
             gated, note = gate_spill_for_worker(
@@ -2609,6 +2883,54 @@ class WorkerStore:
                 # sort candidates oldest-first; a model never served through
                 # central has no entry -> defaults to 0 -> proposed first.
                 stored.setdefault("model_last_picked", {})[model_key] = now
+                # ── THE ONE LEDGER's second column: TOTAL CALLS (key ③ of the
+                # eviction sort, spec assets/evictionflow.html 2026-07-25).
+                #
+                # Stamped HERE, beside last_picked, and for the same reason: this
+                # is the authoritative "central served (worker, model)" event, so
+                # the count and the clock are incremented by the SAME line of
+                # code and can never describe different histories. A separate
+                # counter elsewhere would be a second ledger, and the Parity
+                # invariant is specifically about there being only one.
+                #
+                # Shipped to the worker on the heartbeat reply (it rides
+                # _public_view like model_last_picked, and the worker adopts it
+                # in _adopt_storage_inputs), so the worker's auto-evict ranks by
+                # CENTRAL's counts rather than its own — which is what makes the
+                # two sides' victim sets identical rather than merely similar.
+                _cs = stored.setdefault("model_call_stats", {})
+                _row = _cs.setdefault(model_key, {"calls": 0})
+                _prev_call = _row.get("last_call")
+                try:
+                    _row["calls"] = int(_row.get("calls") or 0) + 1
+                except (TypeError, ValueError):
+                    _row["calls"] = 1
+                # ── CALL INTERVAL (operator, 2026-07-25) ─────────────────────
+                # "time since last call" is a POINT ESTIMATE of a distribution:
+                # a model called every 30s for an hour and one called once
+                # yesterday can both read 5 minutes idle, and they are not
+                # remotely the same eviction risk. What actually ranks them is
+                # EXPECTED TIME UNTIL NEXT CALL, which is estimable from the
+                # history — but only if the history is kept.
+                #
+                # So keep it, here, on the line that already stamps the clock:
+                # one subtraction, one float, no second ledger. Recording is
+                # cheap; reconstructing a distribution you never wrote down is
+                # impossible.
+                #
+                # LOG SPACE because call intervals are heavy-tailed (mostly
+                # short gaps, occasional long ones), so an arithmetic mean is
+                # dominated by outliers. An exponentially-weighted mean of
+                # log-intervals is stable, costs one float per model, needs no
+                # training, no model artifact, and stays DERIVABLE — which is
+                # the property the eviction spec exists to protect. Whether a
+                # learned estimator ever earns its complexity is a decision to
+                # make against this data, not before it.
+                #
+                # NOTHING READS THIS YET. It is deliberately inert: recording
+                # changes no policy, so it cannot regress an eviction.
+                _record_interval(_row, _prev_call, now)
+                _row["last_call"] = now
                 chosen = stored
         return _public_view(chosen)
 

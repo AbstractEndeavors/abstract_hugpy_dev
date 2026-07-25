@@ -569,13 +569,36 @@ def _make_room(need: int, keep_key: str) -> bool:
         if fits():
             return True
         candidates = [(k, v) for k, v in _INDEX["entries"].items() if k != keep_key]
-        # Anti-thrash: exclude anything that served within the residency window.
+        # ── THE SHARED EVICT ORDER (spec assets/evictionflow.html, box 2) ────
+        # The hot tier is the THIRD site that must agree with central's preview
+        # and the worker's auto-evict, so it imports the same key rather than
+        # spelling its own. Its old key was bare ``last_called`` ascending; the
+        # shared key's ②/③/④ (idle longest, fewest calls, stable model_key) is a
+        # strict refinement of that — same primary order, with real tiebreaks
+        # where it previously relied on dict insertion order.
+        #
+        # Device = the hot DRIVE: as on the storage path, key ① ("pref ==
+        # other device first") names VRAM or RAM, neither of which is a disk,
+        # so it is a constant here and the order is honest ②/③/④.
+        #
+        # WALK ONLY — no drop pass. This loop evicts INCREMENTALLY and re-tests
+        # ``fits()`` after each real delete (free bytes move for reasons this
+        # index does not model), so a precomputed victim set would be a lie.
+        # The ORDER is what has to be shared; the stopping rule is this site's.
+        from .. import eviction as _ev
+        # Anti-thrash: the hot tier's OWN residency window, which is the exact
+        # shape enacted proposal 2 reuses in ``eviction._partition`` — kept here
+        # (rather than delegated) because this window is keyed on last_called,
+        # not on a load time this index does not record.
         eligible = [(k, v) for (k, v) in candidates
                     if (now - float(v.get("last_called", 0) or 0)) >= residency]
         fresh = len(candidates) - len(eligible)
-        # Order: least-recently-called first. PURE LRU — pin is routing
-        # persistence, never an eviction input (see the note above _free_bytes).
-        eligible.sort(key=lambda kv: float(kv[1].get("last_called", 0) or 0))
+        eligible.sort(key=lambda kv: _ev.sort_key(
+            _ev.Resident(model_key=kv[0],
+                         bytes=int(kv[1].get("bytes") or 0) or None,
+                         last_call=float(kv[1].get("last_called", 0) or 0),
+                         calls=int(kv[1].get("calls") or 0)),
+            "disk", now))
         for k, v in eligible:
             idle = now - float(v.get("last_called", 0) or 0)
             freed = _evict_locked(k)

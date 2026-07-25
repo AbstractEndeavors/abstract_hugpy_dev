@@ -1289,8 +1289,26 @@ def test_feasible_default_mode_agrees_with_the_allocation_view():
                      (1 * GIB, 4 * GIB), (24 * GIB, None)):
         assert (AM.feasible_default_mode("gguf", t, gpu, ram, moe=d)
                 == AM.default_allocation("gguf", t, gpu, ram, moe=d)["mode"])
-    # without a moe detail the name view is byte-identical to before (max-gpu)
-    assert AM.feasible_default_mode("gguf", t, 24 * GIB, 128 * GIB) == "max-gpu"
+    # ...and WITHOUT a moe detail they must still agree — which is the whole
+    # point, so assert AGREEMENT, never a hardcoded mode.
+    #
+    # ⚠ This line previously asserted `== "max-gpu"`, encoding the very bug the
+    # delegation above was written to prevent: feasible_default_mode carried a
+    # blanket "a GGUF is ALWAYS max-gpu" short-circuit while default_allocation
+    # walked the tree to max-ram. A 45 GiB GGUF on a 24 GiB card with 128 GiB
+    # RAM really is max-ram (it cannot fit the card; RAM-first with the overflow
+    # spilling to GPU is the honest answer). The console dropdown read the name
+    # view and the emitting seam read the other, so the label could promise
+    # max-gpu while the seam did max-ram — and once preference drives EVICTION
+    # too (assets/evictionflow.html), a wrong label mispredicts which model
+    # DIES, not merely where one lands.
+    #
+    # This file's own header warns that it "has TWICE shipped tests that
+    # asserted the bug". This was the third. Pinning agreement instead of a
+    # value is what stops a fourth.
+    assert (AM.feasible_default_mode("gguf", t, 24 * GIB, 128 * GIB)
+            == AM.default_allocation("gguf", t, 24 * GIB, 128 * GIB,
+                                     moe={"is_moe": False})["mode"])
 
 
 def test_moe_all_layers_mirror_matches_spill():

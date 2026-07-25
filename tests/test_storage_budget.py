@@ -90,16 +90,23 @@ check("reserve mode: over_budget (disk_free 10 < reserve 50)", p["over_budget"] 
 check("reserve mode: need = reserve - disk_free = 40 GiB",
       p["need_bytes"] == 40 * GiB)
 prop_keys = [e["model_key"] for e in p["proposed_evictions"]]
-check("LRU order: coldest (never-served last_picked=0) proposed first",
-      prop_keys[0] == "never")
+check("LRU order: a never-served (last_picked=0) model is proposed first",
+      prop_keys[0] in ("assignedm", "never"))
 # `assigned` is a CANDIDATE too (operator 2026-07-17: allocation = routing
-# only, no bearing on eviction) — never-picked assignedm ties never@0 and the
-# -bytes tiebreak puts never (25) first, assignedm (20) second; greedy covers
-# need at 45 GiB and cold@1000 survives.
-check("LRU order: never-picked assigned candidate second (allocation = routing only)",
-      prop_keys[1] == "assignedm")
-check("greedy stops once need is covered (never 25 + assignedm 20 >= 40 GiB)",
-      prop_keys == ["never", "assignedm"])
+# only, no bearing on eviction). Both never-picked models tie on idle AND on
+# calls (0 each), so the SPEC'S KEY ④ — model_key, the stable final tiebreak —
+# decides: "assignedm" < "never" alphabetically.
+#
+# ⚠ THIS ORDER CHANGED (spec 2026-07-25, assets/evictionflow.html). It used to
+# be decided by the ``-bytes`` largest-first tiebreak, which put never (25 GiB)
+# ahead of assignedm (20 GiB). SIZE IS NO LONGER IN THE SORT KEY: the spec
+# replaces it with walk-then-drop, which achieves "fewest deletes" without
+# letting size masquerade as a measure of how expendable a model is. The SET is
+# unchanged (both still go, 45 GiB covers the 40 GiB need); only the order.
+check("key ④ decides the idle+calls tie: model_key, ascending",
+      prop_keys[1] == "never")
+check("the walk stops once need is covered (assignedm 20 + never 25 >= 40 GiB)",
+      prop_keys == ["assignedm", "never"])
 check("proposed_free_bytes = sum of proposed (45 GiB)",
       p["proposed_free_bytes"] == 45 * GiB)
 check("warm (most-recently-picked) is NOT proposed", "warm" not in prop_keys)
@@ -133,9 +140,20 @@ check("cap mode: budget == cap bytes (150 GiB)", pc["budget"] == 150 * GiB)
 check("cap wins: over budget on cache_used>cap even though disk_free>reserve",
       pc["over_budget"] is True and pc["need_bytes"] == 50 * GiB)
 cap_keys = [e["model_key"] for e in pc["proposed_evictions"]]
-check("cap mode: same LRU greedy (need 50 GiB -> never+assignedm+cold: "
-      "assigned is a candidate, 2026-07-17)",
-      cap_keys == ["never", "assignedm", "cold"])
+# SAME shared function in cap mode — and here the DROP PASS visibly bites.
+# need = 50 GiB. The walk goes assignedm(20) -> never(25) -> cold(30) = 75 GiB,
+# reaching cold because 45 was short. The drop pass then removes assignedm: the
+# remaining {never 25, cold 30} = 55 GiB already covers 50 on its own. Two
+# models unloaded instead of three — least reaping, exactly as the spec's y1
+# example describes ("if y1 is first by order but y2 must go anyway and y2
+# alone covers the need, y1 is spared").
+#
+# ⚠ WAS ["never", "assignedm", "cold"] under the old greedy walk, which had no
+# drop pass and so unloaded all three. `assigned` remains a CANDIDATE (operator
+# 2026-07-17: allocation = routing only) — it is spared here on merit, not
+# protected.
+check("cap mode: walk-then-drop spares assignedm (never+cold alone cover 50 GiB)",
+      cap_keys == ["never", "cold"])
 
 
 # --- central redundant guard: slot-merged loaded/loading/provisioning --------

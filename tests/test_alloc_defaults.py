@@ -29,6 +29,8 @@ Run:  venv/bin/python tests/test_alloc_defaults.py
 import os
 import sys
 import tempfile
+
+import pytest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -156,8 +158,30 @@ from abstract_hugpy_dev.flask_app.app.functions.imports.utils.workers import Wor
 _SIZES = {"tf-big": 68 * GIB, "tf-small": 5 * GIB, "g-big": 200 * GIB, "unk": None}
 _ENGINES = {"tf-big": "transformers", "tf-small": "transformers",
             "g-big": "gguf", "unk": "transformers"}
+_REAL_MODEL_SIZE_BYTES = W._model_size_bytes
+_REAL_MODEL_ENGINE = W._model_engine
 W._model_size_bytes = lambda mk: _SIZES.get(mk)
 W._model_engine = lambda mk: _ENGINES.get(mk)
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _restore_workers_module_stubs():
+    """Put W's real functions back when this MODULE is done.
+
+    These are module-SCOPE monkeypatches with no teardown, so without this they
+    outlive the file and poison every later test in the same pytest process.
+    Concretely: test_storage_budget_fifo's
+    ``test_model_size_bytes_really_resolves_against_the_real_manifest`` passes
+    alone (54/54) and fails whenever this file runs first, because
+    _model_size_bytes still returns the stub's None for every real manifest key.
+
+    That cost real debugging time twice on 2026-07-25 — a leaked stub makes a
+    wide run report failures that are not real, which is exactly how a GENUINE
+    regression gets waved through as "just the usual pollution".
+    """
+    yield
+    W._model_size_bytes = _REAL_MODEL_SIZE_BYTES
+    W._model_engine = _REAL_MODEL_ENGINE
 
 # Point the MODULE-GLOBAL store at an ISOLATED tmp registry so this test never
 # touches the real workers.json (the default path sits next to the manifest) and
@@ -413,3 +437,60 @@ check("the workers.py NEW_SPILL_KEYS mirror matches alloc_modes (no drift)",
       W._NEW_SPILL_KEYS_LOCAL == _NSK)
 
 print(f"\nALL {ok} capability-aware-default checks passed")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# THE DROPDOWN DISAGREEMENT (spec assets/evictionflow.html, open item 3).
+#
+# "feasible_default_mode and default_allocation still disagree for a large dense
+#  GGUF. Once preference drives eviction too, a wrong label mispredicts not just
+#  placement but which model dies."
+#
+# The two functions are now ONE tree with two views (feasible_default_mode is a
+# pure projection of default_allocation["mode"]). These assert they cannot drift
+# apart again — the drift was two hand-maintained copies of the same decision.
+# ─────────────────────────────────────────────────────────────────────────────
+def test_the_two_default_views_agree_for_a_large_dense_gguf():
+    """THE reported disagreement, pinned. A dense GGUF that overflows the card
+    but fits RAM: the name-view used to say max-gpu (its blanket "a GGUF is
+    ALWAYS max-gpu" rule) while the allocation-view persisted max-ram (the
+    preference-not-prohibition ruling). Under the eviction flow that label IS
+    the eviction preference, so the mismatch mispredicted which model dies."""
+    from abstract_hugpy_dev.managers.alloc_modes import (
+        feasible_default_mode, default_allocation)
+    GIB = 1 << 30
+    args = ("gguf", 40 * GIB, 24 * GIB, 128 * GIB)
+    assert feasible_default_mode(*args) == default_allocation(*args)["mode"]
+    assert feasible_default_mode(*args) == "max-ram", (
+        "default_allocation is the side that won: it is what gets PERSISTED, "
+        "it carries the measured ~5x-cliff rationale, and it is the only one "
+        "that can express the MoE leaf")
+
+
+def test_the_two_default_views_agree_across_the_whole_tree():
+    """Not just the reported case — every leaf, so a future edit to one side
+    cannot silently re-open the gap."""
+    from abstract_hugpy_dev.managers.alloc_modes import (
+        feasible_default_mode, default_allocation)
+    GIB = 1 << 30
+    moe = {"is_moe": True, "non_expert_bytes": 2 * GIB,
+           "expert_bytes": 44 * GIB}
+    cases = [
+        ("gguf", 10 * GIB, 24 * GIB, 128 * GIB, None),      # small dense
+        ("gguf", 40 * GIB, 24 * GIB, 128 * GIB, None),      # large dense
+        ("gguf", 400 * GIB, 24 * GIB, 128 * GIB, None),     # fits neither
+        ("gguf", 46 * GIB, 24 * GIB, 128 * GIB, moe),       # the MoE split
+        ("gguf", 46 * GIB, 24 * GIB, 8 * GIB, moe),         # experts > RAM
+        ("transformers", 10 * GIB, 24 * GIB, 128 * GIB, None),
+        ("transformers", 40 * GIB, 24 * GIB, 128 * GIB, None),
+        ("transformers", 400 * GIB, 24 * GIB, 128 * GIB, None),
+        ("gguf", None, 24 * GIB, 128 * GIB, None),          # unknown size
+        ("gguf", 40 * GIB, None, 128 * GIB, None),          # unknown GPU
+        ("gguf", 40 * GIB, 24 * GIB, None, None),           # unknown RAM
+    ]
+    for engine, size, gpu, ram, moe_detail in cases:
+        name = feasible_default_mode(engine, size, gpu, ram, moe_detail)
+        alloc = default_allocation(engine, size, gpu, ram, moe=moe_detail)["mode"]
+        assert name == alloc, (
+            f"drift for ({engine}, size={size}, gpu={gpu}, ram={ram}, "
+            f"moe={bool(moe_detail)}): name-view={name}, alloc-view={alloc}")

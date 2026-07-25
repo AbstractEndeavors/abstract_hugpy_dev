@@ -44,6 +44,27 @@ amendment 3: n_gpu_layers semantics NEVER change on the wire):
     ram-only -> {"n_gpu_layers": "off"}
     max-gpu  -> {}                        (autofit, zero knobs)
     max-ram  -> {"alloc_mode": "max-ram"}                       (NEW keys)
+
+⚠ max-gpu HAS TWO ENCODINGS, and the distinction is the whole point of the
+2026-07-25 bugfix — they differ in PROVENANCE, not in behavior:
+
+    {}                          a DERIVED / blank max-gpu. Nothing is persisted;
+                                the model re-derives against current conditions
+                                on every read. Also THE CLEAR SIGNAL: assign_model
+                                treats an empty spill as "remove this row".
+    {"alloc_mode": "max-gpu"}   an EXPLICIT operator pick. Persisted, so it is
+                                immune to the derivation changing under it.
+
+Both mean max-gpu TO THE WORKER, and neither reaches it as a mode key: the
+explicit form is stripped at the emission seam (WorkerStore.spill_for), so the
+wire is byte-identical to today's {} in both cases. That stripping is REQUIRED,
+not cosmetic — a literal HUGPY_ALLOC_MODE=max-gpu on a worker would suppress its
+auto MoE split (slot_agent gates the auto policy on "any k37 alloc_mode set"),
+silently making an explicit max-gpu WORSE than a blank one.
+
+The old code collapsed the explicit form to {} here, which fed it straight into
+the clear path: selecting max-gpu in the console DELETED the row instead of
+writing it. See normalize_spill for the full incident note.
     explicit -> {"alloc_mode": "explicit", gpu_mem_gib?, cpu_mem_gib?,
                  "leniency_pct"?, "priority_device"?, priority?} (NEW keys)
 
@@ -321,35 +342,35 @@ def feasible_default_mode(engine: Any,
     DEGRADE-NOT-GUESS: any missing input (unknown size, unknown GPU total, or —
     for the ram-only decision — unknown RAM total) falls back to ``max-gpu``,
     today's behavior. A default is never derived from a guessed number."""
-    if is_gguf_engine(engine):
-        # MoE: the ONE GGUF case whose default is derived from structure rather
-        # than stamped. Delegating keeps this name-view and the allocation-view
-        # from ever disagreeing about the same model.
-        if isinstance(moe, dict) and moe.get("is_moe"):
-            return default_allocation(engine, model_bytes, gpu_total_bytes,
-                                      ram_total_bytes, moe=moe)["mode"]
-        return "max-gpu"
-    # Non-GGUF: need a real size and a real GPU total to say anything.
-    if not model_bytes or not gpu_total_bytes:
-        return "max-gpu"
-    try:
-        size = int(model_bytes)
-        gpu_total = int(gpu_total_bytes)
-    except (TypeError, ValueError):
-        return "max-gpu"
-    if size <= _GPU_FIT_HEADROOM * gpu_total:
-        return "max-gpu"                       # plausibly fits the GPU
-    # Clearly can't fit the GPU. RAM-only only if it actually fits RAM AND we
-    # know RAM (an unknown RAM total can't justify ram-only -> leave max-gpu).
-    if not ram_total_bytes:
-        return "max-gpu"
-    try:
-        ram_total = int(ram_total_bytes)
-    except (TypeError, ValueError):
-        return "max-gpu"
-    if size <= ram_total:
-        return "ram-only"                      # the only feasible landing
-    return "max-gpu"                           # fits neither -> honest refusal downstream
+    # ── ONE TREE, TWO VIEWS (2026-07-25, eviction-flow slice) ────────────────
+    # This function is now a PURE PROJECTION of ``default_allocation``: same
+    # inputs, same tree, ``["mode"]`` taken off the end. It used to walk its own
+    # copy of the tree for the non-MoE cases, and the copies had DRIFTED — the
+    # spec's third open item ("feasible_default_mode and default_allocation
+    # still disagree for a large dense GGUF").
+    #
+    # THE DISAGREEMENT, precisely: for a DENSE GGUF this returned "max-gpu"
+    # unconditionally ("a GGUF is ALWAYS max-gpu by default — partial offload
+    # makes any size feasible"), while ``default_allocation``'s dense-GGUF leaf
+    # returns **max-ram** when the model exceeds the GPU's usable share but
+    # fits RAM (the PREFERENCE-vs-PROHIBITION ruling: prefer RAM, don't FORBID
+    # the card). So a 40 GiB dense GGUF on a 24 GiB card showed "max-gpu" in the
+    # console dropdown and persisted "max-ram" when chosen.
+    #
+    # WHY IT NOW MATTERS ENOUGH TO FIX. Under the eviction flow the mode is no
+    # longer just a placement label — it is the eviction PREFERENCE (key ①), so
+    # the label decides WHICH MODEL DIES. A dropdown reading "max-gpu" for a
+    # model the system treats as max-ram tells the operator its residents sort
+    # one way while they sort the other. That is not a cosmetic mismatch.
+    #
+    # WHICH SIDE WON, and why ``default_allocation``: it is the side that gets
+    # PERSISTED (it returns the wire encoding, so what the operator picks is
+    # what lands), it is the side with the measured rationale attached (the
+    # ~5x cliff), and it is the only one that can express the MoE leaf. The
+    # name-only view had no argument for its answer beyond "GGUFs spill" —
+    # true, and exactly why the other side chose max-ram rather than ram-only.
+    return default_allocation(engine, model_bytes, gpu_total_bytes,
+                              ram_total_bytes, moe=moe)["mode"]
 
 
 def default_allocation(engine: Any,
@@ -814,10 +835,27 @@ def mode_to_spill(mode: Any, *, ctx_pct: "Optional[int]" = None,
                   cpu_mem_gib: "Optional[float]" = None,
                   leniency_pct: "Optional[float]" = None,
                   priority: "Optional[int]" = None,
-                  priority_device: "Optional[str]" = None) -> dict:
+                  priority_device: "Optional[str]" = None,
+                  explicit_pick: bool = False) -> dict:
     """Materialize a mode (+ optional explicit knobs) into the /assign spill
     contract. Legacy aliases are resolved first. Unknown mode -> {} (max-gpu),
-    logged — degrade, never raise."""
+    logged — degrade, never raise.
+
+    ``explicit_pick`` (2026-07-25) is THE DERIVED-vs-CHOSEN switch, and it only
+    affects max-gpu — the one mode whose natural encoding ({}) collides with the
+    "clear this override" signal:
+
+      * False (default) — max-gpu yields ``{}``. This is the DERIVED default's
+        encoding: nothing is persisted, so the model keeps re-deriving against
+        current conditions. ``default_allocation`` uses this path exclusively,
+        which is why deriving max-gpu still writes nothing.
+      * True — max-gpu yields ``{"alloc_mode": "max-gpu"}``: a real, persisted
+        row recording that a human chose this. Non-empty, so assign_model
+        WRITES it instead of reading it as a clear.
+
+    The other four modes already have non-empty encodings and ignore the flag.
+    Defaulting to False keeps every existing caller byte-identical — only the
+    operator-facing /assign path opts in."""
     canonical, was_alias = resolve_alloc_mode(mode)
     if canonical is None:
         if mode not in (None, ""):
@@ -831,7 +869,9 @@ def mode_to_spill(mode: Any, *, ctx_pct: "Optional[int]" = None,
     elif canonical == "ram-only":
         return {"n_gpu_layers": "off"}          # ctx irrelevant off-GPU
     elif canonical == "max-gpu":
-        spill = {}
+        # {} when DERIVED (stays unpersisted, re-derives); the explicit key when
+        # a human picked it (persists, immune to the derivation moving).
+        spill = {"alloc_mode": "max-gpu"} if explicit_pick else {}
     elif canonical == "max-ram":
         spill = {"alloc_mode": "max-ram"}
     elif canonical == "explicit":
@@ -853,10 +893,16 @@ def mode_to_spill(mode: Any, *, ctx_pct: "Optional[int]" = None,
 
 def normalize_spill(spill: "Optional[dict]") -> "tuple[dict, Optional[str]]":
     """Normalize a client-supplied spill's ``alloc_mode`` value IN PLACE of the
-    wire encoding: legacy aliases resolve to canonical; the three legacy-
-    expressible modes (gpu-only / ram-only / max-gpu) are REWRITTEN onto the
-    unchanged legacy wire (n_gpu_layers / {}), so ``alloc_mode`` only ever
-    survives on the wire for max-ram / explicit (the version-gated pair).
+    wire encoding: legacy aliases resolve to canonical; the two legacy-
+    expressible modes (gpu-only / ram-only) are REWRITTEN onto the unchanged
+    legacy ``n_gpu_layers`` wire, so ``alloc_mode`` survives here only for
+    max-ram / explicit (the version-gated pair) and max-gpu.
+
+    max-gpu KEEPS its key as of 2026-07-25 — it used to be rewritten to ``{}``,
+    which is also the CLEAR signal, so an explicit max-gpu deleted its own row
+    instead of persisting (see the branch comment below). The key is stripped
+    again at the emission seam, so the WIRE is unchanged; this function's output
+    is what gets PERSISTED, and persistence is exactly what max-gpu was missing.
 
     Returns ``(normalized_spill, note)`` — note is a human line when something
     was resolved/rewritten (for logs / say-why), None when untouched. Unknown
@@ -878,7 +924,23 @@ def normalize_spill(spill: "Optional[dict]") -> "tuple[dict, Optional[str]]":
     elif canonical == "ram-only":
         out["n_gpu_layers"] = "off"
     elif canonical == "max-gpu":
-        out.pop("n_gpu_layers", None)       # {} / no layer knob IS max-gpu
+        # EXPLICIT max-gpu KEEPS ITS KEY (bugfix 2026-07-25). It used to be
+        # rewritten to {} here — but {} is ALSO the "clear this override" signal
+        # (assign_model), so an operator who deliberately picked max-gpu had
+        # their row DELETED instead of written, and then silently inherited
+        # whatever the read-time derivation produced. That was harmless only
+        # while the derivation was max-gpu for everything; once derived defaults
+        # landed, a 12.29 GiB GGUF on a 7.6 GiB card derived max-ram and the
+        # operator's explicit max-gpu became max-ram (the live repro).
+        #
+        # So the PERSISTED encoding is {"alloc_mode": "max-gpu"} — non-empty,
+        # therefore structurally distinguishable from a clear. The WIRE stays
+        # byte-identical to before: WorkerStore.spill_for strips this key at the
+        # emission seam (see _WIRE_INERT_MODES there), so no worker ever sees it
+        # and no version gate is engaged. A DERIVED max-gpu still yields {} via
+        # mode_to_spill — only an operator's explicit pick persists.
+        out.pop("n_gpu_layers", None)       # no layer knob: max-gpu IS autofit
+        out["alloc_mode"] = "max-gpu"
     else:                                   # max-ram / explicit keep the key
         out["alloc_mode"] = canonical
     if note:

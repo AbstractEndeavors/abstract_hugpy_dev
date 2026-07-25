@@ -103,7 +103,15 @@ check("gguf keeps the full five", A.modes_for("gguf") == ALLOC_MODES)
 # ── mode_to_spill (the central materialization helper) ───────────────────────
 check("mode_to_spill gpu-only", mode_to_spill("gpu-only") == {"n_gpu_layers": -1})
 check("mode_to_spill ram-only", mode_to_spill("ram-only") == {"n_gpu_layers": "off"})
-check("mode_to_spill max-gpu is {}", mode_to_spill("max-gpu") == {})
+check("mode_to_spill max-gpu is {} when DERIVED (stays unpersisted)",
+      mode_to_spill("max-gpu") == {})
+check("mode_to_spill max-gpu KEEPS the key when explicitly PICKED (so it is "
+      "distinguishable from a clear and actually persists)",
+      mode_to_spill("max-gpu", explicit_pick=True) == {"alloc_mode": "max-gpu"})
+check("explicit_pick does not disturb the other four modes",
+      mode_to_spill("gpu-only", explicit_pick=True) == {"n_gpu_layers": -1}
+      and mode_to_spill("ram-only", explicit_pick=True) == {"n_gpu_layers": "off"}
+      and mode_to_spill("max-ram", explicit_pick=True) == {"alloc_mode": "max-ram"})
 check("mode_to_spill max-ram", mode_to_spill("max-ram") == {"alloc_mode": "max-ram"})
 check("mode_to_spill explicit carries knobs",
       mode_to_spill("explicit", gpu_mem_gib=8, leniency_pct=30, priority=1)
@@ -113,8 +121,17 @@ check("mode_to_spill unknown degrades to max-gpu ({})",
       mode_to_spill("warp-drive") == {})
 
 # ── normalize_spill: alias resolution + coarse-trio rewrite ─────────────────
-check("normalize: alloc_mode 'autofit' rewrites to {} (never emitted back)",
-      normalize_spill({"alloc_mode": "autofit"})[0] == {})
+check("normalize: alloc_mode 'autofit' resolves to the canonical max-gpu key "
+      "(the alias is never emitted back)",
+      normalize_spill({"alloc_mode": "autofit"})[0] == {"alloc_mode": "max-gpu"})
+# BUGFIX 2026-07-25: max-gpu used to normalize to {}, which is ALSO the "clear
+# this override" signal — so choosing max-gpu in the console DELETED the row
+# instead of writing it, and the model silently fell through to the derived
+# default (which, since derived defaults landed, is max-RAM for a 12.29 GiB GGUF
+# on a 7.6 GiB card). It now keeps a non-empty encoding so it can persist.
+check("normalize: an EXPLICIT max-gpu keeps its key (it must be writable, not "
+      "collapse into the clear signal)",
+      normalize_spill({"alloc_mode": "max-gpu"})[0] == {"alloc_mode": "max-gpu"})
 check("normalize: alloc_mode 'gpu-only' rewrites onto the legacy wire",
       normalize_spill({"alloc_mode": "gpu-only"})[0] == {"n_gpu_layers": -1})
 check("normalize: alloc_mode 'cpu-only' -> ram-only wire",
@@ -322,8 +339,17 @@ finally:
 
 # validation seam accepts + normalizes the new keys (bulk path)
 clean, reason = wr._validate_alloc_spill({"alloc_mode": "autofit"})
-check("bulk validate: legacy name accepted, resolved, never written back",
-      reason is None and clean == {})
+check("bulk validate: legacy name accepted, resolved to canonical max-gpu, "
+      "never written back as the alias",
+      reason is None and clean == {"alloc_mode": "max-gpu"})
+# The bulk path must be able to BROADCAST an explicit max-gpu, for the same
+# reason the single path must persist one: {} is the clear signal, so collapsing
+# max-gpu into it silently reset every selected model to the derived default.
+clean_mg, reason_mg = wr._validate_alloc_spill({"alloc_mode": "max-gpu"})
+check("bulk validate: an explicit max-gpu survives as a writable contract",
+      reason_mg is None and clean_mg == {"alloc_mode": "max-gpu"})
+check("bulk validate: an ABSENT spill is still the autofit CLEAR ({})",
+      wr._validate_alloc_spill(None) == ({}, None))
 clean2, reason2 = wr._validate_alloc_spill({"alloc_mode": "max-ram", "ctx_pct": 50})
 check("bulk validate: max-ram survives normalization",
       reason2 is None and clean2 == {"alloc_mode": "max-ram", "ctx_pct": 50})

@@ -97,15 +97,35 @@ def test_never_served_models_are_coldest_and_go_first():
     assert plan["evict"][0] == "never_served"
 
 
-def test_equally_cold_models_evict_largest_first():
-    """Tiebreak among all-zero last_picked: biggest first, so the budget clears
-    in the fewest deletes. Mirrors storage_proposal's sort exactly."""
+def test_equally_cold_models_break_the_tie_on_model_key_then_least_reap():
+    """All-zero last_picked and zero calls -> the spec's key ④ (model_key)
+    decides, and walk-then-drop keeps the set minimal.
+
+    ⚠ RENAMED from test_equally_cold_models_evict_largest_first. SIZE IS NO
+    LONGER IN THE KEY (spec 2026-07-25, assets/evictionflow.html): the old
+    ``-bytes`` largest-first term cleared a budget in the fewest deletes but had
+    no relationship to what the admission needed, and walk-then-drop achieves
+    "fewest deletes" honestly instead. Here "big" still goes first — but now
+    because "big" < "mid" < "small" alphabetically, not because it is biggest.
+    Asserting a REASON, not just an outcome, is the point: this file has twice
+    shipped tests that asserted the bug."""
     storage = _storage([_model("small", 5), _model("big", 30),
                         _model("mid", 15)])
     plan = budget.fit_plan("caller", 20 * GIB, storage,
                            {"disk_cache_gib": 50}, {})
     assert plan["action"] == "evict"
-    assert plan["evict"][0] == "big"
+    # need = 50 used + 20 - 50 cap = 20 GiB. Walk in key order: big(30) covers
+    # it alone, so the walk stops there and nothing is dropped.
+    assert plan["evict"] == ["big"]
+
+    # PROOF the order is by KEY, not by size: rename so the largest sorts LAST
+    # alphabetically. If size were still in the key, "zbig" would lead anyway.
+    storage2 = _storage([_model("aaa", 5), _model("bbb", 15), _model("zbig", 30)])
+    plan2 = budget.fit_plan("caller", 20 * GIB, storage2,
+                            {"disk_cache_gib": 50}, {})
+    assert plan2["evict"][0] == "aaa", (
+        "size must not be in the sort key — the walk starts at the "
+        "lexicographically first equally-cold model")
 
 
 # ── 3. never evicts protected models or the keep-target ────────────────────
@@ -337,7 +357,21 @@ def test_cap_bytes_parses_real_values():
 def test_evict_to_fit_executes_evictions_through_the_guarded_reaper():
     """fit_plan only PLANS. This asserts the executor actually calls the single
     guarded delete path (_reap_reclaim, which re-proves every guard per key),
-    in FIFO order — not some second, divergent delete of its own."""
+    with the SHARED eviction function's victim set — not some second, divergent
+    delete of its own.
+
+    ⚠ THE VICTIM HERE IS "newest", AND THAT IS THE SPEC (2026-07-25,
+    assets/evictionflow.html), not a regression. This test previously asserted
+    ``reaped[0] == "oldest"`` under the old ``(last_picked, -bytes, key)`` walk.
+    The spec replaces that with WALK-THEN-DROP: the walk takes "oldest" (10 GiB,
+    coldest) but 10 < the 15 GiB needed, so it continues to "newest" (35 GiB);
+    the drop pass then removes "oldest" because the REMAINING set covers the
+    need on its own. That is least-reaping working exactly as specified — the
+    fewest models unloaded, and each one only if it is genuinely required.
+
+    Note the deliberate consequence: least reaping counts MODELS, not bytes. It
+    can free more bytes than needed (35 for 15) to avoid unloading two things.
+    """
     from abstract_hugpy_dev.worker_agent import agent
 
     reaped = []
@@ -363,7 +397,10 @@ def test_evict_to_fit_executes_evictions_through_the_guarded_reaper():
         agent._worker_storage, agent._reap_reclaim = orig_storage, orig_reap
         budget._store_is_shared = orig_shared
 
-    assert reaped[0] == "oldest"        # FIFO order reaches the real deleter
+    # The shared plan's victim set reaches the real deleter — and ONLY it.
+    assert reaped == ["newest"], (
+        "walk-then-drop: 'oldest' was walked first but dropped once 'newest' "
+        "alone covered the need (least reaping)")
 
 
 def test_evict_to_fit_raises_and_deletes_nothing_when_it_cannot_fit():

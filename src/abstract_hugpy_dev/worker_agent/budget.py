@@ -84,6 +84,7 @@ disk shield filled his workstation to 0 bytes free on 2026-07-16.
 from __future__ import annotations
 
 import os
+import time as _time
 import logging
 
 logger = logging.getLogger("abstract_hugpy_dev.worker_agent.budget")
@@ -390,7 +391,10 @@ def fit_plan(model_key: str, need_bytes: int, storage: dict,
              limits: dict | None, last_picked: dict | None = None,
              allocated: dict | None = None, shared_store: bool = False,
              effective_cap: int | None = None,
-             budget_sources: dict | None = None) -> dict:
+             budget_sources: dict | None = None,
+             call_stats: dict | None = None,
+             model_modes: dict | None = None,
+             now: float | None = None) -> dict:
     """Decide how to seat ``need_bytes`` of ``model_key`` under the budget.
 
     PURE — computes, never deletes. The caller (evict_to_fit) executes it. Being
@@ -539,30 +543,56 @@ def fit_plan(model_key: str, need_bytes: int, storage: dict,
             continue
         candidates.append((_lp(mk, r), int(r.get("bytes") or 0), mk))
 
-    # Oldest-first (primary key = central last_picked), then largest-first so the
-    # budget clears in the fewest deletes; stable key tiebreak. IDENTICAL primary
-    # order to storage_proposal — the two MUST agree or central's preview and
-    # this auto-evict propose different victims.
+    # ── THE SHARED EVICT FUNCTION (operator spec assets/evictionflow.html) ───
+    # This used to sort `(last_picked, -bytes, model_key)` — oldest-first then
+    # LARGEST-first — and greedily walk it. Both halves are replaced by
+    # ``managers.eviction.evict_plan``: the spec's lexicographic key (pref
+    # mismatch, idle, calls, key) plus walk-then-drop least-reaping. The key is
+    # NOT spelled here; three hand-written copies of one tuple is exactly how
+    # Parity was lost, so this site, storage_proposal, and hot_cache all import
+    # the SAME function.
     #
-    # 📌pin is NOT in this key (operator ruling, 2026-07-25: "pin routing has
+    # THE DEVICE FOR THIS SITE IS THE DISK. Key ① ("pref == other device
+    # first") is a residency concept; a model's alloc-mode preference names
+    # VRAM or RAM, and NEITHER is the disk, so on this site every candidate is
+    # equally "mismatched" and key ① is a constant — the order collapses to
+    # ②/③/④ (idle, calls, key), which is the correct storage semantics. Passing
+    # the disk as the device is what makes that degeneracy explicit and
+    # DERIVED, rather than a special-cased branch that could drift.
+    #
+    # 📌pin is NOT in the key (operator ruling, 2026-07-25: "pin routing has
     # nothing to do with eviction... the only eviction protection is 'static'
-    # residency"). It was a tiebreak the operator had already called "trivial and
-    # likely unnecessary" (2026-07-17); removed rather than retained, because a
-    # vestigial pin term keeps teaching readers that pin is an eviction input.
-    # Pin means only: allocated to this worker, and that allocation survives a
-    # restart. Protection is decided solely by _is_protected() (🔒static).
-    candidates.sort(key=lambda c: (c[0], -c[1], c[2]))
+    # residency"). Protection is decided solely by _is_protected() (🔒static),
+    # whose verdict is folded in as ``static=True`` below.
+    from ..managers import eviction as _ev
+
+    _stats = call_stats or {}
+    _modes = model_modes or {}
+    _now = float(now) if now is not None else _time.time()
+
+    def _calls_for(mk: str) -> int:
+        try:
+            return int((_stats.get(mk) or {}).get("calls") or 0)
+        except (TypeError, ValueError, AttributeError):
+            return 0
 
     must_free = used + delta - cap
     reclaimable_total = sum(b for _lp_, b, _mk in candidates)
 
-    evict: list[str] = []
-    freed = 0
-    for _lp_, b, mk in candidates:
-        if freed >= must_free:
-            break
-        evict.append(mk)
-        freed += b
+    # min_residency_s=0 on the STORAGE path: the thrash floor (enacted proposal
+    # 2) protects a freshly LOADED model from being unloaded, which is a
+    # residency concept. A freshly DOWNLOADED file has no such clock here (rows
+    # carry mtime, not a load time), and a floor derived from mtime would
+    # protect exactly the cold leftovers this budget exists to clear.
+    _plan = _ev.evict_plan(
+        "disk", must_free,
+        [_ev.Resident(model_key=mk, bytes=b,
+                      pref=_ev.preferred_device(_modes.get(mk)),
+                      last_call=(lp or None), calls=_calls_for(mk))
+         for lp, b, mk in candidates],
+        now=_now, min_residency_s=0.0)
+    evict: list[str] = list(_plan.victims)
+    freed = int(_plan.freed)
 
     if freed < must_free:
         # ── B: REFUSE. Not even a full FIFO can seat this model. ────────────
