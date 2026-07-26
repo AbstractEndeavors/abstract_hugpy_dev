@@ -110,12 +110,30 @@ class LlamaCppChatRunner:
                 return_full_text=False,
             )
 
+        # The engine's OWN measured decode rate for this one-shot, when the
+        # engine reported one (operator 2026-07-25, "maximizing tok/s").
+        # llama-server puts a `timings` block on every completion body; the
+        # runner stashed it in its take-once slot. TaskResult is extra="allow",
+        # so this rides back to central as an extra field with no wire version
+        # bump and no schema change — an older central simply ignores it.
+        # Absent (non-llama.cpp runner, older server build) -> omitted entirely
+        # rather than sent as None, so "no measurement" stays distinguishable.
+        # ⚠ RECORDING ONLY — nothing ranks on it yet.
+        _timings = None
+        try:
+            _take = getattr(runner, "_take_stream_timings", None)
+            if callable(_take):
+                _timings = _take()
+        except Exception:  # noqa: BLE001 — never fail a served reply over metrics
+            _timings = None
+        _extra = {"timings": _timings} if isinstance(_timings, dict) and _timings else {}
         return ChatResult(
             request_id=req.request_id,
             model_key=req.model_key,
             ok=True,
             text=text,
             finish_reason="stop",
+            **_extra,
         )
 
     # --- streaming ---------------------------------------------------------

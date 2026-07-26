@@ -858,6 +858,59 @@ def worker_boot_prewarm_list():
     return jsonify(worker_boot_prewarm_state())
 
 
+@worker_bp.route("/llm/evict-policy", methods=["GET", "POST"])
+def evict_policy_route():
+    """The FLEET-WIDE eviction policy — today, the drop-pass switch.
+
+    GET (open, same tier as the /llm/workers roster it complements) returns::
+
+        {"least_reaping": true, "least_reaping_source": "fleet"|"default",
+         "default": true}
+
+    ``source`` is "fleet" once an operator has ruled and "default" until then —
+    the same effective-value honesty ``/ops/config`` reports per worker, so the
+    console never shows a typed value the planner disagrees with.
+
+    POST (operator-gated) body ``{"least_reaping": true|false|null}``. null
+    CLEARS the fleet ruling: central stops publishing the key and every worker
+    reverts to its own drop-in base on the next beat.
+
+    WHY FLEET-WIDE. This gates the DROP PASS, which central's ``storage_proposal``
+    preview runs as well as every worker's auto-evict. A per-worker value would
+    let the console show one victim list while the fleet executed another —
+    the Parity failure the spec (assets/evictionflow.html) exists to prevent.
+    The anti-thrash floor is deliberately NOT here: it is a VRAM-residency
+    concept with no central counterpart, so it stays a per-worker setting on
+    ``/llm/workers/<id>/config``. See comms/evict_policy.py.
+
+    WHAT IT DOES. ON (default, today's behaviour) drops any walked victim the
+    remaining set already covers — one 35 GiB unload satisfies a 15 GiB need
+    instead of two smaller ones. OFF restores the pre-drop-pass greedy walk:
+    more models unloaded, but more headroom left free, which is what an operator
+    on a tight disk may want."""
+    from abstract_hugpy_dev.comms import evict_policy as _evp
+    from abstract_hugpy_dev.managers.eviction import DEFAULT_LEAST_REAPING
+    if request.method == "POST":
+        body = request.get_json(silent=True) or {}
+        if "least_reaping" not in body:
+            return jsonify({"ok": False, "error": {
+                "code": "BadValue",
+                "message": "body must contain least_reaping: true|false|null"}}), 400
+        val = body["least_reaping"]
+        # Strict bool (or null to clear). No truthy-string coercion: a typo must
+        # be a 400, never a silent flip of a parity-critical policy.
+        if val is not None and not isinstance(val, bool):
+            return jsonify({"ok": False, "error": {
+                "code": "BadValue",
+                "message": "least_reaping must be true, false, or null to clear "
+                           "the fleet ruling"}}), 400
+        _evp.set_least_reaping(val)
+    return jsonify({"ok": True,
+                    "least_reaping": _evp.least_reaping(),
+                    "least_reaping_source": "fleet" if _evp.is_set() else "default",
+                    "default": DEFAULT_LEAST_REAPING})
+
+
 @worker_bp.route("/llm/workers/<worker_id>/boot-prewarm", methods=["POST"])
 def set_worker_boot_prewarm_route(worker_id):
     """Set (or clear) this worker's ⭐ KEEP-WARM STAR — the ONE model this worker
@@ -1086,6 +1139,20 @@ def workers_heartbeat(worker_id):
             reply_extra["blocked_models"] = blocked
     except Exception:  # noqa: BLE001 — block propagation is best-effort; never 5xx a beat
         logger.debug("blocklist heartbeat hook failed", exc_info=True)
+    # FLEET-WIDE eviction policy (2026-07-25): publish the drop-pass switch so
+    # every worker's auto-evict runs the SAME pass central's storage_proposal
+    # preview runs — Parity (spec assets/evictionflow.html) is the whole reason
+    # this one is fleet-wide rather than a per-worker setting; see
+    # comms/evict_policy.py. OMIT-WHEN-DEFAULT, the blocked_models idiom: sent
+    # only when the operator has actually ruled, so an older worker ignores it
+    # and a worker with a local drop-in keeps that drop-in until then. Fully
+    # guarded — never fails a beat.
+    try:
+        from abstract_hugpy_dev.comms import evict_policy as _evp
+        if _evp.is_set():
+            reply_extra["evict_least_reaping"] = _evp.least_reaping()
+    except Exception:  # noqa: BLE001 — policy propagation is best-effort; never 5xx a beat
+        logger.debug("evict-policy heartbeat hook failed", exc_info=True)
     # Per-worker KEEP-WARM STAR ("star", operator RULINGS 2026-07-23): publish
     # THIS worker's star on the reply (additive, OMIT-WHEN-UNSET — same wire idiom
     # as calibration/reservations/blocked_models: a plain scalar the worker reads

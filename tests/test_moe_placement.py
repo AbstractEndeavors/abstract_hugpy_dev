@@ -1369,3 +1369,197 @@ def test_derived_split_matches_moe_split_need():
                               128 * GIB, moe=d)["spill"]
     assert s["gpu_mem_gib"] == pytest.approx(need["gpu_bytes"] / GIB, abs=0.01)
     assert s["cpu_mem_gib"] == pytest.approx(need["cpu_bytes"] / GIB, abs=0.01)
+
+
+# ═══════════ the LAST HOP: in-process cannot express the split ══════════════
+# Operator ruling 2026-07-26: "the auto should be moe if it is an moe model."
+# Central derived the split correctly and put it on the wire; it died at the
+# runner seam, where the in-process llama-cpp-python path has no --n-cpu-moe
+# equivalent (spill.llama_kwargs carries n_gpu_layers/tensor_split/main_gpu
+# only). An MoE reaching that path loads WHOLE: ngl=-1 drags the experts onto
+# the card (coder-next: 1.49 GiB non-expert -> ~21 GiB observed on ae's 3090).
+def test_llama_kwargs_cannot_express_the_expert_split(moe_gguf, monkeypatch):
+    """REGRESSION ANCHOR for the root cause. If a future llama-cpp-python gains
+    an expert-split parameter, this test fails and the refusal below can be
+    replaced by actually passing it — that is the intended signal, not a break."""
+    monkeypatch.delenv("HUGPY_RPC_SERVERS", raising=False)
+    kw = spill.llama_kwargs(str(moe_gguf))
+    assert "n_cpu_moe" not in kw, (
+        "llama-cpp-python now expresses the expert split — teach the "
+        "in-process path to pass it and relax the refusal in runners/get.py")
+    assert spill.gguf_moe_detail(str(moe_gguf))["is_moe"] is True
+
+
+def test_moe_refuses_the_in_process_fallback_instead_of_loading_whole(monkeypatch):
+    """An MoE GGUF that reaches the in-process fallback must RAISE, not serve.
+
+    Serving anyway would honor the request while silently discarding the
+    allocation derived for it — the split IS the allocation, so dropping it is
+    not a degraded success but a different (much worse) placement wearing the
+    same name. Mirrors the profile/vision refusals at the same seam."""
+    getmod = importlib.import_module(
+        "abstract_hugpy_dev.managers.llama.runners.get")
+
+    # Force the seam: no slot can seat it, so control reaches the fallback.
+    monkeypatch.setattr(getmod, "_require_profile_ready", lambda k: None)
+    _slots = importlib.import_module("abstract_hugpy_dev.managers.serve.slots")
+    monkeypatch.setattr(_slots, "slots_enabled", lambda: False)
+    # Measured MoE, priced like coder-next.
+    monkeypatch.setattr(getmod, "get_model_config", lambda k: object(),
+                        raising=False)
+    monkeypatch.setattr(getmod, "ensure_model", lambda k: "/models/cn",
+                        raising=False)
+    monkeypatch.setattr(getmod, "get_gguf_file",
+                        lambda d, c: "/models/cn/coder-next.gguf", raising=False)
+    monkeypatch.setattr(
+        "abstract_hugpy_dev.managers.spill.gguf_moe_detail",
+        lambda p: {"is_moe": True,
+                   "non_expert_bytes": int(1.49 * GIB),
+                   "expert_bytes": int(43.59 * GIB)})
+
+    built = []
+    monkeypatch.setattr(getmod, "LlamaCppPythonRunner",
+                        lambda k: built.append(k), raising=False)
+
+    with pytest.raises(getmod.LocalEngineUnavailable) as ei:
+        getmod._build_runner("Qwen~Qwen3-Coder-Next-GGUF")
+
+    msg = str(ei.value)
+    assert "MoE GGUF" in msg and "--n-cpu-moe" in msg
+    assert "1.49 GiB non-expert" in msg and "43.59 GiB" in msg
+    assert not built, "in-process runner was built for an MoE — the split was dropped"
+
+
+def test_dense_models_still_take_the_in_process_fallback(monkeypatch):
+    """The guard is MoE-only: a dense GGUF must be untouched (and gguf_moe_detail
+    degrades to {'is_moe': False} on any read failure, so the gate cannot fire
+    on an unreadable header either)."""
+    getmod = importlib.import_module(
+        "abstract_hugpy_dev.managers.llama.runners.get")
+    monkeypatch.setattr(getmod, "_require_profile_ready", lambda k: None)
+    _slots = importlib.import_module("abstract_hugpy_dev.managers.serve.slots")
+    monkeypatch.setattr(_slots, "slots_enabled", lambda: False)
+    monkeypatch.setattr(getmod, "get_model_config", lambda k: object(),
+                        raising=False)
+    monkeypatch.setattr(getmod, "ensure_model", lambda k: "/models/d",
+                        raising=False)
+    monkeypatch.setattr(getmod, "get_gguf_file",
+                        lambda d, c: "/models/d/dense.gguf", raising=False)
+    monkeypatch.setattr("abstract_hugpy_dev.managers.spill.gguf_moe_detail",
+                        lambda p: {"is_moe": False})
+    _ss = importlib.import_module(
+        "abstract_hugpy_dev.managers.llama.runners.src.shard_server")
+    monkeypatch.setattr(_ss, "ensure_vision_server", lambda k: None)
+
+    built = []
+
+    class _R:
+        def __init__(self, k):
+            built.append(k)
+
+    monkeypatch.setattr(getmod, "LlamaCppPythonRunner", _R, raising=False)
+    getmod._build_runner("some-dense-model")
+    assert built == ["some-dense-model"], "dense model was wrongly refused"
+
+
+# ═══════════ probe fit honesty: price the split, not the VRAM delta ═════════
+class _State:
+    central_url = "http://central.invalid"
+
+
+def _probe_gates(monkeypatch, A):
+    """Satisfy _probe_model's pre-load gates (central metadata + locality) so the
+    test reaches the FIT verdict, which is what these cases are about."""
+    prov = importlib.import_module("abstract_hugpy_dev.worker_agent.provision")
+    monkeypatch.setattr(prov, "ensure_model_registered",
+                        lambda k, url=None: k, raising=False)
+    monkeypatch.setattr(prov, "model_is_local", lambda k: True, raising=False)
+
+
+def test_probe_fit_is_moe_aware_not_a_vram_delta(monkeypatch):
+    """`fit` asked "did GPU free memory drop" — the RIGHT question for a dense
+    model, the WRONG one for a split MoE. Under the derived split only the
+    non-expert share lands on the card (coder-next: ~1.49 GiB of 45 GiB), so a
+    PERFECTLY placed MoE barely trips the 64 MiB threshold and a large-ctx
+    variant misses it outright, reporting fit:false for the configuration we
+    actually want. Observed on ae: fit:false, vram_used:0 both with and without
+    an explicit split. Now the verdict prices the non-expert share vs the card."""
+    A = importlib.import_module("abstract_hugpy_dev.worker_agent.agent")
+
+    class _Runner:
+        base_url = "http://127.0.0.1:8101"
+
+        def ensure_loaded(self):
+            return None
+
+    monkeypatch.setattr(A, "runner_for", lambda model_key: _Runner(),
+                        raising=False)
+    _probe_gates(monkeypatch, A)
+    # A split MoE consumes almost no VRAM — the old rule's blind spot.
+    monkeypatch.setattr(A, "_free_vram_bytes", lambda: 20 * GIB, raising=False)
+    monkeypatch.setattr("abstract_hugpy_dev.managers.spill.total_vram_bytes",
+                        lambda: 24 * GIB)
+    monkeypatch.setattr(
+        "abstract_hugpy_dev.managers.spill.gguf_moe_detail",
+        lambda p: {"is_moe": True,
+                   "non_expert_bytes": int(1.49 * GIB),
+                   "expert_bytes": int(43.59 * GIB)})
+
+    res = A._probe_model("Qwen~Qwen3-Coder-Next-GGUF", _State())
+
+    assert res["vram_used"] == 0, "rig: no VRAM delta (the split's whole point)"
+    assert res["fit"] is True, (
+        "a correctly split MoE must FIT: 1.49 GiB non-expert on a 24 GiB card")
+    basis = res.get("moe_fit_basis") or {}
+    assert basis.get("is_moe") is True and "non-expert" in basis.get("why", "")
+
+
+def test_probe_fit_refuses_an_moe_whose_non_expert_share_overflows(monkeypatch):
+    """The inverse must still be honest: when even the non-expert share exceeds
+    the card there is no split worth seating, so fit stays False."""
+    A = importlib.import_module("abstract_hugpy_dev.worker_agent.agent")
+
+    class _Runner:
+        base_url = "http://127.0.0.1:8101"
+
+        def ensure_loaded(self):
+            return None
+
+    monkeypatch.setattr(A, "runner_for", lambda model_key: _Runner(),
+                        raising=False)
+    _probe_gates(monkeypatch, A)
+    monkeypatch.setattr(A, "_free_vram_bytes", lambda: 20 * GIB, raising=False)
+    monkeypatch.setattr("abstract_hugpy_dev.managers.spill.total_vram_bytes",
+                        lambda: 8 * GIB)
+    monkeypatch.setattr(
+        "abstract_hugpy_dev.managers.spill.gguf_moe_detail",
+        lambda p: {"is_moe": True,
+                   "non_expert_bytes": int(30 * GIB),
+                   "expert_bytes": int(43.59 * GIB)})
+
+    res = A._probe_model("huge-moe", _State())
+    assert res["fit"] is False
+
+
+def test_probe_fit_unchanged_for_dense_models(monkeypatch):
+    """Dense GGUFs keep the raw VRAM-delta rule verbatim (and an unreadable
+    header degrades to dense, so the new branch cannot fire on a guess)."""
+    A = importlib.import_module("abstract_hugpy_dev.worker_agent.agent")
+
+    class _Runner:
+        base_url = None
+
+        def ensure_loaded(self):
+            return None
+
+    monkeypatch.setattr(A, "runner_for", lambda model_key: _Runner(),
+                        raising=False)
+    _probe_gates(monkeypatch, A)
+    monkeypatch.setattr("abstract_hugpy_dev.managers.spill.gguf_moe_detail",
+                        lambda p: {"is_moe": False})
+    seq = iter([20 * GIB, 16 * GIB])          # 4 GiB actually landed on the card
+    monkeypatch.setattr(A, "_free_vram_bytes", lambda: next(seq), raising=False)
+
+    res = A._probe_model("dense-model", _State())
+    assert res["fit"] is True and res["vram_used"] == 4 * GIB
+    assert "moe_fit_basis" not in res

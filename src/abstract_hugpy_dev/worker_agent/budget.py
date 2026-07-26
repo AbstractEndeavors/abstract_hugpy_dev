@@ -387,6 +387,21 @@ def _allocation_clause(allocated: dict | None, cap: int) -> tuple[str, dict]:
     return text, fields
 
 
+def _least_reaping() -> bool:
+    """The fleet drop-pass policy as adopted onto this worker's env.
+
+    Mirrors ``agent._evict_least_reaping`` exactly (same env, same parsing) but
+    is defined here so budget.py never imports agent.py. The env is the shared
+    contract between them: ``agent._adopt_least_reaping`` writes it from the
+    heartbeat, ``_apply_settings_env`` projects any local setting onto it, and
+    both readers agree on what an absent/blank value means."""
+    from ..managers.eviction import DEFAULT_LEAST_REAPING
+    raw = os.environ.get("HUGPY_EVICT_LEAST_REAPING")
+    if raw in (None, ""):
+        return DEFAULT_LEAST_REAPING
+    return str(raw).strip().lower() not in ("0", "false", "no", "off")
+
+
 def fit_plan(model_key: str, need_bytes: int, storage: dict,
              limits: dict | None, last_picked: dict | None = None,
              allocated: dict | None = None, shared_store: bool = False,
@@ -590,7 +605,14 @@ def fit_plan(model_key: str, need_bytes: int, storage: dict,
                       pref=_ev.preferred_device(_modes.get(mk)),
                       last_call=(lp or None), calls=_calls_for(mk))
          for lp, b, mk in candidates],
-        now=_now, min_residency_s=0.0)
+        now=_now, min_residency_s=0.0,
+        # FLEET-WIDE drop-pass policy, adopted from central on the heartbeat
+        # (agent._adopt_least_reaping projects it onto this env). Read from the
+        # env rather than imported from agent.py to keep budget.py free of that
+        # import cycle; the env IS the mechanism, exactly as it is for the
+        # anti-thrash floor. Central's storage_proposal reads the same policy
+        # from its own store, so this preview/execute pair stays in Parity.
+        least_reaping=_least_reaping())
     evict: list[str] = list(_plan.victims)
     freed = int(_plan.freed)
 

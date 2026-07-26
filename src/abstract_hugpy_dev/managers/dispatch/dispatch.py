@@ -408,7 +408,12 @@ async def stream_runner(runner, req, cancel_event=None):
                         finish_reason=getattr(result, "finish_reason", None) or "stop",
                         # ChatResult already defines usage; surface it when the
                         # runner filled it in (None otherwise — additive).
-                        usage=getattr(result, "usage", None))
+                        usage=getattr(result, "usage", None),
+                        # Same additive contract for the engine's measured
+                        # decode rate: TaskResult is extra="allow", so a runner
+                        # that attached `timings` carries it here. None from any
+                        # runner that didn't. RECORDING ONLY.
+                        timings=getattr(result, "timings", None))
     else:
         yield ErrorEvent(request_id=req.request_id,
                          message=getattr(result, "error", None) or "run failed")
@@ -531,6 +536,12 @@ async def execute_chat_stream(*args, cancel_event=None, **kwargs):
     # by the runner); the request's real cost is their key-wise sum. Stays None
     # when no pass reported — consumers (/v1 usage object) must degrade.
     usage_totals: Optional[dict] = None
+    # Engine-measured decode rate across continuation passes. NOT summed, unlike
+    # usage above: tok/s is a RATE and adding two rates is meaningless (two
+    # passes at 115 tok/s is 115 tok/s, not 230). Every pass re-measures the same
+    # steady-state speed on the same placement, so last-reported wins — it is
+    # both representative and the freshest. None when no pass reported.
+    timings_last: Optional[dict] = None
 
     def _merge_usage(part):
         nonlocal usage_totals
@@ -584,6 +595,9 @@ async def execute_chat_stream(*args, cancel_event=None, **kwargs):
             elif etype == "done":
                 finish = getattr(event, "finish_reason", None) or "stop"
                 _merge_usage(getattr(event, "usage", None))
+                _t = getattr(event, "timings", None)
+                if isinstance(_t, dict) and _t:
+                    timings_last = _t
             elif etype == "error":
                 # A pass that dies after text already streamed shouldn't turn a
                 # partially-delivered answer into "[Error: ...]" in the chat.
@@ -605,7 +619,7 @@ async def execute_chat_stream(*args, cancel_event=None, **kwargs):
                                               "answer truncated")
                     yield DoneEvent(request_id=rid, input_tokens=0,
                                     output_chunks=1, finish_reason="stop",
-                                    usage=usage_totals)
+                                    usage=usage_totals, timings=timings_last)
                 else:
                     yield ErrorEvent(request_id=rid,
                                      message=getattr(event, "message", None) or "run failed")
@@ -629,12 +643,12 @@ async def execute_chat_stream(*args, cancel_event=None, **kwargs):
 
         if finish not in _CONTINUE_ON:
             yield DoneEvent(request_id=rid, input_tokens=0, output_chunks=1,
-                            finish_reason=finish, usage=usage_totals)
+                            finish_reason=finish, usage=usage_totals, timings=timings_last)
             return
         if not seg_text.strip():
             # Hit the cap but produced nothing usable — stop to avoid a loop.
             yield DoneEvent(request_id=rid, input_tokens=0, output_chunks=1,
-                            finish_reason="stop", usage=usage_totals)
+                            finish_reason="stop", usage=usage_totals, timings=timings_last)
             return
 
         # Continue: append the partial assistant turn and re-prompt to keep going.
@@ -646,7 +660,7 @@ async def execute_chat_stream(*args, cancel_event=None, **kwargs):
 
     # Exhausted the continuation budget.
     yield DoneEvent(request_id=rid, input_tokens=0, output_chunks=1,
-                    finish_reason="max_tokens", usage=usage_totals)
+                    finish_reason="max_tokens", usage=usage_totals, timings=timings_last)
 
 
 # ---------------------------------------------------------------------------

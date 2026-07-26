@@ -139,6 +139,17 @@ _MODE_DEVICE = {
 # its age rather than evidence it is unwanted.
 DEFAULT_MIN_RESIDENCY_S = 300.0
 
+# Least reaping (the DROP PASS) — the spec read literally: drop any walked
+# victim the remaining set already covers, so ONE unload of 35 GiB satisfies a
+# 15 GiB need instead of two smaller ones. That is fewer disturbances but LESS
+# HEADROOM: the surplus 20 GiB is freed either way under the old greedy walk,
+# and on a tight disk the operator may want it.
+#
+# DEFAULT True == today's shipped behaviour, unchanged. False restores the
+# pre-drop-pass greedy walk EXACTLY: `kept = walked`, nothing spared. This is a
+# FLEET-WIDE policy, never per-worker — see `evict_plan`'s note on why.
+DEFAULT_LEAST_REAPING = True
+
 
 def preferred_device(mode: Any, *, default: str = VRAM) -> str:
     """The device an allocation mode PREFERS — the spec's P -> D mapping.
@@ -266,6 +277,63 @@ def sort_key(r: Resident, device: str, now: float) -> tuple:
     return (matched, r.idle_anchor(), int(r.calls or 0), str(r.model_key))
 
 
+# ── MEASURED DECODE RATE (operator, 2026-07-25) ──────────────────────────────
+# "in the end it is about maximizing tok/s ... lets start recording this".
+#
+# ⚠ READ THIS BEFORE ASSUMING IT IS PART OF THE SORT: it is NOT. ``sort_key``
+# above is unchanged and takes no tok/s input. This parser exists only so the
+# ONE ledger can ACCUMULATE a decode-rate history that a future policy might
+# rank on. Recording changes no victim, no placement, no order.
+#
+# It lives in THIS module — rather than beside the central-side writers — for
+# the same reason ``sort_key`` does: eviction.py is the parity substrate both
+# central's preview and the worker's auto-evict already import. A parser that
+# only central could reach would be the first crack in "one ledger, one
+# definition", which is precisely the failure this module was created to end.
+def tok_s_from_timings(payload: Any) -> Optional[float]:
+    """The engine's OWN decode rate from a llama-server reply, or None.
+
+    llama-server returns a ``timings`` block on EVERY completion, and
+    ``predicted_per_second`` is authoritative decode tok/s measured inside the
+    engine. It costs nothing to keep: no instrumentation in the serving path, no
+    wall-clock arithmetic of ours (which would fold in queueing, network and
+    prompt-eval time and would not be decode rate at all). It was simply being
+    thrown away.
+
+    Verified against llama.cpp ``tools/server/server-task.cpp``: present on the
+    one-shot response body AND pushed onto the FINAL streaming chunk
+    unconditionally, so both transports can be read the same way.
+
+    Falls back to ``predicted_n / predicted_ms`` for a build that reports the
+    raw counters but not the derived rate.
+
+    Returns None for ANYTHING it does not fully recognize — a missing block, a
+    non-dict, a non-numeric, a zero-token generation. The serving path is live;
+    degrade-not-guess, and never raise.
+    """
+    if not isinstance(payload, dict):
+        return None
+    t = payload.get("timings")
+    if not isinstance(t, dict):
+        return None
+    try:
+        rate = t.get("predicted_per_second")
+        if rate is not None:
+            f = float(rate)
+            return f if f > 0.0 and f == f and f != float("inf") else None
+        n, ms = t.get("predicted_n"), t.get("predicted_ms")
+        if n is None or ms is None:
+            return None
+        n_f, ms_f = float(n), float(ms)
+        # predicted_n == 0 is a generation that produced no tokens: it reports
+        # nothing about decode speed, so it is absent rather than 0 tok/s.
+        if n_f <= 0 or ms_f <= 0:
+            return None
+        return (n_f * 1000.0) / ms_f
+    except (TypeError, ValueError):
+        return None
+
+
 def _partition(pool: "Iterable[Resident]", *, now: float,
                min_residency_s: float) -> "tuple[list, list]":
     """Split residents into (walkable, blocking-with-a-why).
@@ -318,7 +386,8 @@ def _partition(pool: "Iterable[Resident]", *, now: float,
 
 
 def evict_plan(device: str, need: int, residents: "Iterable[Resident]", *,
-               now: float, min_residency_s: float = DEFAULT_MIN_RESIDENCY_S
+               now: float, min_residency_s: float = DEFAULT_MIN_RESIDENCY_S,
+               least_reaping: bool = DEFAULT_LEAST_REAPING
                ) -> EvictPlan:
     """EVICT(device d, need n) — the ONE shared function. PURE.
 
@@ -328,7 +397,24 @@ def evict_plan(device: str, need: int, residents: "Iterable[Resident]", *,
 
     ``now`` is REQUIRED and never defaulted to ``time.time()``: a default clock
     read is exactly how central and the worker would drift apart, and the spec
-    names that as the failure mode Parity exists to prevent."""
+    names that as the failure mode Parity exists to prevent.
+
+    ``least_reaping`` is the same shape of argument and for the same reason: it
+    is PASSED IN, never read from the environment here, because this module is
+    pure and a self-read would be a second clock. Its SCOPE, however, differs
+    from ``min_residency_s`` and the difference is load-bearing:
+
+      * ``min_residency_s`` is a VRAM-residency concept. Central never previews
+        a VRAM eviction — its only call site (``storage_proposal``) is the DISK
+        and hardcodes the floor to 0, as does the worker's storage half
+        (``budget.fit_plan``). So a per-worker floor cannot desynchronise
+        anything: there is no central counterpart to disagree with.
+      * ``least_reaping`` changes THE DROP PASS, which every site runs —
+        including central's ``storage_proposal``. If worker A ran it ON and
+        central previewed it OFF, their victim lists would differ on the very
+        fixture ``tests/test_eviction_parity.py`` exists to police. It is
+        therefore FLEET-WIDE: one central setting, shipped to every worker on
+        the heartbeat (the ``blocked_models`` idiom), never a per-worker key."""
     need = max(0, int(need or 0))
     plan = EvictPlan(device=device, need=need)
     walkable, blocking = _partition(residents, now=now,
@@ -353,12 +439,19 @@ def evict_plan(device: str, need: int, residents: "Iterable[Resident]", *,
     # Least reaping. This ONLY removes — it never looks past `walked`, so the
     # frontier rule holds by construction: a hot resident beyond where the walk
     # reached cannot be pulled in, however conveniently sized it is.
+    #
+    # GATED (operator switch, 2026-07-25). least_reaping=False skips the pass
+    # entirely — `kept` stays exactly `walked` and `spared` stays empty, which
+    # is byte-identical to the pre-drop-pass greedy walk. The switch is the
+    # ONLY difference; the WALK and the sort are untouched in both states, so
+    # OFF is a strict superset of ON's victims and never a different ordering.
     kept = list(walked)
-    for r in list(walked):            # same order the walk produced
-        remaining = sum(int(k.bytes or 0) for k in kept if k is not r)
-        if remaining >= need:
-            kept.remove(r)
-            plan.spared.append(r.model_key)
+    if least_reaping:
+        for r in list(walked):        # same order the walk produced
+            remaining = sum(int(k.bytes or 0) for k in kept if k is not r)
+            if remaining >= need:
+                kept.remove(r)
+                plan.spared.append(r.model_key)
 
     plan.victims = [r.model_key for r in kept]
     plan.freed = sum(int(r.bytes or 0) for r in kept)

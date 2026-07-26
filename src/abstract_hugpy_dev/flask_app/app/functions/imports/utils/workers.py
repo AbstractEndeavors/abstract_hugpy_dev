@@ -320,6 +320,21 @@ def _blocked_keys() -> set:
         return set()
 
 
+def _fleet_least_reaping() -> bool:
+    """The fleet's drop-pass policy, degrading to the module default.
+
+    Central's storage_proposal preview and every worker's auto-evict must run
+    the same drop pass (Parity, spec assets/evictionflow.html) — see
+    comms/evict_policy.py for why this knob is fleet-wide and the anti-thrash
+    floor is not."""
+    try:
+        from abstract_hugpy_dev.comms.evict_policy import least_reaping
+        return least_reaping()
+    except Exception:  # noqa: BLE001 — a preview must never break on policy
+        from abstract_hugpy_dev.managers.eviction import DEFAULT_LEAST_REAPING
+        return DEFAULT_LEAST_REAPING
+
+
 def _is_online(worker: Dict[str, Any]) -> bool:
     last = worker.get("last_seen") or 0
     return (_now() - last) <= HEARTBEAT_TIMEOUT_SECONDS
@@ -436,38 +451,11 @@ def _record_tok_s(row: Dict[str, Any], tok_s: Any) -> bool:
     return True
 
 
-def tok_s_from_timings(payload: Any) -> Optional[float]:
-    """Pull the engine's OWN decode rate out of a llama-server reply. Fail-open.
-
-    llama-server returns a ``timings`` block on EVERY /v1/chat/completions
-    response, and its ``predicted_per_second`` is authoritative decode tok/s
-    measured by the engine itself — no instrumentation in the serving path, no
-    wall-clock arithmetic of ours to be wrong. It was simply being discarded.
-
-    Falls back to ``predicted_n / predicted_ms`` when a build reports the raw
-    counters but not the rate. Returns None for anything unrecognizable: the
-    serving path is live, and a relay that raises because a ``timings`` key is
-    missing is a far worse bug than not recording.
-    """
-    if not isinstance(payload, dict):
-        return None
-    t = payload.get("timings")
-    if not isinstance(t, dict):
-        return None
-    try:
-        rate = t.get("predicted_per_second")
-        if rate is not None:
-            f = float(rate)
-            return f if f > 0 else None
-        n, ms = t.get("predicted_n"), t.get("predicted_ms")
-        if n is None or ms is None:
-            return None
-        n_f, ms_f = float(n), float(ms)
-        if n_f <= 0 or ms_f <= 0:
-            return None
-        return (n_f * 1000.0) / ms_f
-    except (TypeError, ValueError):
-        return None
+# ``tok_s_from_timings`` lives in ``managers.eviction`` — the module BOTH the
+# central preview and the worker's auto-evict already import, so the one parser
+# stays on the parity substrate rather than behind a web-only import. Re-exported
+# here because this is where the ledger writers live.
+from ......managers.eviction import tok_s_from_timings  # noqa: E402,F401
 
 
 def _public_view(worker: Dict[str, Any]) -> Dict[str, Any]:
@@ -1520,7 +1508,12 @@ def storage_proposal(worker: Dict[str, Any]) -> Dict[str, Any]:
                           pref=_ev.preferred_device(_modes.get(mk)),
                           last_call=(lp or None), calls=_calls_for(mk))
              for lp, b, mk in candidates],
-            now=_now(), min_residency_s=0.0)
+            now=_now(), min_residency_s=0.0,
+            # FLEET-WIDE drop-pass policy — the SAME value every worker adopts
+            # off the heartbeat (comms/evict_policy.py). Read here rather than
+            # defaulted so this preview and the worker's execution cannot
+            # disagree: that divergence is exactly what Parity forbids.
+            least_reaping=_fleet_least_reaping())
         for mk in _plan.victims:
             lp, b = _by_key.get(mk, (None, 0))
             proposed.append({"model_key": mk, "bytes": b,
@@ -2419,6 +2412,18 @@ class WorkerStore:
             # eviction proposal — a missing entry defaults to 0 (coldest), which
             # is correct for a now-unassigned leftover.
             worker.get("model_last_picked", {}).pop(model_key, None)
+            # …and the call-stats row keyed by the SAME (worker, model) pair.
+            # This was the ledger's one unbounded-growth seam: model_last_picked
+            # was pruned here from the start, but model_call_stats was not, so
+            # every assign/unassign cycle left a permanent orphan row behind —
+            # and the 2026-07-25 columns (interval + tok/s EWMAs) widen those
+            # rows without pruning them. Dropping it is also CORRECT rather than
+            # merely tidy: a re-assigned model is landing on a worker whose
+            # placement may have changed entirely, and a stale tok/s mean from
+            # the previous placement would be a measurement of a configuration
+            # that no longer exists. Missing degrades to "no history", which is
+            # honestly what an unassigned-then-reassigned model has.
+            worker.get("model_call_stats", {}).pop(model_key, None)
             _remember_assignments(worker)   # 4b: an explicit unassign IS forgotten
             return _public_view(worker)
 
@@ -2905,34 +2910,55 @@ class WorkerStore:
                     _row["calls"] = int(_row.get("calls") or 0) + 1
                 except (TypeError, ValueError):
                     _row["calls"] = 1
-                # ── CALL INTERVAL (operator, 2026-07-25) ─────────────────────
-                # "time since last call" is a POINT ESTIMATE of a distribution:
-                # a model called every 30s for an hour and one called once
-                # yesterday can both read 5 minutes idle, and they are not
-                # remotely the same eviction risk. What actually ranks them is
-                # EXPECTED TIME UNTIL NEXT CALL, which is estimable from the
-                # history — but only if the history is kept.
-                #
-                # So keep it, here, on the line that already stamps the clock:
-                # one subtraction, one float, no second ledger. Recording is
-                # cheap; reconstructing a distribution you never wrote down is
-                # impossible.
-                #
-                # LOG SPACE because call intervals are heavy-tailed (mostly
-                # short gaps, occasional long ones), so an arithmetic mean is
-                # dominated by outliers. An exponentially-weighted mean of
-                # log-intervals is stable, costs one float per model, needs no
-                # training, no model artifact, and stays DERIVABLE — which is
-                # the property the eviction spec exists to protect. Whether a
-                # learned estimator ever earns its complexity is a decision to
-                # make against this data, not before it.
-                #
-                # NOTHING READS THIS YET. It is deliberately inert: recording
-                # changes no policy, so it cannot regress an eviction.
+                # ── CALL INTERVAL (operator, 2026-07-25) — see _record_interval
+                # for the full rationale (point-estimate vs distribution, and
+                # why log space). Stamped HERE, on the line that already holds
+                # the clock, so the count, the clock and the interval can never
+                # describe different histories. Inert: nothing reads it yet.
                 _record_interval(_row, _prev_call, now)
                 _row["last_call"] = now
                 chosen = stored
         return _public_view(chosen)
+
+    def record_serve_metrics(self, worker_id: str, model_key: str,
+                             tok_s: Optional[float] = None) -> bool:
+        """THE ONE WRITER for measured serve quality on the shared ledger.
+
+        Stamps decode rate onto ``model_call_stats[model_key]`` — the same row
+        ``pick_for_model`` stamps ``calls``/``last_call``/the interval columns
+        onto, and the same row that rides ``_public_view`` to the worker on the
+        heartbeat reply. That co-location is the point: central's eviction
+        preview and the worker's auto-evict must rank from ONE ledger, so a
+        tok/s column kept anywhere else would be a second store and would break
+        Parity the moment the two disagreed.
+
+        Split from ``pick_for_model`` because the two facts are known at
+        different times: which worker was PICKED is known before the relay, how
+        fast it DECODED only after. Same row, same discipline, one writer each.
+
+        FAIL-OPEN AND TOTAL. The serving path is live; this is called from a
+        relay-completion seam where an exception would surface as a failed user
+        request. A missing ``timings`` block, an unknown worker, an unwritable
+        store — all return False and record nothing. Never raises.
+
+        Returns True iff a sample was actually recorded.
+        """
+        if tok_s is None:
+            return False
+        try:
+            with self._transaction() as workers:
+                stored = workers.get(worker_id)
+                if stored is None:
+                    return False
+                row = stored.setdefault("model_call_stats", {}).setdefault(
+                    model_key, {"calls": 0})
+                if not isinstance(row, dict):
+                    return False
+                return _record_tok_s(row, tok_s)
+        except Exception:  # noqa: BLE001 — recording must never fail a request
+            logger.debug("record_serve_metrics skipped for %s/%s",
+                         worker_id, model_key, exc_info=True)
+            return False
 
     def candidates_for_model(self, model_key: str,
                              pool: Optional[str] = None,
@@ -3249,6 +3275,14 @@ def candidates_for_model(model_key: str, pool: Optional[str] = None,
     """Ranked online workers holding ``model_key`` — the relay gate's reroute
     list (see WorkerStore.candidates_for_model). No routing side effects."""
     return worker_store.candidates_for_model(model_key, pool=pool, task=task)
+
+
+def record_serve_metrics(worker_id: str, model_key: str,
+                         tok_s: Optional[float] = None) -> bool:
+    """Module-level binding of ``WorkerStore.record_serve_metrics`` — the seam
+    the core relay is handed (web -> core), matching pick_worker_for_model's
+    pattern. Fail-open all the way down; see the store method."""
+    return worker_store.record_serve_metrics(worker_id, model_key, tok_s=tok_s)
 
 
 def load_state_for_model(model_key: str, worker_id: str,
@@ -3569,6 +3603,18 @@ try:
         import logging as _logging
         _logging.getLogger(__name__).info(
             "load-state provider not registered (older core): %s", _exc4)
+    # Serve-metrics sink (operator 2026-07-25, "maximizing tok/s"): lets the core
+    # relay stamp the engine's OWN measured decode rate onto the ONE ledger
+    # (model_call_stats) when a relay completes. Central-only; optional in older
+    # cores — guarded; unset ⇒ nothing is recorded and behaviour is unchanged.
+    # ⚠ RECORDING ONLY — no policy reads tok/s yet.
+    try:
+        from ......managers.resolvers.remote import set_serve_metrics_sink
+        set_serve_metrics_sink(record_serve_metrics)
+    except Exception as _exc5:  # older core without the seam — nothing recorded
+        import logging as _logging
+        _logging.getLogger(__name__).info(
+            "serve metrics sink not registered (older core): %s", _exc5)
 except Exception as _exc:  # never let registration break importing the pool
     import logging as _logging
     _logging.getLogger(__name__).warning("worker provider registration failed: %s", _exc)

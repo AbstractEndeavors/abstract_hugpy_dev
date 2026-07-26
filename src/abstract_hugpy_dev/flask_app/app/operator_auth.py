@@ -157,6 +157,11 @@ _SENSITIVE = [
     # admission). Same operator-only, destructive-executor tier as evict/reap;
     # dry_run defaults true so a bare POST previews before it ever kills.
     ({"POST"},                   re.compile(r"^/llm/workers/[^/]+/(restart|update|pip|config|reap|reap-approve|reap-orphans|pin-all|unpin-all|residency-all|free-ram|evict)$")),
+    # FLEET-WIDE eviction policy (2026-07-25): the drop-pass switch applies to
+    # EVERY worker at once and changes which models an admission unloads, so the
+    # write sits in the same operator-only tier as the per-worker config it
+    # complements. The GET stays open (same tier as the /llm/workers roster).
+    ({"POST"},                   re.compile(r"^/llm/evict-policy$")),
     # k14: relaunch a worker's slot child with a new GPU-offload depth / context
     # (the offload speed-cliff sweep lever). A privileged executor op on the box —
     # it STOP->RESPAWNs a llama-server child — so it sits in the same operator-only

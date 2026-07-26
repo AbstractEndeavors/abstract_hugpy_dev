@@ -307,6 +307,56 @@ def _build_runner(model_key: str) -> "LlamaCppBaseRunner":
                 "(SLOT_COUNT=0 / slots disabled, or all slots busy) — stage 1 "
                 "serves profiled models only via slot children; refusing the "
                 "shared-venv in-process fallback")
+        # MoE GGUFs: REFUSE the in-process fallback (operator ruling 2026-07-26,
+        # "the auto should be moe if it is an moe model").
+        #
+        # The expert split is expressible ONLY as llama-server's --n-cpu-moe, which
+        # only slot_agent._build_cmd emits. The in-process path builds its kwargs in
+        # spill.llama_kwargs(), which carries n_gpu_layers/tensor_split/main_gpu and
+        # has NO n_cpu_moe equivalent — llama-cpp-python exposes no such parameter.
+        # So an MoE model reaching here loads WHOLE: ngl=-1 drags the experts onto
+        # the card (coder-next Q4_K_M = 1.49 GiB of non-expert tensors but ~21 GiB
+        # once the 43.59 GiB of experts follow), which is the exact condition the
+        # operator reported. Serving it anyway would honor the request while
+        # silently discarding the allocation that was derived for it — the split IS
+        # the allocation, so dropping the split is not a degraded success, it is a
+        # different (and much worse) placement wearing the same name.
+        #
+        # This mirrors the profile/vision refusals directly above and below: when a
+        # model's REQUIRED placement cannot be expressed on this path, raise with the
+        # reason instead of quietly serving the wrong thing. LocalEngineUnavailable
+        # is the established "this box can't serve it, try elsewhere" signal — on a
+        # worker it surfaces verbatim in central's load_reports, and central is then
+        # free to place the model on a slot-capable box rather than believing this
+        # one seated it correctly.
+        #
+        # Dense models are untouched: gguf_moe_detail returns {"is_moe": False} for
+        # dense GGUFs, non-GGUF paths, and ANY read failure (degrade-not-guess), so
+        # this gate can only ever fire on a file measured to carry expert tensors.
+        try:
+            from ...spill import gguf_moe_detail
+            _mpath = None
+            try:
+                _cfg = get_model_config(model_key)
+                _mpath = get_gguf_file(ensure_model(model_key), _cfg)
+            except Exception:  # noqa: BLE001 — unresolvable path reads as dense
+                _mpath = None
+            _moe = gguf_moe_detail(_mpath) if _mpath else {"is_moe": False}
+        except Exception:  # noqa: BLE001 — the gate must never invent a refusal
+            _moe = {"is_moe": False}
+        if _moe.get("is_moe"):
+            _exp = int(_moe.get("expert_bytes") or 0)
+            _non = int(_moe.get("non_expert_bytes") or 0)
+            raise LocalEngineUnavailable(
+                f"model {model_key!r} is a MoE GGUF "
+                f"({_non / 2**30:.2f} GiB non-expert + {_exp / 2**30:.2f} GiB "
+                "experts) and needs the expert split (--n-cpu-moe), which only a "
+                "native llama-server slot child can express — the in-process "
+                "llama-cpp-python path has no equivalent and would load the whole "
+                "model onto the GPU. No slot could seat it (SLOT_COUNT=0 / slots "
+                "disabled, or all slots busy); refusing the in-process fallback "
+                "rather than silently discarding the split. Free a slot or install "
+                "a native llama-server (`hugpy install-engine`).")
         # Vision GGUFs: the in-process llama-cpp-python multimodal handler fails to
         # load the projector ("Failed to load mtmd context from <mmproj>"). A native
         # llama-server --mmproj loads it C-side and serves images correctly, so spawn/

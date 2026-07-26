@@ -1900,6 +1900,21 @@ def _event_to_dict(ev) -> dict:
         usage = getattr(ev, "usage", None)
         if isinstance(usage, dict) and usage:
             out["usage"] = usage
+        # ENGINE TIMINGS on the wire (operator, 2026-07-25: "maximizing tok/s").
+        # Same additive shape as `usage` directly above, and for the same
+        # reason: the producer knows it, central cannot.
+        #
+        # Without this line the whole tok/s chain is inert. Verified live before
+        # adding it: ccp_runner captures the engine's `timings`, base_runner
+        # threads them through _take_stream_timings(), the DoneEvent schema
+        # carries them, central's relay reads them via tok_s_from_timings() and
+        # its sink is registered — and the SSE `done` frame ended
+        # `{"type":"done","finish_reason":"stop"}` with no timings at all, so
+        # central received nothing and recorded nothing. Every piece passed its
+        # own tests; the wire was the gap.
+        timings = getattr(ev, "timings", None)
+        if isinstance(timings, dict) and timings:
+            out["timings"] = timings
         return out
     if t == "error":
         return {"type": "error", "message": getattr(ev, "message", "run failed")}
@@ -3128,6 +3143,18 @@ def build_app(state: "WorkerState") -> Flask:
         body = request.get_json(silent=True) or {}
         unknown = sorted(set(body) - _SETTINGS_KEYS)
         if unknown:
+            # A fleet-policy key gets its own code + the address of the route
+            # that DOES own it. A bare "unsupported" would be true but useless:
+            # the operator asked for a real thing at the wrong door, and telling
+            # them only that the door is locked makes them guess.
+            fleet = [k for k in unknown if k in _FLEET_ONLY_SETTINGS]
+            if fleet:
+                return jsonify({"ok": False, "error": {
+                    "code": "FleetPolicyKey",
+                    "message": "; ".join(
+                        f"'{k}' is FLEET policy, not a per-worker setting — set "
+                        f"it at {_FLEET_ONLY_SETTINGS[k]}" for k in fleet),
+                    "keys": fleet}}), 400
             return jsonify({"ok": False, "error": {
                 "code": "UnknownKeys",
                 "message": f"unsupported: {unknown}; supported: {sorted(_SETTINGS_KEYS)}"}}), 400
@@ -3172,6 +3199,34 @@ def build_app(state: "WorkerState") -> Flask:
                 return jsonify({"ok": False, "error": {
                     "code": "BadValue", "message": "reconcile_interval_s must be 60..86400"}}), 400
             settings["reconcile_interval_s"] = tval
+        if "evict_min_residency_s" in body:
+            # ANTI-THRASH FLOOR. null/"" CLEARS the setting (falls back to the
+            # drop-in env, then the 300s default) — which is NOT the same as
+            # setting 0. 0 is a real, storable value meaning "floor disabled,
+            # pre-2026-07-25 behaviour", and it must be reachable from the
+            # console without editing a systemd drop-in: that is the entire
+            # point of the knob. So — as with ctx_pct — match None/"" EXPLICITLY
+            # rather than `in (None, "", 0)`, because `0 in (None, "", False)`
+            # is True in Python and would silently turn the escape hatch into a
+            # clear.
+            val = body["evict_min_residency_s"]
+            if val is None or val == "":
+                settings.pop("evict_min_residency_s", None)
+            else:
+                try:
+                    fval = float(val)
+                except (TypeError, ValueError):
+                    return jsonify({"ok": False, "error": {
+                        "code": "BadValue",
+                        "message": "evict_min_residency_s must be a number 0..86400 "
+                                   "(0 disables the anti-thrash floor), or null to "
+                                   "fall back to the env/default"}}), 400
+                if not 0.0 <= fval <= 86400.0:
+                    return jsonify({"ok": False, "error": {
+                        "code": "BadValue",
+                        "message": "evict_min_residency_s must be 0..86400 "
+                                   "(0 disables the anti-thrash floor)"}}), 400
+                settings["evict_min_residency_s"] = fval
         if "residency" in body:
             # DEEP-MERGE per model key: {"model": "static"|null}. The default
             # tier is ON-DEMAND and is represented by NO stored entry — null,
@@ -3790,13 +3845,49 @@ def _probe_model(model_key: str, state: "WorkerState") -> dict:
         # (slot or native llama-server); none means in-process llama-cpp-python.
         base_url = (getattr(runner, "base_url", None)
                     or getattr(getattr(runner, "runner", None), "base_url", None))
+        # MoE-AWARE FIT (2026-07-26). The raw rule below — "GPU free memory
+        # dropped" — is the RIGHT question for a dense model and the WRONG one for
+        # a split MoE. Under the derived split only the NON-EXPERT tensors land on
+        # the card (coder-next: ~1.49 GiB of 45 GiB) while the experts sit in RAM by
+        # design, so a PERFECTLY placed MoE trips the 64 MiB threshold only barely,
+        # and a large-ctx/offloaded variant can miss it outright — reporting
+        # fit:false for the configuration we actually want. Worse, the inverse also
+        # misleads: an MoE that loaded WHOLE (the bug this probe should catch) shows
+        # a huge VRAM drop and reads as a confident fit:true.
+        #
+        # So for a measured MoE, price the split the same way the allocator does:
+        # the model FITS when its non-expert share fits the card. `used` stays in
+        # the payload verbatim — the caller still sees exactly what was consumed —
+        # but the VERDICT stops being a function of how much VRAM disappeared.
+        # Degrade-not-guess: any unreadable header/total falls back to the raw rule.
+        fit = bool(used and used > 64 * 1024 * 1024)
+        try:
+            from ..managers.spill import gguf_moe_detail, total_vram_bytes
+            from .imports import get_model_path
+            _moe = gguf_moe_detail(get_model_path(canonical))
+            if _moe.get("is_moe"):
+                _non = int(_moe.get("non_expert_bytes") or 0)
+                _tot = total_vram_bytes()
+                if _non and _tot:
+                    fit = _non <= _tot
+                    result["moe_fit_basis"] = {
+                        "is_moe": True,
+                        "non_expert_bytes": _non,
+                        "expert_bytes": int(_moe.get("expert_bytes") or 0),
+                        "gpu_total_bytes": _tot,
+                        "why": (f"MoE: priced the {_non / 2**30:.2f} GiB non-expert "
+                                f"share against the {_tot / 2**30:.2f} GiB GPU "
+                                "(experts belong in RAM under the split), not the "
+                                f"{(used or 0) / 2**30:.2f} GiB VRAM delta"),
+                    }
+        except Exception:  # noqa: BLE001 — advisory; never turn a probe into a crash
+            pass
         result.update(
             ok=True,
             vram_free_after=after,
             vram_used=used,
             path="http" if base_url else "in-process",
-            # If GPU free memory dropped meaningfully, weights are on the GPU.
-            fit=bool(used and used > 64 * 1024 * 1024),
+            fit=fit,
         )
         # Vision honesty: a vision GGUF served IN-PROCESS cannot decode images
         # (the python binding fails to load the mmproj projector — the reason
@@ -4350,7 +4441,40 @@ _SETTINGS_KEYS = {"slot_count", "residency", "on_demand_ttl_s",
                   # central's projection of the spill bands (release-time bridge);
                   # the flex engine (_vram_evict_to_fit) reads them here.
                   "ctx_deviation_pct", "vram_deviation_pct",
-                  "ram_deviation_pct", "priority"}
+                  "ram_deviation_pct", "priority",
+                  # Eviction policy (2026-07-25). evict_min_residency_s is the
+                  # anti-thrash floor and is genuinely PER-WORKER: it is a VRAM
+                  # residency concept with exactly one consumer (this worker's
+                  # auto-evict), and BOTH storage sites hardcode a 0 floor — so
+                  # central has no VRAM preview for it to diverge from.
+                  #
+                  # ⚠ evict_least_reaping is DELIBERATELY ABSENT (operator ruling
+                  # 2026-07-25: "yes reject it... best to have these decisions
+                  # explicit in proof of action"). It was briefly accepted here
+                  # so the relay stayed uniform — but it is FLEET-WIDE policy
+                  # owned by central, so a worker would store it, report it back
+                  # as saved, and then have central's heartbeat overwrite it on
+                  # the very next beat. That is a setting you can write, that
+                  # reads back correct, and that silently stops mattering.
+                  #
+                  # This codebase shipped exactly that shape earlier the SAME DAY
+                  # — /assign returned "admission: approved" for a max-gpu that
+                  # was never persisted (b0e02ff). Accepting-then-overriding is
+                  # the same lie wearing different clothes. Rejecting names the
+                  # right door instead; see _fleet_only_hint below.
+                  "evict_min_residency_s"}
+
+# Keys that are FLEET policy, not per-worker settings. Rejected by /ops/config
+# with a message naming where they DO belong, rather than a bare "unsupported"
+# that leaves the operator guessing which of the two knobs they got wrong.
+# Deliberately NOT a toggle: a switch that re-enabled accepting these would have
+# exactly one setting — "make the silent override possible again".
+_FLEET_ONLY_SETTINGS = {
+    "evict_least_reaping": "POST /llm/evict-policy (central owns it; it gates "
+                           "the drop pass that central's storage_proposal also "
+                           "runs, so one value must serve both or their victim "
+                           "sets diverge)",
+}
 _SETTINGS_SOURCE: dict = {}              # key -> "settings" | "env" | "default"
 _RUNTIME_SETTINGS: dict = {}             # the loaded settings, for live readers
 # t21 flex: the ctx% the VRAM admission engine COMMITTED a model to under
@@ -4425,6 +4549,45 @@ def _adopt_blocked_models(worker: "dict | None") -> None:
         _BLOCKED_MODELS.clear()
         _BLOCKED_MODELS.update(parsed)
         _BLOCKED_LOGGED.intersection_update(parsed)  # re-arm anything unblocked
+
+
+def _adopt_least_reaping(worker: "dict | None") -> None:
+    """Adopt central's FLEET-WIDE least-reaping policy from the heartbeat reply.
+
+    Why fleet-wide and not a per-worker setting: this knob changes the DROP
+    PASS, and central's ``storage_proposal`` runs that same drop pass when it
+    previews an eviction. If this worker ran it ON while central previewed it
+    OFF, the two would name different victims — precisely the divergence
+    ``tests/test_eviction_parity.py`` exists to catch. So central owns ONE
+    value and ships it to everyone, the ``blocked_models`` idiom exactly:
+    omit-when-default on the wire, so an older central (or one that has never
+    been switched) simply doesn't send the key.
+
+    ABSENT means "central has no opinion", which must NOT clobber a local
+    drop-in — an operator who set HUGPY_EVICT_LEAST_REAPING on the box before
+    central learned the knob should keep it. So absence RESTORES the captured
+    base rather than forcing the default, the same revert-to-base rule
+    _apply_settings_env uses. A present value always wins: fleet policy
+    outranks a local drop-in, because parity is the thing at stake.
+
+    Best-effort and never raises — an adoption failure must not break a beat.
+    """
+    try:
+        raw = (worker or {}).get("evict_least_reaping")
+        base_env = f"_HUGPY_BASE_{_ENV_LEAST_REAPING}"
+        if raw is None:
+            base = os.environ.get(base_env)
+            if base:
+                os.environ[_ENV_LEAST_REAPING] = base
+            elif base is not None:
+                os.environ.pop(_ENV_LEAST_REAPING, None)
+            return
+        if base_env not in os.environ:
+            os.environ[base_env] = os.environ.get(_ENV_LEAST_REAPING, "")
+        os.environ[_ENV_LEAST_REAPING] = "1" if bool(raw) else "0"
+        _SETTINGS_SOURCE["evict_least_reaping"] = "fleet"
+    except Exception:  # noqa: BLE001 — heartbeat adoption is best-effort
+        logger.debug("least-reaping adoption skipped", exc_info=True)
 
 
 def _is_blocked_locally(model_key: "str | None") -> bool:
@@ -6560,25 +6723,54 @@ def _shared_evict_order(rows: list, need: "int | None",
             break
         members = [r for r in rows if pri.get(r.model_key, 0) == band]
         plan = _ev.evict_plan(_ev.VRAM, remaining, members, now=now,
-                              min_residency_s=_evict_min_residency_s())
+                              min_residency_s=_evict_min_residency_s(),
+                              least_reaping=_evict_least_reaping())
         out.extend(plan.victims)
         remaining -= plan.freed
     return out
 
 
 # Enacted proposal 2 (spec "Open" — thrash floor). Seconds a model must have
-# been resident before it is an eviction candidate at all. Env-tunable and
-# defaulting to the shared module's constant, which mirrors the hot tier's
-# window; 0 disables the floor and restores the pre-spec behaviour exactly.
+# been resident before it is an eviction candidate at all. 0 disables the floor
+# and restores the pre-2026-07-25 behaviour exactly.
+#
+# READS THE ENV, and that is the whole mechanism: the `evict_min_residency_s`
+# SETTING is projected onto HUGPY_EVICT_MIN_RESIDENCY_S by _apply_settings_env
+# at boot, before any reader runs, so this function needs no knowledge of the
+# settings file and the precedence (setting > drop-in env > default) falls out.
+# PER-WORKER is safe here: this floor is a VRAM-residency concept and central
+# has no VRAM preview to disagree with — its one eviction call site
+# (storage_proposal) is the DISK and hardcodes the floor to 0, exactly as the
+# worker's own storage half (budget.fit_plan) does.
+_ENV_EVICT_MIN_RESIDENCY = "HUGPY_EVICT_MIN_RESIDENCY_S"
+
+
 def _evict_min_residency_s() -> float:
     from ..managers import eviction as _ev
-    raw = os.environ.get("HUGPY_EVICT_MIN_RESIDENCY_S")
+    raw = os.environ.get(_ENV_EVICT_MIN_RESIDENCY)
     if raw in (None, ""):
         return _ev.DEFAULT_MIN_RESIDENCY_S
     try:
         return max(0.0, float(raw))
     except (TypeError, ValueError):
         return _ev.DEFAULT_MIN_RESIDENCY_S
+
+
+# Least reaping (the drop pass). FLEET-WIDE, not per-worker — it changes the
+# drop pass central's storage_proposal runs too, so a per-worker value would
+# produce divergent victim sets (the failure Parity exists to prevent). The
+# worker LEARNS it from central on the heartbeat reply (the blocked_models
+# idiom) and _adopt_least_reaping projects it onto this env; a local drop-in is
+# the fallback only until the first beat lands.
+_ENV_LEAST_REAPING = "HUGPY_EVICT_LEAST_REAPING"
+
+
+def _evict_least_reaping() -> bool:
+    from ..managers import eviction as _ev
+    raw = os.environ.get(_ENV_LEAST_REAPING)
+    if raw in (None, ""):
+        return _ev.DEFAULT_LEAST_REAPING
+    return str(raw).strip().lower() not in ("0", "false", "no", "off")
 
 
 def _reclaimable_vram_bytes(candidates: "list[dict]") -> "int | None":
@@ -7533,6 +7725,43 @@ def _apply_settings_env(args) -> dict:
     else:
         os.environ.pop(_ENV_HOT_CACHE_ROOT, None)     # no base -> tier off (unset)
         _SETTINGS_SOURCE["hot_cache_root"] = "default"
+    # ── EVICTION POLICY (2026-07-25) ────────────────────────────────────────
+    # Both knobs are projected onto the env that _evict_min_residency_s /
+    # _evict_least_reaping already read, so those readers stay unchanged and
+    # the precedence (settings > drop-in env > module default) falls out of the
+    # same mechanism slot_count uses. Same base-sentinel dance as COMFY_URL: a
+    # later CLEAR must revert to the true drop-in base, not leak the last
+    # projected value across an execv.
+    #
+    # NOTE the `is not None` guards. These are the ONE place a projected value
+    # can legitimately be falsy-but-set: evict_min_residency_s=0 IS the escape
+    # hatch and evict_least_reaping=False IS the greedy-walk mode. A truthiness
+    # test here (`if settings.get(...)`) would silently drop exactly the two
+    # values the operator most needs to reach.
+    for _key, _env in ((("evict_min_residency_s"), _ENV_EVICT_MIN_RESIDENCY),
+                       (("evict_least_reaping"), _ENV_LEAST_REAPING)):
+        _base_env = f"_HUGPY_BASE_{_env}"
+        if _base_env not in os.environ:
+            os.environ[_base_env] = os.environ.get(_env, "")
+        _base = os.environ.get(_base_env, "")
+        _val = settings.get(_key)
+        if _val is not None:
+            # bools -> "1"/"0" (what _evict_least_reaping parses); numbers via
+            # str(). Never repr() — a Python bool is "True", not a value the
+            # env reader's ("0","false","no","off") check would treat as false.
+            os.environ[_env] = ("1" if _val is True else
+                                "0" if _val is False else str(_val))
+            _SETTINGS_SOURCE[_key] = "settings"
+            if _base and _base != os.environ[_env]:
+                logger.warning("settings override: %s env/drop-in said %r but the "
+                               "operator's runtime settings say %r — settings win",
+                               _env, _base, os.environ[_env])
+        elif _base:
+            os.environ[_env] = _base                  # revert to drop-in/env base
+            _SETTINGS_SOURCE[_key] = "env"
+        else:
+            os.environ.pop(_env, None)                # no base -> module default
+            _SETTINGS_SOURCE[_key] = "default"
     return settings
 
 
@@ -7583,6 +7812,19 @@ def _effective_config() -> dict:
             out["profiles"] = {}
     if _RUNTIME_SETTINGS.get("model_profiles"):
         out["model_profiles"] = dict(_RUNTIME_SETTINGS["model_profiles"])
+    # ── EVICTION POLICY: report what is ACTUALLY IN FORCE, not what was typed.
+    # Read back through the same reader the eviction path uses, so the console
+    # can never show a value the planner disagrees with — including the case
+    # where a setting was cleared and a drop-in env took over. Reported
+    # unconditionally (never omitted when falsy): 0 / False are meaningful
+    # states here, and hiding them would show the operator the default while
+    # the escape hatch was armed.
+    out["evict_min_residency_s"] = _evict_min_residency_s()
+    out["evict_min_residency_s_source"] = _SETTINGS_SOURCE.get(
+        "evict_min_residency_s", "default")
+    out["evict_least_reaping"] = _evict_least_reaping()
+    out["evict_least_reaping_source"] = _SETTINGS_SOURCE.get(
+        "evict_least_reaping", "default")
     return out
 
 
@@ -8308,6 +8550,10 @@ def _heartbeat_loop(client: CentralClient, state: WorkerState, args) -> None:
             # _adopt_blocked_models. Gates only this worker's own background
             # warm/load-ahead loops (slot fill, provisioning re-kick).
             _adopt_blocked_models(worker)
+            # Eviction policy (2026-07-25): least-reaping is FLEET-WIDE because
+            # central's storage_proposal runs the same drop pass — see
+            # _adopt_least_reaping. Omitted by a central with no opinion.
+            _adopt_least_reaping(worker)
             # Per-worker BOOT-LOAD STAR (operator RULING 2026-07-23, post-
             # incident): if central named a star for this worker, load it ONCE
             # per process (a normally-evictable on-demand resident, NOT static).

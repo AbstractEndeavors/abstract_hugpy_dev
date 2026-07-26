@@ -124,6 +124,17 @@ class LlamaCppRunner(LlamaCppBaseRunner):
                                 # older builds -> usage stays None downstream.
                                 if data.get("usage"):
                                     self._stream_usage = data["usage"]
+                                # STREAMING DOES carry the engine's own decode
+                                # rate — verified against llama.cpp
+                                # tools/server/server-task.cpp
+                                # (to_json_oaicompat_chat_stream): the FINAL
+                                # chunk gets `deltas.back().push_back({"timings",
+                                # ...})` unconditionally, independent of
+                                # `include_usage`. So the same take-once slot
+                                # works for both transports; absent on an older
+                                # build -> stays None and nothing is recorded.
+                                if isinstance(data.get("timings"), dict):
+                                    self._stream_timings = data["timings"]
                                 choice = data["choices"][0]
                                 delta = choice.get("delta") or {}
                                 fr    = choice.get("finish_reason")
@@ -177,6 +188,11 @@ class LlamaCppRunner(LlamaCppBaseRunner):
                     if self._refresh_endpoint():   # stale cached endpoint — see _iter_stream
                         continue
                 raise
+        # Non-streaming twin of the capture in _iter_stream: llama-server puts
+        # `timings` on the response body of EVERY /v1/chat/completions call.
+        # Stashed in the same take-once slot so both transports feed one reader.
+        if isinstance(data.get("timings"), dict):
+            self._stream_timings = data["timings"]
         choice = data["choices"][0]
         msg = choice.get("message") or {}
         return (_reinline_reasoning(msg.get("content"), msg.get("reasoning_content")),
@@ -228,6 +244,8 @@ class LlamaCppRunner(LlamaCppBaseRunner):
                 response.raise_for_status()
                 data = response.json()
 
+            if isinstance(data.get("timings"), dict):
+                self._stream_timings = data["timings"]   # see _chat_complete
             choice = data["choices"][0]
             msg = choice.get("message") or {}
             text = _reinline_reasoning(msg.get("content"), msg.get("reasoning_content"))

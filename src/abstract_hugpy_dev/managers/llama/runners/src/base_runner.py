@@ -186,6 +186,26 @@ class LlamaCppBaseRunner(ABC):
         usage, self._stream_usage = self._stream_usage, None
         return usage
 
+    # --- decode-rate accounting (operator, 2026-07-25) ----------------------
+    # "in the end it is about maximizing tok/s ... lets start recording this".
+    #
+    # llama-server measures its own decode rate and reports it in a ``timings``
+    # block: ``predicted_per_second`` is authoritative tok/s straight from the
+    # engine. We were discarding it. Captured here, EXACTLY beside the usage
+    # slot and with the same take-once discipline, because it arrives on the
+    # very same JSON object — the final SSE chunk when streaming, the response
+    # body when not. Adding no timing code of our own is the whole point: a
+    # wall-clock rate we computed at the relay would include queueing, network
+    # and prompt-eval time and would not be decode tok/s at all.
+    #
+    # ⚠ RECORDING ONLY. Nothing ranks on this yet; eviction.sort_key is
+    # untouched.
+    _stream_timings: "Optional[dict]" = None
+
+    def _take_stream_timings(self) -> "Optional[dict]":
+        t, self._stream_timings = self._stream_timings, None
+        return t
+
     def _usage_for(self, engine_usage, messages, completion_text) -> "Optional[dict]":
         """Best-effort token accounting for a DoneEvent — never load-bearing.
 
@@ -229,6 +249,7 @@ class LlamaCppBaseRunner(ABC):
         last_finish: Optional[str] = None
         full_text = ""          # for tokenizer-based usage accounting
         self._stream_usage = None
+        self._stream_timings = None
 
         try:
             async for text, fr in self._iter_stream(messages, max_tokens, temp, top_p):
@@ -249,7 +270,13 @@ class LlamaCppBaseRunner(ABC):
             yield DoneEvent(request_id=req.request_id, input_tokens=0,
                            output_chunks=output_chunks, finish_reason=mapped,
                            usage=self._usage_for(self._take_stream_usage(),
-                                                 messages, full_text))
+                                                 messages, full_text),
+                           # Engine-measured decode rate, when the engine
+                           # reported one. Unlike usage there is NO fallback
+                           # here on purpose: a tokenizer can count tokens after
+                           # the fact, but nothing can reconstruct decode speed
+                           # from outside the engine. None = unmeasured.
+                           timings=self._take_stream_timings())
         except Exception as exc:
             logger.exception("stream_chat failed: model=%s req=%s", self.model_key, req.request_id)
             yield ErrorEvent(request_id=req.request_id, message=f"{type(exc).__name__}: {exc}")
@@ -282,6 +309,15 @@ class LlamaCppBaseRunner(ABC):
         full_text = ""                # all generated text, for tokenizer usage
         usage_sum: Optional[dict] = None
         self._stream_usage = None
+        self._stream_timings = None
+        # Decode rate across a MULTI-PASS continuation. Unlike usage above this
+        # is NOT summed — tok/s is a RATE, and adding two rates is meaningless
+        # (two passes at 115 tok/s is still 115 tok/s, not 230). Each pass
+        # re-measures the same steady-state decode speed on the same placement,
+        # so the last pass that reported one is the representative sample and
+        # also the freshest. Kept per-pass rather than after the loop because
+        # _take_stream_timings is take-once and the next pass would clear it.
+        timings_last: Optional[dict] = None
         # Anti-repetition guard state (see _loop_guard_params / _chunks_are_similar).
         guard_max_repeat, guard_sim = _loop_guard_params()
         prev_norm = ""
@@ -316,6 +352,7 @@ class LlamaCppBaseRunner(ABC):
                 # their sum (the tokenizer fallback in _usage_for covers engines
                 # that report none).
                 usage_sum = _merge_usage(usage_sum, self._take_stream_usage())
+                timings_last = self._take_stream_timings() or timings_last
                 last_finish = chunk_finish or "stop"
                 if last_finish != "length" or not piece_text:
                     break
@@ -345,7 +382,8 @@ class LlamaCppBaseRunner(ABC):
             self._log_done(req, mapped, output_chunks, chunk_tokens)
             yield DoneEvent(request_id=req.request_id, input_tokens=0,
                            output_chunks=output_chunks, finish_reason=mapped,
-                           usage=self._usage_for(usage_sum, initial_convo, full_text))
+                           usage=self._usage_for(usage_sum, initial_convo, full_text),
+                           timings=timings_last)
         except Exception as exc:
             logger.exception("stream_chat_unbounded failed: model=%s req=%s", self.model_key, req.request_id)
             yield ErrorEvent(request_id=req.request_id, message=f"{type(exc).__name__}: {exc}")

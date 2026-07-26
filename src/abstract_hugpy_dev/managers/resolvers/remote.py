@@ -100,6 +100,59 @@ def get_worker_provider() -> Optional[Callable]:
 
 
 # ---------------------------------------------------------------------------
+# Serve-metrics sink (web -> core, optional) — operator 2026-07-25:
+# "in the end it is about maximizing tok/s ... lets start recording this".
+#
+# llama-server measures its own decode rate and ships it in a `timings` block on
+# every completion; we were discarding it. The relay is the one place central
+# learns BOTH which (worker, model) served a request AND how fast it decoded, so
+# it is the natural stamping point — but core must not import the web worker
+# store, so it goes through the same provider registration every other
+# web->core seam here uses. Unregistered (standalone worker / bare central) ⇒
+# no-op, byte-identical behaviour to before.
+#
+# ``sink(worker_id, model_key, tok_s) -> None``. Writes onto the ONE ledger
+# (``model_call_stats``), never a second store.
+#
+# ⚠ RECORDING ONLY. Nothing reads tok/s yet; eviction.sort_key is untouched.
+_serve_metrics_sink: Optional[Callable[..., Any]] = None
+
+
+def set_serve_metrics_sink(sink_fn: Optional[Callable]) -> None:
+    """Register the ledger writer for measured serve quality (web -> core)."""
+    global _serve_metrics_sink
+    _serve_metrics_sink = sink_fn
+    logger.info("serve metrics sink registered: %s",
+                getattr(sink_fn, "__name__", sink_fn))
+
+
+def _record_serve_metrics(worker: Optional[dict], model_key: str,
+                          payload: Any) -> None:
+    """Extract engine tok/s from a worker reply and stamp the ledger.
+
+    TOTALLY FAIL-OPEN, and that is the design constraint, not a nicety: this
+    runs on the LIVE serving path, and a relay that raises because a `timings`
+    key is missing is a far worse bug than not recording. Every failure mode —
+    no sink registered, no worker, no timings block, an old worker that never
+    sends one, a store write that fails — returns quietly having done nothing.
+    """
+    if _serve_metrics_sink is None or not worker:
+        return
+    try:
+        wid = worker.get("id")
+        if not wid:
+            return
+        from ..eviction import tok_s_from_timings
+        tok_s = tok_s_from_timings(payload)
+        if tok_s is None:
+            return
+        _serve_metrics_sink(wid, model_key, tok_s)
+    except Exception:  # noqa: BLE001 — recording must never fail a request
+        logger.debug("serve-metrics recording skipped for %s", model_key,
+                     exc_info=True)
+
+
+# ---------------------------------------------------------------------------
 # No-worker diagnostic (web -> core, optional).
 #
 # When selection yields no worker AND this box refuses local serving
@@ -885,8 +938,20 @@ def _event_from_worker_line(d: dict, request_id: str):
                 # Token accounting from a worker on a build that reports it;
                 # absent (old workers) -> None, same as before.
                 usage=d.get("usage") if isinstance(d.get("usage"), dict) else None,
+                # The engine's own decode rate, same additive contract as usage:
+                # present from a worker that reports it, None from one that
+                # doesn't. RECORDING ONLY — see DoneEvent.timings.
+                timings=d.get("timings") if isinstance(d.get("timings"), dict) else None,
             )
         except Exception:
+            # ⚠ MIXED-VERSION SAFETY. This reconstruction is EXPLICIT-FIELD (it
+            # never splats `d`), so an unknown key a NEWER worker adds cannot
+            # reach DoneEvent's extra="forbid" and cannot fail validation here.
+            # That matters: the fallback below downgrades to a StatusEvent, and
+            # a stream whose terminal `done` silently becomes a status event has
+            # NO done at all — the consumer waits forever or finishes without a
+            # finish_reason. Keep this constructor field-explicit; never
+            # "simplify" it to DoneEvent(**d).
             return StatusEvent(**{**d, "request_id": request_id})
     if t == "error":
         return ErrorEvent(request_id=request_id, message=d.get("message", "worker error"))
@@ -1211,9 +1276,20 @@ def make_delegating_runner(framework: str, task: str):
                     break  # unbuildable (oversized inline) → local, as before
                 action = None                       # "local" | "retry" | None(=done)
                 try:
-                    return await _worker_run_once(
+                    _res = await _worker_run_once(
                         worker, payload, self.result_type,
                         request_id=req.request_id, model_key=self.model_key)
+                    # ONE-SHOT tok/s. The result schema (TaskResult) is
+                    # extra="allow", so a worker's `timings` survives validation
+                    # as an extra attribute and needs no wire version bump in
+                    # this direction; an older worker simply sends none and this
+                    # records nothing. Stamped AFTER a successful relay, so a
+                    # failed call never pollutes the history with a rate that
+                    # was never achieved.
+                    _record_serve_metrics(
+                        worker, self.model_key,
+                        {"timings": getattr(_res, "timings", None)})
+                    return _res
                 except Exception as exc:
                     if _local_fallback_allowed():
                         logger.warning("worker run failed (%s); running %s locally",
@@ -1317,6 +1393,18 @@ def make_delegating_runner(framework: str, task: str):
                         if etype == "token":
                             produced_tokens = True
                         elif etype == "done":
+                            # STREAMING tok/s, stamped on the terminal done —
+                            # the streaming twin of run()'s post-relay stamp,
+                            # and the only frame that carries a rate. llama.cpp
+                            # pushes `timings` onto the FINAL SSE chunk
+                            # unconditionally (server-task.cpp,
+                            # to_json_oaicompat_chat_stream), so streaming is
+                            # NOT a blind spot here — it is measured exactly as
+                            # well as the one-shot path. A worker too old to
+                            # send it yields None and records nothing.
+                            _record_serve_metrics(
+                                worker, self.model_key,
+                                {"timings": getattr(ev, "timings", None)})
                             return  # terminal (even if empty)
                     else:
                         # Stream ended with no done/error marker.
