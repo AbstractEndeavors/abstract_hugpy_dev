@@ -2183,11 +2183,19 @@ def _reap_scan(state: "WorkerState") -> dict:
     def _skip(reason: str):
         skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
 
+    unresolved: list[str] = []
     for mk in keys:
         try:
             cfg = get_model_config(mk)
         except Exception:
+            # An unlearned registry row, NOT an absent model. Left alone this
+            # under-reports the store: on ae 54 of 87 considered keys skipped
+            # here, so only 20 classified while 555 GiB sat resident. Record it
+            # for the out-of-band learn pass (metadata only, no weight bytes) so
+            # the NEXT scan can classify it; the histogram entry stays, because
+            # this scan genuinely could not price the row.
             _skip("no_config")
+            unresolved.append(mk)
             continue
         if getattr(cfg, "framework", None) == "comfy":
             _skip("comfy")
@@ -2254,6 +2262,15 @@ def _reap_scan(state: "WorkerState") -> dict:
             reclaimable.append({"model_key": mk, "bytes": size, "path": path})
 
     reclaimable.sort(key=lambda r: r["bytes"], reverse=True)
+    if unresolved:
+        # Out-of-band, single-flight, metadata-only: teach the registry the rows
+        # this scan could not resolve so the NEXT scan prices them instead of
+        # skipping them as no_config forever. Never inline — this runs on the
+        # heartbeat path. Guarded: the scan must never fail over a learn kick.
+        try:
+            _kick_learn_configs(state, unresolved)
+        except Exception:  # noqa: BLE001
+            pass
     out = {
         "reclaimable": reclaimable,
         "protected": protected,
@@ -4077,6 +4094,50 @@ def _sync_assignment(state: "WorkerState", worker: dict) -> None:
         return
     logger.info("assignment updated: serving %s", models or "(nothing)")
 
+    # LEARN THE CONFIG ROWS (2026-07-26, operator: the missing state "is
+    # misleading, this should be fixed").
+    #
+    # THE BUG THIS CLOSES: locality was decided by `model_is_local` ->
+    # `get_model_config(mk)`, which RAISES for a key this worker's registry has
+    # never learned. model_is_local swallows that and returns False, so the key
+    # silently dropped out of `models_local` and the console painted it
+    # "○ missing" — on ae, 54 of 64 assigned models, including one that had
+    # just served a request. The storage scan hit the same wall one level up
+    # (`except -> _skip("no_config")`: 54 no_config, 20 of 87 keys classified).
+    # An unlearned key stayed unlearned FOREVER on the presence path, because
+    # nothing on that path ever registered it — which is why actually serving
+    # the model did not clear its pill.
+    #
+    # THE ASYMMETRY: `ensure_model_registered` exists precisely to learn an
+    # unknown row from central on demand, and the serve/probe/provision paths
+    # all call it. The two PRESENCE readers did not. This closes that gap at
+    # the one place that already knows the authoritative list.
+    #
+    # WHY HERE AND NOT IN _models_local: this runs only when the assignment
+    # list actually CHANGED (we are past `if not changed: return`), so it is
+    # naturally throttled to assignment edits — not once per heartbeat, and not
+    # a 64-key burst on every beat from every worker. `ensure_model_registered`
+    # short-circuits on `_assure_local_key` (pure local lookup) for everything
+    # already known, so the steady state costs no HTTP at all; only genuinely
+    # unknown keys fetch, and each fetch is METADATA ONLY (a small config row —
+    # no weight bytes, so this is not a transfer order and cannot become one).
+    # Deliberately NOT gated on _eager_pull: learning a config is exactly what
+    # the lazy tiers need to report presence honestly while staying un-pulled.
+    #
+    # Runs in the background via the shared single-flight helper, which skips
+    # keys already resolvable (pure local lookup, no HTTP) — so the steady state
+    # costs nothing and only genuinely unknown rows fetch. Best-effort: a worker
+    # that cannot reach central still reports what it already knows, and today's
+    # behavior (absent -> "missing") IS the failure mode, so a failure here can
+    # only restore the current reading, never worsen it.
+    try:
+        from .provision import _assure_local_key
+        _unknown = [mk for mk in models if not _assure_local_key(mk)]
+    except Exception:  # noqa: BLE001 — never break adoption over a lookup
+        _unknown = []
+    if _unknown:
+        _kick_learn_configs(state, _unknown)
+
     # Lazy by default: pre-pull ONLY 🔒static, the one tier that promises local
     # presence. Everything else — the on-demand default AND 📌pinned — downloads
     # on first call via _ensure_present. Pin is attribution, not a pre-fetch.
@@ -4277,18 +4338,84 @@ def _models_local(state: "WorkerState") -> list[str]:
         # everything '✗ missing' for ~60s after any restart. Don't cache.
         return []
     out: list[str] = []
+    unknown: list[str] = []
     try:
-        from .provision import model_is_local
+        from .provision import _assure_local_key, model_is_local
         for mk in list(state.assigned_models):
             try:
                 if model_is_local(mk):
                     out.append(mk)
+                elif not _assure_local_key(mk):
+                    # NOT-LOCAL vs NOT-KNOWN (2026-07-26). model_is_local returns
+                    # False for BOTH "the files aren't here" and "this worker's
+                    # registry can't resolve the key" (get_model_config raises,
+                    # and it swallows that). Only the first is a real absence;
+                    # the second is a resolution gap that made the console paint
+                    # "○ missing" over models sitting on disk — 54 of 64 on ae.
+                    # _assure_local_key is a pure local lookup (no HTTP), so
+                    # separating the two costs nothing per beat.
+                    unknown.append(mk)
             except Exception:  # noqa: BLE001 — one bad row must not hide the rest
                 pass
     except Exception:  # noqa: BLE001
         pass
+    if unknown:
+        # Learn the rows OUT OF BAND, then let the NEXT beat re-read locality.
+        # Deliberately not inline: this walk runs on the heartbeat path and
+        # ensure_model_registered does one central fetch per unknown key.
+        # Single-flight + metadata-only (no weight bytes — never a transfer
+        # order). The list this beat is still honest about what it could prove.
+        _kick_learn_configs(state, unknown)
     _MODELS_LOCAL_CACHE.update(at=now, value=out)
     return out
+
+
+_LEARN_CONFIGS_LOCK = threading.Lock()
+_LEARN_CONFIGS_INFLIGHT: set = set()
+
+
+def _kick_learn_configs(state: "WorkerState", keys: list) -> None:
+    """Learn central's config rows for keys this worker's registry can't resolve.
+
+    The presence readers (``_models_local``, ``_worker_storage``) decide via
+    ``get_model_config``, which RAISES for an unlearned key — so such a model
+    reads as absent forever even while it serves. ``ensure_model_registered``
+    is the existing cure (metadata only, no weight bytes); this is the throttled
+    way to call it off a per-beat path.
+
+    Single-flight per key: a key already being learned is skipped, so repeated
+    beats can never stack fetches for the same model. Best-effort — on failure
+    the reading simply stays what it is today."""
+    central = getattr(state, "central_url", None)
+    if not central:
+        return
+    with _LEARN_CONFIGS_LOCK:
+        todo = [k for k in keys if k not in _LEARN_CONFIGS_INFLIGHT]
+        _LEARN_CONFIGS_INFLIGHT.update(todo)
+    if not todo:
+        return
+
+    def _bg():
+        learned = 0
+        try:
+            from .provision import ensure_model_registered
+            for mk in todo:
+                if restart_requested():
+                    return
+                try:
+                    if ensure_model_registered(mk, central):
+                        learned += 1
+                except Exception:  # noqa: BLE001
+                    continue
+        finally:
+            with _LEARN_CONFIGS_LOCK:
+                _LEARN_CONFIGS_INFLIGHT.difference_update(todo)
+        if learned:
+            _MODELS_LOCAL_CACHE.update(at=0.0, value=[])
+            logger.info("learned %d unresolved config row(s); presence cache "
+                        "invalidated (was reporting them as absent)", learned)
+
+    threading.Thread(target=_bg, daemon=True).start()
 
 
 def _reconcile_loop(state: "WorkerState") -> None:
