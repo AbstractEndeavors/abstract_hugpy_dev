@@ -4343,7 +4343,7 @@ def _models_local(state: "WorkerState") -> list[str]:
         from .provision import _assure_local_key, model_is_local
         for mk in list(state.assigned_models):
             try:
-                if model_is_local(mk):
+                if model_is_local(mk) or _local_under_any_alias(mk):
                     out.append(mk)
                 elif not _assure_local_key(mk):
                     # NOT-LOCAL vs NOT-KNOWN (2026-07-26). model_is_local returns
@@ -4368,6 +4368,67 @@ def _models_local(state: "WorkerState") -> list[str]:
         _kick_learn_configs(state, unknown)
     _MODELS_LOCAL_CACHE.update(at=now, value=out)
     return out
+
+
+def _key_aliases(model_key: str) -> list:
+    """The other spellings this model may be stored/served under.
+
+    WORKER-SIDE MIRROR of central's ``workers._match_keys`` "~"-tail
+    unification (0.1.202, operator doctrine 2026-07-23). Registry keys qualify
+    a base name with its owner via ``~`` (``Qwen~Qwen3-Coder-Next-GGUF``) while
+    the on-disk/served form is routinely the BARE base
+    (``Qwen3-Coder-Next-GGUF``). Central fixed this for ROUTING; PRESENCE was
+    never taught the same alias, which is the second half of the "○ missing"
+    report — see ``_local_under_any_alias``.
+
+    Deliberately NOT ``provision._dir_slug``: that folds separators but KEEPS
+    the owner segment, so ``qwen_qwen3_coder_next_gguf`` never equals
+    ``qwen3_coder_next_gguf`` and it cannot bridge this pair (verified before
+    writing this). The ``~``/``/``-tail is the alias that actually applies.
+
+    Raw form stays first-class; these are ADDITIONS, never replacements.
+    """
+    raw = str(model_key or "").strip()
+    if not raw:
+        return []
+    out = []
+    for sep in ("~", "/"):
+        if sep in raw:
+            base = raw.split(sep, 1)[1] if sep == "~" else raw.split("/")[-1]
+            if base and base != raw:
+                out.append(base)
+    return out
+
+
+def _local_under_any_alias(model_key: str) -> bool:
+    """True if the model is on disk under an ALIAS of ``model_key``.
+
+    Closes the second half of the 2026-07-26 "○ missing" report. On ae the
+    storage scan listed ``Qwen3-Coder-Next-GGUF`` at 45.09 GiB ON DISK while
+    ``models_local`` omitted it, because the assignment carries
+    ``Qwen~Qwen3-Coder-Next-GGUF`` and membership was compared VERBATIM. Both
+    spellings independently answered ``model_is_local=True`` / probe
+    ``local:true`` — the files were fine and the predicate was fine; only the
+    spelling differed. 9 of the 11 models still falsely missing on ae after the
+    config-learning fix were this exact class.
+
+    Cheap and last-resort: only consulted AFTER ``model_is_local(mk)`` has
+    already said False, and only for keys that actually carry a ``~``/``/``
+    qualifier — a bare key produces no aliases and returns immediately, so the
+    common path pays nothing. Never raises: a bad alias reads as "not local",
+    which is exactly today's behavior.
+    """
+    try:
+        from .provision import model_is_local
+    except Exception:  # noqa: BLE001
+        return False
+    for alias in _key_aliases(model_key):
+        try:
+            if model_is_local(alias):
+                return True
+        except Exception:  # noqa: BLE001 — one bad alias must not hide the rest
+            continue
+    return False
 
 
 _LEARN_CONFIGS_LOCK = threading.Lock()

@@ -197,3 +197,75 @@ def test_one_bad_row_does_not_stop_the_rest(monkeypatch):
     monkeypatch.setattr(P, "ensure_model_registered", _flaky)
     A._kick_learn_configs(_State(), ["bad", "good"])
     assert _settle(lambda: done == ["good"]), f"got {done}"
+
+
+# ── the SECOND half: "~"-key aliasing ───────────────────────────────────────
+# Config learning was necessary but NOT sufficient. After it shipped (0.1.212),
+# 9 of the 11 models still falsely missing on ae were an ALIAS mismatch: central
+# assigns `Qwen~Qwen3-Coder-Next-GGUF`, the worker holds/serves the bare
+# `Qwen3-Coder-Next-GGUF`, and membership was compared VERBATIM. ae's own storage
+# scan listed that model at 45.09 GiB ON DISK while models_local omitted it.
+# Both spellings independently answered model_is_local=True / probe local:true —
+# the files were fine and the predicate was fine; only the spelling differed.
+def test_key_aliases_bridges_the_tilde_and_slash_forms():
+    assert A._key_aliases("Qwen~Qwen3-Coder-Next-GGUF") == ["Qwen3-Coder-Next-GGUF"]
+    assert A._key_aliases("Qwen/Qwen3-Coder-Next-GGUF") == ["Qwen3-Coder-Next-GGUF"]
+    # a bare key has no aliases -> the common path pays nothing
+    assert A._key_aliases("Qwen3-Coder-Next-GGUF") == []
+    assert A._key_aliases("") == [] and A._key_aliases(None) == []
+
+
+def test_dir_slug_alone_cannot_bridge_this_pair():
+    """Guards the design choice. provision._dir_slug folds separators but KEEPS
+    the owner segment, so it can NOT equate the qualified and bare spellings —
+    which is why the ~-tail alias exists instead. If a future _dir_slug starts
+    stripping owners this fails, and the simpler normalizer becomes usable."""
+    from abstract_hugpy_dev.worker_agent.provision import _dir_slug
+    assert _dir_slug("Qwen~Qwen3-Coder-Next-GGUF") != _dir_slug("Qwen3-Coder-Next-GGUF")
+
+
+def test_assigned_tilde_key_is_local_when_the_bare_form_is_on_disk(monkeypatch):
+    """THE REGRESSION. Assigned qualified, stored bare -> must read LOCAL."""
+    on_disk = {"Qwen3-Coder-Next-GGUF"}
+    monkeypatch.setattr(P, "model_is_local", lambda mk: mk in on_disk)
+    monkeypatch.setattr(P, "_assure_local_key", lambda mk: mk)
+    monkeypatch.setattr(A, "_kick_learn_configs", lambda s, keys: None)
+
+    st = _State(["Qwen~Qwen3-Coder-Next-GGUF"])
+    assert A._models_local(st) == ["Qwen~Qwen3-Coder-Next-GGUF"], (
+        "a model on disk under its bare name must not read as missing when the "
+        "assignment carries the ~-qualified key")
+
+
+def test_genuinely_absent_model_still_reads_absent(monkeypatch):
+    """The alias must not manufacture presence: nothing on disk stays absent."""
+    monkeypatch.setattr(P, "model_is_local", lambda mk: False)
+    monkeypatch.setattr(P, "_assure_local_key", lambda mk: mk)
+    monkeypatch.setattr(A, "_kick_learn_configs", lambda s, keys: None)
+
+    assert A._models_local(_State(["Owner~NotHere"])) == []
+
+
+def test_alias_probe_is_only_consulted_after_the_direct_check(monkeypatch):
+    """Cost guard: a model local under its OWN key must never trigger an alias
+    walk (the common path stays exactly as cheap as before)."""
+    seen = []
+
+    def _is_local(mk):
+        seen.append(mk)
+        return True
+
+    monkeypatch.setattr(P, "model_is_local", _is_local)
+    monkeypatch.setattr(P, "_assure_local_key", lambda mk: mk)
+    monkeypatch.setattr(A, "_kick_learn_configs", lambda s, keys: None)
+
+    assert A._models_local(_State(["Owner~X"])) == ["Owner~X"]
+    assert seen == ["Owner~X"], f"alias path ran unnecessarily: {seen}"
+
+
+def test_a_raising_alias_probe_degrades_to_absent(monkeypatch):
+    def _boom(mk):
+        raise RuntimeError("bad row")
+
+    monkeypatch.setattr(P, "model_is_local", _boom)
+    assert A._local_under_any_alias("Owner~X") is False
