@@ -55,8 +55,9 @@ logger = logging.getLogger("abstract_hugpy_dev.spill")
 # model's real geometry at the real n_ctx since 2026-07-27 — see
 # vram_ctx_reserve_bytes; it was a flat 2.5 GiB when this note was written),
 # HUGPY_VRAM_RESERVE_GIB (1.0 GiB, for consumers central cannot see), and the
-# ~90% admission ceiling (HUGPY_VRAM_CEILING_FRAC) which is the real OOM
-# backstop. This removes a redundant fourth margin, not the floor.
+# admission ceiling (agent._vram_ceiling_reserve_bytes — a bounded compute
+# cushion since 2026-07-27, HUGPY_VRAM_CEILING_FRAC to override) which is the
+# real OOM backstop. This removes a redundant fourth margin, not the floor.
 # Tunable if it bites: set HUGPY_VRAM_SAFETY below 1.0 (read at CALL time by
 # _vram_safety(), not here — _env_float is defined further down this module and
 # a module-level call would NameError on import, taking every worker with it).
@@ -1212,10 +1213,15 @@ def autofit_gpu_layers(model_path: str,
     dies with "Failed to create llama_context"). So the credit can only ever
     convert a spill into a whole seat; it never buys extra layers in a split.
 
-    The real OOM backstop is unchanged and lives elsewhere — the ~90% device
-    ceiling (HUGPY_VRAM_CEILING_FRAC, agent ``_worker_slot_fit_check``) still
-    demands (1-frac) of the WHOLE card free after the weights land, and it reads
-    device truth so it sees out-of-band growth this reserve never could.
+    The real OOM backstop lives elsewhere — the device ceiling in agent
+    ``_vram_ceiling_reserve_bytes`` / ``_worker_slot_fit_check``, which demands
+    real device headroom after the weights land and reads device truth, so it
+    sees out-of-band growth this reserve never could. Since 2026-07-27 that
+    ceiling defaults to a BOUNDED cushion — ``_CTX_COMPUTE_RESERVE_BYTES``, the
+    same 512 MiB compute term this function adds, un-stacked against
+    ``vram_reserve_bytes`` — rather than (1-frac) of the WHOLE card, which
+    re-charged for the KV the incoming need already carries. An explicit
+    HUGPY_VRAM_CEILING_FRAC still means exactly what it always did.
     ``free_vram_bytes`` itself is UNCHANGED: every other consumer (heartbeat
     budgets, contention fit, transformers max_memory, preflights) still gets the
     reserve-adjusted figure.

@@ -6022,10 +6022,16 @@ def _total_vram_bytes() -> "int | None":
 
 def _worker_slot_fit_check(model_key: str) -> bool:
     """Real-VRAM CEILING gate (slots.set_fit_check), Fix A (2026-07-15). True when
-    loading ``model_key`` would leave the card at/under the ~90% ceiling given
-    REAL current free VRAM — i.e. at least (1 - ceiling) of total VRAM remains
-    free AFTER the weights land. False when it would breach the ceiling (the slot
-    scheduler then evicts the coldest on-demand occupant(s) and re-checks).
+    loading ``model_key`` still leaves the card real working room given REAL
+    current free VRAM — i.e. at least ``_vram_ceiling_reserve_bytes`` of the
+    budgetable free figure remains AFTER the weights land. False when it would
+    breach that (the slot scheduler then evicts the coldest on-demand
+    occupant(s) and re-checks).
+
+    The reserve is THE SAME binding ``_vram_evict_to_fit`` admits against — a
+    bounded compute/activation cushion since 2026-07-27, not (1 - frac) of the
+    whole card (which double-charged the KV already inside ``need``). These two
+    are siblings and must never disagree.
 
     This is distinct from _worker_fit_check (the in-process contention guard,
     which asks "does it fit WITHOUT yielding a resident"): this gate answers "does
@@ -7549,8 +7555,9 @@ def _size_up_for_eviction(state: "WorkerState", model_key: str, plan: dict,
 def _vram_evict_to_fit(state: "WorkerState", model_key: str,
                        need: "int | None" = None) -> dict:
     """THE VRAM admission choke point. Make room for ``model_key`` to land on the
-    GPU under the ~90% ceiling by evicting the minimum LRU set of EVICTABLE
-    residents, or refuse HONESTLY before any CUDA allocation.
+    GPU under the device ceiling (``_vram_ceiling_reserve_bytes``) by evicting
+    the minimum LRU set of EVICTABLE residents, or refuse HONESTLY before any
+    CUDA allocation.
 
     Protection (operator ruling): NEVER evict a 🔒static resident, a model that is
     ACTIVELY REPLYING (measured: in-flight gen / busy slot), a model with work

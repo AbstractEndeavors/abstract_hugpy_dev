@@ -8,7 +8,7 @@ _ensure_pydantic()
 # Running-source version (authoritative even when the installed metadata is
 # stale, e.g. a run-from-source dev box). Keep in sync with pyproject `version`
 # — keeper/stock_pip_index.sh stamps both. Exposed over HTTP at GET /version.
-__version__ = "0.1.219"
+__version__ = "0.1.220"
 
 from .imports import *
 from .managers import *
