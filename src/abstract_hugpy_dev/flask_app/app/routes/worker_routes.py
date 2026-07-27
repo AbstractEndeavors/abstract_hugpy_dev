@@ -3524,7 +3524,24 @@ def workers_load(worker_id):
             # simply ignore an unrecognized JSON body on /probe — this stays
             # additive/optional, never a required field, so it can't break a
             # worker that hasn't picked up the matching agent code yet.
-            probe_body = {"spill": body.spill} if body.spill else {}
+            # FALL BACK TO THE PERSISTED/DERIVED SPILL when the caller supplied
+            # none (2026-07-27). The console's ▶ activate posts a bare
+            # {"model_key": …}, so `body.spill` is None and this used to forward
+            # {} — dropping everything spill_for would have emitted for this
+            # (worker, model). With the 4-bit lever ON that meant the worker
+            # never saw `bnb_4bit`, loaded fp16, and admission refused with the
+            # fp16 figure ("needs 50.2 GB") while the console showed the 4-bit
+            # projection. The same hole silently dropped a derived MoE split on
+            # any activate, so a coder-next seated this way got no --n-cpu-moe.
+            # An explicit caller spill still wins; this only fills the blank.
+            _spill = body.spill
+            if not _spill:
+                try:
+                    from ..functions.imports.utils.workers import spill_for
+                    _spill = spill_for(worker_id, body.model_key) or None
+                except Exception:  # noqa: BLE001 — never fail a load over this
+                    _spill = None
+            probe_body = {"spill": _spill} if _spill else {}
             r = httpx.post(url, json=probe_body,
                            timeout=900.0)  # worker loads synchronously; can be slow
             try:

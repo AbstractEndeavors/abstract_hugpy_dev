@@ -91,6 +91,50 @@ def _estimate_total_bytes(model: dict) -> int | None:
 # failure reason (HF errors propagate out of download_one) into the error file,
 # then re-raises so the process exits non-zero and the monitor sees the failure.
 # ──────────────────────────────────────────────────────────────────────────
+# How long the (network) size estimate may take before the download proceeds
+# with an indeterminate progress bar. Deliberately short: the estimate is a
+# NICETY (it only turns the bar from indeterminate into a percentage), while the
+# thread it occupies is shared with heartbeat handling.
+_ESTIMATE_TIMEOUT_S = float(os.environ.get("HUGPY_HF_ESTIMATE_TIMEOUT_S", "8") or 8)
+
+
+def _estimate_total_bytes_bounded(model: dict) -> "int | None":
+    """_estimate_total_bytes with a hard wall-clock bound.
+
+    The underlying HfApi call cannot be interrupted, so the worker thread it
+    occupies is left to finish on its own (daemon, so it can never block
+    shutdown) — what we bound is how long WE wait for it. Returns None on
+    timeout: an indeterminate bar, which is strictly better than a stalled API.
+    """
+    # A bare daemon thread, NOT ThreadPoolExecutor: the executor's context
+    # manager JOINS its workers on __exit__, so `with … as ex` waits for the hung
+    # call anyway and the timeout buys nothing. Verified the hard way — a 2s
+    # bound over a 60s call still returned at 60s. Simply ceasing to wait on a
+    # daemon thread is what actually releases us; it dies with the process.
+    import threading as _th
+    box = {}
+
+    def _run():
+        try:
+            box["v"] = _estimate_total_bytes(model)
+        except Exception as exc:  # noqa: BLE001
+            box["e"] = exc
+
+    t = _th.Thread(target=_run, name="hf-estimate", daemon=True)
+    t.start()
+    t.join(_ESTIMATE_TIMEOUT_S)
+    if t.is_alive():
+        logger.warning(
+            "HF size estimate exceeded %.0fs — continuing with an indeterminate "
+            "progress bar (the download itself is unaffected)",
+            _ESTIMATE_TIMEOUT_S)
+        return None
+    if "e" in box:
+        logger.info("HF size estimate unavailable (%s)", box["e"])
+        return None
+    return box.get("v")
+
+
 def _download_worker(job_id: str, model_key: str, model: dict) -> None:
     os.setpgrp()
     try:
@@ -180,7 +224,29 @@ def start_cancellable_download(job: Job, model: dict, total_bytes: int | None = 
 
     def _spawn():
         _clear_error(job.id)
-        p = mp.Process(target=_download_worker, args=(job.id, job.model_key, model), daemon=True)
+        # SPAWN, NOT FORK (operator report 2026-07-27: "a download from hf in the
+        # add models tab seems to push off all of the workers and makes the api
+        # unstable").
+        #
+        # mp.Process defaults to FORK on Linux, and this runs inside a gunicorn
+        # worker configured `--workers 3 --threads 8`. Forking a multi-threaded
+        # process copies the memory image but only the CALLING thread, so any
+        # lock another thread happened to hold is inherited LOCKED and can never
+        # be released. The worker registry is exactly such a lock:
+        # workers.json is guarded by fcntl.flock(LOCK_EX) and EVERY heartbeat
+        # takes it. Fork mid-transaction and heartbeat handling stalls; past the
+        # 45s HEARTBEAT_TIMEOUT_SECONDS every worker reads `offline` — the whole
+        # fleet "pushed off" by one download. The child also inherits the parent's
+        # HTTP/CUDA/SSL state, which is its own class of instability.
+        #
+        # `spawn` starts a clean interpreter: no inherited locks, no shared fds,
+        # no half-copied thread state. It costs an interpreter start (~0.3s) per
+        # download, which is irrelevant next to the transfer itself, and the child
+        # already takes only picklable args (job id, model_key, a plain dict), so
+        # nothing here depended on inherited memory.
+        ctx = mp.get_context("spawn")
+        p = ctx.Process(target=_download_worker,
+                        args=(job.id, job.model_key, model), daemon=True)
         p.start()
         job_store.update(job.id, _proc=p)
         return p
@@ -188,7 +254,30 @@ def start_cancellable_download(job: Job, model: dict, total_bytes: int | None = 
     def monitor() -> None:
         nonlocal total_bytes
         if total_bytes is None:
-            total_bytes = _estimate_total_bytes(model)
+            # SIZE ESTIMATE IS A NETWORK CALL — keep it OFF the request path and
+            # bounded (operator, 2026-07-27: "a download from hf in the add
+            # models tab seems to push off all of the workers and makes the api
+            # unstable ... it just needs to take a path to download that doesn't
+            # affect the api").
+            #
+            # _estimate_total_bytes -> comms.model_metadata.fetch_repo_info ->
+            # HfApi.model_info(files_metadata=True): a blocking HTTPS round-trip
+            # to huggingface.co, with no timeout of its own, for the FULL file
+            # manifest of the repo. It runs here purely to make the progress bar
+            # show a percentage. When HF is slow or unreachable it parks this
+            # thread indefinitely — and with gunicorn at --workers 3 --threads 8
+            # a handful of parked threads starve the pool that also serves
+            # /llm/workers/<id>/heartbeat. Miss 45s of heartbeats
+            # (HEARTBEAT_TIMEOUT_SECONDS) and every worker reads `offline`:
+            # exactly "pushes off all of the workers".
+            #
+            # It is already on a daemon thread rather than the request itself, so
+            # the download STARTS promptly; the hazard is the thread it holds.
+            # Bounded by a watchdog: if the estimate has not landed in
+            # _ESTIMATE_TIMEOUT_S we proceed WITHOUT a total (an indeterminate
+            # bar, which the UI already handles) rather than let one slow HF call
+            # hold a thread for the life of the download.
+            total_bytes = _estimate_total_bytes_bounded(model)
             if total_bytes:
                 job_store.update(job.id, total_bytes=total_bytes)
 
