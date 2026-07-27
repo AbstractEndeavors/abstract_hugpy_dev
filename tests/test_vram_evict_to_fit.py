@@ -53,6 +53,21 @@ def rig(monkeypatch):
     busy_slots = set()
     evicted_calls = []
 
+    # ENV HYGIENE. These knobs are read straight from os.environ deep inside the
+    # admission (spill.alloc_mode_env, the HUGPY_GPU_MEM_GIB band cap, the 4-bit
+    # re-price, the thrash floor), so a sibling suite that setenv's one of them
+    # in the same process silently re-plans every test here. That is exactly the
+    # cross-file pollution that made four tests in this file pass alone and fail
+    # in a full run: test_fleet_templates leaks HUGPY_GPU_MEM_GIB="0.0", which is
+    # a TRUTHY string, so `budget = min(budget, band_ceiling(0.0, ...))` collapsed
+    # the partial-offload budget to 0 and every hybrid degenerated into a refusal.
+    # Clearing them here makes the rig mean what it says: an unconfigured box.
+    for _leak in ("HUGPY_GPU_MEM_GIB", "HUGPY_CPU_MEM_GIB", "HUGPY_ALLOC_MODE",
+                  "HUGPY_LENIENCY_PCT", "HUGPY_PRIORITY_DEVICE", "HUGPY_BNB_4BIT",
+                  "HUGPY_N_GPU_LAYERS", "HUGPY_VRAM_CEILING_FRAC",
+                  "HUGPY_EVICT_MIN_RESIDENCY_S", "HUGPY_EVICT_LEAST_REAPING"):
+        monkeypatch.delenv(_leak, raising=False)
+
     monkeypatch.setattr(A, "_total_vram_bytes", lambda: card["total"])
     monkeypatch.setattr(A, "_free_vram_bytes", lambda: card["free"])
     monkeypatch.setattr(A, "_incoming_need_bytes", lambda mk: card["need"])
@@ -625,3 +640,286 @@ def test_static_still_outranks_everything_the_spec_says(rig, monkeypatch):
     monkeypatch.setattr(A, "_served_gguf_geometry", lambda mk: (None, None))
     plan = A._vram_evict_to_fit(_State(), "subject")
     assert plan["action"] == "refuse" and plan["evicted"] == []
+
+
+# ═══════ 2026-07-27: THE SUBJECT IS ITS OWN BLOCKER (ae, 0.1.216) ═══════════
+# Operator, verbatim: "it says its serving it, it gets the call, it loads the
+# model, it serves it then says it cannot because it's not loaded and has no
+# room."
+#
+#   LoadRefusal: won't fit on GPU: needs 12.0 GB, 8.1 GB free of 23.6 GB
+#   (2.4 GB ceiling reserve); evicted 0 idle resident(s) freeing 0 B;
+#   no evictable resident is attributable to a model, yet ~15.4 GB of the card
+#   is in use — GPU memory is held by process(es) this worker cannot map to a
+#   model_key (orphaned/adopted child or out-of-band process)
+#
+# …emitted while the console showed the SAME model resident and serving:
+#   MN-GRAND-23.5B-Gutenberg : 13.3 GiB attributed + 1.6 GiB KV = 14.8 GiB used
+#   pid registry: MN-GRAND -> pid 1071915 -> in_process -> 12.8 GiB (alive)
+#   vram_attributed_bytes = 13.3 GiB     vram_unattributed_bytes = 0
+#
+# TWO defects, both asserted here:
+#  A. `_partition_residents` drops the subject from BOTH halves ("never evict
+#     yourself", correct) and nothing ever credited the subject's own footprint
+#     as headroom — so the only resident on the card was invisible to the fit
+#     math AND unavailable as a victim. 8.1 free + 12.8 held = 20.9 >= 12.0.
+#  B. the "cannot map to a model_key / orphaned / out-of-band" sentence fired on
+#     an empty candidates+protected pool, which means "nothing EVICTABLE", not
+#     "nothing ATTRIBUTABLE". It was false, and provably so.
+MNG = "TheDrummer~MN-GRAND-Gutenberg-Lyra4-Lyra-23.5B-v4.0-GGUF"
+
+
+@pytest.fixture
+def ae_1216(rig):
+    """The live ae numbers, exactly: 23.6 GiB card, 8.1 GB free, 12.0 GB need,
+    subject already resident in-process holding 12.8 GiB."""
+    rig.card["total"] = int(23.6 * GIB)
+    rig.card["free"] = 8_100_000_000               # 8.1 GB free (the refusal)
+    rig.card["need"] = 12_000_000_000              # 12.0 GB need (the refusal)
+    rig.residents[MNG] = {"vram_bytes": int(12.8 * GIB),   # pid 1071915, alive
+                          "host_mode": "in_process"}
+    return rig
+
+
+def test_resident_subject_is_credited_its_own_footprint_and_admits(ae_1216):
+    """THE REGRESSION. The subject is already on the card; crediting its own
+    bytes makes its own need fit trivially, so admission proceeds instead of
+    refusing — and it evicts NOTHING to do it."""
+    plan = A._vram_evict_to_fit(_State(), MNG)
+    assert plan["action"] == "proceed", plan.get("reason")
+    assert plan["evicted"] == []
+    assert ae_1216.evicted == []                   # nobody was disturbed
+
+
+def test_the_subject_is_never_a_victim_of_its_own_admission(ae_1216):
+    """The credit must not be implemented by evicting the subject: the operator's
+    'never the subject itself' protection is inviolable and the whole point is
+    that the bytes are ALREADY there."""
+    A._vram_evict_to_fit(_State(), MNG)
+    assert MNG not in ae_1216.evicted
+    assert MNG in ae_1216.residents                # still resident afterwards
+
+
+def test_credit_is_exactly_the_measured_footprint(ae_1216):
+    """The credited figure is the MEASURED pid-registry footprint, not a
+    declared/derived one — a guessed credit is how admit-then-OOM happens."""
+    assert A._subject_resident_vram_bytes(_State(), MNG) == int(12.8 * GIB)
+
+
+def test_credit_is_zero_for_a_subject_that_is_not_resident(ae_1216):
+    """Non-resident subject -> no credit -> today's arithmetic, untouched."""
+    assert A._subject_resident_vram_bytes(_State(), "some-other-model") == 0
+
+
+def test_non_resident_subject_path_is_byte_identical(rig):
+    """The regression guard for everyone else: with the subject absent from the
+    resident set the verdict is exactly what it was before the credit existed
+    (this is the ae shape with the subject's row removed -> still refuses)."""
+    rig.card["total"] = int(23.6 * GIB)
+    rig.card["free"] = 8_100_000_000
+    rig.card["need"] = 12_000_000_000
+    rig.residents["someone-else"] = {"vram_bytes": int(12.8 * GIB),
+                                     "host_mode": "in_process"}
+    # someone-else is evictable, so this admits by eviction — the subject gets
+    # no credit at all and the neighbour pays, exactly as before.
+    plan = A._vram_evict_to_fit(_State(), MNG)
+    assert plan["action"] == "evicted"
+    assert plan["evicted"] == ["someone-else"]
+
+
+def test_resident_subject_still_too_big_refuses_honestly(rig, monkeypatch):
+    """The credit is a fit INPUT, not a bypass. A re-seat that wants more than
+    even (free + its own bytes) can give still refuses — and the refusal shows
+    the credit so the arithmetic is checkable."""
+    rig.card["total"] = int(23.6 * GIB)
+    rig.card["free"] = 1 * GIB
+    rig.card["need"] = 40 * GIB                    # bigger than the whole card
+    rig.residents["big"] = {"vram_bytes": int(12.8 * GIB), "host_mode": "in_process"}
+    monkeypatch.setattr(A, "_served_gguf_geometry", lambda mk: (None, None))
+    plan = A._vram_evict_to_fit(_State(), "big")
+    assert plan["action"] == "refuse"
+    assert plan["evicted"] == []                   # never itself
+    r = plan["reason"]
+    assert r["subject_resident_bytes"] == int(12.8 * GIB)
+    assert r["free_vram_bytes"] == 1 * GIB         # RAW device read, unchanged
+    assert r["free_vram_effective_bytes"] == 1 * GIB + int(12.8 * GIB)
+    assert "the subject itself already holds" in r["reason"]
+
+
+def test_refusal_names_the_subject_instead_of_inventing_an_orphan(rig, monkeypatch):
+    """DEFECT B. When the subject is the holder, the refusal must SAY SO — never
+    'GPU memory is held by process(es) this worker cannot map to a model_key'.
+    That sentence sent the operator hunting external PIDs that did not exist."""
+    rig.card["total"] = int(23.6 * GIB)
+    rig.card["free"] = 1 * GIB
+    rig.card["need"] = 40 * GIB
+    rig.residents["big"] = {"vram_bytes": int(12.8 * GIB), "host_mode": "in_process"}
+    monkeypatch.setattr(A, "_served_gguf_geometry", lambda mk: (None, None))
+    msg = A._vram_evict_to_fit(_State(), "big")["reason"]["reason"]
+    assert "cannot map to a model_key" not in msg
+    assert "orphaned" not in msg
+    assert "the SUBJECT ITSELF" in msg
+    assert "big" in msg
+
+
+def test_orphan_message_only_fires_on_genuinely_unattributed_memory(
+        rig, monkeypatch):
+    """The orphan sentence survives — but only where it is TRUE: an occupied
+    card whose pid log accounts for none of it (the k30 shape)."""
+    from abstract_hugpy_dev.worker_agent import pid_registry as PR
+    monkeypatch.setattr(PR, "snapshot_for_heartbeat",
+                        lambda: {"models": [], "unattributed": []})
+    rig.card["total"] = int(23.6 * GIB)
+    rig.card["free"] = int(4.0 * GIB)              # 19.6 GiB in use, 0 attributed
+    rig.card["need"] = int(51.8 * GIB)
+    monkeypatch.setattr(A, "_served_gguf_geometry", lambda mk: (None, None))
+    msg = A._vram_evict_to_fit(_State(), "coder")["reason"]["reason"]
+    assert "cannot map to a model_key" in msg
+
+
+def test_orphan_message_cites_the_measured_unattributed_figure(rig, monkeypatch):
+    """When memory really is unattributed, the refusal quotes the measured
+    figure rather than asserting the whole occupancy is foreign."""
+    from abstract_hugpy_dev.worker_agent import pid_registry as PR
+    monkeypatch.setattr(PR, "snapshot_for_heartbeat", lambda: {
+        "models": [], "unattributed": [{"pid": 9001, "name": "python", "mib": 6000}]})
+    rig.card["total"] = int(23.6 * GIB)
+    rig.card["free"] = int(4.0 * GIB)
+    rig.card["need"] = int(51.8 * GIB)
+    monkeypatch.setattr(A, "_served_gguf_geometry", lambda mk: (None, None))
+    r = A._vram_evict_to_fit(_State(), "coder")["reason"]
+    assert "cannot map to a model_key" in r["reason"]
+    assert "measured UNATTRIBUTED" in r["reason"]
+    assert r["vram_unattributed_bytes"] == 6000 * (1 << 20)
+
+
+def test_attributed_occupancy_is_not_reported_as_an_orphan(rig, monkeypatch):
+    """The ae contradiction, generalised: attribution says the card is fully
+    accounted for (unattributed = 0), so the refusal must not claim a squatter.
+    Here the attributed bytes are a model_key-less cuda_context lump, which
+    `_vram_residents` skips — so candidates AND protected are empty without any
+    orphan being involved."""
+    from abstract_hugpy_dev.worker_agent import pid_registry as PR
+    monkeypatch.setattr(PR, "snapshot_for_heartbeat", lambda: {
+        "models": [{"model_key": None, "pid": 4242, "host_mode": "cuda_context",
+                    "vram_bytes": int(19.6 * GIB), "alive": True}],
+        "unattributed": []})
+    rig.card["total"] = int(23.6 * GIB)
+    rig.card["free"] = int(4.0 * GIB)
+    rig.card["need"] = int(51.8 * GIB)
+    monkeypatch.setattr(A, "_served_gguf_geometry", lambda mk: (None, None))
+    r = A._vram_evict_to_fit(_State(), "coder")["reason"]
+    assert "cannot map to a model_key" not in r["reason"]
+    assert "nothing foreign is squatting" in r["reason"]
+    assert r["vram_attributed_bytes"] == int(19.6 * GIB)
+    assert r["vram_unattributed_bytes"] == 0
+
+
+def test_unmeasurable_attribution_degrades_instead_of_naming_a_culprit(
+        rig, monkeypatch):
+    """DEGRADE-NOT-GUESS: an unreadable pid log must not be reported as either
+    an orphan or a clean bill of health."""
+    from abstract_hugpy_dev.worker_agent import pid_registry as PR
+    monkeypatch.setattr(PR, "snapshot_for_heartbeat", lambda: None)
+    rig.card["total"] = int(23.6 * GIB)
+    rig.card["free"] = int(4.0 * GIB)
+    rig.card["need"] = int(51.8 * GIB)
+    monkeypatch.setattr(A, "_served_gguf_geometry", lambda mk: (None, None))
+    r = A._vram_evict_to_fit(_State(), "coder")["reason"]
+    assert "UNMEASURABLE" in r["reason"]
+    assert "cannot map to a model_key" not in r["reason"]
+    assert "vram_unattributed_bytes" not in r     # omitted, never fabricated
+
+
+# ── anti-double-count: the credit must be memory that is REALLY available ────
+def test_a_dead_resident_row_is_not_credited(rig, monkeypatch):
+    """`vram-admission-no-evict` guard. A reaped/dead row's bytes are ALREADY
+    back in the device's free figure; crediting them would count them twice and
+    admit-then-OOM. Only live rows count."""
+    monkeypatch.setattr(A, "_vram_residents", lambda s: [
+        {"model_key": "ghost", "vram_bytes": 20 * GIB,
+         "host_mode": "in_process", "alive": False}])
+    assert A._subject_resident_vram_bytes(_State(), "ghost") == 0
+
+
+def test_an_unjoinable_resident_row_credits_nothing(rig, monkeypatch):
+    """A row we could not join to nvidia-smi (vram_bytes 0) is an occupant of
+    UNKNOWN size — degrade-not-guess, credit nothing rather than invent."""
+    monkeypatch.setattr(A, "_vram_residents", lambda s: [
+        {"model_key": "unjoined", "vram_bytes": 0,
+         "host_mode": "subprocess", "alive": True}])
+    assert A._subject_resident_vram_bytes(_State(), "unjoined") == 0
+
+
+def test_comfy_is_never_credited_to_a_subject(rig, monkeypatch):
+    """comfy is out of allocations (0.1.137) and has its own headroom path — its
+    bytes are never headroom for a model admission."""
+    monkeypatch.setattr(A, "_vram_residents", lambda s: [
+        {"model_key": "comfy-sdxl", "vram_bytes": 12 * GIB,
+         "host_mode": "comfy", "alive": True}])
+    assert A._subject_resident_vram_bytes(_State(), "comfy-sdxl") == 0
+
+
+def test_credit_is_not_double_counted_against_the_eviction_need(rig):
+    """The credit must shrink the deficit the eviction planner works to, not sit
+    alongside it: with the subject holding 10G and 0 free, a 12G need is 2G
+    short — the ceiling reserve pushes it to ~4.4G, which the 5G neighbour
+    covers ALONE. Crediting twice (22G apparent) would evict nobody and OOM;
+    not crediting at all would evict BOTH neighbours."""
+    rig.card["total"] = 24 * GIB
+    rig.card["free"] = 0
+    rig.card["need"] = 12 * GIB
+    rig.residents["subj"] = {"vram_bytes": 10 * GIB, "host_mode": "in_process"}
+    rig.residents["n1"] = {"vram_bytes": 5 * GIB, "host_mode": "subprocess"}
+    rig.residents["n2"] = {"vram_bytes": 5 * GIB, "host_mode": "subprocess"}
+    rig.lru.update(n1=1.0, n2=2.0)
+    plan = A._vram_evict_to_fit(_State(), "subj")
+    assert plan["action"] == "evicted"
+    assert plan["evicted"] == ["n1"]               # the MINIMUM set, still minimum
+    assert "n2" not in plan["evicted"]
+    assert "subj" not in rig.evicted
+
+
+def test_partial_offload_budget_includes_the_subjects_own_bytes(rig, gguf_rig):
+    """A GGUF re-seat that can't fit whole still gets the honest hybrid, sized
+    against free + its own released bytes — not against free alone."""
+    rig.card["total"] = 24 * GIB
+    rig.card["free"] = 1 * GIB                     # 1 - 2.4 reserve => 0 budget
+    rig.card["need"] = 52 * GIB
+    rig.residents["coder"] = {"vram_bytes": 20 * GIB, "host_mode": "subprocess"}
+    plan = A._vram_evict_to_fit(_State(), "coder")
+    # Without the credit the budget is 0 -> degenerate -> refuse. With it the
+    # budget is (1 + 20) - 2.4 = 18.6 GiB -> the same 17/48 hybrid as ever.
+    assert plan["action"] == "partial"
+    assert plan["n_gpu_layers"] == 17
+
+
+# ── all five protection classes still hold WITH a resident subject ──────────
+@pytest.mark.parametrize("klass", ["static", "replying", "busy_slot",
+                                   "queued_ahead", "comfy"])
+def test_every_protection_class_still_holds_with_a_credited_subject(
+        rig, monkeypatch, klass):
+    """The credit must not buy its way past any protection. Subject resident and
+    credited, need still unsatisfiable, one protected neighbour each time: the
+    neighbour is never evicted and the refusal still names why."""
+    rig.card["total"] = 24 * GIB
+    rig.card["free"] = 0
+    rig.card["need"] = 40 * GIB                    # unsatisfiable either way
+    rig.residents["subj"] = {"vram_bytes": 2 * GIB, "host_mode": "in_process"}
+    rig.residents["neighbour"] = {
+        "vram_bytes": 20 * GIB,
+        "host_mode": "comfy" if klass == "comfy" else "subprocess"}
+    if klass == "static":
+        rig.static.add("neighbour")
+    elif klass == "replying":
+        rig.replying.add("neighbour")
+    elif klass == "busy_slot":
+        rig.busy_slots.add("neighbour")
+    elif klass == "queued_ahead":
+        monkeypatch.setattr(A, "_queued_ahead_of", lambda subj: {"neighbour"})
+    monkeypatch.setattr(A, "_served_gguf_geometry", lambda mk: (None, None))
+    plan = A._vram_evict_to_fit(_State(), "subj")
+    assert plan["action"] == "refuse"
+    assert "neighbour" not in rig.evicted, f"{klass} protection was weakened"
+    assert "subj" not in rig.evicted, "the subject protected itself"
+    assert plan["reason"]["protected"], "the protected row must be reported"

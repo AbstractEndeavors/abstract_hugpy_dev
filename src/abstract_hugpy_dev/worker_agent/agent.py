@@ -6840,6 +6840,97 @@ def _partition_residents(state: "WorkerState", model_key: str) -> "tuple[list, l
     return candidates, protected
 
 
+def _subject_resident_vram_bytes(state: "WorkerState", model_key: str) -> int:
+    """MEASURED VRAM the SUBJECT of an admission ALREADY holds on this card.
+
+    THE SUBJECT-IS-ITS-OWN-BLOCKER FIX (operator, 2026-07-27). ae/0.1.216 refused
+    a model that was resident AND serving at that instant:
+
+        "needs 12.0 GB, 8.1 GB free of 23.6 GB (2.4 GB ceiling reserve);
+         evicted 0 idle resident(s) freeing 0 B; no evictable resident is
+         attributable to a model, yet ~15.4 GB of the card is in use"
+
+    …while the console showed the very same model resident at 13.3 GiB attributed
+    + 1.6 GiB KV, pid-mapped, ``vram_unattributed_bytes = 0``. The arithmetic that
+    should have decided it: 8.1 free + 12.8 the subject itself holds = 20.9 GB
+    against a 12.0 GB need — it fits trivially. Admission never credited the
+    subject's OWN footprint, and ``_partition_residents`` (correctly) drops the
+    subject from BOTH halves, so with the subject as the ONLY resident the planner
+    saw an empty pool on an occupied card and refused.
+
+    Why a CREDIT and not a bare "already resident -> proceed" short circuit: an
+    admission is a (RE)SEAT. The re-seat may want MORE than the current placement
+    (a relaunch at a higher ngl / a wider ctx), and a short circuit would wave
+    that through unmeasured — admit-then-OOM. Crediting the footprint keeps the
+    fit test real: the DELTA still has to fit.
+
+    ANTI-DOUBLE-COUNT (the whole risk of this credit — see the
+    ``vram-admission-no-evict`` landmine). Only bytes that are BOTH measured and
+    still held are credited:
+
+      * rows are the pid-registry/slot-union MEASURED truth (``_vram_residents``),
+        the same source the eviction planner ranks — not a declared figure;
+      * ``alive`` is required. A dead/reaped row's bytes are already back in
+        ``_free_vram_bytes()``; crediting them would count them twice. Under-
+        crediting is the safe direction (it degrades to today's refusal), so a
+        mid-load slot child reading ``healthy=False`` is deliberately NOT credited;
+      * ``vram_bytes <= 0`` (a row we could not join to nvidia-smi) contributes
+        nothing — degrade-not-guess, never an invented figure;
+      * comfy rows are excluded: comfy is out of allocations (0.1.137) and would
+        never be a hugpy model_key subject anyway.
+
+    A SECOND live copy of one model_key would make this credit a lie, so that was
+    checked rather than assumed: the in-process GGUF cache
+    (``llama/runners/get.py::_LLAMA_INSTANCES``) is keyed by model_key alone, the
+    transformers cache (``generate/coder.py::_Registry``) by
+    ``DeepCoderConfig.cache_key()`` (model_dir + compute, task-independent), and
+    ``SlotPool.endpoint_for`` returns the existing seat for a matching model_key
+    before it ever reaches the ceiling gate. One model_key = one seat, so the
+    subject's bytes are genuinely the bytes this admission supersedes.
+
+    0 when the subject is not resident — which makes every non-resident admission
+    byte-identical to today."""
+    try:
+        rows = _vram_residents(state) or []
+    except Exception:  # noqa: BLE001 — unreadable residents -> no credit (today)
+        return 0
+    total = 0
+    for r in rows:
+        if r.get("model_key") != model_key:
+            continue
+        if str(r.get("host_mode")) == "comfy":
+            continue
+        if not r.get("alive", True):
+            continue                         # already freed -> would double-count
+        try:
+            vb = int(r.get("vram_bytes") or 0)
+        except (TypeError, ValueError):
+            continue                         # unmeasurable -> credit nothing
+        if vb > 0:
+            total += vb
+    return total
+
+
+def _vram_occupancy_attribution() -> dict:
+    """``{vram_attributed_bytes, vram_unattributed_bytes}`` for the card RIGHT
+    NOW, from the SAME pid-registry snapshot the heartbeat ships to central.
+
+    This is the honesty input for the refusal's "who holds the card" clause. The
+    console and the refusal must not disagree about whether occupancy is
+    attributable: on ae the refusal claimed "GPU memory is held by process(es)
+    this worker cannot map to a model_key (orphaned/adopted child or out-of-band
+    process)" while the very same snapshot reported ``vram_unattributed_bytes =
+    0`` and mapped the model to its pid. That wrong sentence sent the operator
+    hunting external PIDs. Both figures None when there is no readable pid log —
+    degrade-not-guess; the refusal then says attribution is unmeasurable rather
+    than naming a culprit."""
+    try:
+        from . import pid_registry as _pidreg
+        return _vram_split_from_pidlog(_pidreg.snapshot_for_heartbeat())
+    except Exception:  # noqa: BLE001
+        return {"vram_attributed_bytes": None, "vram_unattributed_bytes": None}
+
+
 def _model_alloc_mode(model_key: str) -> "str | None":
     """The per-model allocation MODE as the operator persisted (or central
     derived) it — the PREFERENCE input to the shared eviction sort's key ①.
@@ -7256,6 +7347,18 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
     EVERYTHING else is a candidate — on-demand idle residents, SLOT CHILDREN
     included ('max GPU' alloc included) — LRU/coldest-first, minimum set to fit.
 
+    THE SUBJECT CREDIT (2026-07-27). "It says it's serving it, it gets the call,
+    it loads the model, it serves it, then says it cannot because it's not loaded
+    and has no room." An admission for an ALREADY-RESIDENT model credits that
+    model's own measured footprint on the FREE side
+    (``_subject_resident_vram_bytes``), because a (re)seat releases the seat it
+    holds. Without it the subject was its own blocker: protected from eviction by
+    the operator's ruling, dropped from both halves of ``_partition_residents``,
+    and never counted as headroom — so a model plainly on the card was refused
+    for want of room it was itself occupying. The credit is a fit input only; the
+    DELTA still has to fit, so a re-seat that genuinely wants more than the card
+    can give still refuses honestly.
+
     Returns a typed verdict:
       {"action": "proceed"|"evicted"|"refuse", "evicted": [mk...],
        "freed_bytes": int, "reason": {...}|None}
@@ -7356,8 +7459,44 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
                          f"non-expert + KV), expert tensors "
                          f"(~{_human_bytes(moe_commit.get('cpu_bytes'))}) on CPU")}
 
-    def _fits() -> "bool | None":
+    # ── SUBJECT CREDIT (operator, 2026-07-27) ───────────────────────────────
+    # The subject's OWN measured footprint is headroom for the subject: an
+    # admission is a (re)seat of THIS model, so whatever it already holds is
+    # released by the seat it is about to take. Credited on the FREE side, never
+    # subtracted from `need`, deliberately:
+    #
+    #   * `need` is a property of the MODEL (weights + KV at the resolved ctx),
+    #     not of the card. It is the number the refusal PRINTS, the number
+    #     _record_calibration_refuse learns from, the base for the MoE commit
+    #     (`moe_commit["gpu_total"]`), for the flex re-price, and for the partial
+    #     offload's `kv_eff = need - weights`. Netting a card fact into it would
+    #     make every one of those lie — and drive kv_eff negative.
+    #   * the subject's footprint is a property of the CARD's current state,
+    #     which is exactly what the free side means. One credit here covers the
+    #     first fit test, the flex deficit, the eviction need, the per-victim
+    #     re-check and the partial-offload budget, so no two of them can drift.
+    #
+    # `_free_vram_bytes()` is re-read every call (the device moves under us and
+    # evictions must be seen); the credit is a constant because the subject is
+    # never evicted — it is the one resident guaranteed still to be there.
+    subject_held = _subject_resident_vram_bytes(state, model_key)
+    if subject_held:
+        logger.info(
+            "VRAM admission for %s: the subject is ALREADY resident holding ~%s "
+            "— crediting that against its own need (%s); a model is never "
+            "refused for want of room it is itself occupying",
+            model_key, _human_bytes(subject_held), _human_bytes(need))
+
+    def _free_eff() -> "int | None":
+        """Free VRAM available TO THE SUBJECT = device free + what the subject
+        itself already holds. None when the device can't be read (fail open)."""
         fv = _free_vram_bytes()
+        if fv is None:
+            return None
+        return int(fv) + subject_held
+
+    def _fits() -> "bool | None":
+        fv = _free_eff()
         if fv is None:
             return None                      # can't read -> fail open at the caller
         return (fv - need) >= ceiling_reserve
@@ -7377,6 +7516,12 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
         # layers with 3.1 GiB free; re-seating put all 36 on the card). Size up
         # for the eviction instead: plan against free + reclaimable, evict to
         # realise it, then RE-PLAN from what was actually freed.
+        #
+        # Deliberately the RAW device free, NOT `_free_eff()`: this planner is a
+        # bonus size-up that never refuses, and `_size_up_for_eviction` re-plans
+        # against the raw device read after evicting. Feeding it the credited
+        # figure here would make the target systematically un-deliverable and
+        # push it down its "under-delivered" branch. Byte-identical to today.
         _up = _plan_autofit_against_reclaimable(
             state, model_key, _partition_residents(state, model_key)[0],
             _free_vram_bytes())
@@ -7407,7 +7552,7 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
     # manifests as the priority-ordered eviction below.
     from .flex import plan_flex, flex_priority_key as _fpk, kv_at_ctx_pct as _kvat
     flex_note = None
-    fv_now = _free_vram_bytes()
+    fv_now = _free_eff()                                 # incl. the subject credit
     if fv_now is not None:
         deficit = ceiling_reserve - (fv_now - need)      # >0 here (ok was False)
         # Under a MoE re-target the subject's GPU-side weights are the typed
@@ -7478,9 +7623,11 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
     # they do in the preview. The loop below still re-tests `_fits()` and
     # re-proves protection per victim (the device moves for reasons no plan
     # models), so the PLAN chooses and the LOOP verifies.
-    _fv_for_need = _free_vram_bytes()
+    _fv_for_need = _free_eff()               # incl. the subject credit: we must
     _ev_need = (max(0, ceiling_reserve - (_fv_for_need - need))
-                if _fv_for_need is not None else None)
+                if _fv_for_need is not None else None)   # only evict the REMAINING
+                                                         # deficit, never a victim
+                                                         # for the subject's own bytes
     _ev_rows = _evict_residents(state, candidates, model_key)
     _ev_order = _shared_evict_order(
         _ev_rows, need=_ev_need,
@@ -7523,7 +7670,13 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
         return {"action": "evicted", "evicted": evicted,
                 "freed_bytes": freed, "reason": None}
 
+    # `fv` is the RAW device read — what the refusal below REPORTS, because the
+    # operator must see the card as the driver sees it. `fv_eff` is what the
+    # subject may actually spend (raw + its own credited footprint) and is what
+    # the partial-offload budget is sized from, so the hybrid plan and the
+    # `_fits()` that just failed are priced off the same number.
     fv = _free_vram_bytes()
+    fv_eff = _free_eff()
 
     # ── stage (2.5): honest GGUF PARTIAL offload — autofit's hybrid contract ──
     # Full GPU offload still doesn't fit after flex + evict. For a GGUF this is
@@ -7537,10 +7690,12 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
     # only; transformers placement modes are t26 (out of scope).
     partial = None
     ppath, total_layers = _served_gguf_geometry(model_key)
-    if fv is not None and total_layers:
+    if fv_eff is not None and total_layers:
         weights = int(_det.get("weights") or 0)
         kv_eff = max(0, int(need) - weights)     # honors any committed ctx flex
-        budget = max(0, fv - ceiling_reserve)    # VRAM the offloaded layers may use
+        budget = max(0, fv_eff - ceiling_reserve)  # VRAM the offloaded layers may
+                                                   # use — incl. the subject's own
+                                                   # bytes, which this seat frees
         # Cap by the model's explicit VRAM band CEILING when a gpu_mem_gib budget
         # is set (t21) — stretchable to the band ceiling under this model's own
         # need. band_ceiling collapses to the gpu_mem_gib target when no deviation
@@ -7632,22 +7787,75 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
     if evict_failed:
         holders.append(f"{len(evict_failed)} eviction attempt(s) failed to free "
                        "their resident")
+    _attr = {"vram_attributed_bytes": None, "vram_unattributed_bytes": None}
     if not protected and not evict_failed and not candidates and not evicted:
+        # THE ORPHAN-MESSAGE HONESTY FIX (operator, 2026-07-27). This clause used
+        # to assert, unconditionally, that the card was held by "process(es) this
+        # worker cannot map to a model_key (orphaned/adopted child or out-of-band
+        # process)". On ae that was FALSE and provably so — the pid registry
+        # mapped the subject to its pid and reported vram_unattributed_bytes = 0
+        # — and it cost the operator hours hunting external PIDs. An empty
+        # candidates+protected pool means "nothing EVICTABLE was enumerable", not
+        # "nothing is attributable": `_partition_residents` deliberately drops the
+        # SUBJECT from both halves, and a model_key-less cuda_context lump never
+        # enters them either. So consult the attribution the worker already
+        # computes for the heartbeat, and say only what it supports.
         occupied = None
         if fv is not None and total:
             occupied = max(0, int(total) - int(fv))
-        holders.append(
-            f"no evictable resident is attributable to a model, yet "
-            f"~{_human_bytes(occupied)} of the card is in use — GPU memory is "
-            "held by process(es) this worker cannot map to a model_key "
-            "(orphaned/adopted child or out-of-band process)")
+        _attr = _vram_occupancy_attribution()
+        _unattr = _attr.get("vram_unattributed_bytes")
+        _attributed = _attr.get("vram_attributed_bytes")
+        if subject_held:
+            # THE LIVE ae SHAPE. The subject is the holder — and it is protected
+            # from itself by the operator's own ruling, so there was never
+            # anything to evict. Name it; do not invent a squatter.
+            holders.append(
+                f"the only thing holding the card is the SUBJECT ITSELF — "
+                f"{model_key} is already resident with ~{_human_bytes(subject_held)} "
+                f"(pid-attributed, already credited against its own need above), "
+                f"and the subject is never evicted to make room for itself; "
+                f"~{_human_bytes(occupied)} of the card is in use")
+        elif _unattr:
+            holders.append(
+                f"no evictable resident is attributable to a model, and "
+                f"~{_human_bytes(_unattr)} of the ~{_human_bytes(occupied)} in use "
+                f"is measured UNATTRIBUTED — GPU memory is held by process(es) "
+                f"this worker cannot map to a model_key (orphaned/adopted child "
+                f"or out-of-band process)")
+        elif _unattr is None:
+            holders.append(
+                f"no evictable resident is attributable to a model and "
+                f"~{_human_bytes(occupied)} of the card is in use; VRAM "
+                f"attribution is UNMEASURABLE on this box, so the holder cannot "
+                f"be named (degrade-not-guess)")
+        elif not _attributed:
+            # Attribution is readable and says NOTHING is attributed, yet the
+            # card is occupied. That is the k30 shape and the orphan sentence is
+            # true here: the registry can account for none of the occupancy.
+            holders.append(
+                f"no evictable resident is attributable to a model, yet "
+                f"~{_human_bytes(occupied)} of the card is in use — GPU memory is "
+                "held by process(es) this worker cannot map to a model_key "
+                "(orphaned/adopted child or out-of-band process)")
+        else:
+            # Occupied, fully accounted for, and none of it evictable — say THAT.
+            holders.append(
+                f"no evictable resident is attributable to a model, but the "
+                f"~{_human_bytes(occupied)} in use IS attributed to this worker "
+                f"(~{_human_bytes(_attributed)} across its model rows and its own "
+                f"CUDA context) with 0 B measured unattributed — nothing foreign "
+                f"is squatting the card, there is simply nothing evictable left")
     reason = {
         "state": "refused",
         "model_key": model_key,
         "reason": (
             f"won't fit on GPU: needs {_human_bytes(need)}{_need_split_str(_det)}, "
             f"{_human_bytes(fv)} free of {_human_bytes(total)} "
-            f"({_human_bytes(ceiling_reserve)} ceiling reserve); "
+            + (f"(+{_human_bytes(subject_held)} the subject itself already holds, "
+               f"credited -> {_human_bytes(fv_eff)} available to it) "
+               if subject_held else "")
+            + f"({_human_bytes(ceiling_reserve)} ceiling reserve); "
             f"evicted {len(evicted)} idle resident(s) freeing "
             f"{_human_bytes(freed)}"
             + ("; " + "; ".join(holders) if holders else "")
@@ -7672,6 +7880,17 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
                        "host_mode": p.get("host_mode"), "why": p.get("why")}
                       for p in protected],
     }
+    # SUBJECT CREDIT + ATTRIBUTION, structured for the console. WIRE: strictly
+    # ADDITIVE and OMITTED-WHEN-UNSET — the fleet is 0.1.216 and a released
+    # consumer must not meet a field it can't model. A non-resident subject and
+    # an unread attribution therefore produce a byte-identical reason dict.
+    if subject_held:
+        reason["subject_resident_bytes"] = subject_held
+        reason["free_vram_effective_bytes"] = fv_eff
+    if _attr.get("vram_attributed_bytes") is not None:
+        reason["vram_attributed_bytes"] = _attr["vram_attributed_bytes"]
+    if _attr.get("vram_unattributed_bytes") is not None:
+        reason["vram_unattributed_bytes"] = _attr["vram_unattributed_bytes"]
     # MoE honesty: when a split governed (or was considered for) this model,
     # carry its typed numbers so the refusal explains what the split would have
     # needed — the operator sees "even the 2.9G non-expert share didn't fit",
