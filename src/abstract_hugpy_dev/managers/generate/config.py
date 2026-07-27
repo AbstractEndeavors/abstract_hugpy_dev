@@ -25,6 +25,16 @@ _SENTINEL = object()
 class DeepCoderConfig:
     model_dir: str
     device: str
+    # The REGISTRY key this config was built for. Carried so the worker's
+    # in-process VRAM attribution can name the model holding the weights:
+    # _inprocess_gpu_bytes walks coder.REGISTRY._instances and reads
+    # `dc.cfg.model_key`, and without it every transformers causal-LM loaded
+    # in-process reported model_key=None — VRAM that shows as an anonymous
+    # `cuda_context` lump on the agent's own pid, which is UNATTRIBUTABLE and
+    # therefore UNEVICTABLE (every eviction verb keys on model_key). That is the
+    # 2026-07-26 report: a 4-bit load took 13.6 GiB, the console said "No models
+    # are using this GPU's VRAM", and the next load refused against memory
+    # nothing could reclaim. Default None keeps every existing caller valid.
     torch_dtype: Any
     use_quantization: bool = False
     use_flash_attention: bool = False
@@ -34,6 +44,7 @@ class DeepCoderConfig:
     # HF repo. OFF by default; only ever True via an explicit opt-in (per call, or
     # the operator switch HUGPY_TRUST_REMOTE_CODE). Never defaults on.
     trust_remote_code: bool = False
+    model_key: Optional[str] = None
 
     max_new_tokens_cap: int = 16000
 
@@ -115,6 +126,7 @@ def build_deepcoder_runtime(
 
     return DeepCoderConfig(
         model_dir=model_dir,
+        model_key=model_key,        # carried for in-process VRAM attribution
         device=chosen_device,
         torch_dtype=chosen_dtype,
         use_quantization=use_quantization and chosen_device == "cuda",

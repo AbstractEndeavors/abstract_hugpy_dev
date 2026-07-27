@@ -6029,6 +6029,46 @@ def _drop_inprocess_model(model_key: str) -> bool:
                 dropped = True
     except Exception:  # noqa: BLE001
         pass
+    # TRANSFORMERS CAUSAL-LMs (2026-07-26). Their weights live in coder.REGISTRY's
+    # OWN module-level _instances, not on the dispatch adapter — the same reason
+    # _inprocess_gpu_bytes needs a dedicated pass for them. Without this the
+    # dispatch evict above returned "dropped" while the nn.Module stayed
+    # referenced here, so the VRAM never came back: the operator's 13.6 GiB
+    # in-process load survived every eviction attempt and blocked the next load.
+    # Match on the config's model_key (now carried) AND the runner's own cache
+    # key, since a DeepCoder is keyed by cfg.cache_key() not by model_key.
+    try:
+        from ..managers.generate.coder import REGISTRY as _DC
+        insts = getattr(_DC, "_instances", None)
+        if isinstance(insts, dict):
+            for ck, dc in list(insts.items()):
+                if getattr(getattr(dc, "cfg", None), "model_key", None) != model_key:
+                    continue
+                try:
+                    model = getattr(dc, "model", None)
+                    if model is not None:
+                        try:
+                            model.to("meta")     # release CUDA storage eagerly
+                        except Exception:  # noqa: BLE001
+                            pass
+                    dc.model = None
+                    dc.tokenizer = None
+                except Exception:  # noqa: BLE001
+                    pass
+                insts.pop(ck, None)
+                dropped = True
+    except Exception:  # noqa: BLE001
+        pass
+    # Free the CUDA caching allocator's blocks too — dropping python refs alone
+    # leaves the memory reserved by torch and still visible to nvidia-smi, which
+    # is what makes an "evicted" model look like it never left the card.
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:  # noqa: BLE001
+        pass
     _trim_host_ram()
     return dropped
 
