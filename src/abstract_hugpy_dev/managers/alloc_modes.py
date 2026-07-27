@@ -176,6 +176,63 @@ _GIB_F = float(1 << 30)
 # The two are asserted equal in tests so the mirror can never drift silently.
 MOE_ALL_LAYERS = 999
 
+# ── bitsandbytes "specialization" (operator, 2026-07-26) ────────────────────
+# A SEPARATE AXIS FROM THE MoE SPLIT, and the distinction matters:
+#   * the MoE split is PLACEMENT — the weights are untouched, we just decide
+#     which tensors sit on the card and which sit in RAM (coder-next is 45 GiB
+#     either way; only 1.49 GiB of it is non-expert);
+#   * bitsandbytes is COMPRESSION — it changes what the weights ARE, loading
+#     fp16 at nf4 so a 67 GiB model becomes ~17 GiB and genuinely fits a 24 GiB
+#     card. It needs no structural seam, so it applies to dense models too.
+# They compose (a transformers MoE could be both) and they live at different
+# layers: --n-cpu-moe is a llama.cpp flag, bitsandbytes is a transformers
+# load-time quantization_config.
+#
+# 4-bit nf4 + double quant ~= 1/4 of fp16, but the RESIDUAL is not free: the
+# quantization constants, the un-quantized layers (embeddings/norms/lm_head are
+# commonly skipped) and the compute buffers all stay. 0.30 is the honest
+# working figure rather than a flattering 0.25 — an OPTIMISTIC ratio here would
+# derive "fits the GPU" for a model that then OOMs at load, which is exactly the
+# failure defaults-are-promises forbids.
+BNB_4BIT_SIZE_RATIO = 0.30
+
+# Repos that are ALREADY quantized must never be offered bitsandbytes: loading a
+# pre-quantized checkpoint under a second quantization config fails, and the
+# size win is already banked. Matched on the key/hub id because that is what the
+# registry reliably carries for a not-yet-downloaded model.
+_PREQUANT_MARKERS = ("4bit", "8bit", "nvfp4", "fp4", "int4", "int8",
+                     "gptq", "awq", "-nf4", "bnb")
+
+
+def is_prequantized(model_key: Any) -> bool:
+    """True if the model name declares an existing quantization."""
+    k = str(model_key or "").lower()
+    return any(m in k for m in _PREQUANT_MARKERS)
+
+
+def bnb_eligible(engine: Any, model_key: Any, *, has_cuda: bool = True) -> bool:
+    """Can this (model, worker) take a bitsandbytes specialization?
+
+    Three gates, all necessary:
+      * NOT a GGUF — llama.cpp carries its own quantization; bitsandbytes is a
+        transformers/diffusers loader concept and has no meaning here;
+      * the worker HAS CUDA — bitsandbytes' 4-bit kernels are CUDA-only, so
+        offering the lever on a CPU-only box would be a promise that fails at
+        load (op has no GPU);
+      * NOT already quantized — see is_prequantized.
+    """
+    if is_gguf_engine(engine):
+        return False
+    if not has_cuda:
+        return False
+    return not is_prequantized(model_key)
+
+
+def bnb_effective_bytes(model_bytes: Any) -> "Optional[int]":
+    """The size the allocator should PRICE when bitsandbytes is enabled."""
+    n = _as_int(model_bytes)
+    return int(n * BNB_4BIT_SIZE_RATIO) if n else None
+
 
 def is_gguf_engine(engine: Any) -> bool:
     """True for the GGUF family (gguf / llama_cpp), case-insensitive. Anything
@@ -305,7 +362,9 @@ def feasible_default_mode(engine: Any,
                           model_bytes: "Optional[int]",
                           gpu_total_bytes: "Optional[int]",
                           ram_total_bytes: "Optional[int]",
-                          moe: "Optional[dict]" = None) -> str:
+                          moe: "Optional[dict]" = None,
+                          bnb: bool = False,
+                          moe_force: "Optional[bool]" = None) -> str:
     """The BLANK default alloc mode derived by FEASIBILITY for one (model x
     worker), engine-aware (operator ruling 2026-07-24). This ONLY supplies the
     default when NOTHING is persisted — an explicit alloc_mode always wins
@@ -370,7 +429,8 @@ def feasible_default_mode(engine: Any,
     # name-only view had no argument for its answer beyond "GGUFs spill" —
     # true, and exactly why the other side chose max-ram rather than ram-only.
     return default_allocation(engine, model_bytes, gpu_total_bytes,
-                              ram_total_bytes, moe=moe)["mode"]
+                              ram_total_bytes, moe=moe, bnb=bnb,
+                              moe_force=moe_force)["mode"]
 
 
 def default_allocation(engine: Any,
@@ -378,7 +438,9 @@ def default_allocation(engine: Any,
                        gpu_total_bytes: "Optional[int]",
                        ram_total_bytes: "Optional[int]",
                        *,
-                       moe: "Optional[dict]" = None) -> dict:
+                       moe: "Optional[dict]" = None,
+                       bnb: bool = False,
+                       moe_force: "Optional[bool]" = None) -> dict:
     """THE full operator decision tree (2026-07-25) for a model's INITIAL
     DEFAULT allocation, DERIVED from its own structure instead of a blanket
     stamp. Returns ``{"mode": <one of ALLOC_MODES>, "spill": {...}, "why": str}``
@@ -483,6 +545,16 @@ def default_allocation(engine: Any,
     gpu_total = _as_int(gpu_total_bytes)
     ram_total = _as_int(ram_total_bytes)
 
+    # BITSANDBYTES SPECIALIZATION (operator, 2026-07-26). The lever is a
+    # COMPRESSION choice, so it belongs here — at the PRICING step, before the
+    # placement tree walks. Re-pricing rather than adding a branch is what makes
+    # the two axes compose: a 4-bit model still goes through the SAME tree and
+    # can still take a MoE split if it has one. The visible effect is the point —
+    # a 67 GiB transformers model prices at ~20 GiB and flips ram-only ->
+    # max-gpu, i.e. it stops being banished to RAM for a size it no longer has.
+    if bool(bnb) and not is_gguf_engine(engine) and size:
+        size = bnb_effective_bytes(size) or size
+
     def _plain(mode: str, why: str) -> dict:
         return {"mode": mode, "spill": mode_to_spill(mode), "why": why}
 
@@ -586,6 +658,14 @@ def default_allocation(engine: Any,
 
     # ── GGUF ─────────────────────────────────────────────────────────────────
     detail = moe if isinstance(moe, dict) else None
+    # OPERATOR OVERRIDE (2026-07-26). moe_force=False means "never split this
+    # one" — the escape hatch when a derived split misbehaves; it drops to the
+    # dense tail so the model still SERVES, just without the expert placement.
+    # moe_force=True cannot manufacture a split for a file with no expert
+    # structure (there would be nothing to place), so it never fabricates one —
+    # the priced branch below still has to agree the numbers work.
+    if moe_force is False:
+        return _gpu_else_ram("gguf (operator forced the MoE split OFF)")
     if not (detail and detail.get("is_moe")):
         return _gpu_else_ram("dense gguf")
 

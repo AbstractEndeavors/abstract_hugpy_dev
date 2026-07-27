@@ -13,6 +13,139 @@ def get_model_home(models_home=None):
 
 
 
+# ---------------------------------------------------------------------------
+# CAPABILITY FLAGS on the marker (operator, 2026-07-26)
+#
+# "the 4-bit capable designation should be made a bool in the hugpy.json that
+# accompanies the models ... this as well should be the same for an moe capable
+# model."
+#
+# WHY THE MARKER AND NOT A HEURISTIC. Both facts were being INFERRED at read
+# time — bnb-eligibility from the model NAME (does it contain "4bit"/"awq"/…)
+# and MoE-ness by parsing GGUF headers on demand. Name-matching is a guess that
+# a differently-named repo defeats, and the header parse only works for GGUF on
+# a box that holds the file. The marker is the model's declared identity and is
+# already what discovery keys on, so a capability recorded here is durable,
+# survives re-discovery, needs no re-parse, and answers for models the local box
+# has never opened.
+#
+# BOTH ARE CAPABILITY, NOT PREFERENCE. `moe_capable` says the file HAS an expert
+# structure; it does not say a split is in use (that is the derived allocation).
+# `bnb_capable` says the weights COULD be loaded 4-bit; whether they are is the
+# operator's per-worker lever (bnb_by_model). Keeping capability on the model
+# and preference on the worker is what lets the same model be 4-bit on the 3090
+# and full precision elsewhere.
+#
+# NULL IS MEANINGFUL: absent/None = "never determined" (an older marker), which
+# readers must treat as unknown and fall back to their existing inference —
+# never as False. A stamped False is a real measured negative.
+# ---------------------------------------------------------------------------
+
+# Repos whose NAME declares an existing quantization: re-quantizing a
+# pre-quantized checkpoint fails, and the size win is already banked.
+_PREQUANT_NAME_MARKERS = ("4bit", "8bit", "nvfp4", "fp4", "int4", "int8",
+                          "gptq", "awq", "-nf4", "bnb")
+
+
+def detect_bnb_capable(directory, *, framework=None, hub_id=None, name=None):
+    """Can this model be loaded with bitsandbytes 4-bit?
+
+    Structural, in preference order:
+      * GGUF/comfy -> False. llama.cpp carries its own quantization and comfy
+        checkpoints are not transformers loads; bitsandbytes has no meaning.
+      * an existing quantization_config in config.json -> False (already
+        quantized; a second config fails at load).
+      * a name that declares a quantization -> False (the pre-download case,
+        where no config.json is on disk yet).
+      * otherwise a transformers/diffusers model -> True.
+    Returns None only when the framework is unknown — "not determined" rather
+    than a guess."""
+    fw = str(framework or "").strip().lower()
+    if fw in ("gguf", "llama_cpp", "comfy"):
+        return False
+    blob = f"{hub_id or ''} {name or ''}".lower()
+    if any(m in blob for m in _PREQUANT_NAME_MARKERS):
+        return False
+    cfg_path = os.path.join(directory or "", "config.json")
+    try:
+        if os.path.isfile(cfg_path):
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            if isinstance(cfg, dict):
+                if cfg.get("quantization_config"):
+                    return False
+                # A config.json proves it is a transformers-style load.
+                return True
+    except (OSError, json.JSONDecodeError, ValueError):
+        pass
+    if fw in ("transformers", "diffusers", "sentence_transformers"):
+        return True
+    return None
+
+
+def detect_moe_capable(directory, *, framework=None):
+    """Does this model have an EXPERT structure (MoE)?
+
+    GGUF: asks the real reader (managers.spill.gguf_moe_detail), which gates on
+    the header's expert_count and confirms by tensor name OR shape — the same
+    ground truth the allocator prices a split from, so the marker can never
+    disagree with the split it enables.
+    transformers: reads config.json for the standard expert keys
+    (num_experts / num_local_experts / n_routed_experts / moe_layer_freq).
+    Returns None when nothing could be read — unknown, never a guessed False."""
+    fw = str(framework or "").strip().lower()
+    if fw in ("gguf", "llama_cpp"):
+        try:
+            # ABSOLUTE import: this module sits at
+            # abstract_hugpy_dev/imports/src/constants/, so the relative depth to
+            # managers/ is easy to get wrong — and a wrong one is silently
+            # swallowed by the except, leaving every GGUF marker unstamped
+            # (moe_capable absent) with no error anywhere. Absolute is
+            # unambiguous and fails loudly if the package ever moves.
+            from abstract_hugpy_dev.managers.spill import gguf_moe_detail
+        except Exception:  # noqa: BLE001
+            gguf_moe_detail = None
+        if gguf_moe_detail is not None:
+            # Quants live in a PER-VARIANT SUBDIR (…/Coder-Next-GGUF/
+            # Qwen3-Coder-Next-Q4_K_M/*.gguf), so a top-level listdir finds
+            # nothing — walk one level down. Shard-aware by construction: the
+            # reader sums split files itself, so the FIRST .gguf answers for the
+            # whole set and we stop there rather than parsing every shard.
+            try:
+                for root, _dirs, files in os.walk(directory or ""):
+                    for fn in sorted(files):
+                        if fn.lower().endswith(".gguf"):
+                            d = gguf_moe_detail(os.path.join(root, fn))
+                            return bool(d and d.get("is_moe"))
+            except OSError:
+                return None
+        return None
+    cfg_path = os.path.join(directory or "", "config.json")
+    try:
+        if not os.path.isfile(cfg_path):
+            return None
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(cfg, dict):
+        return None
+    blobs = [cfg]
+    for k in ("text_config", "llm_config", "language_config"):
+        sub = cfg.get(k)
+        if isinstance(sub, dict):
+            blobs.append(sub)
+    for b in blobs:
+        for k in ("num_experts", "num_local_experts", "n_routed_experts",
+                  "num_experts_per_tok", "moe_layer_freq", "n_expert"):
+            v = b.get(k)
+            if isinstance(v, (int, float)) and v and int(v) > 1:
+                return True
+            if isinstance(v, list) and any(v):
+                return True
+    return False
+
+
 def write_hugpy_marker(directory, *, hub_id, name=None, framework=None,
                        tasks=None, primary_task=None, filename=None,
                        include=None, source="download", **extra):
@@ -32,6 +165,25 @@ def write_hugpy_marker(directory, *, hub_id, name=None, framework=None,
         "stamped_at": datetime.now(timezone.utc).isoformat(),
         **extra,
     }
+    # CAPABILITY FLAGS (operator, 2026-07-26) — stamped at write time so the
+    # facts are durable rather than re-inferred from the model's NAME (bnb) or a
+    # GGUF header re-parse (moe) on every read. An explicit value passed by the
+    # caller via **extra always wins; these only fill what wasn't supplied, and a
+    # detector that cannot tell leaves the key ABSENT (unknown), never False.
+    for field, detect in (("bnb_capable",
+                           lambda: detect_bnb_capable(
+                               directory, framework=framework,
+                               hub_id=hub_id, name=payload.get("name"))),
+                          ("moe_capable",
+                           lambda: detect_moe_capable(
+                               directory, framework=framework))):
+        if payload.get(field) is None:
+            try:
+                val = detect()
+            except Exception:  # noqa: BLE001 — a probe must never block the stamp
+                val = None
+            if val is not None:
+                payload[field] = bool(val)
     os.makedirs(directory, exist_ok=True)
     path = os.path.join(directory, HUGPY_MARKER)
     safe_dump_to_json(file_path=path,data=payload, indent=2)

@@ -1334,6 +1334,48 @@ def _gib(n: float) -> str:
     return f"{n:.2f}GiB"
 
 
+def bnb_4bit_env() -> bool:
+    """Is the operator's bitsandbytes 4-bit lever ON for the model being loaded?
+
+    Rides the same spill wire as n_cpu_moe (HUGPY_BNB_4BIT, set per-load by the
+    agent's _apply_spill and cleared when absent). Central decides; this is the
+    worker-side read."""
+    return str(os.environ.get("HUGPY_BNB_4BIT", "")).strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def transformers_quantization_config():
+    """``BitsAndBytesConfig`` for a 4-bit load, or None when the lever is off /
+    bitsandbytes is unavailable.
+
+    nf4 + double-quant + fp16 compute — the same recipe generate/coder.py has
+    used since before this lever existed, so a model quantized through the
+    console loads identically to one quantized by the coder path.
+
+    Returns None (never raises) when bitsandbytes is missing: the caller then
+    loads full precision, which is the pre-lever behaviour. A worker without
+    the package must degrade honestly rather than fail the load — central's
+    eligibility gate already refuses CPU-only boxes, so this is the belt to
+    that braces."""
+    if not bnb_4bit_env():
+        return None
+    try:
+        import bitsandbytes  # noqa: F401 — availability probe
+        from ..imports.src.module_imports import get_transformers
+        BitsAndBytesConfig = get_transformers("BitsAndBytesConfig")
+        import torch
+        return BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+        )
+    except Exception as exc:  # noqa: BLE001 — never break a load over the lever
+        logger.warning("4-bit requested but bitsandbytes is unusable (%s) — "
+                       "loading full precision", exc)
+        return None
+
+
 def transformers_max_memory(model_need_bytes: Optional[int] = None) -> Optional[dict]:
     """Build a ``max_memory`` map for device_map='auto', or None to skip.
 

@@ -757,6 +757,11 @@ _SPILL_ENV = {
     # and to llama-server as --n-cpu-moe. Cleared when absent — a leaked split
     # would silently displace the next model's experts.
     "n_cpu_moe": "HUGPY_N_CPU_MOE",
+    # bitsandbytes 4-bit (operator lever, 2026-07-26). Rides the SAME spill
+    # wire as n_cpu_moe so central's per-model decision reaches the loader by
+    # the channel that already exists. Cleared-when-absent (below) so a lever
+    # switched off cannot leak onto the next model loaded in this process.
+    "bnb_4bit": "HUGPY_BNB_4BIT",
     "gpu_mem_gib": "HUGPY_GPU_MEM_GIB",
     "cpu_mem_gib": "HUGPY_CPU_MEM_GIB",
     # Explicit per-model core budget (slot loads pass it to the child;
@@ -783,7 +788,7 @@ _SPILL_ENV = {
 # next model's placement (a dead-wrong knob), unlike the layer/budget knobs
 # whose stickiness is long-standing behavior we don't change here.
 _SPILL_ENV_CLEAR_WHEN_ABSENT = ("alloc_mode", "leniency_pct", "priority_device",
-                                "n_cpu_moe")
+                                "n_cpu_moe", "bnb_4bit")
 
 
 # ── operator resource limits (two-tier) ─────────────────────────────────────
@@ -7237,6 +7242,19 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
     if not need:
         return {"action": "proceed", "evicted": [], "freed_bytes": 0,
                 "reason": None, "note": "unknown weight size — fail open"}
+    # 4-BIT RE-PRICE (operator lever, 2026-07-26). The need detail is computed
+    # from the model's fp16 FILE SIZE, so with the lever on, admission was
+    # refusing a load that would actually have fit: the console projected
+    # "13.1 GiB VRAM planned" while this check demanded 50.2 GB and returned
+    # LoadRefusal. Price what will ACTUALLY be loaded, using the same ratio
+    # central derived the projection from, so the two agree by construction.
+    try:
+        from ..managers.spill import bnb_4bit_env
+        if bnb_4bit_env():
+            from ..managers.alloc_modes import BNB_4BIT_SIZE_RATIO
+            need = int(need * BNB_4BIT_SIZE_RATIO)
+    except Exception:  # noqa: BLE001 — never break admission over the lever
+        pass
     ceiling_reserve = int(total * (1.0 - _vram_ceiling_frac()))
 
     # ── MoE re-target: typed bytes over the opaque byte-bag ─────────────────

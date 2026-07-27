@@ -953,6 +953,127 @@ def worker_wildcard_list():
     return jsonify(worker_wildcard_state())
 
 
+@worker_bp.route("/llm/workers/<worker_id>/moe", methods=["POST"])
+def set_worker_moe_route(worker_id):
+    """Set the MoE-split override for one model (or all) on this worker.
+
+    Body: ``{"model_key": "<key>", "value": true|false|null}`` — true forces the
+    split on, false forces it off, null restores AUTO (follow the derivation).
+    Bulk form ``{"all": true, "value": …}`` sweeps every MoE-CAPABLE model,
+    resolved server-side so the result never depends on a stale client payload.
+
+    AUTO IS THE DEFAULT AND STAYS VISIBLE (operator 2026-07-26: "defaults can
+    remain auto and should, but that also should entail a checked box under the
+    correct column, that could be switched by the user"). An auto model whose
+    derivation produced a split renders TICKED — the console reads
+    ``moe_effective``, not the override map — so the operator always sees what is
+    actually happening and can flip it without first having to discover that
+    "unset" meant "on".
+
+    Refuses a model with no expert structure: forcing a split on a dense file
+    would place tensors that do not exist."""
+    body = request.get_json(silent=True) or {}
+    from ..functions.imports.utils.workers import (
+        list_workers, moe_capable, set_moe)
+    worker = next((w for w in (list_workers() or [])
+                   if w.get("id") == worker_id), None)
+    if worker is None:
+        return jsonify({"ok": False, "error": {
+            "code": "NotFound", "message": f"no worker {worker_id!r}"}}), 404
+    raw = body.get("value", body.get("enabled"))
+    value = None if raw is None else bool(raw)
+    if body.get("all"):
+        keys = [mk for mk in (worker.get("models") or []) if moe_capable(mk)]
+        updated = None
+        for mk in keys:
+            updated = set_moe(worker_id, mk, value) or updated
+        return jsonify({"ok": True, "worker": updated, "count": len(keys),
+                        "value": value})
+    model_key = body.get("model_key")
+    if not model_key or not isinstance(model_key, str):
+        return jsonify({"ok": False, "error": {
+            "code": "BadValue", "message": "model_key is required"}}), 400
+    if value and not moe_capable(model_key):
+        return jsonify({"ok": False, "error": {
+            "code": "NotEligible",
+            "message": (f"{model_key!r} has no expert structure — there is "
+                        "nothing to split")}}), 409
+    updated = set_moe(worker_id, model_key, value)
+    if updated is None:
+        return jsonify({"ok": False, "error": {
+            "code": "NotFound", "message": f"no worker {worker_id!r}"}}), 404
+    return jsonify({"ok": True, "worker": updated, "model_key": model_key,
+                    "value": value})
+
+
+@worker_bp.route("/llm/workers/<worker_id>/bnb", methods=["POST"])
+def set_worker_bnb_route(worker_id):
+    """Toggle the bitsandbytes SPECIALIZATION for one model on this worker.
+
+    Body: ``{"model_key": "<key>", "enabled": true|false}`` (enabled defaults
+    true). Persisted per (worker, model) in its own ``bnb_by_model`` map.
+
+    WHY THIS IS NOT A SPILL. A spill is a PLACEMENT contract — where the tensors
+    go. bitsandbytes is COMPRESSION — what the tensors ARE (fp16 loaded at nf4,
+    ~30% of the original footprint once quant constants and the un-quantized
+    layers are counted). Keeping them in separate maps means "↺ Auto — derived"
+    can clear a placement without silently dropping the quantization, and means
+    enabling the quantization RE-PRICES the model so the derivation can then
+    pick a better placement for it: a 67 GiB transformers model that derived
+    ram-only (cannot fit a 24 GiB card) prices at ~20 GiB and derives max-gpu.
+
+    Refuses when the lever does not apply, rather than storing a flag that can
+    never take effect: GGUF (llama.cpp carries its own quantization),
+    CPU-only workers (the 4-bit kernels are CUDA-only), and already-quantized
+    repos (loading a pre-quantized checkpoint under a second quantization config
+    fails). Operator-gated like the other registry writes."""
+    body = request.get_json(silent=True) or {}
+    from ..functions.imports.utils.workers import (
+        bnb_available, list_workers, set_bnb)
+    # BULK form: {"all": true, "enabled": bool}. Server-side so the sweep is ONE
+    # atomic decision over the CURRENT eligible set — the client cannot know it
+    # reliably (its worker payload lags a just-applied bulk, which left rows
+    # enabled while the UI showed none ticked). Clearing sweeps the same set, so
+    # "clear" is idempotent no matter what the client believed was on.
+    if body.get("all"):
+        enabled_all = bool(body.get("enabled", True))
+        worker = next((w for w in (list_workers() or [])
+                       if w.get("id") == worker_id), None)
+        if worker is None:
+            return jsonify({"ok": False, "error": {
+                "code": "NotFound", "message": f"no worker {worker_id!r}"}}), 404
+        keys = [mk for mk in (worker.get("models") or [])
+                if bnb_available(worker, mk)]
+        updated = None
+        for mk in keys:
+            updated = set_bnb(worker_id, mk, enabled_all) or updated
+        return jsonify({"ok": True, "worker": updated, "count": len(keys),
+                        "enabled": enabled_all})
+    model_key = body.get("model_key")
+    if not model_key or not isinstance(model_key, str):
+        return jsonify({"ok": False, "error": {
+            "code": "BadValue", "message": "model_key is required"}}), 400
+    enabled = bool(body.get("enabled", True))
+    worker = next((w for w in (list_workers() or [])
+                   if w.get("id") == worker_id), None)
+    if worker is None:
+        return jsonify({"ok": False, "error": {
+            "code": "NotFound", "message": f"no worker {worker_id!r}"}}), 404
+    if enabled and not bnb_available(worker, model_key):
+        return jsonify({"ok": False, "error": {
+            "code": "NotEligible",
+            "message": (f"{model_key!r} cannot take a bitsandbytes "
+                        "specialization on this worker (GGUF models carry their "
+                        "own quantization, the 4-bit kernels need CUDA, and an "
+                        "already-quantized repo cannot be re-quantized)")}}), 409
+    updated = set_bnb(worker_id, model_key, enabled)
+    if updated is None:
+        return jsonify({"ok": False, "error": {
+            "code": "NotFound", "message": f"no worker {worker_id!r}"}}), 404
+    return jsonify({"ok": True, "worker": updated, "model_key": model_key,
+                    "enabled": enabled})
+
+
 @worker_bp.route("/llm/workers/<worker_id>/wildcard", methods=["POST"])
 def set_worker_wildcard_route(worker_id):
     """Set (or clear) this worker's WILDCARD ("take all comers") routing opt-in.

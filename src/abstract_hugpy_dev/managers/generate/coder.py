@@ -118,7 +118,18 @@ class DeepCoder:
         if self.cfg.use_flash_attention:
             kwargs["attn_implementation"] = "flash_attention_2"
 
-        if self.cfg.use_quantization:
+        # 4-bit: the OPERATOR's per-model lever (console "4-bit" column, ridden
+        # in on the spill wire as HUGPY_BNB_4BIT) OR this runner's own
+        # use_quantization config. Either turns it on; the env lever is what
+        # makes the console switch actually reach the loader.
+        #
+        # THE BUG THIS CLOSES: the lever only ever re-priced central's
+        # DERIVATION, so the console showed "13.1 GiB VRAM planned" while the
+        # worker loaded fp16 and refused with "needs 50.2 GB". The projection was
+        # right about what 4-bit WOULD cost; nothing had told the loader to
+        # actually do it.
+        from ..spill import bnb_4bit_env
+        if self.cfg.use_quantization or bnb_4bit_env():
             BitsAndBytesConfig = get_transformers("BitsAndBytesConfig")
             kwargs["quantization_config"] = BitsAndBytesConfig(
                 load_in_4bit=True,
@@ -126,6 +137,12 @@ class DeepCoder:
                 bnb_4bit_use_double_quant=True,
                 bnb_4bit_quant_type="nf4",
             )
+            # A 4-bit model must NOT also be handed an fp16-sized max_memory
+            # budget: accelerate would shard against a footprint ~3x larger than
+            # the load actually needs and spill layers to CPU for no reason.
+            kwargs.pop("max_memory", None)
+            logger.info("loading %s in 4-bit (nf4, double-quant)",
+                        getattr(self.cfg, "model_dir", "model"))
 
         # model_dir is the BASE model in both cases. adapter_dir, when set,
         # is a LoRA delta loaded on top of it. Same kwargs feed both loads.

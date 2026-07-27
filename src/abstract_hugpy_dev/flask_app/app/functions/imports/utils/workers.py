@@ -505,6 +505,28 @@ def _public_view(worker: Dict[str, Any]) -> Dict[str, Any]:
         # max-gpu: absent degrades to the blank max-gpu default at the reader,
         # which is the same answer without asserting a preference nobody chose.
         "model_alloc_modes": _model_alloc_modes(worker),
+        # BITSANDBYTES SPECIALIZATION (operator, 2026-07-26) — two separate
+        # maps because "can this take it" and "is it switched on" are different
+        # questions and the console needs both: availability decides whether the
+        # cell renders a lever at all, enablement decides whether it is ticked.
+        # A model absent from bnb_available simply has no lever (gguf, a
+        # CPU-only worker, an already-quantized repo).
+        "bnb_by_model": dict(worker.get("bnb_by_model") or {}),
+        "bnb_available": {mk: True for mk in (worker.get("models") or [])
+                          if bnb_available(worker, mk)},
+        # MoE: capability (can it split at all), the operator override, and the
+        # EFFECTIVE state the checkbox renders — auto shows as ticked when the
+        # derivation produced a split, so the real behaviour is never hidden.
+        "moe_capable": {mk: True for mk in (worker.get("models") or [])
+                        if moe_capable(mk)},
+        "moe_by_model": dict(worker.get("moe_by_model") or {}),
+        "moe_effective": {mk: True for mk in (worker.get("models") or [])
+                          if moe_effective(worker, mk)},
+        # The INTENDED vram/ram division per model — what the Memory column
+        # shows for a model that is not resident yet, so it stops echoing the
+        # Size column and starts answering "where will this actually go".
+        "planned_split": {mk: planned_split(worker, mk)
+                          for mk in (worker.get("models") or [])},
     }
 
 
@@ -534,6 +556,29 @@ def _model_alloc_modes(worker: Dict[str, Any]) -> Dict[str, str]:
             out[str(mk)] = derive_alloc_mode(spill)
         except Exception:  # noqa: BLE001
             continue
+    # DERIVED DEFAULTS FOR THE REST (2026-07-26). Persisted rows are the
+    # MINORITY: on ae only 2 of 64 assigned models carry a contract, and the
+    # other 62 track the derivation. Emitting only the persisted ones left the
+    # console with nothing to show for those 62, so its deriveAllocMode() fell
+    # through to its hardcoded 'max-gpu' — displaying "⚡ Max GPU · auto" for a
+    # 67 GiB transformers model whose real derived default is ram-only (it
+    # cannot fit a 24 GiB card, and max-gpu on transformers has no spill to
+    # fall back on). The operator's decision tree was already correct and
+    # already shipped; its ANSWER just never reached the UI.
+    #
+    # A persisted contract always wins, so this only fills the blanks
+    # (setdefault). Read-time and pure like the rest of _public_view; per-key
+    # failures are skipped rather than raised, and a key that resolves to
+    # nothing is simply omitted (the console then keeps its own fallback).
+    for mk in (worker.get("models") or []):
+        if str(mk) in out:
+            continue
+        try:
+            mode = derived_default_mode(worker, str(mk))
+        except Exception:  # noqa: BLE001 — never break a worker read
+            continue
+        if mode:
+            out[str(mk)] = mode
     return out
 
 
@@ -1109,6 +1154,177 @@ def _worker_ram_total_bytes(worker: Dict[str, Any]) -> Optional[int]:
     return None
 
 
+def _model_marker_flag(model_key: str, field: str) -> Optional[bool]:
+    """Read a capability bool straight off the model's hugpy.json marker.
+
+    Returns None when the model, its directory or the field cannot be resolved —
+    "never determined", which every caller must treat as unknown and fall back
+    on, never as False. Cheap: read_hugpy_marker is a single small JSON read and
+    this is only consulted on per-model surfaces, not per request."""
+    try:
+        from ......imports.src.constants.hugpy_marker import read_hugpy_marker
+        from ......imports.config.main import get_model_config, get_model_path
+        cfg = get_model_config(model_key)
+        d = None
+        try:
+            d = get_model_path(model_key)
+        except Exception:  # noqa: BLE001
+            d = None
+        d = d or getattr(cfg, "dir", None) or getattr(cfg, "directory", None)
+        if not d:
+            return None
+        marker = read_hugpy_marker(d) or {}
+        val = marker.get(field)
+        return None if val is None else bool(val)
+    except Exception:  # noqa: BLE001 — a marker read must never break a view
+        return None
+
+
+def planned_split(worker: Dict[str, Any], model_key: str) -> Dict[str, Any]:
+    """The INTENDED VRAM/RAM division for this (worker, model) — what the current
+    allocation, 4-bit lever and MoE lever ADD UP TO before anything is loaded.
+
+    Operator, 2026-07-26: the Memory column "was meant to display the split or
+    overall resource allocation, i.e. vram and ram; this in implementation should
+    change with the selected switches being switched and/or the alloc being
+    changed." Measured residency only exists once a model is resident, so an
+    idle row fell back to the on-disk size — the same number the Size column
+    already shows, which is the redundancy.
+
+    Returns ``{"gpu_bytes", "ram_bytes", "size_bytes", "mode", "why"}``. Derived
+    from the SAME allocation the worker will actually receive, so the projection
+    cannot drift from the placement it describes:
+      * explicit (the MoE split) — the two budgets it already carries;
+      * ram-only  — everything in RAM;
+      * gpu-only  — everything in VRAM;
+      * max-gpu / max-ram — a spill, so the division is decided at load time
+        against whatever is free; reported as the whole size on the PREFERRED
+        side with split=False, never a fabricated ratio.
+    size_bytes reflects the 4-bit lever, so ticking it visibly shrinks the row."""
+    out = {"gpu_bytes": None, "ram_bytes": None, "size_bytes": None,
+           "mode": None, "split": False}
+    try:
+        from ......managers.alloc_modes import bnb_effective_bytes
+        size = _model_size_bytes(model_key)
+        if size and bnb_enabled(worker, model_key):
+            size = bnb_effective_bytes(size) or size
+        out["size_bytes"] = size
+        d = derived_default_allocation(worker, model_key) or {}
+        mode = d.get("mode")
+        out["mode"] = mode
+        spill = d.get("spill") or {}
+        gib = float(2 ** 30)
+        g, c = spill.get("gpu_mem_gib"), spill.get("cpu_mem_gib")
+        if g is not None or c is not None:
+            # The MoE leaf: both sides are priced, so this is a REAL split.
+            out["gpu_bytes"] = int(float(g) * gib) if g is not None else 0
+            out["ram_bytes"] = int(float(c) * gib) if c is not None else 0
+            out["split"] = True
+        elif mode == "ram-only":
+            out["ram_bytes"] = size
+        elif mode == "gpu-only":
+            out["gpu_bytes"] = size
+        elif mode == "max-gpu":
+            out["gpu_bytes"] = size      # preferred side; spills what won't fit
+        elif mode == "max-ram":
+            out["ram_bytes"] = size
+    except Exception:  # noqa: BLE001 — a projection must never break a read
+        pass
+    return out
+
+
+def moe_capable(model_key: str) -> bool:
+    """Does this model HAVE an expert structure? (the marker's moe_capable)
+
+    Reads the durable hugpy.json bool first — it answers for models this box has
+    never opened, and for transformers MoE, which the GGUF header reader cannot
+    see at all. Falls back to the live header parse when the marker predates the
+    flag, so an unstamped model is never wrongly called dense."""
+    flag = _model_marker_flag(model_key, "moe_capable")
+    if flag is not None:
+        return bool(flag)
+    d = _model_moe_detail(model_key) or {}
+    return bool(d.get("is_moe"))
+
+
+def moe_override(worker: Dict[str, Any], model_key: str) -> Optional[bool]:
+    """The operator's MoE-split override for this (worker, model), or None.
+
+    THREE STATES, and the third is the default (operator, 2026-07-26: "defaults
+    can remain auto and should, but that also should entail a checked box under
+    the correct column, that could be switched by the user"):
+      * None  — AUTO: follow the derivation. The console still shows the box
+        TICKED when the derivation produced a split, so the effective state is
+        always visible rather than hidden behind "unset".
+      * True  — force the split on.
+      * False — force it off (the escape hatch when a split misbehaves).
+    Absent/garbage reads as None, i.e. auto — a malformed row can never pin a
+    placement the operator did not choose."""
+    try:
+        v = (worker.get("moe_by_model") or {}).get(str(model_key))
+        return None if v is None else bool(v)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def moe_effective(worker: Dict[str, Any], model_key: str) -> bool:
+    """Whether a split IS in force for this (worker, model) — what the checkbox
+    renders. The override when the operator set one, else what the derivation
+    actually produced (n_cpu_moe present in the derived spill)."""
+    ov = moe_override(worker, model_key)
+    if ov is not None:
+        return ov
+    try:
+        spill = (derived_default_allocation(worker, model_key) or {}).get("spill") or {}
+        return spill.get("n_cpu_moe") is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def bnb_enabled(worker: Dict[str, Any], model_key: str) -> bool:
+    """Is the bitsandbytes SPECIALIZATION switched on for this (worker, model)?
+
+    Operator lever (2026-07-26), persisted per worker as
+    ``worker["bnb_by_model"][model_key] = true``. Deliberately NOT part of
+    spill_by_model: a spill is a PLACEMENT contract, this is a COMPRESSION
+    choice, and conflating them would make "revert to the derived placement"
+    silently drop the quantization too. Absent/garbage reads as OFF — the lever
+    is an explicit opt-in, never something a malformed row can switch on."""
+    try:
+        return bool((worker.get("bnb_by_model") or {}).get(str(model_key)))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def bnb_available(worker: Dict[str, Any], model_key: str) -> bool:
+    """Whether the lever should be OFFERED for this (worker, model).
+
+    Gates on engine (never GGUF — llama.cpp carries its own quantization), the
+    worker actually having CUDA (bitsandbytes' 4-bit kernels are CUDA-only, so
+    offering it on op would be a promise that fails at load), and the repo not
+    already being quantized."""
+    try:
+        from ......managers.alloc_modes import bnb_eligible
+        has_cuda = bool((worker.get("gpus") or [])
+                        or _worker_gpu_total_bytes(worker))
+        if not has_cuda:
+            return False          # CUDA-only kernels; nothing else can override
+        # THE MARKER IS AUTHORITATIVE when it has been stamped (operator
+        # 2026-07-26): hugpy.json records `bnb_capable` as a structural fact
+        # (framework + an existing quantization_config), which beats
+        # bnb_eligible's fallback name-matching — a repo whose name happens not
+        # to say "awq"/"4bit" is still correctly excluded, and one that merely
+        # LOOKS quantized is not wrongly excluded. Absent/None means "never
+        # determined" (older markers) and falls through to the heuristic.
+        flag = _model_marker_flag(model_key, "bnb_capable")
+        if flag is not None:
+            return bool(flag)
+        return bnb_eligible(_model_engine(model_key), model_key,
+                            has_cuda=has_cuda)
+    except Exception:  # noqa: BLE001 — never break a read over a capability probe
+        return False
+
+
 def derived_default_mode(worker: Dict[str, Any], model_key: str) -> str:
     """The FEASIBLE blank default alloc mode for one (worker, model) — engine +
     box-totals aware (operator ruling 2026-07-24). Pure glue over the stdlib
@@ -1124,7 +1340,9 @@ def derived_default_mode(worker: Dict[str, Any], model_key: str) -> str:
             _model_size_bytes(model_key),
             _worker_gpu_total_bytes(worker),
             _worker_ram_total_bytes(worker),
-            moe=_model_moe_detail(model_key))
+            moe=_model_moe_detail(model_key),
+            bnb=bnb_enabled(worker, model_key),
+            moe_force=moe_override(worker, model_key))
     except Exception:  # noqa: BLE001 — a derivation must never break a read/relay
         return "max-gpu"
 
@@ -1149,7 +1367,9 @@ def derived_default_allocation(worker: Dict[str, Any],
             _model_size_bytes(model_key),
             _worker_gpu_total_bytes(worker),
             _worker_ram_total_bytes(worker),
-            moe=_model_moe_detail(model_key))
+            moe=_model_moe_detail(model_key),
+            bnb=bnb_enabled(worker, model_key),
+            moe_force=moe_override(worker, model_key))
     except Exception:  # noqa: BLE001 — a derivation must never break a read/relay
         return {"mode": "max-gpu", "spill": {},
                 "why": "derivation unavailable — kept the max-gpu default"}
@@ -2400,6 +2620,47 @@ class WorkerStore:
             _remember_assignments(worker)   # 4b: designations survive row loss
             return _public_view(worker)
 
+    def set_moe(self, worker_id: str, model_key: str,
+                value: Optional[bool]) -> Optional[Dict[str, Any]]:
+        """Set the MoE-split override: True (force on), False (force off), or
+        None (AUTO — follow the derivation, the default).
+
+        None REMOVES the key rather than storing null, so the map holds only real
+        operator decisions and an absent entry unambiguously means auto."""
+        with self._transaction() as workers:
+            worker = workers.get(worker_id)
+            if worker is None:
+                return None
+            by_model = worker.setdefault("moe_by_model", {})
+            if value is None:
+                by_model.pop(str(model_key), None)
+            else:
+                by_model[str(model_key)] = bool(value)
+            return _public_view(worker)
+
+    def set_bnb(self, worker_id: str, model_key: str,
+                enabled: bool) -> Optional[Dict[str, Any]]:
+        """Switch the bitsandbytes SPECIALIZATION on/off for one (worker, model).
+
+        Stored in its OWN map, never inside spill_by_model: a spill is a
+        PLACEMENT contract and this is a COMPRESSION choice. Keeping them apart
+        is what lets "↺ Auto — derived" clear a placement without silently
+        dropping the quantization, and lets the quantization re-price the model
+        so the derivation can then choose a BETTER placement for it.
+
+        OFF removes the key rather than storing false, so the map only ever
+        holds real opt-ins and an absent entry unambiguously means off."""
+        with self._transaction() as workers:
+            worker = workers.get(worker_id)
+            if worker is None:
+                return None
+            by_model = worker.setdefault("bnb_by_model", {})
+            if enabled:
+                by_model[str(model_key)] = True
+            else:
+                by_model.pop(str(model_key), None)
+            return _public_view(worker)
+
     def unassign_model(self, worker_id: str, model_key: str) -> Optional[Dict[str, Any]]:
         with self._transaction() as workers:
             worker = workers.get(worker_id)
@@ -2501,10 +2762,22 @@ class WorkerStore:
             except Exception:  # noqa: BLE001 — never break the relay over a derive
                 mode, out = "max-gpu", {}
             if mode == "max-gpu" or not out:
-                return {}                        # max-gpu: today's blank ({})
+                # Blank max-gpu — but the 4-bit lever must still ride, or a
+                # max-gpu model (the commonest case!) silently loads fp16. This
+                # is the MN-GRAND report: console showed 13.1 GiB planned, the
+                # worker asked for 50.2 GB and refused.
+                return {"bnb_4bit": True} if bnb_enabled(worker, model_key) else {}
             logger.info("blank default for %s on %s derived to %s (%s)",
                         model_key, worker.get("name") or worker_id, mode,
                         derived.get("why") or "structure-derived")
+            # The 4-bit lever rides the wire whenever it is ON, regardless of
+            # which allocation mode was derived: it is a COMPRESSION choice, so
+            # it applies to a max-gpu model exactly as much as a ram-only one.
+            # Without this the worker loaded fp16 and refused ("needs 50.2 GB")
+            # while the console showed the 4-bit projection — the lever changed
+            # central's arithmetic but never reached the loader.
+            if bnb_enabled(worker, model_key):
+                out["bnb_4bit"] = True
             if not (set(out) & _NEW_SPILL_KEYS_LOCAL):
                 return out                       # legacy wire: no gate needed
             try:
@@ -2529,6 +2802,10 @@ class WorkerStore:
         # entirely fictional note). See _WIRE_INERT_MODES for why sending it
         # would actively regress the MoE auto-split.
         spill = _strip_wire_inert_mode(spill)
+        # An operator-pinned placement does not cancel the compression lever —
+        # the two are independent axes (see bnb_enabled's docstring).
+        if bnb_enabled(worker, model_key):
+            spill["bnb_4bit"] = True
         try:
             from ......managers.alloc_modes import gate_spill_for_worker
             gated, note = gate_spill_for_worker(
@@ -3061,6 +3338,14 @@ def enroll_required() -> bool:
 def assign_model(worker_id: str, model_key: str,
                  spill: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     return worker_store.assign_model(worker_id, model_key, spill=spill)
+
+
+def set_moe(worker_id: str, model_key: str, value) -> Optional[Dict[str, Any]]:
+    return worker_store.set_moe(worker_id, model_key, value)
+
+
+def set_bnb(worker_id: str, model_key: str, enabled: bool) -> Optional[Dict[str, Any]]:
+    return worker_store.set_bnb(worker_id, model_key, enabled)
 
 
 def unassign_model(worker_id: str, model_key: str) -> Optional[Dict[str, Any]]:
