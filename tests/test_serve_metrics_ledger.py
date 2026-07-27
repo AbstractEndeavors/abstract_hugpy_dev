@@ -364,8 +364,7 @@ class TestNothingChangesAnEvictionDecision:
     def test_plan_is_byte_identical_with_and_without_the_new_columns(self):
         residents = self._residents()
         need = 5 << 30
-        before = EV.evict_plan(EV.VRAM, need, residents, now=2000.0,
-                               min_residency_s=0.0).as_dict()
+        before = EV.evict_plan(EV.VRAM, need, residents, now=2000.0).as_dict()
 
         # The new columns exist on the LEDGER, not on Resident — so the honest
         # form of "with the fields present" is: stamp a full ledger, build
@@ -393,8 +392,7 @@ class TestNothingChangesAnEvictionDecision:
                         resident_since=r.resident_since)
             for r in residents
         ]
-        after = EV.evict_plan(EV.VRAM, need, rebuilt, now=2000.0,
-                              min_residency_s=0.0).as_dict()
+        after = EV.evict_plan(EV.VRAM, need, rebuilt, now=2000.0).as_dict()
 
         assert after == before
         assert after["victims"] == before["victims"]
@@ -404,8 +402,7 @@ class TestNothingChangesAnEvictionDecision:
         recorded — but it must not move either one in the order. Only the
         pre-existing keys (pref / idle / calls / key) may rank."""
         residents = self._residents()
-        plan = EV.evict_plan(EV.VRAM, 5 << 30, residents, now=2000.0,
-                             min_residency_s=0.0)
+        plan = EV.evict_plan(EV.VRAM, 5 << 30, residents, now=2000.0)
         keys = [EV.sort_key(r, EV.VRAM, 2000.0) for r in residents]
         # 'b' prefers RAM, so key ① puts it first regardless of its slow rate.
         assert keys[1][0] == 0

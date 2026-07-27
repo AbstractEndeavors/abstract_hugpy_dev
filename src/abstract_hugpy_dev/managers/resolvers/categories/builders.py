@@ -89,6 +89,37 @@ def _build_vision_chat_request(kwargs: Dict[str, Any], model_key: str) -> ChatRe
     return _build_chat_request(kw, model_key).model_copy(update={"file": file})
 
 
+def _build_vl_text_or_vision_request(kwargs: Dict[str, Any], model_key: str):
+    """transformers VL: an IMAGELESS turn is a chat turn, not an error.
+
+    A VL model is text-capable too — its tasks[] carries text-generation
+    alongside image-text-to-text — and capability is the FULL list, never the
+    primary label. Routing every request for it to the strict vision builder
+    made a plain chat call fail with:
+
+        ValueError: vision request needs 'image_path', 'file', or 'image_b64';
+        got keys: ['max_chunks','max_new_tokens','messages','model_key',
+                   'request_id']
+
+    i.e. a chat request (it has `messages`) rejected for not being an image
+    request. Observed on Surogate-3.5-2B during a whole-fleet probe, where it
+    fails EVERY text prompt.
+
+    The GGUF half of this table already did the right thing —
+    _build_vision_chat_request falls back to chat when there is no image,
+    documented there as "so a VL model still answers text turns". The two
+    engines disagreed: the identical request succeeded on a GGUF VL model and
+    500'd on a transformers one. This closes that gap on the transformers side
+    while keeping its distinct shape — WITH an image it still builds a real
+    VisionRequest (transformers vision is a different runner path from
+    llama.cpp's image_url part, so it cannot simply reuse the GGUF builder).
+    """
+    if (kwargs.get("image_path") or kwargs.get("file")
+            or kwargs.get("image_b64")):
+        return _build_vision_request(kwargs, model_key)
+    return _build_chat_request(kwargs, model_key)
+
+
 def _build_vision_request(kwargs: Dict[str, Any], model_key: str) -> VisionRequest:
     image_path = kwargs.get("image_path") or kwargs.get("file")
     image_b64 = kwargs.get("image_b64")
@@ -456,7 +487,9 @@ MODEL_REQUEST_BUILDERS: Dict[Tuple[str, str], Callable[[Dict[str, Any], str], Ba
     ("comfy", "image-to-image"):                      _build_img2img_request,
     ("transformers", "text-generation"):              _build_chat_request,
     ("gguf",         "text-generation"):              _build_chat_request,
-    ("transformers", "image-text-to-text"):           _build_vision_request,
+    # Imageless turns fall back to chat — a VL model is text-capable too, and
+    # the GGUF row below has always behaved this way. See the builder's note.
+    ("transformers", "image-text-to-text"):           _build_vl_text_or_vision_request,
     # GGUF vision rides the chat path: the image stays on ChatRequest.file and
     # the runner attaches it as an image_url part for the multimodal handler.
     ("gguf",         "image-text-to-text"):           _build_vision_chat_request,

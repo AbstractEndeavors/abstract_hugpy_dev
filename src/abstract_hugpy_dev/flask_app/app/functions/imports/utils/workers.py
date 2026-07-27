@@ -465,7 +465,21 @@ def _public_view(worker: Dict[str, Any]) -> Dict[str, Any]:
     operator gate (pending/approved/blocked) and is independent of liveness. Rows
     written before the admission feature have no ``admission`` key; they are
     grandfathered to ``approved`` here so an existing fleet keeps serving.
+
+    Every PER-MODEL physical fact below (sizes, MoE structure, marker
+    capabilities) is a lookup against the persisted record, with only a BOUNDED
+    amount of cold-record filling per view — see _view_fill_window. Everything
+    the worker REPORTED stays LIVE and untouched: gpus[] free/total, slots[]
+    health/pid, disk, the storage survey, last_seen, loaded/loading/provisioning,
+    status. Those are the point of the view; only the derived per-model physical
+    facts moved.
     """
+    with _view_fill_window():
+        return _public_view_fields(worker)
+
+
+def _public_view_fields(worker: Dict[str, Any]) -> Dict[str, Any]:
+    """The body of :func:`_public_view`, inside its cold-fill window."""
     return {
         **worker,
         **_vram_summary(worker),
@@ -945,6 +959,118 @@ def _disk_reserve_bytes() -> int:
     return int(gib * (1 << 30))
 
 
+def _registry_row(model_key: str) -> Optional[Dict[str, Any]]:
+    """The model's registry row (a COPY), or None when central doesn't know it."""
+    try:
+        # Import depths differ and are NOT interchangeable: this module sits at
+        # flask_app/app/functions/imports/utils/, so `functions` is 3 up while
+        # the TOP-LEVEL `imports` package (abstract_hugpy_dev.imports — a
+        # different tree from this one's own `imports` parent) is 6. Getting
+        # this wrong raises ModuleNotFoundError, which an over-broad except
+        # would swallow into a permanent "size unknown" — every model silently
+        # unsized, an over-subscribed set reading as empty. Logged loudly.
+        from ......imports.config.models.models_config import get_models_dict
+    except Exception as exc:  # noqa: BLE001 — sizing must never break a read
+        logger.warning("allocation sizing unavailable (%s) — assigned-set totals "
+                       "will report as unknown", exc)
+        return None
+    try:
+        entry = (get_models_dict(dict_return=True) or {}).get(model_key)
+    except Exception:  # noqa: BLE001
+        return None
+    # A COPY: the physical helpers are handed a row that must not be the cached,
+    # shared MODEL_REGISTRY_DICT object the listings mutate in place.
+    return dict(entry) if isinstance(entry, dict) else None
+
+
+# ── cold-fill budget for the worker view ──────────────────────────────────
+# _public_view is on TWO hot paths: /llm/workers (the console polls it
+# continuously) and the HEARTBEAT REPLY. Deriving a missing physical record is
+# the honest fallback — but doing it for ~111 designated models inside one call
+# is a multi-minute walk, and a heartbeat that slow blows
+# HEARTBEAT_TIMEOUT_SECONDS and makes the whole fleet read offline. That is the
+# "pushes off all of the workers" failure, re-entered through the back door.
+#
+# So a single view may spend a BOUNDED amount of time filling cold rows; past
+# that it serves what is persisted and reports the rest as UNKNOWN — which this
+# surface already renders honestly (allocated_unknown_count, a None size, no
+# lever). Unknown-and-filling beats a view that never renders. Successive polls
+# (and any /models listing, or the /models/discover sweep) finish the fill.
+# Set HUGPY_WORKER_VIEW_FILL_BUDGET_S <= 0 to derive without a bound.
+_VIEW_FILL_BUDGET_S = 1.5
+_view_fill = threading.local()
+
+
+def _view_fill_budget_seconds() -> float:
+    raw = (os.environ.get("HUGPY_WORKER_VIEW_FILL_BUDGET_S") or "").strip()
+    if not raw:
+        return _VIEW_FILL_BUDGET_S
+    try:
+        return float(raw)
+    except ValueError:
+        return _VIEW_FILL_BUDGET_S
+
+
+@contextmanager
+def _view_fill_window():
+    """Bound cold-record filling for the duration of ONE worker view.
+
+    Scoped, not just started: the budget MUST be cleared on the way out. These
+    helpers are also called from DECISION paths (assigning a model, deriving an
+    allocation for a load), and a decision must never be answered "size unknown"
+    because a listing on the same gunicorn thread happened to run out of budget
+    first. Outside a window there is no budget at all — decisions derive."""
+    budget = _view_fill_budget_seconds()
+    _view_fill.deadline = None if budget <= 0 else (time.time() + budget)
+    try:
+        yield
+    finally:
+        _view_fill.deadline = None
+
+
+def _may_derive() -> bool:
+    """May this call still afford to derive a missing record from the store?"""
+    deadline = getattr(_view_fill, "deadline", None)
+    return deadline is None or time.time() < deadline
+
+
+def _model_physical(model_key: str) -> Dict[str, Any]:
+    """One model's PERSISTED size half — a dict lookup, not a store walk.
+
+    THE fix for /llm/workers (2026-07-27). This used to run
+    ``_annotate_gguf_size`` + ``_annotate_size`` — a recursive listing of every
+    servable .gguf plus an ``os.walk`` of the model dir — and every caller below
+    called it again: ``allocated_totals``, ``planned_split``,
+    ``derived_default_mode`` and ``derived_default_allocation`` each want a size
+    and/or the MoE structure, PER DESIGNATED MODEL. ae carries 75 designations,
+    ~111 across the fleet, so building a view of THREE machines cost several
+    hundred recursive walks of a spinning array over virtiofs: measured 11.8s
+    cold / 5.3s warm for ``list_workers()``, 31.0s for ``GET /llm/workers``
+    under the console's continuous polling — the workers view never rendered.
+
+    Same numbers, same source, from the record central already wrote at the
+    events that change it (comms/model_physical.py). Empty dict when central
+    cannot say — callers must keep treating that as UNKNOWN, never as zero."""
+    if not model_key:
+        return {}
+    row = _registry_row(model_key)
+    if row is None:
+        return {}
+    try:
+        from ......comms.model_physical import ASPECT_SIZE, lookup_physical
+        fields, state = lookup_physical(model_key, row, ASPECT_SIZE)
+        if state == "fresh":
+            return fields or {}
+        if not _may_derive():
+            # Out of cold-fill budget: serve what is persisted (possibly an
+            # expired-but-real record) and otherwise say UNKNOWN. Never a zero.
+            return fields or {}
+        from ...downloads.model_physical import size_fields
+        return size_fields(row, model_key, source="workers") or {}
+    except Exception:  # noqa: BLE001 — unknown size is a valid answer here
+        return {}
+
+
 def _model_size_bytes(model_key: str) -> Optional[int]:
     """One ASSIGNED model's size per central's manifest, or None if unknowable.
 
@@ -955,7 +1081,7 @@ def _model_size_bytes(model_key: str) -> Optional[int]:
     GGUF honesty: a GGUF dir holds SEVERAL quants, so its directory sum is NOT
     what serving costs. ``effective_bytes`` (gguf_variants_detail) is the quant
     that actually serves — the same number the Models tab shows. Falls back to
-    the mtime-cached directory footprint for transformers/comfy.
+    the directory footprint for transformers/comfy.
 
     None is a FIRST-CLASS answer meaning "central cannot say" (not in the
     manifest / not on disk / sizing raised). Callers MUST count it as unknown and
@@ -963,35 +1089,10 @@ def _model_size_bytes(model_key: str) -> Optional[int]:
     assignment set read as comfortably fitting (the exact dishonesty this
     feature exists to remove).
     """
-    if not model_key:
-        return None
+    size = _model_physical(model_key).get("size_bytes")
     try:
-        # Import depths differ and are NOT interchangeable: this module sits at
-        # flask_app/app/functions/imports/utils/, so `routes` is 4 up while the
-        # TOP-LEVEL `imports` package (abstract_hugpy_dev.imports — a different
-        # tree from this one's own `imports` parent) is 6. Getting this wrong
-        # raises ModuleNotFoundError, which an over-broad except would swallow
-        # into a permanent "size unknown" — every model silently unsized, an
-        # over-subscribed set reading as empty. Logged loudly for that reason.
-        from ....routes.llm_storage_routes import _annotate_gguf_size, _annotate_size
-        from ......imports.config.models.models_config import get_models_dict
-    except Exception as exc:  # noqa: BLE001 — sizing must never break a read
-        logger.warning("allocation sizing unavailable (%s) — assigned-set totals "
-                       "will report as unknown", exc)
-        return None
-    try:
-        manifest = get_models_dict(dict_return=True) or {}
-        entry = manifest.get(model_key)
-        if not isinstance(entry, dict):
-            return None
-        # Work on a COPY: the annotators mutate the dict they are handed, and the
-        # registry entry is the cached, shared MODEL_REGISTRY_DICT row.
-        model = dict(entry)
-        _annotate_gguf_size(model, model_key)   # -> effective_bytes (GGUF quant)
-        _annotate_size(model, model_key)        # -> size_bytes (eff or dir sum)
-        size = model.get("size_bytes")
         return int(size) if size else None
-    except Exception:  # noqa: BLE001 — unknown size is a valid answer here
+    except (TypeError, ValueError):
         return None
 
 
@@ -999,28 +1100,18 @@ def _model_moe_gpu_bytes(model_key: str) -> Optional[int]:
     """The GPU-side need of a detected-MoE GGUF under the expert split (its
     non-expert bytes + mmproj), or None for dense/non-GGUF/unresolvable.
 
-    Same source as _model_size_bytes: the registry row annotated by
-    _annotate_gguf_size, whose ``moe`` field rides gguf_variants_detail exactly
-    like effective_bytes (spill.gguf_moe_detail caches the header parse per
-    file, so this costs the enrichment read it already does — never a
-    per-request re-parse). Feasibility uses it so a MoE the split makes
-    serveable is never eliminated against its full file size."""
-    if not model_key:
-        return None
+    Same source as _model_size_bytes: the model's PERSISTED size half, whose
+    ``moe`` field rides gguf_variants_detail exactly like effective_bytes — so
+    this costs a dict lookup, never a per-request header re-parse. Feasibility
+    uses it so a MoE the split makes serveable is never eliminated against its
+    full file size."""
     try:
-        from ....routes.llm_storage_routes import _annotate_gguf_size
-        from ......imports.config.models.models_config import get_models_dict
-        manifest = get_models_dict(dict_return=True) or {}
-        entry = manifest.get(model_key)
-        if not isinstance(entry, dict):
-            return None
-        model = dict(entry)                     # copy: annotators mutate
-        _annotate_gguf_size(model, model_key)
-        moe = model.get("moe") or {}
+        fields = _model_physical(model_key)
+        moe = fields.get("moe") or {}
         nexp = moe.get("non_expert_bytes")
         if not nexp:
             return None
-        return int(nexp) + int(model.get("mmproj_bytes") or 0)
+        return int(nexp) + int(fields.get("mmproj_bytes") or 0)
     except Exception:  # noqa: BLE001 — MoE sizing is additive; unknown is fine
         return None
 
@@ -1038,18 +1129,8 @@ def _model_moe_detail(model_key: str) -> Optional[Dict[str, Any]]:
 
     None is a first-class "central cannot say" — the caller must degrade to the
     dense path, never guess a split."""
-    if not model_key:
-        return None
     try:
-        from ....routes.llm_storage_routes import _annotate_gguf_size
-        from ......imports.config.models.models_config import get_models_dict
-        manifest = get_models_dict(dict_return=True) or {}
-        entry = manifest.get(model_key)
-        if not isinstance(entry, dict):
-            return None
-        model = dict(entry)                     # copy: annotators mutate
-        _annotate_gguf_size(model, model_key)
-        moe = model.get("moe")
+        moe = _model_physical(model_key).get("moe")
         if not isinstance(moe, dict) or not moe.get("is_moe"):
             return None
         return moe
@@ -1159,25 +1240,35 @@ def _model_marker_flag(model_key: str, field: str) -> Optional[bool]:
 
     Returns None when the model, its directory or the field cannot be resolved —
     "never determined", which every caller must treat as unknown and fall back
-    on, never as False. Cheap: read_hugpy_marker is a single small JSON read and
-    this is only consulted on per-model surfaces, not per request."""
+    on, never as False.
+
+    Reads the PERSISTED marker aspect (comms/model_physical.py). It looked cheap
+    — "a single small JSON read … only consulted on per-model surfaces, not per
+    request" — but /llm/workers consults it TWICE per designated model
+    (moe_capable + bnb_available), which on ae is 150 dir resolutions plus 150
+    JSON reads off a spinning array over virtiofs, on every console poll. The
+    blob is derived once at the events that change it and read as a dict here."""
+    if not model_key:
+        return None
+    row = _registry_row(model_key)
+    if row is None:
+        return None
     try:
-        from ......imports.src.constants.hugpy_marker import read_hugpy_marker
-        from ......imports.config.main import get_model_config, get_model_path
-        cfg = get_model_config(model_key)
-        d = None
-        try:
-            d = get_model_path(model_key)
-        except Exception:  # noqa: BLE001
-            d = None
-        d = d or getattr(cfg, "dir", None) or getattr(cfg, "directory", None)
-        if not d:
-            return None
-        marker = read_hugpy_marker(d) or {}
-        val = marker.get(field)
-        return None if val is None else bool(val)
+        from ......comms.model_physical import ASPECT_MARKER, lookup_physical
+        fields, state = lookup_physical(model_key, row, ASPECT_MARKER)
+        if state != "fresh":
+            if not _may_derive():
+                fields = fields or {}    # budget spent — persisted or unknown
+            else:
+                from ...downloads.model_physical import marker_fields
+                fields = marker_fields(row, model_key)
     except Exception:  # noqa: BLE001 — a marker read must never break a view
         return None
+    if not fields or "hugpy_marker" not in fields:
+        return None                      # never determined -> caller falls back
+    marker = fields.get("hugpy_marker") or {}
+    val = marker.get(field) if isinstance(marker, dict) else None
+    return None if val is None else bool(val)
 
 
 def planned_split(worker: Dict[str, Any], model_key: str) -> Dict[str, Any]:
@@ -1717,18 +1808,17 @@ def storage_proposal(worker: Dict[str, Any]) -> Dict[str, Any]:
                 return 0
 
         _by_key = {mk: (lp, b) for lp, b, mk in candidates}
-        # min_residency_s=0 — the thrash floor guards a freshly LOADED model
-        # (a residency concept); a freshly downloaded FILE has no load clock
-        # here, and inventing one from mtime would protect the cold leftovers
-        # this budget exists to clear. Same choice as the worker half, so the
-        # two stay identical.
+        # No residency floor — the 300s anti-thrash veto was retired
+        # 2026-07-27 (operator). This path never had one regardless: a freshly
+        # downloaded FILE has no load clock here, and inventing one from mtime
+        # would protect the cold leftovers this budget exists to clear.
         _plan = _ev.evict_plan(
             "disk", need_bytes,
             [_ev.Resident(model_key=mk, bytes=b,
                           pref=_ev.preferred_device(_modes.get(mk)),
                           last_call=(lp or None), calls=_calls_for(mk))
              for lp, b, mk in candidates],
-            now=_now(), min_residency_s=0.0,
+            now=_now(),
             # FLEET-WIDE drop-pass policy — the SAME value every worker adopts
             # off the heartbeat (comms/evict_policy.py). Read here rather than
             # defaulted so this preview and the worker's execution cannot

@@ -546,6 +546,18 @@ def _persist_registry(registry_updates, apply):
                 json.dump(data, fh, indent=2)
             os.replace(tmp, path)
             files.append(path)
+    # An APPLIED reconcile MOVED weights between layouts, so every persisted
+    # destination and size is suspect — for models we rewrote AND for their
+    # neighbours (a merge/archive action retargets dirs the registry update
+    # never names). refresh_registry(run_discovery=False) deliberately only
+    # drops re-keyed rows, so say the wider thing here, where we know weights
+    # moved. Whole-table: over-dropping costs a re-derive, under-dropping leaves
+    # a record pointing at a dir that is no longer there.
+    try:
+        from ...comms.model_physical import forget_all_physical
+        forget_all_physical("reconcile applied")
+    except Exception as exc:  # noqa: BLE001 — never fail a reconcile over a cache
+        logger.debug("physical-state drop after reconcile skipped: %s", exc)
     try:
         from ..config.models.models_config import refresh_registry
         refresh_registry(run_discovery=False)

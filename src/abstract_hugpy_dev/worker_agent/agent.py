@@ -3190,6 +3190,17 @@ def build_app(state: "WorkerState") -> Flask:
             # that DOES own it. A bare "unsupported" would be true but useless:
             # the operator asked for a real thing at the wrong door, and telling
             # them only that the door is locked makes them guess.
+            # A RETIRED key gets its own code and says what replaced it. The
+            # operator (or an old script) is asking for a lever that no longer
+            # exists; "unsupported" would read as a typo rather than a removal.
+            retired = [k for k in unknown if k in _RETIRED_SETTINGS]
+            if retired:
+                return jsonify({"ok": False, "error": {
+                    "code": "RetiredKey",
+                    "message": "; ".join(
+                        f"'{k}' was RETIRED — {_RETIRED_SETTINGS[k]}"
+                        for k in retired),
+                    "keys": retired}}), 400
             fleet = [k for k in unknown if k in _FLEET_ONLY_SETTINGS]
             if fleet:
                 return jsonify({"ok": False, "error": {
@@ -3242,34 +3253,6 @@ def build_app(state: "WorkerState") -> Flask:
                 return jsonify({"ok": False, "error": {
                     "code": "BadValue", "message": "reconcile_interval_s must be 60..86400"}}), 400
             settings["reconcile_interval_s"] = tval
-        if "evict_min_residency_s" in body:
-            # ANTI-THRASH FLOOR. null/"" CLEARS the setting (falls back to the
-            # drop-in env, then the 300s default) — which is NOT the same as
-            # setting 0. 0 is a real, storable value meaning "floor disabled,
-            # pre-2026-07-25 behaviour", and it must be reachable from the
-            # console without editing a systemd drop-in: that is the entire
-            # point of the knob. So — as with ctx_pct — match None/"" EXPLICITLY
-            # rather than `in (None, "", 0)`, because `0 in (None, "", False)`
-            # is True in Python and would silently turn the escape hatch into a
-            # clear.
-            val = body["evict_min_residency_s"]
-            if val is None or val == "":
-                settings.pop("evict_min_residency_s", None)
-            else:
-                try:
-                    fval = float(val)
-                except (TypeError, ValueError):
-                    return jsonify({"ok": False, "error": {
-                        "code": "BadValue",
-                        "message": "evict_min_residency_s must be a number 0..86400 "
-                                   "(0 disables the anti-thrash floor), or null to "
-                                   "fall back to the env/default"}}), 400
-                if not 0.0 <= fval <= 86400.0:
-                    return jsonify({"ok": False, "error": {
-                        "code": "BadValue",
-                        "message": "evict_min_residency_s must be 0..86400 "
-                                   "(0 disables the anti-thrash floor)"}}), 400
-                settings["evict_min_residency_s"] = fval
         if "residency" in body:
             # DEEP-MERGE per model key: {"model": "static"|null}. The default
             # tier is ON-DEMAND and is represented by NO stored entry — null,
@@ -4656,11 +4639,9 @@ _SETTINGS_KEYS = {"slot_count", "residency", "on_demand_ttl_s",
                   # the flex engine (_vram_evict_to_fit) reads them here.
                   "ctx_deviation_pct", "vram_deviation_pct",
                   "ram_deviation_pct", "priority",
-                  # Eviction policy (2026-07-25). evict_min_residency_s is the
-                  # anti-thrash floor and is genuinely PER-WORKER: it is a VRAM
-                  # residency concept with exactly one consumer (this worker's
-                  # auto-evict), and BOTH storage sites hardcode a 0 floor — so
-                  # central has no VRAM preview for it to diverge from.
+                  # Eviction policy (2026-07-25).
+                  # ⚠ evict_min_residency_s was RETIRED 2026-07-27 — see
+                  # _RETIRED_SETTINGS. No time-based veto on eviction exists.
                   #
                   # ⚠ evict_least_reaping is DELIBERATELY ABSENT (operator ruling
                   # 2026-07-25: "yes reject it... best to have these decisions
@@ -4676,7 +4657,7 @@ _SETTINGS_KEYS = {"slot_count", "residency", "on_demand_ttl_s",
                   # was never persisted (b0e02ff). Accepting-then-overriding is
                   # the same lie wearing different clothes. Rejecting names the
                   # right door instead; see _fleet_only_hint below.
-                  "evict_min_residency_s"}
+                  }
 
 # Keys that are FLEET policy, not per-worker settings. Rejected by /ops/config
 # with a message naming where they DO belong, rather than a bare "unsupported"
@@ -4688,6 +4669,18 @@ _FLEET_ONLY_SETTINGS = {
                            "the drop pass that central's storage_proposal also "
                            "runs, so one value must serve both or their victim "
                            "sets diverge)",
+}
+
+# Keys that USED to exist and deliberately no longer do. Rejected with what
+# happened to them, so an old console build or a saved script gets an answer
+# instead of a bare "unsupported" that reads like a typo.
+_RETIRED_SETTINGS = {
+    "evict_min_residency_s": (
+        "2026-07-27, operator. It vetoed eviction of any model resident for "
+        "less than N seconds — a clock-driven third protection class. Exactly "
+        "two block eviction now: 🔒static residency and actively-answering. "
+        "Freshness is handled by RANK (sort_key orders on calls, then "
+        "last_call), never by a veto"),
 }
 _SETTINGS_SOURCE: dict = {}              # key -> "settings" | "env" | "default"
 _RUNTIME_SETTINGS: dict = {}             # the loaded settings, for live readers
@@ -7246,37 +7239,18 @@ def _shared_evict_order(rows: list, need: "int | None",
             break
         members = [r for r in rows if pri.get(r.model_key, 0) == band]
         plan = _ev.evict_plan(_ev.VRAM, remaining, members, now=now,
-                              min_residency_s=_evict_min_residency_s(),
                               least_reaping=_evict_least_reaping())
         out.extend(plan.victims)
         remaining -= plan.freed
     return out
 
 
-# Enacted proposal 2 (spec "Open" — thrash floor). Seconds a model must have
-# been resident before it is an eviction candidate at all. 0 disables the floor
-# and restores the pre-2026-07-25 behaviour exactly.
-#
-# READS THE ENV, and that is the whole mechanism: the `evict_min_residency_s`
-# SETTING is projected onto HUGPY_EVICT_MIN_RESIDENCY_S by _apply_settings_env
-# at boot, before any reader runs, so this function needs no knowledge of the
-# settings file and the precedence (setting > drop-in env > default) falls out.
-# PER-WORKER is safe here: this floor is a VRAM-residency concept and central
-# has no VRAM preview to disagree with — its one eviction call site
-# (storage_proposal) is the DISK and hardcodes the floor to 0, exactly as the
-# worker's own storage half (budget.fit_plan) does.
-_ENV_EVICT_MIN_RESIDENCY = "HUGPY_EVICT_MIN_RESIDENCY_S"
-
-
-def _evict_min_residency_s() -> float:
-    from ..managers import eviction as _ev
-    raw = os.environ.get(_ENV_EVICT_MIN_RESIDENCY)
-    if raw in (None, ""):
-        return _ev.DEFAULT_MIN_RESIDENCY_S
-    try:
-        return max(0.0, float(raw))
-    except (TypeError, ValueError):
-        return _ev.DEFAULT_MIN_RESIDENCY_S
+# RETIRED 2026-07-27 (operator: "is there still some timeblock on a model being
+# evicted? if so eliminate it"). `evict_min_residency_s` / the
+# HUGPY_EVICT_MIN_RESIDENCY_S env used to veto eviction of any model resident
+# for less than 300s. It was a clock-driven THIRD protection class, and the
+# standing ruling is that exactly two exist — 🔒static and actively-answering.
+# Nothing reads it now; a stored setting or a drop-in env carrying it is inert.
 
 
 # Least reaping (the drop pass). FLEET-WIDE, not per-worker — it changes the
@@ -8430,20 +8404,19 @@ def _apply_settings_env(args) -> dict:
         os.environ.pop(_ENV_HOT_CACHE_ROOT, None)     # no base -> tier off (unset)
         _SETTINGS_SOURCE["hot_cache_root"] = "default"
     # ── EVICTION POLICY (2026-07-25) ────────────────────────────────────────
-    # Both knobs are projected onto the env that _evict_min_residency_s /
-    # _evict_least_reaping already read, so those readers stay unchanged and
-    # the precedence (settings > drop-in env > module default) falls out of the
-    # same mechanism slot_count uses. Same base-sentinel dance as COMFY_URL: a
-    # later CLEAR must revert to the true drop-in base, not leak the last
-    # projected value across an execv.
+    # Projected onto the env that _evict_least_reaping already reads, so that
+    # reader stays unchanged and the precedence (settings > drop-in env > module
+    # default) falls out of the same mechanism slot_count uses. Same
+    # base-sentinel dance as COMFY_URL: a later CLEAR must revert to the true
+    # drop-in base, not leak the last projected value across an execv.
     #
-    # NOTE the `is not None` guards. These are the ONE place a projected value
-    # can legitimately be falsy-but-set: evict_min_residency_s=0 IS the escape
-    # hatch and evict_least_reaping=False IS the greedy-walk mode. A truthiness
-    # test here (`if settings.get(...)`) would silently drop exactly the two
-    # values the operator most needs to reach.
-    for _key, _env in ((("evict_min_residency_s"), _ENV_EVICT_MIN_RESIDENCY),
-                       (("evict_least_reaping"), _ENV_LEAST_REAPING)):
+    # NOTE the `is not None` guard. This is the ONE place a projected value can
+    # legitimately be falsy-but-set: evict_least_reaping=False IS the
+    # greedy-walk mode. A truthiness test here (`if settings.get(...)`) would
+    # silently drop exactly the value the operator most needs to reach.
+    # (evict_min_residency_s was projected here too until it was retired
+    # 2026-07-27 — no time-based eviction veto exists now.)
+    for _key, _env in ((("evict_least_reaping"), _ENV_LEAST_REAPING),):
         _base_env = f"_HUGPY_BASE_{_env}"
         if _base_env not in os.environ:
             os.environ[_base_env] = os.environ.get(_env, "")
@@ -8523,9 +8496,6 @@ def _effective_config() -> dict:
     # unconditionally (never omitted when falsy): 0 / False are meaningful
     # states here, and hiding them would show the operator the default while
     # the escape hatch was armed.
-    out["evict_min_residency_s"] = _evict_min_residency_s()
-    out["evict_min_residency_s_source"] = _SETTINGS_SOURCE.get(
-        "evict_min_residency_s", "default")
     out["evict_least_reaping"] = _evict_least_reaping()
     out["evict_least_reaping_source"] = _SETTINGS_SOURCE.get(
         "evict_least_reaping", "default")

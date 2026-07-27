@@ -4,6 +4,10 @@ from datetime import datetime, timezone
 from flask import jsonify, abort
 from .imports import *
 from .downloader import *
+# The persisted physical-state read path (comms/model_physical.py is the store).
+from .model_physical import (
+    ASPECT_SIZE, ASPECT_STATUS, size_fields, stamp_fields, status_fields,
+)
 # ──────────────────────────────────────────────────────────────────────────
 # Tunables (env-overridable). A download that writes no new bytes for
 # STALL_SECONDS is considered stalled and gets killed + resumed. Each download
@@ -48,22 +52,52 @@ def _clear_error(job_id: str) -> None:
 def update_model_status(model: dict) -> dict:
     """Stamp status/destination onto a manifest row — THE listing hot path.
 
-    Reads through the per-model memo (downloader.cached_model_status) instead of
-    re-walking the store for every model on every request. Same keys, same
-    values, same in-place mutation of the caller's dict; only the number of
-    filesystem calls changes. See comms/model_status_cache.py for the TTL,
-    the invalidation events and the cross-process story.
+    Reads the PERSISTED physical state (comms/model_physical.py) instead of
+    re-walking the store for every model on every request. Central downloaded
+    these models; it already knows whether they are installed and where. Same
+    keys, same values, same in-place mutation of the caller's dict — only the
+    number of filesystem calls changes (a warm row: zero).
+
+    A model with no persisted record is derived LIVE and written through, so a
+    fresh install and a newly-added model are correct rather than zeroed.
     """
-    model.update(cached_model_status(model))
-    return model
+    return stamp_fields(model, status_fields(model), ASPECT_STATUS)
 
 
-def invalidate_model_status_cache(reason: str = "") -> None:
-    """Tell every gunicorn worker that installation status just changed.
+def update_model_sizes(model: dict, mk: str = None) -> dict:
+    """Stamp the SIZE half (effective quant / variants / dir + effective bytes)
+    onto a row — the extra half ``/models`` shows and ``/v1/models`` does not.
 
-    Called from the events that actually move a model between
-    not_installed/partial/installed. Best-effort by design: a cache that cannot
-    be invalidated must never break the operation that changed the store."""
+    Same contract as :func:`update_model_status`: persisted lookup, live derive
+    + write-through on a miss."""
+    mk = mk or model.get("model_key")
+    return stamp_fields(model, size_fields(model, mk), ASPECT_SIZE)
+
+
+def invalidate_model_status_cache(reason: str = "", model_key: str = None) -> None:
+    """Tell every gunicorn worker that a model's physical state just changed.
+
+    THE one invalidation entry point, called from the events that actually move
+    a model between not_installed/partial/installed. Two things happen:
+
+      * the PERSISTED physical record is dropped — targeted when ``model_key``
+        is known (delete / prune / a download reaching a terminal state), so the
+        other ~106 rows stay warm; whole-table otherwise (an applied reconcile
+        moved weights, blast radius unknown). Persisting is what makes targeted
+        invalidation expressible at all: the in-process memo could only ever
+        drop everything, because that is all the epoch token could say.
+      * the ``central-holdings`` memo (comms/model_status_cache.py) is flushed —
+        it answers a DIFFERENT question ("can central provide this model to a
+        worker?") off the same presence facts, so it must hear the same events.
+
+    Best-effort by design: a cache that cannot be invalidated must never break
+    the operation that changed the store."""
+    try:
+        from .....comms.model_physical import forget_physical
+        forget_physical(model_key, reason)
+    except Exception:  # noqa: BLE001
+        logger.debug("model physical-state invalidation failed (%s)", reason,
+                     exc_info=True)
     try:
         from .....comms.model_status_cache import invalidate_model_status
         invalidate_model_status(reason)
@@ -334,7 +368,8 @@ def start_cancellable_download(job: Job, model: dict, total_bytes: int | None = 
                 # status. Over-invalidating costs one re-walk; under-invalidating
                 # hides a model the operator just downloaded.
                 invalidate_model_status_cache(
-                    f"download completed: {job.model_key}")
+                    f"download completed: {job.model_key}",
+                    model_key=job.model_key)
                 return
 
             # Failed or stalled — figure out why, then resume or give up.
@@ -351,7 +386,8 @@ def start_cancellable_download(job: Job, model: dict, total_bytes: int | None = 
                 # Terminal too: a give-up leaves partial files at the
                 # destination, which is a real not_installed -> partial move.
                 invalidate_model_status_cache(
-                    f"download failed: {job.model_key}")
+                    f"download failed: {job.model_key}",
+                    model_key=job.model_key)
                 return
 
             backoff = min(2 ** attempt, 30)
@@ -387,7 +423,8 @@ def cancel_download(job_id: str) -> dict:
         terminate_tree(proc)
     # Cancel is terminal and leaves whatever landed on disk behind — the row's
     # status can move (not_installed -> partial).
-    invalidate_model_status_cache(f"download cancelled: {job.model_key}")
+    invalidate_model_status_cache(f"download cancelled: {job.model_key}",
+                                 model_key=job.model_key)
     return {"cancelled": True}
 
 

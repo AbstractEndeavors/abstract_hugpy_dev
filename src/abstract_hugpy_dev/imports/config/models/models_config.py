@@ -569,14 +569,33 @@ def _default_media(model_key):
     return model_key in MODELS
 
 
-def media_state(model_key):
-    """Effective media-chat flag for ``model_key`` (override wins over default)."""
-    ov = _load_media()
+def _media_state(ov, model_key):
+    """Effective flag for one key against an ALREADY-LOADED override set."""
     if model_key in ov["disabled"]:
         return False
     if model_key in ov["enabled"]:
         return True
     return _default_media(model_key)
+
+
+def media_state(model_key):
+    """Effective media-chat flag for ``model_key`` (override wins over default).
+
+    Single-model read: it loads the override store. Use :func:`media_states` in
+    a loop — see why there."""
+    return _media_state(_load_media(), model_key)
+
+
+def media_states(model_keys):
+    """Effective media-chat flags for MANY models in ONE store read.
+
+    ``/models`` loops the whole manifest, and calling :func:`media_state` per
+    model re-read media_models.json ~107 times — an isfile + open + read EACH,
+    every one a virtiofs round-trip on central. That is the same per-model I/O
+    the persisted physical state exists to remove, so the listing hoists the
+    load out of its loop through here."""
+    ov = _load_media()
+    return {k: _media_state(ov, k) for k in model_keys}
 
 
 def set_model_media(model_key, enabled):
@@ -1033,11 +1052,41 @@ def refresh_registry(run_discovery=True):
         logger.warning("refresh_registry: serve-override migration skipped (%s)", exc)
     # THE chokepoint for "the catalog/store moved": every caller that changes
     # what is on disk lands here (download completion, the discovery sweep,
-    # reconcile's _persist_registry). The per-model install-status memo the
-    # listing routes read (comms/model_status_cache.py) is dropped from one
-    # place rather than hoping every future call site remembers. Guarded and
-    # lazy — comms is stdlib-only and imports nothing back, but a registry
-    # refresh must never fail over a cache.
+    # reconcile's _persist_registry). Both stores of derived physical state are
+    # told from one place rather than hoping every future call site remembers.
+    # Guarded and lazy — comms is stdlib-only and imports nothing back, but a
+    # registry refresh must never fail over a cache.
+    #
+    # The PERSISTED physical state (comms/model_physical.py) is dropped at a
+    # granularity that matches what actually changed — over-dropping only costs
+    # a re-derive, but it costs the WHOLE table's worth, and the point of
+    # persisting was to stop paying that:
+    #
+    #   run_discovery=True  -> a real store walk just happened, so anything on
+    #     disk may have moved: drop EVERYTHING. This is /models/discover, which
+    #     immediately rebuilds the table in its own background thread, so the
+    #     next listing is warm as well as correct.
+    #   run_discovery=False -> only the on-disk report was re-read; no fresh
+    #     evidence about the store. Drop exactly the rows the registry no longer
+    #     backs or whose ROUTING IDENTITY moved (a re-keyed / re-routed model —
+    #     its old record must never answer for the new row). The events that DID
+    #     change the store on this path carry their own targeted invalidation:
+    #     download completion names its model_key, and an applied reconcile
+    #     drops the whole table from _persist_registry / the route.
+    try:
+        from ....comms.model_physical import (
+            forget_all_physical, reconcile_physical_identities)
+        if run_discovery:
+            forget_all_physical("refresh_registry:discovery")
+        else:
+            reconcile_physical_identities(MODEL_REGISTRY_DICT,
+                                          "refresh_registry")
+    except Exception:  # noqa: BLE001
+        logger.debug("refresh_registry: physical-state invalidation skipped",
+                     exc_info=True)
+    # The central-holdings memo answers a different question ("can central
+    # provide this model to a worker?") off the same presence facts, and can
+    # only express a whole-memo drop, so it is flushed unconditionally.
     try:
         from ....comms.model_status_cache import invalidate_model_status
         invalidate_model_status("refresh_registry")

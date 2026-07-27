@@ -27,7 +27,6 @@ def R(key, gib, *, pref=ev.VRAM, last=None, calls=0, static=False,
 
 
 def plan(device, need_gib, residents, **kw):
-    kw.setdefault("min_residency_s", 0.0)      # off unless a test is about it
     return ev.evict_plan(device, int(need_gib * GIB), residents, now=NOW, **kw)
 
 
@@ -217,37 +216,42 @@ def test_last_activity_is_max_of_request_start_and_last_token():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OPEN ITEM 2 (ENACTED PROPOSAL) — the thrash floor.
+# OPEN ITEM 2 — the thrash floor, RETIRED 2026-07-27 (operator: "is there still
+# some timeblock on a model being evicted? if so eliminate it").
+#
+# These tests are inverted from what they asserted before: age must NOT veto.
+# The full removal regression suite lives in test_evict_policy_knobs.py §2.
 # ─────────────────────────────────────────────────────────────────────────────
-def test_thrash_floor_removes_a_fresh_load_from_the_pool():
-    """ENACTED PROPOSAL: 'a minimum-residency floor that REMOVES it from the
-    pool, not a score adjustment.' Without it, a fresh load has zero calls and
-    anchors at load time, so it sorts high in the never-called bucket and the
-    very next admission evicts it: load -> evict -> reload."""
-    # THE THRASH SETUP, precisely. `just-loaded` is 30s old and never called,
-    # so its anchor is 30s ago. `veteran` is a busy model that answered 10s ago.
-    # The fresh load therefore has the OLDER anchor and sorts FIRST — it is
-    # about to be evicted for the crime of having existed for 30 seconds. That
-    # is load -> evict -> reload, and it is what the floor exists to stop.
+def test_a_fresh_load_is_an_ordinary_candidate():
+    """THE OLD THRASH SETUP, now asserting the ruling instead of the floor.
+
+    `just-loaded` is 30s old and never called, so its anchor is 30s ago.
+    `veteran` answered 10s ago. The fresh load therefore has the OLDER anchor
+    and sorts FIRST, so it is the victim.
+
+    That IS load -> evict -> reload, and it is accepted deliberately: the
+    alternative — vetoing it — refuses the admission outright, which is worse
+    than a reload. Freshness is expressed as RANK, never as a veto, and the two
+    classes that DO block eviction are 🔒static and actively-answering.
+    """
     fresh = R("just-loaded", 10, since=30)          # 30s old, never called
     busy = R("veteran", 10, last=10, calls=1000)    # answered 10s ago
-    # Floor OFF -> the bug reproduces: the fresh load is the victim.
-    assert plan(ev.VRAM, 5, [fresh, busy], min_residency_s=0).victims == ["just-loaded"]
-    # Floor ON -> the fresh load is REMOVED from the pool and the veteran goes.
-    assert plan(ev.VRAM, 5, [fresh, busy], min_residency_s=300).victims == ["veteran"]
+    p = plan(ev.VRAM, 5, [fresh, busy])
+    assert p.victims == ["just-loaded"]
+    assert not any("residency" in b["why"] for b in p.blocking)
 
 
-def test_the_floor_removes_rather_than_penalises_so_a_big_need_cannot_beat_it():
-    """The reason it is a REMOVAL: a score adjustment still loses to a large
-    enough need. Here the floored model is the ONLY thing that could satisfy
-    the need, and it is still not taken — the admission refuses instead."""
-    p = plan(ev.VRAM, 50, [R("just-loaded", 90, since=10)], min_residency_s=300)
-    assert p.victims == [] and not p.enough
-    assert any("minimum residency" in b["why"] for b in p.blocking)
+def test_a_fresh_model_can_satisfy_a_need_nothing_else_could():
+    """The concrete cost the floor used to impose: with one fresh resident and a
+    big need, the floor refused the admission entirely. Now it is taken."""
+    p = plan(ev.VRAM, 50, [R("just-loaded", 90, since=10)])
+    assert p.victims == ["just-loaded"] and p.enough
+    assert p.blocking == []
 
 
-def test_a_model_past_the_floor_is_an_ordinary_candidate():
-    p = plan(ev.VRAM, 5, [R("settled", 10, since=9_000)], min_residency_s=300)
+def test_a_settled_model_is_also_an_ordinary_candidate():
+    """Age cuts neither way — old models were never protected and still aren't."""
+    p = plan(ev.VRAM, 5, [R("settled", 10, since=9_000)])
     assert p.victims == ["settled"]
 
 
@@ -304,7 +308,7 @@ def A(size_gib, mode, *, vfree, rfree, vtotal=None, rtotal=None,
         vram_total=(int(vtotal * GIB) if vtotal is not None else None),
         ram_total=(int(rtotal * GIB) if rtotal is not None else None),
         vram_residents=list(vres), ram_residents=list(rres),
-        now=NOW, min_residency_s=0.0)
+        now=NOW)
 
 
 def test_preference_names_the_device_max_gpu_vram_max_ram_ram():

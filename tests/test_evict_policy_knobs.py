@@ -1,16 +1,25 @@
-"""The two eviction knobs, on real switches (operator, 2026-07-25).
+"""The eviction policy knob, on a real switch — and the one that was RETIRED.
 
-Both shipped env-only and were only reachable by editing a systemd drop-in.
-This file covers putting them on settings/console switches:
+Two knobs used to live here (operator, 2026-07-25). One remains:
 
-  1. ANTI-THRASH FLOOR  ``evict_min_residency_s``  — PER-WORKER.
+  1. ANTI-THRASH FLOOR  ``evict_min_residency_s``  — **RETIRED 2026-07-27.**
   2. LEAST REAPING      ``evict_least_reaping``    — FLEET-WIDE.
 
-The scope split is the load-bearing decision and is asserted here, not just
-documented: the floor is a VRAM-residency concept with no central counterpart
-(both storage sites hardcode it to 0), while least-reaping gates the DROP PASS
-that central's ``storage_proposal`` runs too — so a per-worker value would
-break Parity. ``test_parity_holds_under_the_fleet_switch`` is the guard.
+**Why the floor is gone** (operator: _"is there still some timeblock on a model
+being evicted? if so eliminate it"_): it vetoed eviction of any model resident
+for less than 300s. That is a clock-driven THIRD protection class, and the
+standing ruling (2026-07-23) is that exactly two exist — 🔒static residency and
+actively-answering. It also contradicted the minimize-loading doctrine directly:
+_"if the answer is a timer, it's wrong by default."_
+
+Section 2 is now the REGRESSION SUITE for that removal: a fresh model must be
+evictable, nothing may veto on age, and the settings key must be rejected rather
+than silently accepted. Freshness survives as RANK (``sort_key`` orders on
+calls, then last_call) — chosen last, never unchoosable.
+
+The scope split for what remains is asserted, not just documented: least-reaping
+gates the DROP PASS that central's ``storage_proposal`` runs too, so a per-worker
+value would break Parity. ``test_parity_holds_under_the_fleet_switch`` guards it.
 
 Run: venv/bin/python -m pytest tests/test_evict_policy_knobs.py -v
 """
@@ -28,13 +37,15 @@ from abstract_hugpy_dev.worker_agent import agent, budget  # noqa: E402
 GIB = 1 << 30
 NOW = 1_000_000.0
 
+# The retired floor's env name. Kept ONLY so the regression tests can prove that
+# setting it has no effect whatsoever.
 _ENV_FLOOR = "HUGPY_EVICT_MIN_RESIDENCY_S"
 _ENV_REAP = "HUGPY_EVICT_LEAST_REAPING"
 
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
-    """Both knobs read the ENV, so every test starts from a known-absent one."""
+    """The knob reads the ENV, so every test starts from a known-absent one."""
     monkeypatch.delenv(_ENV_FLOOR, raising=False)
     monkeypatch.delenv(_ENV_REAP, raising=False)
     agent._SETTINGS_SOURCE.clear()
@@ -59,7 +70,7 @@ _DROP_NEED = 15 * GIB
 def test_least_reaping_on_drops_the_covered_victim():
     """ON (today's default): one 35 GiB unload satisfies a 15 GiB need."""
     plan = ev.evict_plan(ev.VRAM, _DROP_NEED, _DROP_RESIDENTS,
-                         now=NOW, min_residency_s=0.0, least_reaping=True)
+                         now=NOW, least_reaping=True)
     assert plan.victims == ["big"]
     assert plan.spared == ["small"]
     assert plan.freed == 35 * GIB
@@ -68,7 +79,7 @@ def test_least_reaping_on_drops_the_covered_victim():
 def test_least_reaping_off_keeps_the_whole_walk():
     """OFF: the greedy walk, nothing spared — MORE headroom, more unloads."""
     plan = ev.evict_plan(ev.VRAM, _DROP_NEED, _DROP_RESIDENTS,
-                         now=NOW, min_residency_s=0.0, least_reaping=False)
+                         now=NOW, least_reaping=False)
     assert plan.victims == ["small", "big"]
     assert plan.spared == []
     assert plan.freed == 40 * GIB          # the extra headroom the operator wanted
@@ -92,7 +103,7 @@ def test_off_is_byte_identical_to_the_pre_drop_pass_walk():
         freed += r.bytes
 
     plan = ev.evict_plan(ev.VRAM, _DROP_NEED, _DROP_RESIDENTS,
-                         now=NOW, min_residency_s=0.0, least_reaping=False)
+                         now=NOW, least_reaping=False)
     assert plan.victims == expected
     assert plan.freed == freed
 
@@ -100,44 +111,101 @@ def test_off_is_byte_identical_to_the_pre_drop_pass_walk():
 def test_default_is_least_reaping_on():
     """Absent argument == today's behaviour. Defaults must not change behaviour."""
     assert ev.DEFAULT_LEAST_REAPING is True
-    plan = ev.evict_plan(ev.VRAM, _DROP_NEED, _DROP_RESIDENTS,
-                         now=NOW, min_residency_s=0.0)
+    plan = ev.evict_plan(ev.VRAM, _DROP_NEED, _DROP_RESIDENTS, now=NOW)
     assert plan.victims == ["big"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. THE ANTI-THRASH FLOOR — and 0 genuinely disabling it.
+# 2. THE RETIRED FLOOR — regression suite for its REMOVAL (2026-07-27).
+#
+#    Each test here fails if the time-based veto comes back in any form:
+#    as a parameter, as a module default, as an env, or as a settings key.
 # ─────────────────────────────────────────────────────────────────────────────
 def _fresh_resident():
-    """One model, resident 10s — inside any non-zero floor."""
+    """One model, resident 10s — inside any floor that might be reintroduced."""
     return [ev.Resident(model_key="fresh", bytes=10 * GIB, last_call=None,
                         calls=0, resident_since=NOW - 10)]
 
 
-def test_floor_removes_a_fresh_model_from_the_pool():
-    plan = ev.evict_plan(ev.VRAM, 5 * GIB, _fresh_resident(),
-                         now=NOW, min_residency_s=300.0)
-    assert plan.victims == []
-    assert not plan.enough                    # the admission REFUSES
-    assert any("minimum residency" in b["why"] for b in plan.blocking)
+def test_a_freshly_loaded_model_is_evictable():
+    """THE ruling, asserted directly: no timeblock on a model being evicted.
 
-
-def test_floor_zero_genuinely_disables_it():
-    """0 is the ESCAPE HATCH — it must restore the pre-2026-07-25 behaviour."""
-    plan = ev.evict_plan(ev.VRAM, 5 * GIB, _fresh_resident(),
-                         now=NOW, min_residency_s=0.0)
+    A model resident for 10 seconds must be a legal victim. Under the retired
+    floor this plan returned no victims and the admission REFUSED.
+    """
+    plan = ev.evict_plan(ev.VRAM, 5 * GIB, _fresh_resident(), now=NOW)
     assert plan.victims == ["fresh"]
     assert plan.enough
+    assert plan.blocking == []
 
 
-def test_floor_reader_env_and_default():
-    assert agent._evict_min_residency_s() == ev.DEFAULT_MIN_RESIDENCY_S
-    os.environ[_ENV_FLOOR] = "42"
-    assert agent._evict_min_residency_s() == 42.0
-    os.environ[_ENV_FLOOR] = "0"
-    assert agent._evict_min_residency_s() == 0.0       # 0 survives as 0
-    os.environ[_ENV_FLOOR] = "nonsense"
-    assert agent._evict_min_residency_s() == ev.DEFAULT_MIN_RESIDENCY_S
+def test_nothing_blocks_on_age():
+    """No blocking entry may cite residency time, whatever the resident's age.
+
+    Sweeps ages from 0s to a day. Any age-based veto shows up as a blocking row,
+    which is exactly what the operator asked to eliminate.
+    """
+    for age in (0, 1, 10, 60, 299, 300, 301, 86400):
+        rows = [ev.Resident(model_key="m", bytes=10 * GIB, last_call=None,
+                            calls=0, resident_since=NOW - age)]
+        plan = ev.evict_plan(ev.VRAM, 5 * GIB, rows, now=NOW)
+        assert plan.victims == ["m"], f"age={age}s was vetoed"
+        assert not any("residency" in b["why"] for b in plan.blocking), age
+
+
+def test_the_floor_parameter_no_longer_exists():
+    """``min_residency_s`` must be gone from the signature, not merely defaulted
+    to 0 — a defaulted parameter is a veto one caller away from returning."""
+    import inspect
+    for fn in (ev.evict_plan, ev.plan_admission, ev.plan_admission_split):
+        assert "min_residency_s" not in inspect.signature(fn).parameters, fn.__name__
+    with pytest.raises(TypeError):
+        ev.evict_plan(ev.VRAM, 5 * GIB, _fresh_resident(),
+                      now=NOW, min_residency_s=300.0)
+
+
+def test_the_module_default_is_gone():
+    assert not hasattr(ev, "DEFAULT_MIN_RESIDENCY_S")
+    assert not hasattr(agent, "_evict_min_residency_s")
+
+
+def test_the_retired_env_has_no_effect(monkeypatch):
+    """An old systemd drop-in still carrying the env must be INERT, not honoured.
+
+    This is the realistic upgrade path: a box with the drop-in from 2026-07-25
+    still on disk. It must not resurrect the veto.
+    """
+    monkeypatch.setenv(_ENV_FLOOR, "3600")
+    plan = ev.evict_plan(ev.VRAM, 5 * GIB, _fresh_resident(), now=NOW)
+    assert plan.victims == ["fresh"]
+
+
+def test_only_two_classes_can_block_eviction():
+    """The standing ruling (2026-07-23) as an executable assertion.
+
+    static and in-flight block; a plain idle resident does not — and neither
+    does a brand-new one. 'unmeasurable' is not a protection class but a
+    degrade-not-guess refusal, so it is asserted separately below.
+    """
+    rows = [
+        ev.Resident(model_key="static", bytes=10 * GIB, calls=0, static=True),
+        ev.Resident(model_key="busy", bytes=10 * GIB, calls=0, in_flight=True),
+        ev.Resident(model_key="fresh", bytes=10 * GIB, calls=0,
+                    resident_since=NOW - 1),
+    ]
+    plan = ev.evict_plan(ev.VRAM, 5 * GIB, rows, now=NOW)
+    assert plan.victims == ["fresh"]
+    blocked = {b["model_key"] for b in plan.blocking}
+    assert blocked == {"static", "busy"}
+
+
+def test_unmeasurable_is_still_not_walked():
+    """Degrade-not-guess survives the floor's removal: an occupant we cannot
+    size is still never evicted, because the plan could not be verified."""
+    rows = [ev.Resident(model_key="unknown", bytes=None, calls=0)]
+    plan = ev.evict_plan(ev.VRAM, 5 * GIB, rows, now=NOW)
+    assert plan.victims == []
+    assert any("unmeasurable" in b["why"] for b in plan.blocking)
 
 
 def test_least_reaping_reader_env_and_default():
@@ -170,7 +238,7 @@ class _Args:
 
 
 def _apply(tmp_path, settings, monkeypatch, env=None):
-    """Write a settings file, project it, and return (floor, least_reaping)."""
+    """Write a settings file, project it, and return least_reaping."""
     import json
     p = tmp_path / "settings.json"
     p.write_text(json.dumps(settings))
@@ -183,84 +251,79 @@ def _apply(tmp_path, settings, monkeypatch, env=None):
             monkeypatch.delenv(k, raising=False)
     monkeypatch.setattr(agent, "_load_settings", lambda _a: dict(settings))
     agent._apply_settings_env(_Args(p))
-    return agent._evict_min_residency_s(), agent._evict_least_reaping()
+    return agent._evict_least_reaping()
 
 
 def test_settings_roundtrip_through_apply(tmp_path, monkeypatch):
-    floor, reap = _apply(tmp_path, {"evict_min_residency_s": 120.0,
-                                    "evict_least_reaping": False}, monkeypatch)
-    assert floor == 120.0
+    reap = _apply(tmp_path, {"evict_least_reaping": False}, monkeypatch)
     assert reap is False
-    assert agent._SETTINGS_SOURCE["evict_min_residency_s"] == "settings"
     assert agent._SETTINGS_SOURCE["evict_least_reaping"] == "settings"
 
 
-def test_setting_zero_survives_projection(tmp_path, monkeypatch):
+def test_setting_false_survives_projection(tmp_path, monkeypatch):
     """The escape hatch must survive the projector.
 
-    ``0`` and ``False`` are the two legitimately-FALSY projected values in the
-    whole settings file. A truthiness guard in _apply_settings_env would drop
-    exactly the two the operator most needs — hence this test.
+    ``False`` is a legitimately-FALSY projected value. A truthiness guard in
+    _apply_settings_env would drop exactly the state the operator needs to
+    reach — hence this test.
     """
-    floor, reap = _apply(tmp_path, {"evict_min_residency_s": 0.0,
-                                    "evict_least_reaping": False}, monkeypatch)
-    assert floor == 0.0
+    reap = _apply(tmp_path, {"evict_least_reaping": False}, monkeypatch)
     assert reap is False
-    assert agent._SETTINGS_SOURCE["evict_min_residency_s"] == "settings"
+    assert agent._SETTINGS_SOURCE["evict_least_reaping"] == "settings"
 
 
 def test_settings_beat_the_env_dropin(tmp_path, monkeypatch):
-    floor, reap = _apply(tmp_path, {"evict_min_residency_s": 77.0,
-                                    "evict_least_reaping": False},
-                         monkeypatch, env={_ENV_FLOOR: "900", _ENV_REAP: "1"})
-    assert floor == 77.0                     # setting, not the 900s drop-in
+    reap = _apply(tmp_path, {"evict_least_reaping": False},
+                  monkeypatch, env={_ENV_REAP: "1"})
     assert reap is False
 
 
-def test_env_wins_when_no_setting(tmp_path, monkeypatch):
-    floor, _ = _apply(tmp_path, {}, monkeypatch, env={_ENV_FLOOR: "900"})
-    assert floor == 900.0
-    assert agent._SETTINGS_SOURCE["evict_min_residency_s"] == "env"
-
-
 def test_default_when_neither(tmp_path, monkeypatch):
-    floor, reap = _apply(tmp_path, {}, monkeypatch)
-    assert floor == ev.DEFAULT_MIN_RESIDENCY_S
+    reap = _apply(tmp_path, {}, monkeypatch)
     assert reap is ev.DEFAULT_LEAST_REAPING
-    assert agent._SETTINGS_SOURCE["evict_min_residency_s"] == "default"
     assert agent._SETTINGS_SOURCE["evict_least_reaping"] == "default"
 
 
-def test_cleared_setting_reverts_to_the_dropin_base(tmp_path, monkeypatch):
-    """A CLEAR must revert to the true drop-in base, not leak the last
-    projected value across the re-exec (the COMFY_URL sentinel dance)."""
-    monkeypatch.setenv(_ENV_FLOOR, "900")
-    _apply(tmp_path, {"evict_min_residency_s": 77.0}, monkeypatch)
-    assert agent._evict_min_residency_s() == 77.0
-    # Second "boot" with the setting gone, sentinels intact (no monkeypatch
-    # clearing this time) — the base must come back.
-    monkeypatch.setattr(agent, "_load_settings", lambda _a: {})
-    agent._apply_settings_env(_Args(tmp_path / "settings.json"))
-    assert agent._evict_min_residency_s() == 900.0
-    assert agent._SETTINGS_SOURCE["evict_min_residency_s"] == "env"
+def test_retired_floor_setting_is_not_silently_stored(tmp_path, monkeypatch):
+    """A settings file still carrying the retired key must not resurrect it.
 
-
-def test_only_the_per_worker_key_is_in_the_whitelist():
-    """RENAMED + INVERTED (operator ruling 2026-07-25: "yes reject it").
-
-    This previously asserted BOTH keys were accepted, which encoded the
-    accept-then-silently-override behaviour the ruling removed: a worker stored
-    evict_least_reaping, reported it back as saved, and central's heartbeat
-    overwrote it on the next beat. The floor stays — it is genuinely per-worker.
+    Storing-and-ignoring is the exact 'setting you can write, that reads back
+    correct, and that silently stops mattering' shape this codebase rejects
+    elsewhere. Projection must simply not know the key.
     """
-    assert "evict_min_residency_s" in agent._SETTINGS_KEYS
+    _apply(tmp_path, {"evict_min_residency_s": 900.0}, monkeypatch)
+    assert "evict_min_residency_s" not in agent._SETTINGS_SOURCE
+    assert _ENV_FLOOR not in os.environ
+
+
+def test_neither_eviction_key_is_a_per_worker_setting():
+    """RETIRED + FLEET-ONLY: neither key may be accepted by /ops/config.
+
+    ``evict_least_reaping`` is fleet policy (operator ruling 2026-07-25, "yes
+    reject it"); ``evict_min_residency_s`` no longer exists at all (2026-07-27).
+    """
+    assert "evict_min_residency_s" not in agent._SETTINGS_KEYS
     assert "evict_least_reaping" not in agent._SETTINGS_KEYS
 
 
 def test_unknown_key_is_still_rejected():
-    """The strict whitelist must not have been loosened to admit the new keys."""
+    """The strict whitelist must not have been loosened."""
     assert "evict_min_residency" not in agent._SETTINGS_KEYS   # near-miss typo
     assert "totally_made_up" not in agent._SETTINGS_KEYS
+
+
+def test_retired_key_rejection_says_what_happened_to_it():
+    """A removal must ANSWER, not just refuse.
+
+    Same principle as the fleet-only rejection naming the right door: an
+    operator (or an old console build) asking for a lever that no longer exists
+    gets told it was retired and why, instead of a bare "unsupported" that reads
+    like a typo.
+    """
+    assert "evict_min_residency_s" in agent._RETIRED_SETTINGS
+    why = agent._RETIRED_SETTINGS["evict_min_residency_s"]
+    assert "static" in why and "answering" in why, (
+        "the rejection must name the two classes that DO block eviction")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -314,20 +377,19 @@ def test_parity_holds_under_the_fleet_switch(monkeypatch):
             f"victim sets diverged with least_reaping={state}")
 
 
-def test_the_floor_is_zero_on_both_storage_sites():
-    """The scope decision's OTHER half, asserted rather than assumed.
+def test_no_site_passes_a_residency_floor():
+    """The removal, asserted at every call site rather than assumed.
 
-    The anti-thrash floor is safe to make per-worker precisely BECAUSE neither
-    storage site consults it — both hardcode 0, so a per-worker floor can never
-    desynchronise central's preview from a worker's execution. If someone later
-    wires the floor into a storage site, this fails and the scope decision must
-    be revisited.
+    If someone later reintroduces a floor at any eviction site, this fails.
+    Checks the two storage sites plus the worker's VRAM auto-evict — the one
+    that actually carried the 300s veto.
     """
     import inspect
     from abstract_hugpy_dev.flask_app.app.functions.imports.utils import workers
     for src in (inspect.getsource(budget.fit_plan),
-                inspect.getsource(workers.storage_proposal)):
-        assert "min_residency_s=0.0" in src
+                inspect.getsource(workers.storage_proposal),
+                inspect.getsource(agent)):
+        assert "min_residency_s=" not in src
 
 
 # ── the operator's ruling: a fleet key is REJECTED, and says where to go ─────
@@ -353,8 +415,6 @@ def test_fleet_only_key_is_rejected_by_ops_config_with_the_right_door():
 
     assert "evict_least_reaping" not in A._SETTINGS_KEYS, (
         "fleet policy must not be a per-worker setting key")
-    assert "evict_min_residency_s" in A._SETTINGS_KEYS, (
-        "the anti-thrash floor IS genuinely per-worker and must stay accepted")
 
     # The variable is the declaration — one place, extensible, no toggle.
     assert "evict_least_reaping" in A._FLEET_ONLY_SETTINGS

@@ -375,7 +375,19 @@ def set_override(model_key: str, fields: dict) -> dict:
         else:
             data.pop(model_key, None)
         _save(data)
-        return current
+    # ``gguf_file`` picks WHICH quant serves, so it changes effective_bytes /
+    # effective_gguf / mmproj_bytes / moe — the persisted size half. It is an
+    # operator choice, NOT part of the model's routing identity, so nothing else
+    # would notice: drop this model's physical record so the next listing
+    # re-derives the size of the quant the operator just chose. Targeted and
+    # guarded — a settings write must never fail over a cache.
+    if "gguf_file" in (fields or {}):
+        try:
+            from ...comms.model_physical import forget_physical
+            forget_physical(model_key, "gguf_file override changed")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("physical-state drop after override skipped: %s", exc)
+    return current
 
 
 def effective_alloc_mode(model_key: str) -> str:

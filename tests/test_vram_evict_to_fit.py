@@ -608,10 +608,16 @@ def test_the_frontier_rule_holds_on_the_vram_path(rig):
     assert set(plan["evicted"]) == {"c1", "c2"}
 
 
-def test_the_thrash_floor_protects_a_freshly_loaded_resident(rig, monkeypatch):
-    """ENACTED PROPOSAL 2, on the real path. 'fresh' is the coldest thing on
-    the card by idle anchor (loaded 10s ago, never called) and would be evicted
-    immediately — load, evict, reload. The floor REMOVES it from the pool."""
+def test_a_freshly_loaded_resident_is_evictable_on_the_real_path(rig, monkeypatch):
+    """The RETIREMENT of the thrash floor (2026-07-27), asserted on the live
+    worker path rather than only on the pure planner.
+
+    'fresh' is the coldest thing on the card by idle anchor (loaded 10s ago,
+    never called), so it leads the walk and is taken. The retired
+    HUGPY_EVICT_MIN_RESIDENCY_S env is set to 300 here ON PURPOSE: a box still
+    carrying the old systemd drop-in must NOT resurrect the veto. If anything
+    ever reads that env again, this test fails.
+    """
     import time as _t
     rig.card["free"] = 0
     rig.card["need"] = 4 * GIB
@@ -625,18 +631,10 @@ def test_the_thrash_floor_protects_a_freshly_loaded_resident(rig, monkeypatch):
         A, "_vram_residents",
         lambda s: [{"model_key": k, **v, "alive": True}
                    for k, v in rig.residents.items()])
-    monkeypatch.setenv("HUGPY_EVICT_MIN_RESIDENCY_S", "300")
-    assert A._vram_evict_to_fit(_State(), "subject")["evicted"][0] == "settled", (
-        "the floored fresh load must not be the FIRST thing taken")
-    # Floor OFF -> the thrash reproduces (the fresh load is taken).
-    monkeypatch.setenv("HUGPY_EVICT_MIN_RESIDENCY_S", "0")
-    rig.residents["fresh"] = {"vram_bytes": 5 * GIB, "host_mode": "subprocess",
-                              "resident_since": now - 10}
-    rig.residents["settled"] = {"vram_bytes": 5 * GIB, "host_mode": "subprocess",
-                                "resident_since": now - 99_999}
-    rig.card["free"] = 0
+    monkeypatch.setenv("HUGPY_EVICT_MIN_RESIDENCY_S", "300")   # inert
     assert A._vram_evict_to_fit(_State(), "subject")["evicted"][0] == "fresh", (
-        "with the floor off the thrash reproduces: the fresh load leads")
+        "no timeblock on eviction: the fresh load leads the walk, and the "
+        "retired env must not bring the veto back")
 
 
 def test_static_still_outranks_everything_the_spec_says(rig, monkeypatch):

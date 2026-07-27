@@ -186,7 +186,7 @@ def test_parity_survives_the_full_admission_flow_not_just_the_sort():
             model_key=key, bytes=gib * GIB,
             pref=ev.preferred_device(mode), last_call=lp, calls=calls))
     need = _used_bytes() + NEED_GIB * GIB - CAP_GIB * GIB   # the worker's need
-    direct = ev.evict_plan("disk", need, rows, now=NOW, min_residency_s=0.0)
+    direct = ev.evict_plan("disk", need, rows, now=NOW)
     assert direct.victims == _worker_victims() == _central_victims()
 
 

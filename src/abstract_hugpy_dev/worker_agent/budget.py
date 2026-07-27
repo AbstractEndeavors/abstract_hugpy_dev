@@ -594,18 +594,17 @@ def fit_plan(model_key: str, need_bytes: int, storage: dict,
     must_free = used + delta - cap
     reclaimable_total = sum(b for _lp_, b, _mk in candidates)
 
-    # min_residency_s=0 on the STORAGE path: the thrash floor (enacted proposal
-    # 2) protects a freshly LOADED model from being unloaded, which is a
-    # residency concept. A freshly DOWNLOADED file has no such clock here (rows
-    # carry mtime, not a load time), and a floor derived from mtime would
-    # protect exactly the cold leftovers this budget exists to clear.
+    # No residency floor here or anywhere else — the 300s anti-thrash veto was
+    # retired 2026-07-27 (operator). This path never had one regardless: rows
+    # carry mtime, not a load time, and a floor derived from mtime would protect
+    # exactly the cold leftovers this budget exists to clear.
     _plan = _ev.evict_plan(
         "disk", must_free,
         [_ev.Resident(model_key=mk, bytes=b,
                       pref=_ev.preferred_device(_modes.get(mk)),
                       last_call=(lp or None), calls=_calls_for(mk))
          for lp, b, mk in candidates],
-        now=_now, min_residency_s=0.0,
+        now=_now,
         # FLEET-WIDE drop-pass policy, adopted from central on the heartbeat
         # (agent._adopt_least_reaping projects it onto this env). Read from the
         # env rather than imported from agent.py to keep budget.py free of that

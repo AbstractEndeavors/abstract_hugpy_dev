@@ -5,7 +5,7 @@ from ..functions import *
 # Registry prune (hide a not-installed "ghost" model) + media-chat allow-flag.
 # Explicit imports so they work regardless of the functions star-export.
 from ....imports.config.models.models_config import (
-    prune_model, set_model_media, media_state,
+    prune_model, set_model_media, media_state, media_states,
     media_default_state, set_media_default, refresh_registry,
 )
 
@@ -31,82 +31,18 @@ def peers():
     return jsonify(list_peers())
 
 
-def _annotate_gguf_size(model: dict, mk: str) -> None:
-    """For a GGUF model, attach the EFFECTIVE-quant size — the single quant that
-    actually serves (operator ``gguf_file`` override → ``cfg.filename`` → auto),
-    plus its mmproj projector — so the console shows the model's real size instead
-    of the whole-directory / whole-repo sum (a GGUF repo holds many quants; only
-    one is served). No-op for transformers models and for GGUF dirs not downloaded
-    here. Model-level + worker-agnostic, so the Models tab AND the worker-card
-    strip both read this one number (same /models feed)."""
-    fw = (model.get("framework") or "").lower()
-    if fw not in ("gguf", "llama_cpp"):
-        return
-    try:
-        from ....managers.serve.overrides import gguf_variants_detail
-        from ....imports.config.main import get_model_config, get_model_path
-        model_dir = model.get("destination") or get_model_path(mk)
-        try:
-            cfg = get_model_config(mk)
-        except Exception:  # noqa: BLE001
-            cfg = None
-        d = gguf_variants_detail(mk, model_dir, cfg)
-    except Exception:  # noqa: BLE001 — never break the models list over sizing
-        d = {}
-    if not d:
-        return
-    if d.get("effective_bytes"):
-        model["effective_bytes"] = d["effective_bytes"]
-    model["effective_gguf"] = d.get("effective_gguf")
-    model["gguf_variants"] = d.get("variants") or []
-    model["mmproj_bytes"] = d.get("mmproj_bytes")
-    # MoE (2026-07-24): the effective quant's expert/non-expert split, riding
-    # the registry the same way effective_bytes does (computed once per file —
-    # spill.gguf_moe_detail caches by path+size+mtime). Feasibility prices the
-    # GPU side of a MoE by non_expert_bytes; absent for dense models.
-    if d.get("moe"):
-        model["moe"] = d["moe"]
-
-
-def _annotate_size(model: dict, mk: str) -> None:
-    """Give EVERY model a ``size_bytes`` the picker can show in ANY disposition
-    (cold / idle / serving) — so choosing a model for static or on-demand
-    residency shows what it costs BEFORE you commit it. GGUF: the effective quant
-    that actually serves (already resolved into ``effective_bytes`` by
-    _annotate_gguf_size), never the all-quants dir sum. Everything else
-    (transformers / comfy): the SINGLE-FORMAT effective footprint — the one usable
-    weight format + sidecars a worker actually holds, NOT the whole-snapshot sum
-    (a mirrored HF repo carries the same weights in 3-5 formats + an fp32 dupe;
-    ledgering the dir sum made an ~11GB model read as 45GB — the 2026-07-16 scare).
-    ``dir_bytes`` keeps the whole-dir footprint for diagnostics. ``None`` when the
-    model isn't on disk."""
-    eff = model.get("effective_bytes")
-    if eff:
-        model["size_bytes"] = eff
-        model.setdefault("dir_bytes", eff)
-        return
-    try:
-        from ....imports.config.models.model_meta import dir_size_bytes
-        from ....imports.config.main import get_model_path
-        from ..functions.imports.utils.format_select import (
-            walk_listing, effective_bytes as _eff_bytes,
-        )
-        model_dir = model.get("destination") or get_model_path(mk)
-        dir_bytes = dir_size_bytes(model_dir)          # whole snapshot (all formats)
-        model["dir_bytes"] = dir_bytes
-        if model_dir:
-            listing = walk_listing(model_dir)
-            if listing:
-                # Same single-format selection the transfer manifest applies, so
-                # the ledger equals what a worker would actually hold post-pull.
-                model["size_bytes"] = _eff_bytes(
-                    listing, framework=model.get("framework"))
-            else:
-                model["size_bytes"] = dir_bytes
-        else:
-            model["size_bytes"] = dir_bytes
-    except Exception:  # noqa: BLE001 — never break the models list over sizing
-        model["size_bytes"] = None
+# The two size annotators MOVED to functions/downloads/model_physical.py, which
+# owns deriving a model's physical state. They were route privates, and a route
+# private cannot be a WRITE point — the download hook and the /models/discover
+# repair sweep have to derive the same numbers the listing shows, through the
+# same code, or the persisted record and the response drift. Re-exported here
+# under their old names so nothing that reached for them has to move.
+from ..functions.downloads.model_physical import (        # noqa: E402
+    annotate_gguf_size as _annotate_gguf_size,
+    annotate_size as _annotate_size,
+    refresh_fields,
+    rebuild_physical,
+)
 
 
 @llm_bp.route("/models", methods=["GET"])
@@ -119,6 +55,12 @@ def list_models():
         _blocked = blocked_keys()
     except Exception:  # noqa: BLE001
         _blocked, block_info = set(), (lambda _k: None)
+    # Media-chat flags for the WHOLE manifest in one store read — media_state()
+    # per model re-read media_models.json ~107 times (isfile + open + read each,
+    # every one a virtiofs round-trip). Same rule as the physical state below:
+    # nothing on this loop may touch the filesystem per model.
+    _media = media_states(manifest.keys() | {
+        (m.get("model_key") or k) for k, m in manifest.items()})
     output = []
     for key, model in manifest.items():
         model = update_model_status(model)
@@ -136,15 +78,17 @@ def list_models():
             # is not enough.
             model.pop("block", None)
         # Whether this model is offered in the media-intelligence chat dropdown.
-        model["media"] = media_state(mk)
+        model["media"] = _media[mk]
         # Whether this model is THE preselected default for the media chat.
         # Exactly one model carries media_default=True (or none, if unset).
         model["media_default"] = (mk == media_default)
-        # GGUF: the model's real size = the one quant that serves, not the dir sum.
-        _annotate_gguf_size(model, mk)
-        # A size for EVERY model (cold/idle/serving) so the picker shows what
-        # you're committing when you pick a static / on-demand residency.
-        _annotate_size(model, mk)
+        # The size half of the model's PERSISTED physical state: the GGUF
+        # effective quant (the one that serves, never the all-quants dir sum)
+        # plus a size for EVERY model in ANY disposition, so the picker shows
+        # what you're committing before you commit it. Same numbers the two
+        # annotators produced — derived once, at the events that change them,
+        # not re-walked out of the store on every GET.
+        update_model_sizes(model, mk)
         output.append(model)
 
     return jsonify(output)
@@ -200,7 +144,19 @@ def _write_discover_state(state: dict) -> None:
 def _run_discovery(state: dict):
     try:
         refresh_registry(run_discovery=True)   # walk + save report + in-place update
-        state["found"] = len(get_models_dict(dict_return=True))
+        manifest = get_models_dict(dict_return=True)
+        state["found"] = len(manifest)
+        # THE REPAIR PASS for the persisted physical state. The store is SHARED
+        # and MUTABLE — another box writes weights, an operator `mv`s a
+        # directory, the reaper deletes — and none of that fires one of our
+        # events, so a persisted size or status can go stale with nobody to tell
+        # us. This sweep re-derives and rewrites every row. It belongs here
+        # because /models/discover is ALREADY the "re-read the disk, the catalog
+        # drifted" recovery route, it already runs on a background thread where
+        # a full walk is affordable, and refresh_registry above has just dropped
+        # the table — so the console's next /models is correct AND warm instead
+        # of paying the whole walk inside one request.
+        state["physical"] = rebuild_physical(manifest, source="discover")
     except Exception as exc:  # noqa: BLE001 — state must always resolve
         logger.warning("model discovery sweep failed: %s", exc)
         state["error"] = f"{type(exc).__name__}: {exc}"
@@ -250,10 +206,13 @@ def reconcile_store_route():
     report = reconcile_store(apply=apply, report_path=report_path)
     report["report_path"] = report_path
     if apply:
-        # An applied reconcile MOVES weights between layouts, so every cached
-        # destination is suspect. reconcile's own _persist_registry only calls
+        # An applied reconcile MOVES weights between layouts, so every persisted
+        # destination and every persisted size is suspect. No model_key here on
+        # purpose: the blast radius is the whole store, so the whole table goes
+        # (over-dropping costs re-derivation; under-dropping would keep pointing
+        # at the old dirs). reconcile's own _persist_registry only calls
         # refresh_registry when it had registry rows to write — a move-only plan
-        # would otherwise leave the memo pointing at the old dirs.
+        # would otherwise leave the records pointing at the old dirs.
         invalidate_model_status_cache("store reconciled")
     return jsonify(report), (200 if apply else 202)
 
@@ -265,10 +224,13 @@ def get_model(model_key):
     if model_key not in manifest:
         abort(404, description="Unknown model key.")
     model = manifest[model_key]
-    # The single-model detail read is the EXPLICIT refresh path: it always stats
-    # live (one model is ~10^2 filesystem calls, not ~10^4) and seeds the memo
-    # the listings share, so "open the row" is also how you force a re-read.
-    return jsonify({"key": model_key, **model, **refresh_model_status(model)})
+    # The single-model detail read is the EXPLICIT refresh path: it always
+    # derives LIVE (one model is ~10^2 filesystem calls, not ~10^4) and REWRITES
+    # the persisted record the listings read, so "open the row" is how an
+    # operator forces a re-read of a shared, mutable store — and it repairs the
+    # listing for everyone else at the same time.
+    return jsonify({"key": model_key, **model,
+                    **refresh_fields(model, model_key)})
 
 
 @llm_bp.route("/models/<model_key>/download", methods=["POST"])
@@ -357,7 +319,8 @@ def delete_model(model_key):
     # DELETE does not go through refresh_registry (the catalog row survives, only
     # the files go), so it must say so itself — otherwise the listings would keep
     # reporting "installed" for a model whose weights are gone.
-    invalidate_model_status_cache(f"model deleted: {model_key}")
+    invalidate_model_status_cache(f"model deleted: {model_key}",
+                                  model_key=model_key)
     return jsonify({"deleted": True, "destination": str(destination)})
 
 
@@ -386,7 +349,8 @@ def prune_model_route(model_key):
     # STATUS is unchanged — but it is a mutating store op and the memo is keyed
     # by routing identity, so drop it rather than reason about whether a pruned
     # key can come back. One re-walk is the entire cost.
-    invalidate_model_status_cache(f"model pruned: {model_key}")
+    invalidate_model_status_cache(f"model pruned: {model_key}",
+                                  model_key=model_key)
     return jsonify(result)
 
 

@@ -17,19 +17,31 @@ virtiofs round-trip. The manifest itself was already cached; the per-model
 status stat was not. Installation status only changes on download / delete /
 prune / reconcile / discovery, so re-walking per request was pure waste.
 
-This suite locks the fix (``comms/model_status_cache.py`` + its call sites):
+SCOPE (narrowed 2026-07-27, same day): the memo was the MITIGATION — it made a
+redundant walk cheap instead of removing it. Install status is now DERIVED at the
+events that change it and PERSISTED beside the registry
+(``comms/model_physical.py``), so ``/models`` and ``/v1/models`` read a dict and
+there is no memo in front of ``model_status`` at all. Those tests live in
+``tests/test_model_physical_state.py``.
 
-  * same VALUES cached vs uncached — the listing content never changes shape;
-  * a second listing does far fewer status reads (counted stub, not wall time);
-  * TTL expiry re-reads;
-  * every invalidation event forces a re-read — download completed / failed /
-    cancelled, model delete, prune, reconcile apply, and refresh_registry (the
-    chokepoint that covers discovery too);
+The memo survives owning exactly ONE question: **/llm/central-provisioning** —
+"can central PROVIDE this model to a worker?" (scope ``central-holdings``). Same
+underlying walk, different answer, no persisted home, and the console polls it
+every 10s over the whole manifest.
+
+This suite locks (``comms/model_status_cache.py`` + that call site):
+
+  * same VALUES cached vs uncached — the content never changes shape;
+  * a second fan-out does far fewer probes (counted stub, not wall time);
+  * TTL expiry re-reads; scopes never collide; a routing change re-keys;
   * concurrent callers single-flight instead of stampeding the walk;
-  * a failure in the cache machinery degrades to the LIVE stat, and an error
-    raised by the live stat still propagates (never an invented status);
+  * a failure in the cache machinery degrades to the LIVE probe, and an error
+    raised by the live probe still propagates (never an invented status);
   * a sibling PROCESS's invalidation is picked up (the gunicorn --workers 3
-    case) via the local epoch file.
+    case) via the local epoch file;
+  * every store event STILL flushes it — download completed / failed /
+    cancelled, delete, prune, reconcile apply, refresh_registry — because the
+    provisioning answer is derived from the same presence facts.
 
 Runs under pytest:
     venv/bin/python -m pytest tests/test_model_status_cache.py -q
@@ -59,6 +71,10 @@ _EPOCH_DIR = tempfile.mkdtemp(prefix="hugpy-status-cache-test-")
 os.environ["HUGPY_MODEL_STATUS_EPOCH_PATH"] = os.path.join(_EPOCH_DIR, "epoch")
 os.environ.pop("HUGPY_MODEL_STATUS_TTL_S", None)
 os.environ.pop("HUGPY_MODEL_STATUS_EPOCH_POLL_S", None)
+# Same rule for the PERSISTED physical table these routes also write: the
+# delete/prune/reconcile wiring tests below drive real routes, and a test run
+# must never drop rows out of the live central's table.
+os.environ["HUGPY_MODEL_PHYSICAL_PATH"] = os.path.join(_EPOCH_DIR, "physical.json")
 
 cache = importlib.import_module("abstract_hugpy_dev.comms.model_status_cache")
 from abstract_hugpy_dev.comms.jobs import normalize_status  # noqa: E402
@@ -98,6 +114,35 @@ class CountingStat:
         return {"status": self.status,
                 "destination": f"{self.destination}/{model.get('model_key')}",
                 "installed_marker": f"{self.destination}/{model.get('model_key')}/hugpy.json"}
+
+
+def _catalog_stamp():
+    """(mtime_ns, size) of the registry's two persisted artifacts."""
+    from abstract_hugpy_dev.imports.src.constants.constants import (
+        MODELS_DICT_PATH, MODELS_DISCOVERY_PATH)
+    out = {}
+    for path in (str(MODELS_DISCOVERY_PATH), str(MODELS_DICT_PATH)):
+        try:
+            st = os.stat(path)
+            out[path] = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            out[path] = None
+    return out
+
+
+@pytest.fixture(autouse=True)
+def _live_catalog_is_off_limits():
+    """Fail LOUDLY if a test writes the live discovery report or manifest.
+
+    Earned 2026-07-27: refresh_registry(run_discovery=True) runs
+    discover_models(save_json=True), which walks the live 16TB store and
+    OVERWRITES model_discovery.json — and with get_models_dict stubbed it wrote
+    an empty one. No test here has any business touching a real catalog file."""
+    before = _catalog_stamp()
+    yield
+    after = _catalog_stamp()
+    changed = [p for p in before if before[p] != after[p]]
+    assert not changed, f"a test modified live registry state: {changed}"
 
 
 @pytest.fixture(autouse=True)
@@ -414,82 +459,35 @@ def _flask_app():
         "abstract_hugpy_dev.flask_app.wsgi_app").get_hugpy_flask()
 
 
-def test_update_model_status_reads_through_the_memo(monkeypatch):
+
+# ── the one question this memo still owns ─────────────────────────────────
+# INSTALL STATUS moved out (2026-07-27): /models + /v1/models now read the
+# PERSISTED physical record (comms/model_physical.py) written at the events that
+# change it, so there is no memo in front of `model_status` any more — a memo and
+# a persisted record both answering "is this installed?" is exactly the
+# two-mechanisms-one-question trap. Those tests live in
+# tests/test_model_physical_state.py.
+#
+# What remains here is /llm/central-provisioning: "can central PROVIDE this model
+# to a worker?". Same walk underneath, different answer, no persisted home — the
+# console polls it every 10s over the whole manifest, so the fan-out is memoized
+# and the single-model GUARD stays live.
+def test_the_install_status_question_no_longer_reads_the_memo(monkeypatch):
+    """update_model_status must not be a memo caller — it is a store lookup."""
     live = CountingStat()
     monkeypatch.setattr(dl, "model_status", live)
-    rows = [_model(f"repo-{i}") for i in range(30)]
-    first = [dict(cd.update_model_status(dict(r))) for r in rows]
-    second = [dict(cd.update_model_status(dict(r))) for r in rows]
-    assert live.calls == 30, "the second manifest walk must not touch the store"
-    assert first == second
-    assert first[0]["status"] == "installed"
-    assert first[0]["destination"].endswith("repo-0")
-
-
-def test_v1_models_identical_cached_vs_uncached(monkeypatch):
-    """Response CONTENT is unchanged; only the number of store reads moves."""
-    live = CountingStat()
-    manifest = _manifest()
-    monkeypatch.setattr(dl, "model_status", live)
-    monkeypatch.setattr(v1, "get_models_dict", lambda **_k: manifest)
-    monkeypatch.setattr(v1, "api_key_required", lambda: False)
-    app = _flask_app()
-
-    monkeypatch.setenv("HUGPY_MODEL_STATUS_TTL_S", "0")     # today's behaviour
-    with app.test_client() as client:
-        uncached = client.get("/v1/models")
-        assert uncached.status_code == 200
-        uncached_body = uncached.get_json()
-    reads_uncached = live.calls
-
-    cache.reset_model_status_cache()
-    monkeypatch.setenv("HUGPY_MODEL_STATUS_TTL_S", "30")
-    live.calls = 0
-    with app.test_client() as client:
-        cold = client.get("/v1/models").get_json()
-        reads_cold = live.calls
-        warm = client.get("/v1/models").get_json()
-        reads_warm = live.calls
-
-    assert uncached_body == cold == warm
-    assert len(cold["data"]) == len(manifest)
-    assert reads_uncached == len(manifest)
-    assert reads_cold == len(manifest)
-    assert reads_warm == reads_cold, (
-        "a second /v1/models must add ZERO store reads")
-
-
-def test_models_listing_shares_the_same_memo(monkeypatch):
-    """/models and /v1/models must not each keep their own idea of status."""
-    live = CountingStat()
-    manifest = _manifest(10)
-    monkeypatch.setattr(dl, "model_status", live)
-    monkeypatch.setattr(v1, "get_models_dict", lambda **_k: manifest)
-    monkeypatch.setattr(v1, "api_key_required", lambda: False)
-    monkeypatch.setattr(routes, "get_models_dict", lambda **_k: manifest)
-    app = _flask_app()
-    with app.test_client() as client:
-        first = client.get("/models")
-        assert first.status_code == 200
-        assert live.calls == len(manifest)
-        client.get("/v1/models")
-        assert live.calls == len(manifest), (
-            "/v1/models re-walked what /models had already read")
-        body = client.get("/models").get_json()
-    assert len(body) == len(manifest)
-    assert live.calls == len(manifest)
-
-
-def test_single_model_route_is_a_live_refresh(monkeypatch):
-    live = CountingStat()
-    manifest = _manifest(3)
-    monkeypatch.setattr(dl, "model_status", live)
-    monkeypatch.setattr(routes, "get_models_dict", lambda **_k: manifest)
-    app = _flask_app()
-    with app.test_client() as client:
-        client.get("/models/repo-0")
-        client.get("/models/repo-0")
-    assert live.calls == 2, "the detail route must always read the store"
+    assert not hasattr(dl, "cached_model_status"), (
+        "downloader.cached_model_status is retired; the persisted record owns "
+        "the install-status question now")
+    assert not hasattr(dl, "refresh_model_status"), (
+        "downloader.refresh_model_status is retired; "
+        "model_physical.refresh_fields is the force-refresh")
+    before = cache.cache_stats()
+    cd.update_model_status(_model("memo-check"))
+    after = cache.cache_stats()
+    assert after["hits"] == before["hits"]
+    assert after["misses"] == before["misses"], (
+        "the listing path went through the install-status memo")
 
 
 def test_central_provisioning_poll_shares_the_memo(monkeypatch):
@@ -537,7 +535,11 @@ def test_central_provisioning_poll_shares_the_memo(monkeypatch):
     assert probes["n"] == before + 2
 
 
-# ── invalidation events ───────────────────────────────────────────────────
+# ── the memo must still hear the store events ─────────────────────────────
+# The central-holdings answer is derived from the same presence facts, so every
+# event that moves a model between not_installed/partial/installed still has to
+# flush it. (What each event does to the PERSISTED record — targeted vs
+# whole-table — is asserted in tests/test_model_physical_state.py.)
 def _spy_invalidation(monkeypatch):
     seen = []
     real = cache.invalidate_model_status
@@ -550,9 +552,15 @@ def _spy_invalidation(monkeypatch):
     return seen
 
 
-def test_delete_route_invalidates_and_forces_a_re_read(monkeypatch, tmp_path):
+def _memo_is_flushed(live, model):
+    """True if the central-holdings memo re-reads after the event."""
+    before = live.calls
+    cache.cached_model_status(model, live, scope="central-holdings")
+    return live.calls == before + 1
+
+
+def test_delete_route_flushes_the_memo(monkeypatch, tmp_path):
     live = CountingStat()
-    monkeypatch.setattr(dl, "model_status", live)
     dest = tmp_path / "models" / "gguf" / "org" / "repo-0"
     dest.mkdir(parents=True)
     (dest / "w.gguf").write_bytes(b"x")
@@ -562,23 +570,19 @@ def test_delete_route_invalidates_and_forces_a_re_read(monkeypatch, tmp_path):
     seen = _spy_invalidation(monkeypatch)
     app = _flask_app()
 
+    m = _model("repo-0")
+    cache.cached_model_status(m, live, scope="central-holdings")
+    assert live.calls == 1
     with app.test_client() as client:
-        cd.update_model_status(_model("repo-0"))
-        assert live.calls == 1
-        cd.update_model_status(_model("repo-0"))
-        assert live.calls == 1                     # memoized
         resp = client.delete("/models/repo-0")
         assert resp.status_code == 200
         assert resp.get_json()["deleted"] is True
-
     assert any("deleted" in r for r in seen), seen
-    cd.update_model_status(_model("repo-0"))
-    assert live.calls == 2, "delete must force the listings to re-read"
+    assert _memo_is_flushed(live, m)
 
 
-def test_prune_route_invalidates(monkeypatch, tmp_path):
+def test_prune_route_flushes_the_memo(monkeypatch, tmp_path):
     live = CountingStat()
-    monkeypatch.setattr(dl, "model_status", live)
     manifest = _manifest(3)
     monkeypatch.setattr(routes, "get_models_dict", lambda **_k: manifest)
     monkeypatch.setattr(routes, "route_destination",
@@ -587,26 +591,24 @@ def test_prune_route_invalidates(monkeypatch, tmp_path):
     seen = _spy_invalidation(monkeypatch)
     app = _flask_app()
 
-    cd.update_model_status(_model("repo-0"))
-    assert live.calls == 1
+    m = _model("repo-0")
+    cache.cached_model_status(m, live, scope="central-holdings")
     with app.test_client() as client:
-        resp = client.post("/models/repo-0/prune")
-        assert resp.status_code == 200
+        assert client.post("/models/repo-0/prune").status_code == 200
     assert any("pruned" in r for r in seen), seen
-    cd.update_model_status(_model("repo-0"))
-    assert live.calls == 2
+    assert _memo_is_flushed(live, m)
 
 
-def test_reconcile_apply_invalidates_but_a_dry_run_does_not(monkeypatch):
+def test_reconcile_apply_flushes_but_a_dry_run_does_not(monkeypatch):
     live = CountingStat()
-    monkeypatch.setattr(dl, "model_status", live)
     reconcile = importlib.import_module("abstract_hugpy_dev.imports.apis.reconcile")
     monkeypatch.setattr(reconcile, "reconcile_store",
                         lambda **_k: {"actions": [], "warnings": []})
     seen = _spy_invalidation(monkeypatch)
     app = _flask_app()
 
-    cd.update_model_status(_model("repo-0"))
+    m = _model("repo-0")
+    cache.cached_model_status(m, live, scope="central-holdings")
     assert live.calls == 1
     # /models/reconcile is operator-token gated (operator_auth._SENSITIVE), so
     # drive the view function inside a request context — we are testing the
@@ -616,7 +618,7 @@ def test_reconcile_apply_invalidates_but_a_dry_run_does_not(monkeypatch):
         _body, status = routes.reconcile_store_route()
         assert status == 202
     assert not seen, "a dry run touches nothing and must not invalidate"
-    cd.update_model_status(_model("repo-0"))
+    cache.cached_model_status(m, live, scope="central-holdings")
     assert live.calls == 1
 
     with app.test_request_context("/models/reconcile", method="POST",
@@ -624,15 +626,13 @@ def test_reconcile_apply_invalidates_but_a_dry_run_does_not(monkeypatch):
         _body, status = routes.reconcile_store_route()
         assert status == 200
     assert any("reconcile" in r for r in seen), seen
-    cd.update_model_status(_model("repo-0"))
-    assert live.calls == 2
+    assert _memo_is_flushed(live, m)
 
 
-def test_refresh_registry_invalidates(monkeypatch):
+def test_refresh_registry_flushes_the_memo(monkeypatch):
     """THE chokepoint: download completion, the discovery sweep and reconcile's
     registry write all land here, so one hook covers them."""
     live = CountingStat()
-    monkeypatch.setattr(dl, "model_status", live)
     md = importlib.import_module(
         "abstract_hugpy_dev.imports.config.models.models_default")
     ov = importlib.import_module("abstract_hugpy_dev.managers.serve.overrides")
@@ -643,163 +643,22 @@ def test_refresh_registry_invalidates(monkeypatch):
     monkeypatch.setattr(ov, "migrate_overrides", lambda *a, **k: [])
     seen = _spy_invalidation(monkeypatch)
 
-    cd.update_model_status(_model("repo-0"))
+    m = _model("repo-0")
+    cache.cached_model_status(m, live, scope="central-holdings")
     assert live.calls == 1
     mc.refresh_registry(run_discovery=False)
     assert any("refresh_registry" in r for r in seen), seen
-    cd.update_model_status(_model("repo-0"))
-    assert live.calls == 2
+    assert _memo_is_flushed(live, m)
 
 
-def test_download_cancel_invalidates(monkeypatch):
+def test_download_cancel_flushes_the_memo(monkeypatch):
     live = CountingStat()
-    monkeypatch.setattr(dl, "model_status", live)
     seen = _spy_invalidation(monkeypatch)
     job = cd.job_store.create("repo-0", kind="download", transport="test")
 
-    cd.update_model_status(_model("repo-0"))
+    m = _model("repo-0")
+    cache.cached_model_status(m, live, scope="central-holdings")
     assert live.calls == 1
     assert cd.cancel_download(job.id)["cancelled"] is True
     assert any("cancelled" in r for r in seen), seen
-    cd.update_model_status(_model("repo-0"))
-    assert live.calls == 2
-
-
-class _FakeProc:
-    """A download child that finishes immediately with ``exitcode``."""
-
-    def __init__(self, exitcode=0):
-        self.exitcode = exitcode
-        self._alive = False
-
-    def start(self):
-        self._alive = False
-
-    def is_alive(self):
-        return self._alive
-
-    def join(self, *_a, **_k):
-        return None
-
-
-class _FakeCtx:
-    def __init__(self, exitcode=0):
-        self.exitcode = exitcode
-
-    def Process(self, *_a, **_k):
-        return _FakeProc(self.exitcode)
-
-
-def _drive_download(monkeypatch, tmp_path, exitcode, max_attempts=1):
-    """Run start_cancellable_download's monitor to a terminal state with no
-    real subprocess, network or store walk."""
-    dest = tmp_path / "dest"
-    dest.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setattr(cd, "route_destination", lambda **_k: str(dest))
-    monkeypatch.setattr(cd, "_estimate_total_bytes_bounded", lambda _m: None)
-    monkeypatch.setattr(cd, "_watch", lambda *_a, **_k: False)
-    monkeypatch.setattr(cd, "_read_error", lambda _j: "synthetic failure")
-    monkeypatch.setattr(cd, "record_downloaded_model", lambda *a, **k: None)
-    monkeypatch.setattr(cd, "refresh_registry", lambda *a, **k: None)
-    monkeypatch.setattr(cd, "MAX_ATTEMPTS", max_attempts)
-    monkeypatch.setattr(cd.mp, "get_context", lambda _n: _FakeCtx(exitcode))
-
-    job = cd.job_store.create("repo-0", kind="download", transport="test")
-    cd.start_cancellable_download(job, _model("repo-0"))
-    deadline = time.time() + 30
-    while time.time() < deadline:
-        cur = cd.job_store.get(job.id)
-        if cur is not None and cur.terminal:
-            return cur
-        time.sleep(0.05)
-    raise AssertionError("download monitor never reached a terminal state")
-
-
-def test_download_completion_invalidates(monkeypatch, tmp_path):
-    live = CountingStat()
-    monkeypatch.setattr(dl, "model_status", live)
-    seen = _spy_invalidation(monkeypatch)
-    cd.update_model_status(_model("repo-0"))
-    assert live.calls == 1
-
-    # "completed" canonicalizes to "done" in the shared job store.
-    job = _drive_download(monkeypatch, tmp_path, exitcode=0)
-    assert normalize_status(job.status) == "done"
-    assert any("completed" in r for r in seen), seen
-    cd.update_model_status(_model("repo-0"))
-    assert live.calls == 2, "a finished download must show up in the listings"
-
-
-def test_download_failure_invalidates(monkeypatch, tmp_path):
-    live = CountingStat()
-    monkeypatch.setattr(dl, "model_status", live)
-    seen = _spy_invalidation(monkeypatch)
-    cd.update_model_status(_model("repo-0"))
-    assert live.calls == 1
-
-    job = _drive_download(monkeypatch, tmp_path, exitcode=1)
-    assert normalize_status(job.status) == "failed"
-    assert any("failed" in r for r in seen), seen
-    cd.update_model_status(_model("repo-0"))
-    assert live.calls == 2, "a give-up leaves partial files — re-read"
-
-
-# ──────────────────────────────────────────────────────────────────────────
-# 5. the real walk, measured against a synthetic store
-# ──────────────────────────────────────────────────────────────────────────
-def test_real_model_status_walk_is_eliminated_on_the_second_pass(tmp_path,
-                                                                 monkeypatch):
-    """End-to-end with the REAL ``model_status``: count actual os.* calls.
-
-    Uses the real resolver against a throwaway store (never the live one), so
-    this measures the thing that was killing central rather than a stub."""
-    paths = importlib.import_module(
-        "abstract_hugpy_dev.imports.src.constants.paths")
-    root = tmp_path / "store"
-    for i in range(20):
-        d = root / "models" / "gguf" / f"org{i % 4}" / f"repo-{i}"
-        d.mkdir(parents=True)
-        (d / f"repo-{i}.Q4_K_M.gguf").write_bytes(b"\0" * (2 * 1024 * 1024))
-    for task in ("text-generation", "image-text-to-text"):
-        (root / "models" / "gguf" / task).mkdir(parents=True, exist_ok=True)
-
-    real_route = paths.route_destination
-    monkeypatch.setattr(
-        dl, "route_destination",
-        lambda m, _r=str(root): real_route(m, _r))
-
-    counter = {"n": 0}
-    originals = {name: getattr(os, name)
-                 for name in ("stat", "lstat", "listdir", "scandir")}
-
-    def wrap(fn):
-        def inner(*a, **k):
-            counter["n"] += 1
-            return fn(*a, **k)
-        return inner
-
-    rows = [_model(f"repo-{i}") for i in range(20)]
-    try:
-        for name, fn in originals.items():
-            monkeypatch.setattr(os, name, wrap(fn))
-        [cd.update_model_status(dict(r)) for r in rows]      # warm the dentries
-        cache.reset_model_status_cache()
-
-        counter["n"] = 0
-        first = [dict(cd.update_model_status(dict(r))) for r in rows]
-        cold_calls = counter["n"]
-
-        counter["n"] = 0
-        second = [dict(cd.update_model_status(dict(r))) for r in rows]
-        warm_calls = counter["n"]
-    finally:
-        for name, fn in originals.items():
-            setattr(os, name, fn)
-
-    assert first == second, "the memo must not change what the listing reports"
-    assert cold_calls > 100, f"expected a real walk, saw {cold_calls} os calls"
-    assert warm_calls <= 4, (
-        f"a warm listing still made {warm_calls} filesystem calls "
-        f"(cold pass was {cold_calls})")
-    print(json.dumps({"models": len(rows), "cold_os_calls": cold_calls,
-                      "warm_os_calls": warm_calls}))
+    assert _memo_is_flushed(live, m)

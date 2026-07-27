@@ -22,16 +22,16 @@ owned CENTRALLY, stored once, and shipped to every worker on the heartbeat
 reply (the ``blocked_models`` idiom: additive, omit-when-default, so an older
 worker simply ignores it).
 
-CONTRAST — what is correctly PER-WORKER
----------------------------------------
-``evict_min_residency_s`` (the anti-thrash floor) is NOT here, deliberately. It
-is a VRAM-RESIDENCY concept, and central has no VRAM preview to diverge from:
-its single eviction call site (``storage_proposal``) is the DISK and hardcodes
-``min_residency_s=0.0``, as does the worker's own storage half
-(``budget.fit_plan``) — both with a standing comment explaining that a freshly
-DOWNLOADED file has no load clock. The floor therefore only ever affects the
-worker's own VRAM auto-evict, where per-box hardware differences make a
-per-worker value the right answer. It lives in the worker's own settings file.
+CONTRAST — the knob that USED to sit beside this one
+----------------------------------------------------
+``evict_min_residency_s`` (the anti-thrash floor) was RETIRED 2026-07-27 by
+operator ruling ("is there still some timeblock on a model being evicted? if so
+eliminate it"). It vetoed eviction of any model resident for less than 300s —
+a clock-driven THIRD protection class, where the standing ruling allows exactly
+two (🔒static residency and actively-answering). Freshness is now expressed as
+RANK, never as a veto: ``eviction.sort_key`` already orders on (calls,
+last_call), so a zero-call fresh load is chosen last but is never unchoosable.
+No time-based eviction block exists anywhere in the residency path.
 
 PERSISTENCE
 -----------

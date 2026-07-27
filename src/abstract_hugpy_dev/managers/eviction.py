@@ -87,14 +87,22 @@ here so the operator can rule and change exactly one place:
      the pool REGARDLESS of rank. Rationale for unevictable-not-deprioritised:
      a rank penalty still evicts it when it is the only candidate, which is the
      failure it exists to prevent.
-  2. THRASH FLOOR (``min_residency_s`` + ``Resident.resident_since``). A fresh
-     load has zero calls and anchors its idle clock at load time, so it sorts
-     high in the never-called bucket and the very next admission can evict it:
-     load -> evict -> reload. ENACTED PROPOSAL: a minimum-residency floor that
-     REMOVES it from the pool (not a score adjustment), the same shape
-     ``managers/serve/hot_cache.py`` already uses for the hot tier. A score
-     adjustment would still lose to a big enough need; removal is the only form
-     that actually stops the loop.
+  2. THRASH FLOOR — RETIRED 2026-07-27 (operator: "is there still some timeblock
+     on a model being evicted? if so eliminate it"). A ``min_residency_s`` floor
+     briefly removed freshly-loaded residents from the pool for 300s. It was a
+     THIRD protection class, and a clock-driven one, which contradicts both
+     standing rulings: protection is exactly ``static`` OR ``in_flight``
+     (2026-07-23), and "when designing anything that unloads/evicts/expires a
+     model, ask what demanded the resources — if the answer is a timer, it's
+     wrong by default" (minimize-loading doctrine).
+
+     What it was actually defending against still stands — a fresh load has zero
+     calls and anchors its idle clock at load time, so it sorts high in the
+     never-called bucket — but the answer is RANK, not a veto. ``sort_key``
+     already orders by (calls, last_call); a zero-call fresh load only wins the
+     victim lottery when nothing better exists, and in that case evicting it is
+     correct, because the alternative is refusing the admission outright. A veto
+     turns "this is the least-bad victim" into "no victim at all".
   3. DROPDOWN DISAGREEMENT is not here — it is a defect in
      ``alloc_modes.feasible_default_mode`` and is fixed there.
 
@@ -131,13 +139,6 @@ _MODE_DEVICE = {
     "max-ram": RAM,
     "ram-only": RAM,
 }
-
-# Enacted proposal 2: default minimum-residency floor, in seconds. Mirrors the
-# hot tier's shape (hot_cache._DEFAULT_MIN_RESIDENCY_S). A model that has been
-# resident for less than this is not a candidate — it has not yet had the
-# chance to earn a call, so its zero-call/never-called rank is an artifact of
-# its age rather than evidence it is unwanted.
-DEFAULT_MIN_RESIDENCY_S = 300.0
 
 # Least reaping (the DROP PASS) — the spec read literally: drop any walked
 # victim the remaining set already covers, so ONE unload of 35 GiB satisfies a
@@ -334,16 +335,18 @@ def tok_s_from_timings(payload: Any) -> Optional[float]:
         return None
 
 
-def _partition(pool: "Iterable[Resident]", *, now: float,
-               min_residency_s: float) -> "tuple[list, list]":
+def _partition(pool: "Iterable[Resident]", *, now: float) -> "tuple[list, list]":
     """Split residents into (walkable, blocking-with-a-why).
 
-    The spec's pool is "residents on d, minus 🔒static". The other three
-    exclusions are the ENACTED PROPOSALS + degrade-not-guess, each named in the
-    blocking report so a refusal explains itself:
+    The spec's pool is "residents on d, minus 🔒static". Exactly two further
+    exclusions survive, each named in the blocking report so a refusal explains
+    itself:
       * in_flight       — enacted proposal 1
-      * thrash floor    — enacted proposal 2
       * unmeasurable    — degrade-not-guess (never free an unknown amount)
+
+    There is deliberately NO time-based exclusion (the 300s thrash floor was
+    retired 2026-07-27 — see the module docstring). ``now`` is still taken
+    because the ranking downstream is time-aware; nothing here vetoes on age.
     """
     walkable: list = []
     blocking: list = []
@@ -356,19 +359,6 @@ def _partition(pool: "Iterable[Resident]", *, now: float,
             # ENACTED PROPOSAL 1 (spec "Open"): unevictable regardless of rank.
             blocking.append({"model_key": r.model_key, "bytes": r.bytes,
                              "why": "in flight (mid-generation)"})
-            continue
-        age = None
-        try:
-            if r.resident_since:
-                age = float(now) - float(r.resident_since)
-        except (TypeError, ValueError):
-            age = None
-        if age is not None and min_residency_s > 0 and age < min_residency_s:
-            # ENACTED PROPOSAL 2 (spec "Open"): REMOVED from the pool, never a
-            # score adjustment — a score adjustment still loses to a big need.
-            blocking.append({"model_key": r.model_key, "bytes": r.bytes,
-                             "why": (f"minimum residency ({age:.0f}s of "
-                                     f"{min_residency_s:.0f}s) — anti-thrash")})
             continue
         try:
             b = int(r.bytes)          # type: ignore[arg-type]
@@ -386,7 +376,7 @@ def _partition(pool: "Iterable[Resident]", *, now: float,
 
 
 def evict_plan(device: str, need: int, residents: "Iterable[Resident]", *,
-               now: float, min_residency_s: float = DEFAULT_MIN_RESIDENCY_S,
+               now: float,
                least_reaping: bool = DEFAULT_LEAST_REAPING
                ) -> EvictPlan:
     """EVICT(device d, need n) — the ONE shared function. PURE.
@@ -399,26 +389,20 @@ def evict_plan(device: str, need: int, residents: "Iterable[Resident]", *,
     read is exactly how central and the worker would drift apart, and the spec
     names that as the failure mode Parity exists to prevent.
 
-    ``least_reaping`` is the same shape of argument and for the same reason: it
-    is PASSED IN, never read from the environment here, because this module is
-    pure and a self-read would be a second clock. Its SCOPE, however, differs
-    from ``min_residency_s`` and the difference is load-bearing:
+    ``least_reaping`` is PASSED IN, never read from the environment here,
+    because this module is pure and a self-read would be a second clock. It
+    changes THE DROP PASS, which every site runs — including central's
+    ``storage_proposal``. If worker A ran it ON and central previewed it OFF,
+    their victim lists would differ on the very fixture
+    ``tests/test_eviction_parity.py`` exists to police. It is therefore
+    FLEET-WIDE: one central setting, shipped to every worker on the heartbeat
+    (the ``blocked_models`` idiom), never a per-worker key.
 
-      * ``min_residency_s`` is a VRAM-residency concept. Central never previews
-        a VRAM eviction — its only call site (``storage_proposal``) is the DISK
-        and hardcodes the floor to 0, as does the worker's storage half
-        (``budget.fit_plan``). So a per-worker floor cannot desynchronise
-        anything: there is no central counterpart to disagree with.
-      * ``least_reaping`` changes THE DROP PASS, which every site runs —
-        including central's ``storage_proposal``. If worker A ran it ON and
-        central previewed it OFF, their victim lists would differ on the very
-        fixture ``tests/test_eviction_parity.py`` exists to police. It is
-        therefore FLEET-WIDE: one central setting, shipped to every worker on
-        the heartbeat (the ``blocked_models`` idiom), never a per-worker key."""
+    There is no residency-floor argument: nothing here vetoes a victim on age
+    (retired 2026-07-27, see the module docstring)."""
     need = max(0, int(need or 0))
     plan = EvictPlan(device=device, need=need)
-    walkable, blocking = _partition(residents, now=now,
-                                    min_residency_s=min_residency_s)
+    walkable, blocking = _partition(residents, now=now)
     plan.blocking = blocking
     if need <= 0:
         plan.enough = True
@@ -511,7 +495,6 @@ def plan_admission(size: "Optional[int]", mode: Any, *,
                    ram_total: "Optional[int]" = None,
                    residents: "Optional[Iterable[Resident]]" = None,
                    now: float = 0.0,
-                   min_residency_s: float = DEFAULT_MIN_RESIDENCY_S
                    ) -> Placement:
     """Box 1 of the spec — the SINGLE-POOL convenience form. PURE.
 
@@ -537,7 +520,7 @@ def plan_admission(size: "Optional[int]", mode: Any, *,
         vram_total=vram_total, ram_total=ram_total,
         vram_residents=(residents if preferred_device(mode) == VRAM else None),
         ram_residents=(residents if preferred_device(mode) == RAM else None),
-        now=now, min_residency_s=min_residency_s)
+        now=now)
 
 
 def plan_admission_split(size: "Optional[int]", mode: Any, *,
@@ -547,7 +530,6 @@ def plan_admission_split(size: "Optional[int]", mode: Any, *,
                          vram_residents: "Optional[Iterable[Resident]]" = None,
                          ram_residents: "Optional[Iterable[Resident]]" = None,
                          now: float = 0.0,
-                         min_residency_s: float = DEFAULT_MIN_RESIDENCY_S
                          ) -> Placement:
     """Box 1 with the two device pools passed explicitly. THE real entry point.
 
@@ -603,8 +585,7 @@ def plan_admission_split(size: "Optional[int]", mode: Any, *,
     out = Placement(action="place", device=device)
 
     # EVICT(D, need = Z - D_free)
-    p1 = evict_plan(device, Z - free[device], pools[device], now=now,
-                    min_residency_s=min_residency_s)
+    p1 = evict_plan(device, Z - free[device], pools[device], now=now)
     out.evict.append(p1)
     if p1.enough:
         out.on_device = Z
@@ -631,8 +612,7 @@ def plan_admission_split(size: "Optional[int]", mode: Any, *,
         return out
 
     # EVICT(O, need = R - O_free)
-    p2 = evict_plan(other, R - free[other], pools[other], now=now,
-                    min_residency_s=min_residency_s)
+    p2 = evict_plan(other, R - free[other], pools[other], now=now)
     out.evict.append(p2)
     if p2.enough:
         out.action = "split"
