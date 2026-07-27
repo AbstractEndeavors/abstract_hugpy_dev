@@ -7129,16 +7129,24 @@ def _reclaimable_vram_bytes(candidates: "list[dict]") -> "int | None":
 
 
 def _autofit_layers_for(path: str, free_vram: "int | None",
-                        extra_reserve: int = 0) -> "int | None":
+                        extra_reserve: int = 0,
+                        n_ctx: "int | None" = None) -> "int | None":
     """``autofit_gpu_layers`` against an EXPLICIT free-VRAM figure, or None when it
     can't be evaluated. Thin wrapper so the eviction-aware planner and the slot
-    child agree on one layer-fitting formula (no parallel estimator)."""
+    child agree on one layer-fitting formula (no parallel estimator).
+
+    ``n_ctx`` is the context the child will be launched with. The context reserve
+    is linear in it (spill.vram_ctx_reserve_bytes), so the planner must price the
+    SAME ctx the slot child will — otherwise the plan it hands the child (which
+    lands as an explicit n_gpu_layers) is sized against a different context than
+    the one that gets served. None -> spill derives the loader's own choice."""
     if not path or not free_vram or free_vram <= 0:
         return None
     try:
         from ..managers import spill as _spill
         return _spill.autofit_gpu_layers(path, free_vram=int(free_vram),
-                                         extra_reserve_bytes=int(extra_reserve or 0))
+                                         extra_reserve_bytes=int(extra_reserve or 0),
+                                         n_ctx=n_ctx)
     except Exception:  # noqa: BLE001 — unmeasurable -> caller keeps today's path
         return None
 
@@ -7184,10 +7192,19 @@ def _plan_autofit_against_reclaimable(state: "WorkerState", model_key: str,
         extra_reserve = int(_vpb(path) or 0)
     except Exception:  # noqa: BLE001
         extra_reserve = 0
-    layers_now = _autofit_layers_for(path, free_now, extra_reserve)
+    # The ctx this model is ALLOCATED (ctx_pct) — the same number the slot child
+    # will serve, so planner and child price the same KV cache. None when ctx_pct
+    # is unset: spill then derives the loader's own default, exactly as the child
+    # does (byte-identical to before this became a variable).
+    try:
+        _ctx_plan = _resolved_ctx(model_key)[0]
+    except Exception:  # noqa: BLE001 — a ctx read must never block the planner
+        _ctx_plan = None
+    layers_now = _autofit_layers_for(path, free_now, extra_reserve, _ctx_plan)
     if layers_now is None or layers_now == -1:
         return None                          # already plans every layer -> today
-    target = _autofit_layers_for(path, int(free_now) + int(reclaimable), extra_reserve)
+    target = _autofit_layers_for(path, int(free_now) + int(reclaimable),
+                                 extra_reserve, _ctx_plan)
     if target is None:
         return None
     if target != -1 and target <= layers_now:
@@ -7195,7 +7212,7 @@ def _plan_autofit_against_reclaimable(state: "WorkerState", model_key: str,
     return {"target_layers": target, "layers_now": layers_now,
             "free_now": int(free_now), "reclaimable": int(reclaimable),
             "path": path, "total_layers": int(total_layers),
-            "extra_reserve": extra_reserve}
+            "extra_reserve": extra_reserve, "n_ctx": _ctx_plan}
 
 
 def _size_up_for_eviction(state: "WorkerState", model_key: str, plan: dict,
@@ -7218,6 +7235,7 @@ def _size_up_for_eviction(state: "WorkerState", model_key: str, plan: dict,
     """
     path = plan["path"]
     extra = plan.get("extra_reserve") or 0
+    _ctx_plan = plan.get("n_ctx")            # same ctx the plan was sized against
     if lru is None:
         try:
             from ..managers.dispatch.dispatch import last_used_snapshot as _lus
@@ -7250,7 +7268,7 @@ def _size_up_for_eviction(state: "WorkerState", model_key: str, plan: dict,
         # Stop as soon as the layer target is ACHIEVED — the minimum eviction
         # set, same discipline as the fit loop. Re-planned from the device each
         # round, so we never evict past what the plan actually needs.
-        cur = _autofit_layers_for(path, _free_vram_bytes(), extra)
+        cur = _autofit_layers_for(path, _free_vram_bytes(), extra, _ctx_plan)
         if cur == -1 or (target != -1 and cur is not None and cur >= target):
             break
         mk = r["model_key"]
@@ -7278,7 +7296,7 @@ def _size_up_for_eviction(state: "WorkerState", model_key: str, plan: dict,
     # ── THE RE-PLAN. Measure the device again and size the layer count against
     #    what MATERIALISED, never against the theoretical figure we planned with.
     final_free = _free_vram_bytes()
-    final = _autofit_layers_for(path, final_free, extra)
+    final = _autofit_layers_for(path, final_free, extra, _ctx_plan)
     if final is None:
         # Lost the measurement mid-flight -> emit nothing; the child autofits for
         # itself exactly as today (degrade-not-guess).

@@ -47,6 +47,28 @@ D = importlib.import_module("abstract_hugpy_dev.managers.dispatch.dispatch")
 GIB = 1 << 30
 
 
+@pytest.fixture(autouse=True)
+def _no_env_leak():
+    """Restore the HUGPY_* spill wire after every test.
+
+    This suite exercises agent._apply_spill, whose JOB is to write the spill
+    knobs into os.environ — so a test that drives it LEAKS them into the process
+    for every suite that runs afterwards. Measured 2026-07-27: this file left
+    HUGPY_GPU_MEM_GIB=0.0 behind, which makes autofit_gpu_layers cap free VRAM at
+    zero and return 0 layers, and that is what fails
+    test_spill_vision_fit::test_vision_ngl_arg_env_overrides in a whole-directory
+    run (the recorded 'cross-file pollution' landmine). Snapshot/restore here, so
+    the leak stops at the file boundary. Asserts nothing; changes no behaviour."""
+    saved = {k: v for k, v in os.environ.items() if k.startswith("HUGPY_")}
+    try:
+        yield
+    finally:
+        for k in [k for k in os.environ if k.startswith("HUGPY_")]:
+            if k not in saved:
+                del os.environ[k]
+        os.environ.update(saved)
+
+
 # ═══════════ synthetic GGUF fixtures (the real reader parses these) ═════════
 def _mk_gguf(path, *, tensors=(), block_count=None, expert_count=None,
              expert_used=None, dims_by_name=None):
@@ -355,8 +377,12 @@ def cmd_rig(monkeypatch, moe_gguf, dense_gguf):
     monkeypatch.setattr(serve, "LLAMA_SERVER_BIN", "/bin/echo")
     monkeypatch.setattr(sa, "_server_supports_flag", lambda b, f: True)
     auto = {"value": 17}
+    # **_kw so the stub tracks the real signature as it grows (n_ctx joined it
+    # 2026-07-27 when the context reserve became per-model) — this rig is about
+    # the MoE placement policy, never about autofit's own arithmetic.
     monkeypatch.setattr(spill, "autofit_gpu_layers",
-                        lambda p, free_vram=None, extra_reserve_bytes=0: auto["value"])
+                        lambda p, free_vram=None, extra_reserve_bytes=0,
+                        **_kw: auto["value"])
     for env in ("HUGPY_ALLOC_MODE", "HUGPY_N_CPU_MOE", "HUGPY_N_GPU_LAYERS",
                 "HUGPY_HOT_CACHE_ROOT", "HUGPY_MODEL_CACHE"):
         monkeypatch.delenv(env, raising=False)

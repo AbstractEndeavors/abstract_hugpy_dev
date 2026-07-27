@@ -154,6 +154,21 @@ def _finish_reason(reason: str | None) -> str:
     return {"max_tokens": "length"}.get(reason or "stop", reason or "stop")
 
 
+def _is_request_shape_message(message: str) -> bool:
+    """Is this terminal error a malformed-REQUEST error (chat template) ?
+
+    Delegates to the ONE classifier (managers.resolvers.remote) so the route and
+    the relay can never drift on what counts as a request-shape fault. Any
+    import failure degrades to False — today's behaviour, never a new 500 path.
+    """
+    try:
+        from abstract_hugpy_dev.managers.resolvers.remote import (
+            _is_request_shape_error)
+        return bool(_is_request_shape_error(message))
+    except Exception:  # noqa: BLE001 — classification must never break a reply
+        return False
+
+
 @v1_bp.route("/v1/chat/completions", methods=["POST"])
 @v1_auth
 def v1_chat_completions():
@@ -318,6 +333,11 @@ def v1_chat_completions():
         return _openai_error(str(exc).strip("'\""), 404, "invalid_request_error")
     except Exception as exc:
         logger.exception("v1 completion failed")
+        # Same classification for an exception that escaped the stream (the
+        # one-shot relay raises rather than yielding): a request-shape fault is
+        # a 400, never a 500 the client is invited to retry.
+        if _is_request_shape_message(f"{type(exc).__name__}: {exc}"):
+            return _openai_error(f"{exc}", 400, "invalid_request_error")
         return _openai_error(f"{type(exc).__name__}: {exc}", 500, "api_error")
 
     if error_message and not text_parts:
@@ -327,6 +347,12 @@ def v1_chat_completions():
         # instead of treating it as a hard error.
         if "worker_busy" in error_message or "model_busy" in error_message:
             return _openai_error(error_message, 503, "server_busy")
+        # A malformed request (the model's chat template refuses this message
+        # sequence) is the CLIENT's fault, not ours: answer 400
+        # invalid_request_error so an OpenAI SDK raises BadRequestError instead
+        # of retrying a 500 — and so nothing blames the box's size.
+        if _is_request_shape_message(error_message):
+            return _openai_error(error_message, 400, "invalid_request_error")
         status = 404 if "Unknown model" in error_message else 500
         return _openai_error(error_message, status, "api_error")
 

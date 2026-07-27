@@ -49,8 +49,12 @@ def cmd_rig(monkeypatch, tmp_path):
     monkeypatch.setattr(serve, "LLAMA_SERVER_BIN", "/bin/echo")
     monkeypatch.setattr(sa, "_server_supports_flag", lambda b, f: True)
     auto = {"value": -1}
+    # **_kw so the stub tracks the real signature as it grows (n_ctx joined it
+    # 2026-07-27 when the context reserve became per-model) — this suite is
+    # about the inverse-VRAM guard, never about autofit's own arithmetic.
     monkeypatch.setattr(spill, "autofit_gpu_layers",
-                        lambda p, free_vram=None, extra_reserve_bytes=0: auto["value"])
+                        lambda p, free_vram=None, extra_reserve_bytes=0,
+                        **_kw: auto["value"])
     # Dense (gguf_moe_detail sees no expert tensors) so the AUTO MoE-split
     # branches inside _build_cmd stay inert — this suite is about the NEW
     # inverse-VRAM guard, not the MoE auto-placement policy.

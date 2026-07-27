@@ -716,6 +716,52 @@ def _is_permanent_load_error(err: Any) -> bool:
     return any(m in low for m in _PERMANENT_LOAD_MARKERS)
 
 
+# A REQUEST-SHAPE failure — the messages the caller sent are malformed for THIS
+# model's chat template (strict user/assistant alternation, an unsupported role,
+# a template that demands the last turn be a user turn, ...). It is NOT a load
+# problem and NOT a capacity problem, so:
+#   * it must never be held/retried — the identical payload fails identically,
+#     and holding it for the full cold-hold ceiling is what made a single
+#     malformed call hang until the client gave up (HTTP 000, operator report
+#     2026-07-27), and
+#   * the surfaced message must NEVER speculate about the box being too small.
+#     "the model may be too large for the box" was asserted for ANY late failure
+#     and cost hours of VRAM investigation on a request-shape bug. A confidently
+#     wrong diagnostic is worse than a vague one.
+_REQUEST_SHAPE_MARKERS = (
+    "templateerror", "template error", "jinja2", "jinja",
+    "roles must alternate", "must alternate",
+    "chat template",
+    "only user and assistant roles are supported",
+    "conversation roles must",
+)
+
+
+def _is_request_shape_error(err: Any) -> bool:
+    low = str(getattr(err, "message", None) or err or "").lower()
+    return any(m in low for m in _REQUEST_SHAPE_MARKERS)
+
+
+def _request_shape_message(model_key: str, worker: Optional[dict],
+                           err: Any) -> str:
+    """The honest line for a malformed-request failure.
+
+    Names the actual fault class (request shape / chat template) and the raw
+    engine error, and says nothing about box size or load stalls — none of which
+    are implicated.
+    """
+    wname = (worker or {}).get("name") or (worker or {}).get("id") or "worker"
+    raw = str(getattr(err, "message", None) or err or "").strip()
+    detail = f": {raw}" if raw else ""
+    return (f"'{model_key}' on '{wname}' rejected the REQUEST SHAPE{detail} — "
+            f"this model's chat template will not render the message sequence "
+            f"that was sent (it requires the roles in a particular order, e.g. "
+            f"strict user/assistant alternation after an optional system "
+            f"message). This is a malformed request, not a capacity or load "
+            f"problem: the model is loaded and resending the same messages will "
+            f"fail identically. Fix the message list and send again.")
+
+
 def _blocked_reason(model_key: Optional[str]) -> Optional[str]:
     """Operator BLOCK gate: the honest refusal when ``model_key`` is blocked from
     the serving pool, else None. Block is an operator override that outranks BOTH
@@ -779,7 +825,15 @@ def _loading_status(request_id: str, model_key: str, worker: Optional[dict],
 
 def _cold_timeout_message(model_key: str, worker: Optional[dict],
                           last_err: str) -> str:
-    """The honest give-up line when a held load never became ready in time."""
+    """The honest give-up line when a held load never became ready in time.
+
+    The size/stall speculation is only ever appended when the last error is
+    actually consistent with a LOAD problem. A request-shape failure that
+    somehow reached the ceiling reports itself as what it is — the wrapper must
+    never re-label another fault class as a capacity problem.
+    """
+    if last_err and _is_request_shape_error(last_err):
+        return _request_shape_message(model_key, worker, last_err)
     wname = (worker or {}).get("name") or (worker or {}).get("id") or "worker"
     tail = f" (last: {last_err})" if last_err else ""
     return (f"'{model_key}' did not finish loading on '{wname}' in time"
@@ -1291,6 +1345,12 @@ def make_delegating_runner(framework: str, task: str):
                         {"timings": getattr(_res, "timings", None)})
                     return _res
                 except Exception as exc:
+                    if _is_request_shape_error(exc) and not _local_fallback_allowed():
+                        # Malformed for this model's chat template — fail FAST
+                        # and name the real fault. Never held (running it local
+                        # would fail the same way, and holding it is the hang).
+                        raise RuntimeError(
+                            _request_shape_message(self.model_key, worker, exc)) from exc
                     if _local_fallback_allowed():
                         logger.warning("worker run failed (%s); running %s locally",
                                        exc, self.model_key)
@@ -1381,6 +1441,13 @@ def make_delegating_runner(framework: str, task: str):
                                                          f"(the reply was interrupted partway through)")
                                 return
                                 # pragma: no cover
+                            if _is_request_shape_error(ev.message):
+                                # Request-shape (chat template) — honest, never
+                                # held, never blamed on box size. Ahead of the
+                                # local-fallback branch: local would render the
+                                # same template and fail identically.
+                                raise _LoadFailed(_request_shape_message(
+                                    self.model_key, worker, ev.message))
                             if _local_fallback_allowed():
                                 logger.warning("worker %s errored before output (%s); "
                                                "running %s locally", worker.get("id"),
@@ -1423,6 +1490,9 @@ def make_delegating_runner(framework: str, task: str):
                         yield ErrorEvent(request_id=req.request_id,
                                          message=f"worker {wname}: stream interrupted: {exc}")
                         return
+                    if _is_request_shape_error(exc):
+                        raise _LoadFailed(_request_shape_message(
+                            self.model_key, worker, exc))
                     if _local_fallback_allowed():
                         logger.warning("worker offload failed (%s); running %s locally",
                                        exc, self.model_key)

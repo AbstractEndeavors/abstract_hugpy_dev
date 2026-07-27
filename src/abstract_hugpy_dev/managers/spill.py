@@ -28,6 +28,7 @@ layers) when no GPU is visible, so a CPU-only host behaves exactly as before.
 from __future__ import annotations
 
 import os
+import sys
 import logging
 from typing import Any, Optional
 
@@ -50,10 +51,12 @@ logger = logging.getLogger("abstract_hugpy_dev.spill")
 # published for. Operator: "i've accepted lack of safety simply due to the
 # 23.5 GB transformers that obviously are for a 3090".
 #
-# STILL IN FORCE, so this is not "no safety": the explicit ctx reserve (2.5 GiB,
-# measured-accurate), HUGPY_VRAM_RESERVE_GIB (1.0 GiB, for consumers central
-# cannot see), and the ~90% admission ceiling (HUGPY_VRAM_CEILING_FRAC) which is
-# the real OOM backstop. This removes a redundant fourth margin, not the floor.
+# STILL IN FORCE, so this is not "no safety": the ctx reserve (COMPUTED from the
+# model's real geometry at the real n_ctx since 2026-07-27 — see
+# vram_ctx_reserve_bytes; it was a flat 2.5 GiB when this note was written),
+# HUGPY_VRAM_RESERVE_GIB (1.0 GiB, for consumers central cannot see), and the
+# ~90% admission ceiling (HUGPY_VRAM_CEILING_FRAC) which is the real OOM
+# backstop. This removes a redundant fourth margin, not the floor.
 # Tunable if it bites: set HUGPY_VRAM_SAFETY below 1.0 (read at CALL time by
 # _vram_safety(), not here — _env_float is defined further down this module and
 # a module-level call would NameError on import, taking every worker with it).
@@ -1013,10 +1016,160 @@ def vision_projector_bytes(model_path: str) -> int:
     return 0
 
 
+# ── The llama_context reserve: COMPUTED, not a flat constant (2026-07-27) ───
+# THE DEFECT this replaces. ``autofit_gpu_layers`` held back a FLAT
+# HUGPY_VRAM_CTX_RESERVE_GIB (2.5 GiB) on every card, and ``free_vram_bytes``
+# had already held back a FLAT HUGPY_VRAM_RESERVE_GIB (1.0 GiB) before autofit
+# ever saw the number. 3.5 GiB flat is 15% of a 24 GiB 3090 (tolerable) and 44%
+# of computron's 8 GiB 4060 (crippling). The 2.5 was hand-tuned so a 70B could
+# still build its llama_context on a 24 GB card; it never scaled DOWN, so a
+# constant sized for the biggest card starved the smallest.
+#
+# What it cost, MEASURED on computron (RTX 4060, 7807 MiB card) with
+# flux2-klein-9b-uncensored q4_k_m (5_027_783_648 B = 4.68 GiB, 36 layers):
+#     autofit given 7.5 GiB (the whole empty card)  ->  29/36 layers
+#     autofit given 6.5 GiB (after the 1.0 reserve) ->  23/36 layers
+# yet a manual re-seat at n_gpu_layers=-1 put ALL 36 layers on that card —
+# 6739 MiB used, 1068 MiB STILL FREE. The model demonstrably fit and the fit
+# math could not see it. By the cliff measured 2026-07-25 that is a ~4x loss: a
+# dense GGUF runs ~135 tok/s fully resident and ~36 the moment ONE layer spills.
+#
+# THE REPLACEMENT. The reserve is what a llama_context actually costs, and that
+# is COMPUTABLE from geometry the GGUF header already carries and this module
+# already parses (``_gguf_kv_geometry`` -> block_count / head_count_kv /
+# key_length / context_length, verified against real files):
+#
+#     ctx_reserve = kv_bytes(n_ctx, geometry, fp16) + _CTX_COMPUTE_RESERVE_BYTES
+#
+# KV dominates and is EXACT (llama.cpp caches fp16 by default; we never assume a
+# quantized cache). Verified against the real flux2 header (36 layers, 8 kv
+# heads, head_dim 128): 2 x 36 x 8 x 128 x 2 B = 147_456 B/token = 144 KiB/token,
+# so at n_ctx 16384 the KV cache is 2.25 GiB. The module's own measurement at
+# that ctx was "7441 MiB on the card, 4.68 GiB of weights" -> 2.59 GiB of
+# KV+compute+context, i.e. a 348 MiB residual on top of the computed KV. That
+# residual is the compute-graph buffers + logits buffer + the process's own CUDA
+# runtime/kernels, which do NOT scale with n_ctx; _CTX_COMPUTE_RESERVE_BYTES
+# (512 MiB) covers it with ~47% headroom.
+#
+# DEGRADE-NOT-GUESS. Geometry that cannot be read (a non-GGUF path, a truncated
+# header, a model with no head_count_kv) returns TODAY'S FLAT 2.5 GiB, so every
+# unparseable case behaves exactly as before. An EXPLICIT
+# HUGPY_VRAM_CTX_RESERVE_GIB is an operator override and is honoured verbatim,
+# flat, with no computation and no un-stacking (see autofit_gpu_layers).
+_DEFAULT_CTX_RESERVE_GIB = 2.5
+# Mirrors serve.DEFAULT_LLAMA_CTX — the cap the llama.cpp loader applies to
+# every served ctx. Duplicated (not imported) so the fit math stays self-
+# contained and offline-testable; llama_ctx_cap() prefers the REAL value
+# whenever the serve layer is already loaded in this process.
+_CTX_CAP_FALLBACK = 16384
+# Compute-graph + logits + CUDA-runtime VRAM that lands beside the KV cache.
+# Measured 348 MiB on the reference model (see above); 512 MiB is that with
+# headroom. Deliberately ctx-INDEPENDENT: llama.cpp sizes these off n_ubatch
+# (512 by default here) and n_vocab, not off n_ctx.
+_CTX_COMPUTE_RESERVE_BYTES = 512 * 2**20
+
+
+def llama_ctx_cap() -> int:
+    """The ctx cap the llama.cpp loader would apply (``serve.DEFAULT_LLAMA_CTX``).
+
+    Read WITHOUT importing the serve layer: if serve is already in
+    ``sys.modules`` (every real serving path) its authoritative value is used;
+    otherwise the same ``DEFAULT_LLAMA_CTX`` env var serve itself reads; else the
+    module fallback. Never raises, always returns a positive int."""
+    cap = None
+    try:
+        mod = sys.modules.get(
+            __name__.replace(".managers.spill", ".managers.serve.serve"))
+        if mod is not None:
+            cap = getattr(mod, "DEFAULT_LLAMA_CTX", None)
+    except Exception:  # noqa: BLE001 — a cap read must never break a load
+        cap = None
+    if not cap:
+        cap = _env_int("DEFAULT_LLAMA_CTX")
+    try:
+        cap = int(cap or 0)
+    except (TypeError, ValueError):
+        cap = 0
+    return cap if cap > 0 else _CTX_CAP_FALLBACK
+
+
+def ctx_for_fit(model_path: str, n_ctx: Optional[int] = None,
+                geometry: Optional[dict] = None) -> int:
+    """The n_ctx the fit math should price the KV cache against.
+
+    An explicit ``n_ctx`` (the caller KNOWS what the child will be launched with
+    — slot_agent resolves ``-c`` before it fits layers) always wins. Otherwise
+    mirror what the loader would pick: ``min(the model's trained context, the
+    engine cap)`` — the same shape as ``serve._ctx_for``'s fallback, derived from
+    the GGUF's own ``*.context_length`` rather than guessed."""
+    try:
+        n = int(n_ctx) if n_ctx else 0
+    except (TypeError, ValueError):
+        n = 0
+    if n > 0:
+        return n
+    cap = llama_ctx_cap()
+    geo = geometry if isinstance(geometry, dict) else _gguf_kv_geometry(model_path)
+    try:
+        trained = int((geo or {}).get("ctx_train") or 0)
+    except (TypeError, ValueError):
+        trained = 0
+    return min(trained, cap) if trained > 0 else cap
+
+
+def vram_ctx_reserve_bytes(model_path: str,
+                           n_ctx: Optional[int] = None) -> "tuple[int, str, dict]":
+    """VRAM a llama_context needs BESIDES the weights: ``(bytes, source, detail)``.
+
+    ``source`` is one of:
+      * ``"env"``       — HUGPY_VRAM_CTX_RESERVE_GIB was explicitly set. The
+        operator's number, flat, verbatim; no geometry is consulted.
+      * ``"computed"``  — KV(n_ctx, real geometry, fp16) + the compute-graph
+        allowance. The honest per-model figure.
+      * ``"default"``   — geometry unreadable (non-GGUF, truncated header, no
+        head_count_kv): TODAY'S FLAT 2.5 GiB, byte-identical to the old
+        behaviour. Degrade-not-guess.
+
+    ``detail`` carries the inputs (ctx, kv_bytes, geometry) for logging; it is
+    never load-bearing."""
+    env_gib = _env_float("HUGPY_VRAM_CTX_RESERVE_GIB")
+    if env_gib is not None:
+        return int(env_gib * 2**30), "env", {"ctx": None}
+    flat = int(_DEFAULT_CTX_RESERVE_GIB * 2**30)
+    try:
+        geo = _gguf_kv_geometry(model_path) or {}
+    except Exception:  # noqa: BLE001 — an unreadable header is the flat path
+        geo = {}
+    n_layers = geo.get("n_layers")
+    n_kv_heads = geo.get("n_kv_heads")
+    head_dim = geo.get("head_dim")
+    if not (n_layers and n_kv_heads and head_dim):
+        # Incomplete geometry: do NOT fall to kv_bytes' bytes-per-token heuristic
+        # here — a fit decision must not be made on a guessed cache size. Today's
+        # flat reserve is the stated degrade.
+        return flat, "default", {"ctx": None}
+    ctx = ctx_for_fit(model_path, n_ctx=n_ctx, geometry=geo)
+    kv = kv_bytes(ctx_tokens=ctx, n_layers=n_layers, n_kv_heads=n_kv_heads,
+                  head_dim=head_dim, dtype_bytes=2.0)   # llama.cpp caches fp16
+    if not kv:
+        return flat, "default", {"ctx": ctx}
+    return (int(kv) + _CTX_COMPUTE_RESERVE_BYTES, "computed",
+            {"ctx": ctx, "kv_bytes": int(kv),
+             "compute_bytes": _CTX_COMPUTE_RESERVE_BYTES,
+             "n_layers": int(n_layers), "n_kv_heads": int(n_kv_heads),
+             "head_dim": int(head_dim)})
+
+
 def autofit_gpu_layers(model_path: str,
                        free_vram: Optional[int] = None,
-                       extra_reserve_bytes: int = 0) -> int:
+                       extra_reserve_bytes: int = 0,
+                       n_ctx: Optional[int] = None) -> int:
     """How many GGUF layers fit in free VRAM. -1 (all) when the whole file fits.
+
+    ``free_vram`` is a BUDGETABLE figure — the operator VRAM reserve
+    (``vram_reserve_bytes``) already removed, i.e. what ``free_vram_bytes()``
+    returns. Every caller in the tree passes one from that family; the reserve
+    arithmetic below relies on it (see THE STACKING DECISION).
 
     ``extra_reserve_bytes`` is VRAM that must be held OUT of the layer budget
     because something else lands on the GPU next to the offloaded layers — for a
@@ -1024,7 +1177,54 @@ def autofit_gpu_layers(model_path: str,
     It is subtracted from the budget alongside the KV/context allowance, so a
     partial split leaves honest room for the projector and we only return -1 (all
     layers) when the whole model AND the projector AND the context all fit. 0
-    (the default) reproduces the historical text-model behaviour exactly."""
+    (the default) reproduces the historical text-model behaviour exactly.
+
+    ``n_ctx`` is the context the child will ACTUALLY be launched with. The KV
+    cache is linear in it, so this is the single biggest input to the reserve;
+    slot_agent resolves ``-c`` before calling. Omitted -> ``ctx_for_fit``
+    reproduces the loader's own choice from the GGUF header.
+
+    THE STACKING DECISION (2026-07-27). Two reserves used to be charged against
+    the same card for the same load: ``vram_reserve_bytes`` (1.0 GiB, removed
+    upstream inside ``free_vram_bytes``, for "GPU consumers central knows nothing
+    about") and this context reserve. They are different CONCERNS and they still
+    stack — for a SPLIT. They no longer stack for the WHOLE-FIT test:
+
+        whole fits?  free - max(0, context need - external floor) >= file
+                     (equivalently: raw free - max(need, floor) >= file)
+        how many?    free - (context need + projector)
+                     (fully stacked: a split never plans into the floor)
+
+    Why the whole-fit test is un-stacked, in one measured line: the manual
+    re-seat proved flux2-klein-9b costs 6739 MiB all-in on a 7807 MiB card, so
+    the honest non-weight overhead is ~1.9 GiB. Against the post-reserve 6.5 GiB
+    even a PERFECT context reserve leaves 4.60 GiB for a 4.68 GiB file — it
+    still refuses, by 84 MiB. No achievable accuracy in this reserve fixes the
+    measured case while the two stack; the stack ITSELF is the refusal. And the
+    external reserve is a GROWTH cushion, not an occupancy measure: the free read
+    already excludes every byte a stranger holds right now.
+
+    Why the SPLIT stays stacked: the credit exists to stop the CLIFF — a model
+    that measurably fits being spilled anyway costs ~4x throughput (135 -> 36
+    tok/s the moment one layer leaves the card). A model that cannot fit whole
+    has no cliff to avoid, so there is nothing to buy by planning into the floor
+    — and everything to lose (that is how a 70B lands 20 GB of weights and then
+    dies with "Failed to create llama_context"). So the credit can only ever
+    convert a spill into a whole seat; it never buys extra layers in a split.
+
+    The real OOM backstop is unchanged and lives elsewhere — the ~90% device
+    ceiling (HUGPY_VRAM_CEILING_FRAC, agent ``_worker_slot_fit_check``) still
+    demands (1-frac) of the WHOLE card free after the weights land, and it reads
+    device truth so it sees out-of-band growth this reserve never could.
+    ``free_vram_bytes`` itself is UNCHANGED: every other consumer (heartbeat
+    budgets, contention fit, transformers max_memory, preflights) still gets the
+    reserve-adjusted figure.
+
+    An EXPLICIT HUGPY_VRAM_CTX_RESERVE_GIB opts out of all of the above: the
+    operator's number is used flat and stacks exactly as it did before, for both
+    tests. So does the geometry-unreadable fallback (today's flat 2.5 GiB,
+    stacked) — degrade-not-guess means the degraded path is the OLD path,
+    unchanged."""
     if free_vram is None:
         free_vram = free_vram_bytes()
         # Operator VRAM budget (the console's "VRAM budget…" mode / spill
@@ -1060,28 +1260,54 @@ def autofit_gpu_layers(model_path: str,
     if file_bytes <= 0:
         return 0
 
-    # Weights are not the whole story: llama_context still needs VRAM AFTER
-    # the weights land (KV cache scales with n_ctx, plus compute-graph
-    # buffers). The flat safety factor leaves only ~3.5 GB on a 24 GB card —
-    # a 70B uploads ~20 GB of weights and then dies with "Failed to create
-    # llama_context". Reserve an explicit context allowance under the margin.
-    ctx_reserve = int((_env_float("HUGPY_VRAM_CTX_RESERVE_GIB") or 2.5) * 2**30)
-    reserve = ctx_reserve + max(0, int(extra_reserve_bytes))
-    budget = int(free_vram * _vram_safety()) - reserve
-    if budget <= 0:
-        return 0
-    if budget >= file_bytes:
+    # Weights are not the whole story: llama_context still needs VRAM AFTER the
+    # weights land (KV cache, linear in n_ctx, plus compute-graph buffers). That
+    # is the OOM this guard was built for — a 70B uploads ~20 GB of weights and
+    # then dies with "Failed to create llama_context". It is now COMPUTED from
+    # the model's real geometry at the real n_ctx instead of a flat constant
+    # (vram_ctx_reserve_bytes), and it no longer stacks on the external floor
+    # (see THE STACKING DECISION in the docstring).
+    ctx_reserve, ctx_source, ctx_detail = vram_ctx_reserve_bytes(
+        model_path, n_ctx=n_ctx)
+    extra = max(0, int(extra_reserve_bytes))
+    # SPLIT budget — fully stacked, the conservative figure. The external floor
+    # is already off ``free_vram``, so a partial plan leaves that floor intact:
+    # predicted card use (layers + context) <= raw free - floor.
+    split_reserve = ctx_reserve + extra
+    # WHOLE-FIT budget — the un-stacked one (see THE STACKING DECISION). Only a
+    # "computed" reserve earns the credit; an operator override and the
+    # geometry-unreadable degrade keep today's stacked arithmetic exactly.
+    whole_reserve = split_reserve
+    if ctx_source == "computed":
+        whole_reserve = max(0, ctx_reserve - vram_reserve_bytes()) + extra
+    scaled = int(free_vram * _vram_safety())
+    total_layers = _gguf_layer_count(model_path) or _ASSUMED_LAYERS
+    if scaled - whole_reserve >= file_bytes:
+        logger.info(
+            "autofit gguf: file=%.1fGiB free=%.1fGiB reserve=%.2fGiB (%s, "
+            "ctx=%s) -> ALL %d layers on GPU",
+            file_bytes / 2**30, free_vram / 2**30, whole_reserve / 2**30,
+            ctx_source, ctx_detail.get("ctx"), total_layers)
         return -1                           # everything fits on the GPU
                                             # (model + projector + context)
+    budget = scaled - split_reserve
+    if budget <= 0:
+        logger.info(
+            "autofit gguf: file=%.1fGiB free=%.1fGiB reserve=%.2fGiB (%s, "
+            "ctx=%s) -> 0/%d layers on GPU (no budget)",
+            file_bytes / 2**30, free_vram / 2**30, split_reserve / 2**30,
+            ctx_source, ctx_detail.get("ctx"), total_layers)
+        return 0
 
-    total_layers = _gguf_layer_count(model_path) or _ASSUMED_LAYERS
     # Weights dominate the file; approximate per-layer cost as an even split.
     per_layer = file_bytes / max(total_layers, 1)
     fit = int(budget // per_layer)
     fit = max(0, min(fit, total_layers))
     logger.info(
-        "autofit gguf: file=%.1fGiB free=%.1fGiB -> %d/%d layers on GPU",
-        file_bytes / 2**30, free_vram / 2**30, fit, total_layers,
+        "autofit gguf: file=%.1fGiB free=%.1fGiB reserve=%.2fGiB (%s, ctx=%s) "
+        "-> %d/%d layers on GPU",
+        file_bytes / 2**30, free_vram / 2**30, split_reserve / 2**30,
+        ctx_source, ctx_detail.get("ctx"), fit, total_layers,
     )
     return fit
 

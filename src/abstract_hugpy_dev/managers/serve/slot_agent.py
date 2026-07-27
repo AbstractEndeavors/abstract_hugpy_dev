@@ -430,15 +430,21 @@ def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None,
     # child then OOMs when the ~1.3 GB projector lands on top. 0 for text models
     # (byte-identical to before).
     _mmproj_reserve = vision_projector_bytes(path)
+    # Resolve the SERVED ctx BEFORE fitting layers. The VRAM a llama_context
+    # costs is linear in n_ctx (the KV cache), so autofit must price the context
+    # THIS CHILD will actually run with rather than a flat constant — see
+    # spill.vram_ctx_reserve_bytes. Pure move of the line that was below; nothing
+    # between here and the old position reads ctx.
+    ctx = int(ctx) if ctx else (_ctx_for(cfg, model_key) if cfg is not None else 4096)
     if free_cap is not None:
         from ..spill import free_vram_bytes as _fvb
         fv = _fvb()
         auto = autofit_gpu_layers(path, free_vram=min(fv, free_cap) if fv else free_cap,
-                                  extra_reserve_bytes=_mmproj_reserve)
+                                  extra_reserve_bytes=_mmproj_reserve, n_ctx=ctx)
     else:
-        auto = autofit_gpu_layers(path, extra_reserve_bytes=_mmproj_reserve)
+        auto = autofit_gpu_layers(path, extra_reserve_bytes=_mmproj_reserve,
+                                  n_ctx=ctx)
     ngl = _effective_ngl(n_gpu_layers, auto)
-    ctx = int(ctx) if ctx else (_ctx_for(cfg, model_key) if cfg is not None else 4096)
     threads = int(threads) if threads else DEFAULT_LLAMA_THREADS
     cpus = str(cpus).strip() if cpus not in (None, "") else None
 

@@ -32,6 +32,100 @@ class ChatMessage(BaseModel):
                 data.pop(key, None)
         return data
 
+# ---------------------------------------------------------------------------
+# Role-alternation normalisation — the ONE shim for chat templates that demand
+# strict user/assistant/user/assistant order (Mistral/Nemo family, and every
+# GLM/Gutenberg merge built on them). Their jinja raises
+#
+#   TemplateError: After the optional system message, conversation roles must
+#   alternate user/assistant/user/assistant/...
+#
+# ...which is a POISON LOOP in any chat UI that posts the whole history: a turn
+# that fails appends NO assistant reply, so the next attempt posts [user, user],
+# then [user, user, user] — every retry is more malformed than the last and the
+# conversation can never recover (operator report 2026-07-27:
+# DavidAU~MN-GRAND-23.5B-…-GLM4.7-Thinking on ae, never once answered).
+#
+# Merging adjacent same-role turns is the standard, CONTENT-PRESERVING shim:
+# nothing is reordered, dropped or invented — two consecutive user turns become
+# one user turn holding both texts. It also fixes legitimate double-sends.
+#
+# It lives on ChatRequest because that is the single funnel every chat path
+# passes through (console route, /v1, the agent client, utils.text, and the
+# worker re-validating a relayed payload), and because it runs at CENTRAL
+# *before* _worker_payload() dumps the request onto the relay wire — so already
+# released workers get well-formed histories with no wire change and no new
+# field.
+# ---------------------------------------------------------------------------
+_TOOL_SHAPE_KEYS = ("tool_calls", "tool_call_id")
+
+
+def _msg_role(message: Any) -> Any:
+    if isinstance(message, Mapping):
+        return message.get("role", "user")
+    return getattr(message, "role", None)
+
+
+def _msg_content(message: Any) -> Any:
+    if isinstance(message, Mapping):
+        return message.get("content")
+    return getattr(message, "content", None)
+
+
+def _is_tool_shaped(message: Any) -> bool:
+    """A tool-loop turn (role 'tool', or an assistant echo carrying tool_calls).
+
+    These are NEVER merged and are never merged ACROSS — the working /v1 tool
+    loop (2026-07-17) renders them into a precise <tool_call>/<tool_response>
+    dialect and folding two of them together would corrupt it.
+    """
+    if _msg_role(message) == "tool":
+        return True
+    if isinstance(message, Mapping):
+        return any(message.get(k) for k in _TOOL_SHAPE_KEYS)
+    return any(getattr(message, k, None) for k in _TOOL_SHAPE_KEYS)
+
+
+def _is_mergeable(message: Any) -> bool:
+    if _is_tool_shaped(message):
+        return False
+    if not isinstance(_msg_role(message), str):
+        return False
+    # content must already be flat text; a list (multimodal parts) is flattened
+    # by _normalize_multimodal upstream, and anything else is left alone.
+    return isinstance(_msg_content(message), (str, type(None)))
+
+
+def merge_consecutive_messages(messages: Any) -> Any:
+    """Merge adjacent same-role turns; return the input unchanged if none merge.
+
+    Content-preserving: same order, same text, joined by a blank line. Empty
+    contents contribute nothing (no leading/trailing blank lines). Tool-shaped
+    turns act as barriers. An already-alternating history is returned as the
+    SAME object — byte-identical, zero effect on every model that never needed
+    this.
+    """
+    if not isinstance(messages, (list, tuple)) or len(messages) < 2:
+        return messages
+    out: list = []
+    merged_any = False
+    for message in messages:
+        if (out
+                and _is_mergeable(message)
+                and _is_mergeable(out[-1])
+                and _msg_role(message) == _msg_role(out[-1])):
+            prev = out[-1]
+            parts = [p for p in (_msg_content(prev), _msg_content(message)) if p]
+            base = dict(prev) if isinstance(prev, Mapping) else {
+                "role": _msg_role(prev)}
+            base["content"] = "\n\n".join(parts)
+            out[-1] = base
+            merged_any = True
+            continue
+        out.append(message)
+    return out if merged_any else messages
+
+
 class ChatRequest(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
     request_id: str = Field(default_factory=lambda: get_request_id())
@@ -61,14 +155,23 @@ class ChatRequest(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def _normalize_multimodal(cls, data: Any) -> Any:
-        """Funnel every image-bearing message shape down to one path.
+        """Funnel every message shape down to one well-formed history.
 
-        Whatever a client sends — OpenAI-style ``content`` arrays of
-        ``{"type":"text"}`` / ``{"type":"image_url"}`` parts, a bare image part,
-        ``input_image`` — the image(s) are hoisted into ``images`` (data-URI /
-        base64 / url strings) and the message ``content`` is flattened to its
-        text. The runner then turns ``images`` into the bytes the model sees, so
-        there is a single image path regardless of how the request was phrased.
+        Two normalisations, in order, because the second needs the first's
+        output to be flat text:
+
+        1. Whatever a client sends — OpenAI-style ``content`` arrays of
+           ``{"type":"text"}`` / ``{"type":"image_url"}`` parts, a bare image
+           part, ``input_image`` — the image(s) are hoisted into ``images``
+           (data-URI / base64 / url strings) and the message ``content`` is
+           flattened to its text. The runner then turns ``images`` into the
+           bytes the model sees, so there is a single image path regardless of
+           how the request was phrased.
+        2. Adjacent same-role turns are merged (see
+           ``merge_consecutive_messages``) so a history is always alternating
+           by the time any chat template renders it. A leading system message
+           has no same-role neighbour and is therefore passed through as-is,
+           and an already-alternating history is returned unchanged.
         """
         if not isinstance(data, Mapping):
             return data
@@ -106,8 +209,12 @@ class ChatRequest(BaseModel):
                 m["content"] = "\n".join(t for t in texts if t)
             out_msgs.append(m)
 
+        # Alternation shim — runs LAST so it sees flattened text content.
+        # Returns `out_msgs` itself when nothing needed merging.
+        normalized = merge_consecutive_messages(out_msgs)
+
         data = dict(data)
-        data["messages"] = out_msgs
+        data["messages"] = normalized
         if collected:
             data["images"] = collected
         return data
