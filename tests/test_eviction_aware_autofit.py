@@ -93,6 +93,10 @@ def rig(monkeypatch, tmp_path):
     # No k37 alloc mode / no explicit ngl on the env wire by default.
     monkeypatch.delenv("HUGPY_N_GPU_LAYERS", raising=False)
     monkeypatch.delenv("HUGPY_GPU_MEM_GIB", raising=False)
+    # The admission ceiling reads all three (2026-07-27 bounded cushion).
+    for _c in ("HUGPY_VRAM_CEILING_FRAC", "HUGPY_VRAM_CEILING_CUSHION_GIB",
+               "HUGPY_VRAM_RESERVE_GIB"):
+        monkeypatch.delenv(_c, raising=False)
 
     hooks = {"on_evict": None}
 

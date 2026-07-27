@@ -42,6 +42,35 @@ def model_status(model: dict) -> dict:
     return out
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# model_status is EXPENSIVE: route_destination globs four runtime families'
+# legacy task dirs and stats every candidate, then model_looks_downloaded globs
+# the winner — ~10^2 filesystem calls per model, every one a virtiofs round-trip
+# to the host on central. A listing route loops ~107 models, so an uncached
+# /v1/models cost ~10^4 of them and collapsed under concurrency (18.5s → 55.3s
+# and degrading, 2026-07-27). Installation status only changes on download /
+# delete / prune / reconcile / discovery, so the listings read it through a memo
+# with a short TTL, cross-process epoch invalidation and single-flight — see
+# comms/model_status_cache.py. model_status itself stays the LIVE read.
+# ──────────────────────────────────────────────────────────────────────────
+def cached_model_status(model: dict) -> dict:
+    """``model_status`` served from the shared memo (degrades to the live stat)."""
+    try:
+        from .....comms.model_status_cache import cached_model_status as _cached
+    except Exception:  # noqa: BLE001 — the cache is an optimisation, never a gate
+        return model_status(model)
+    return _cached(model, model_status)
+
+
+def refresh_model_status(model: dict) -> dict:
+    """A LIVE ``model_status`` that also repairs the memo for this model."""
+    try:
+        from .....comms.model_status_cache import refresh_model_status as _refresh
+    except Exception:  # noqa: BLE001
+        return model_status(model)
+    return _refresh(model, model_status)
+
+
 def _status_cfg(model: dict):
     """A minimal cfg shim for model_looks_downloaded from a registry/manifest
     dict — only framework/filename/include/primary_task/tasks are read."""

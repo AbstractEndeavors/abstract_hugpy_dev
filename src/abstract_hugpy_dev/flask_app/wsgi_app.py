@@ -217,6 +217,20 @@ def get_hugpy_flask(name=None,allowed_origins=None,debug=False):
     dist_dir = _ui_dist_dir()
     if dist_dir:
         _mount_ui(app, dist_dir)
+    # Abandon-on-disconnect (2026-07-27 outage): bind a probe for each request's
+    # client socket so a WSGI thread blocked on model work can discover that its
+    # caller left and give the request slot back — instead of holding one of the
+    # site's 24 slots for the rest of a 25-minute cold hold, serving nobody.
+    # Inert wherever no socket is published (waitress / dev server / no gunicorn)
+    # and switchable off via HUGPY_CLIENT_DISCONNECT_ABANDON=off. Never break boot.
+    try:
+        from abstract_hugpy_dev._platform import client_liveness
+        client_liveness.install(app)
+    except Exception as _exc:
+        import logging as _logging
+        _logging.getLogger(__name__).error(
+            "client-liveness probe install failed: %s", _exc)
+
     # Server-side operator auth gate on console-side management routes. Inert
     # until HUGPY_AUTH_MODE=external (or HUGPY_OPERATOR_TOKEN is set), so this
     # is safe to deploy and verify before activation.

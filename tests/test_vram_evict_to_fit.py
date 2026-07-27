@@ -65,6 +65,11 @@ def rig(monkeypatch):
     for _leak in ("HUGPY_GPU_MEM_GIB", "HUGPY_CPU_MEM_GIB", "HUGPY_ALLOC_MODE",
                   "HUGPY_LENIENCY_PCT", "HUGPY_PRIORITY_DEVICE", "HUGPY_BNB_4BIT",
                   "HUGPY_N_GPU_LAYERS", "HUGPY_VRAM_CEILING_FRAC",
+                  # The admission cushion (2026-07-27) reads BOTH of these:
+                  # the external floor is what the cushion un-stacks against, so
+                  # a leaked HUGPY_VRAM_RESERVE_GIB silently re-prices every
+                  # ceiling decision in this file.
+                  "HUGPY_VRAM_RESERVE_GIB", "HUGPY_VRAM_CEILING_CUSHION_GIB",
                   "HUGPY_EVICT_MIN_RESIDENCY_S", "HUGPY_EVICT_LEAST_REAPING"):
         monkeypatch.delenv(_leak, raising=False)
 
@@ -340,13 +345,18 @@ def test_oversize_gguf_admits_as_partial_offload(rig, gguf_rig):
     assert plan["action"] == "partial"
     assert plan["n_gpu_layers"] > 0
     assert 0 < plan["gpu_pct"] < 100
-    # budget = 21 - 2.4 = 18.6 GiB; per-layer = 52/48 GiB -> 17 layers fit.
-    assert plan["n_gpu_layers"] == 17
+    # budget = free - ceiling_reserve. Since 2026-07-27 the DEFAULT reserve is a
+    # bounded compute cushion un-stacked against the 1.0 GiB external floor
+    # already out of `free` (see agent._vram_ceiling_reserve_bytes), so on a
+    # 24 GiB card it is 0 and the budget is the whole 21 GiB: 19 layers fit
+    # instead of 17. The 2.4 GiB the old percentage-of-the-card reserve held back
+    # was re-charging for KV that `need` already carries.
+    assert plan["n_gpu_layers"] == 19
     # The in-process load is pinned to the honest count (overrides shard-blind
     # autofit) on the served path.
     from abstract_hugpy_dev.managers import spill
-    assert spill._NGL_OVERRIDE.get(gguf_rig.geo["path"]) == 17
-    assert A._PARTIAL_NGL["Qwen~Qwen3-Coder-Next-GGUF"]["n"] == 17
+    assert spill._NGL_OVERRIDE.get(gguf_rig.geo["path"]) == 19
+    assert A._PARTIAL_NGL["Qwen~Qwen3-Coder-Next-GGUF"]["n"] == 19
 
 
 def test_partial_refused_when_ram_cannot_hold_remainder(rig, gguf_rig):
@@ -884,14 +894,16 @@ def test_partial_offload_budget_includes_the_subjects_own_bytes(rig, gguf_rig):
     """A GGUF re-seat that can't fit whole still gets the honest hybrid, sized
     against free + its own released bytes — not against free alone."""
     rig.card["total"] = 24 * GIB
-    rig.card["free"] = 1 * GIB                     # 1 - 2.4 reserve => 0 budget
+    rig.card["free"] = 1 * GIB                     # 1 GiB budget without the credit
     rig.card["need"] = 52 * GIB
     rig.residents["coder"] = {"vram_bytes": 20 * GIB, "host_mode": "subprocess"}
     plan = A._vram_evict_to_fit(_State(), "coder")
-    # Without the credit the budget is 0 -> degenerate -> refuse. With it the
-    # budget is (1 + 20) - 2.4 = 18.6 GiB -> the same 17/48 hybrid as ever.
+    # Without the credit the budget is 1 GiB -> degenerate -> refuse. With it the
+    # budget is (1 + 20) - 0 = 21 GiB -> the same 19/48 hybrid the uncredited
+    # 21-GiB-free case gets (see test_oversize_gguf_admits_as_partial_offload):
+    # the credit is worth exactly the subject's own 20 GiB, no more.
     assert plan["action"] == "partial"
-    assert plan["n_gpu_layers"] == 17
+    assert plan["n_gpu_layers"] == 19
 
 
 # ── all five protection classes still hold WITH a resident subject ──────────
@@ -923,3 +935,188 @@ def test_every_protection_class_still_holds_with_a_credited_subject(
     assert "neighbour" not in rig.evicted, f"{klass} protection was weakened"
     assert "subj" not in rig.evicted, "the subject protected itself"
     assert plan["reason"]["protected"], "the protected row must be reported"
+
+
+# ═══════════ THE CEILING CUSHION (2026-07-27) ═══════════════════════════════
+# The refusal the operator quoted from ae:
+#
+#   LoadRefusal: won't fit on GPU: needs 21.1 GB, 21.3 GB free of 23.6 GB
+#   (2.4 GB ceiling reserve); evicted 1 idle resident(s) freeing 21.0 GB
+#
+# 21.3 free, 21.1 needed, a resident already evicted to make the room — and it
+# refused anyway. Root cause: the reserve was 10% of TOTAL card VRAM, which
+# (a) re-charged for the KV cache `need` already contains
+# (_incoming_need_detail = weights x1.15 + KV(resolved ctx)) and (b) scaled with
+# the CARD, not with the ctx-independent compute/activation residual it is
+# actually there to protect. The replacement is that residual, measured:
+# 348 MiB on a real card, allowed at 512 MiB by spill._CTX_COMPUTE_RESERVE_BYTES,
+# un-stacked against the external floor already deducted from the free read.
+#
+# _human_bytes labels 1024-based units "GB", so the quoted figures are GiB.
+AE_TOTAL = int(23.6 * GIB)
+AE_FREE_AFTER_EVICT = int(21.3 * GIB)
+AE_NEED = int(21.1 * GIB)
+AE_VICTIM = AE_FREE_AFTER_EVICT - int(0.3 * GIB)      # the 21.0 GiB it reclaimed
+
+
+def test_live_ae_refusal_now_admits_after_the_same_eviction(rig):
+    """THE REGRESSION. Same card, same need, same victim: the eviction happens
+    and the admission now SUCCEEDS instead of refusing the room it just made."""
+    rig.card["total"] = AE_TOTAL
+    rig.card["free"] = AE_FREE_AFTER_EVICT - AE_VICTIM     # 0.3 GiB before evicting
+    rig.card["need"] = AE_NEED
+    rig.residents["idle_resident"] = {"vram_bytes": AE_VICTIM,
+                                      "host_mode": "subprocess"}
+    rig.lru["idle_resident"] = 10.0
+    plan = A._vram_evict_to_fit(_State(), "subject")
+    assert plan["action"] == "evicted", plan.get("reason")
+    assert plan["evicted"] == ["idle_resident"]
+    assert plan["freed_bytes"] == AE_VICTIM
+    # And the room it kept is real: 21.3 - 21.1 = 0.2 GiB budgetable, on top of
+    # the 1.0 GiB external floor that never entered the free figure at all.
+    assert rig.card["free"] - AE_NEED >= 0
+
+
+def test_live_ae_shape_admits_outright_when_the_card_is_already_clear(rig):
+    """No eviction needed: 21.3 free / 21.1 need is a plain 'proceed'."""
+    rig.card["total"] = AE_TOTAL
+    rig.card["free"] = AE_FREE_AFTER_EVICT
+    rig.card["need"] = AE_NEED
+    plan = A._vram_evict_to_fit(_State(), "subject")
+    assert plan["action"] == "proceed"
+    assert plan["evicted"] == []
+
+
+def test_a_load_with_no_working_room_still_refuses(rig, monkeypatch):
+    """The OOM guard is intact. A need that would spend the external floor —
+    the last real device headroom — is refused, not admitted-then-OOM'd."""
+    monkeypatch.setattr(A, "_served_gguf_geometry", lambda mk: (None, None))
+    rig.card["total"] = AE_TOTAL
+    rig.card["free"] = AE_FREE_AFTER_EVICT
+    rig.card["need"] = int(22.6 * GIB)             # 1.3 GiB past what's free
+    plan = A._vram_evict_to_fit(_State(), "subject")
+    assert plan["action"] == "refuse"
+    assert "won't fit on GPU" in plan["reason"]["reason"]
+
+
+def test_full_card_still_refuses(rig, monkeypatch):
+    monkeypatch.setattr(A, "_served_gguf_geometry", lambda mk: (None, None))
+    rig.card["total"] = AE_TOTAL
+    rig.card["free"] = 0                           # nothing budgetable at all
+    rig.card["need"] = 4 * GIB
+    plan = A._vram_evict_to_fit(_State(), "subject")
+    assert plan["action"] == "refuse"
+
+
+def test_no_external_floor_leaves_the_measured_cushion_as_the_guard(
+        rig, monkeypatch):
+    """With HUGPY_VRAM_RESERVE_GIB=0 there is nothing to un-stack against, so
+    the 512 MiB compute cushion IS the reserve and enforces itself."""
+    monkeypatch.setenv("HUGPY_VRAM_RESERVE_GIB", "0")
+    monkeypatch.setattr(A, "_served_gguf_geometry", lambda mk: (None, None))
+    rig.card["total"] = AE_TOTAL
+    rig.card["need"] = 20 * GIB
+    rig.card["free"] = 20 * GIB + 512 * 2**20      # exactly the cushion left over
+    assert A._vram_evict_to_fit(_State(), "subject")["action"] == "proceed"
+    rig.card["free"] = 20 * GIB + 512 * 2**20 - 1  # one byte short of it
+    assert A._vram_evict_to_fit(_State(), "subject")["action"] == "refuse"
+
+
+def test_explicit_ceiling_frac_reproduces_the_old_gate_exactly(rig, monkeypatch):
+    """Requirement 3: HUGPY_VRAM_CEILING_FRAC keeps its CURRENT meaning. Asking
+    for 0.90 explicitly brings the old refusal back, byte for byte."""
+    monkeypatch.setenv("HUGPY_VRAM_CEILING_FRAC", "0.90")
+    monkeypatch.setattr(A, "_served_gguf_geometry", lambda mk: (None, None))
+    rig.card["total"] = AE_TOTAL
+    rig.card["free"] = AE_FREE_AFTER_EVICT
+    rig.card["need"] = AE_NEED
+    plan = A._vram_evict_to_fit(_State(), "subject")
+    assert plan["action"] == "refuse"
+    assert plan["reason"]["ceiling_reserve_bytes"] == int(AE_TOTAL * 0.10)
+    # ...and a laxer explicit ceiling admits it again.
+    monkeypatch.setenv("HUGPY_VRAM_CEILING_FRAC", "0.999")
+    assert A._vram_evict_to_fit(_State(), "subject")["action"] == "proceed"
+
+
+def test_unmeasurable_total_and_free_are_unchanged(rig, monkeypatch):
+    """Requirement 4: degrade-not-guess. Both unmeasurable paths fail OPEN with
+    the same notes as before the cushion landed."""
+    rig.card["need"] = 40 * GIB
+    rig.card["total"] = 0
+    assert "no GPU" in A._vram_evict_to_fit(_State(), "s")["note"]
+    rig.card["total"] = AE_TOTAL
+    monkeypatch.setattr(A, "_free_vram_bytes", lambda: None)
+    out = A._vram_evict_to_fit(_State(), "s")
+    assert out["action"] == "proceed" and "can't read free VRAM" in out["note"]
+
+
+def test_refusal_names_the_external_floor_when_the_reserve_reads_zero(
+        rig, monkeypatch):
+    """A bare '0 B ceiling reserve' would read like the guard is off. It is not:
+    the floor is already out of the quoted free figure, and the message says so."""
+    monkeypatch.setattr(A, "_served_gguf_geometry", lambda mk: (None, None))
+    rig.card["total"] = AE_TOTAL
+    rig.card["free"] = 1 * GIB
+    rig.card["need"] = 20 * GIB
+    r = A._vram_evict_to_fit(_State(), "subject")["reason"]
+    assert r["ceiling_reserve_bytes"] == 0
+    assert "already held back from the free figure" in r["reason"]
+
+
+# ── the siblings must agree, on every card, at every fill ───────────────────
+@pytest.mark.parametrize("total_gib", [4, 8, 11.6, 23.6, 24, 48])
+@pytest.mark.parametrize("frac_env", [None, "0.90", "0.99"])
+def test_slot_fit_check_and_admission_never_disagree(
+        rig, monkeypatch, total_gib, frac_env):
+    """_worker_slot_fit_check (slot routing) and _vram_evict_to_fit (the
+    admission choke point) answer the same question from two entry points. A
+    disagreement means the pool refuses a seat admission just granted — the
+    'preview vs auto-evict propose different victims' class of bug."""
+    if frac_env is None:
+        monkeypatch.delenv("HUGPY_VRAM_CEILING_FRAC", raising=False)
+    else:
+        monkeypatch.setenv("HUGPY_VRAM_CEILING_FRAC", frac_env)
+    monkeypatch.setattr(A, "_served_gguf_geometry", lambda mk: (None, None))
+    total = int(total_gib * GIB)
+    rig.card["total"] = total
+    for free_frac in (0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0):
+        for need_frac in (0.05, 0.25, 0.5, 0.75, 0.95):
+            rig.card["free"] = int(total * free_frac)
+            rig.card["need"] = int(total * need_frac)
+            gate = A._worker_slot_fit_check("subject")
+            # No residents in the rig -> the admission gate has nothing to evict,
+            # so 'proceed' <=> the fit test passed and 'refuse' <=> it did not.
+            admit = A._vram_evict_to_fit(_State(), "subject")["action"] == "proceed"
+            assert gate == admit, (
+                f"disagreement at total={total_gib}GiB free={free_frac} "
+                f"need={need_frac} frac={frac_env}: slot={gate} admission={admit}")
+
+
+def test_empty_card_budget_agrees_with_the_gate(rig, monkeypatch):
+    """_vram_empty_card_budget is what the MoE log calls 'can never fit this
+    card'. It must be the largest need the gate would actually admit on an
+    otherwise-empty card, or the log lies."""
+    monkeypatch.setattr(A, "_served_gguf_geometry", lambda mk: (None, None))
+    for total_gib in (4, 8, 23.6, 24, 48):
+        total = int(total_gib * GIB)
+        budget = A._vram_empty_card_budget(total)
+        rig.card["total"] = total
+        # An empty card presents (total - external floor) as budgetable free.
+        rig.card["free"] = total - A._external_vram_floor_bytes()
+        rig.card["need"] = budget
+        assert A._worker_slot_fit_check("s") is True, total_gib
+        rig.card["need"] = budget + 1
+        assert A._worker_slot_fit_check("s") is False, total_gib
+
+
+def test_headroom_sweep_keeps_the_percentage_threshold(rig):
+    """The IDLE-PRESSURE sweep is deliberately NOT unified with the admission
+    cushion: sized with it, the threshold would be ~0 on a default box and the
+    deadlock-breaker would never fire again. It still uses (1 - frac) x total."""
+    assert A._vram_pressure_reserve_bytes(24 * GIB) == int(24 * GIB * 0.10)
+    assert A._vram_ceiling_reserve_bytes(24 * GIB) == 0     # and they differ
+    rig.card["free"] = 1 * GIB                              # under 2.4 GiB
+    rig.residents["idle"] = {"vram_bytes": 20 * GIB, "host_mode": "subprocess"}
+    rig.lru["idle"] = 5.0
+    A._vram_headroom_sweep(_State())
+    assert rig.evicted == ["idle"]

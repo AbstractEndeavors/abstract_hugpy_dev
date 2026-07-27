@@ -1031,4 +1031,17 @@ def refresh_registry(run_discovery=True):
                         len(moved), moved)
     except Exception as exc:
         logger.warning("refresh_registry: serve-override migration skipped (%s)", exc)
+    # THE chokepoint for "the catalog/store moved": every caller that changes
+    # what is on disk lands here (download completion, the discovery sweep,
+    # reconcile's _persist_registry). The per-model install-status memo the
+    # listing routes read (comms/model_status_cache.py) is dropped from one
+    # place rather than hoping every future call site remembers. Guarded and
+    # lazy — comms is stdlib-only and imports nothing back, but a registry
+    # refresh must never fail over a cache.
+    try:
+        from ....comms.model_status_cache import invalidate_model_status
+        invalidate_model_status("refresh_registry")
+    except Exception:  # noqa: BLE001
+        logger.debug("refresh_registry: model-status cache invalidation skipped",
+                     exc_info=True)
     return MODEL_REGISTRY

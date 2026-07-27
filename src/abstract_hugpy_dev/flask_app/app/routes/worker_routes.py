@@ -1430,6 +1430,46 @@ def _central_missing_reason(model_key: str) -> str | None:
         return f"{type(exc).__name__}: {exc}"
 
 
+def _central_missing_reason_cached(model_key: str) -> str | None:
+    """``_central_missing_reason`` served from the shared per-model store memo.
+
+    Same walk, same strings — this is the LISTING variant. ``route_destination``
+    + ``model_looks_downloaded`` is the very walk that made /v1/models collapse
+    (~10^2 virtiofs round-trips per model), and /llm/central-provisioning runs it
+    over the WHOLE manifest while the console polls that route every 10s. So the
+    listing rides the same memo, with the same TTL and the same invalidation
+    events (comms/model_status_cache.py).
+
+    The single-model GUARD path deliberately keeps calling the LIVE
+    ``_central_missing_reason``: refusing a load/assign is a decision, and one
+    model's walk is cheap. Only the fan-out over every key is memoized.
+
+    ``scope`` keeps this in its own namespace — the key is the model's routing
+    identity, which the install-status memo also uses, and the two answer
+    different questions.
+    """
+    def _probe(_routing):
+        return {"reason": _central_missing_reason(model_key)}
+
+    try:
+        from ....imports.config.main import get_model_config
+        cfg = get_model_config(model_key)
+        routing = cfg.to_dict() if hasattr(cfg, "to_dict") else dict(
+            hub_id=getattr(cfg, "hub_id", None),
+            framework=getattr(cfg, "framework", None),
+            tasks=getattr(cfg, "tasks", None),
+            primary_task=getattr(cfg, "primary_task", None),
+            filename=getattr(cfg, "filename", None),
+            include=getattr(cfg, "include", None),
+            name=getattr(cfg, "name", None),
+            folder=getattr(cfg, "folder", None))
+        from ....comms.model_status_cache import cached_model_status
+        return cached_model_status(routing, _probe,
+                                   scope="central-holdings").get("reason")
+    except Exception:  # noqa: BLE001 — degrade to the live probe, never guess
+        return _central_missing_reason(model_key)
+
+
 def _disk_preflight_reason(worker: dict, model_key: str) -> str | None:
     """Disk-aware allocation: a designation triggers a pull onto the worker's
     model-root volume — refuse EARLY (clear 409) when it won't fit, instead of
@@ -1486,7 +1526,9 @@ def central_provisioning():
         keys = list(manifest.keys())
     out = {}
     for k in keys:
-        reason = _central_missing_reason(k)
+        # Memoized: this loop is the whole manifest and the console polls it
+        # every 10s — the same walk that made /v1/models unusable.
+        reason = _central_missing_reason_cached(k)
         if reason is None:
             state = "ready"
         elif reason == "no model directory":

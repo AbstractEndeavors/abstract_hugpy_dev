@@ -288,6 +288,16 @@ def _run_ml(task: str):
         # builder/validation errors — caller's to fix.
         return jsonify({"ok": False, "error": str(exc).strip("'\"")}), 400
     except Exception as exc:
+        # Same two non-failures /prompt handles: central declining to start
+        # another concurrent model load (503 + Retry-After) and a caller who
+        # hung up (499). Neither is a fault, so neither gets a 500 traceback.
+        from .prompt_routes import _capacity_refusal, _client_gone
+        cap = _capacity_refusal(exc)
+        if cap is not None:
+            return cap
+        if _client_gone(exc):
+            logger.info("ml task %s abandoned: client disconnected", task)
+            return jsonify({"ok": False, "error": "client disconnected"}), 499
         logger.exception("ml task %s failed", task)
         return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 500
 

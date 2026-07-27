@@ -36,6 +36,34 @@ def _await_sync(value):
     return async_runtime.run(value)
 
 
+def _capacity_refusal(exc):
+    """A 503 + Retry-After when ``exc`` is the cold-hold admission cap, else None.
+
+    The cap is central declining to START another concurrent model load so the
+    rest of the site keeps its request slots — an honest, retryable answer, never
+    a 500. Guarded so an older core without the cap changes nothing.
+    """
+    try:
+        from abstract_hugpy_dev.managers.resolvers.remote import (
+            ColdHoldCapacityError)
+    except Exception:                       # noqa: BLE001 — older core
+        return None
+    if not isinstance(exc, ColdHoldCapacityError):
+        return None
+    body = dict(exc.as_error()["error"])
+    return (jsonify({"ok": False, "error": exc.stream_message(), **body}), 503,
+            {"Retry-After": str(exc.retry_after_s)})
+
+
+def _client_gone(exc) -> bool:
+    """Did this request end because the CALLER disconnected (not a failure)?"""
+    try:
+        from abstract_hugpy_dev._platform.client_liveness import ClientGone
+    except Exception:                       # noqa: BLE001
+        return False
+    return isinstance(exc, ClientGone)
+
+
 def _result_payload(result) -> dict:
     for attr in ("model_dump", "to_dict", "dict"):
         fn = getattr(result, attr, None)
@@ -79,6 +107,20 @@ def prompt_execute():
         # resolve()/builder validation errors — the caller's to fix.
         return jsonify({"ok": False, "error": str(exc).strip("'\"")}), 400
     except Exception as exc:
+        # Cold-hold ADMISSION CAP: central is already holding its maximum number
+        # of concurrent model loads. Not a fault and not a traceback — an honest
+        # 503 + Retry-After so the caller (very often a script iterating models,
+        # which is exactly what took the site down on 2026-07-27) backs off
+        # instead of parking another of the site's 24 request slots in a hold.
+        cap = _capacity_refusal(exc)
+        if cap is not None:
+            return cap
+        # The caller hung up while we were working; the work was cancelled and
+        # the slot released. There is nobody to answer — log it as the routine
+        # event it is (never a 500 traceback) and close.
+        if _client_gone(exc):
+            logger.info("prompt abandoned: client disconnected")
+            return jsonify({"ok": False, "error": "client disconnected"}), 499
         logger.exception("execute_prompt failed")
         return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 500
 

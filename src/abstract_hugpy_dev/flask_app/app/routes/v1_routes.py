@@ -57,8 +57,39 @@ def _bearer_token() -> str | None:
     return request.args.get("api_key")
 
 
-def _openai_error(message: str, status: int, err_type: str = "invalid_request_error"):
-    return jsonify({"error": {"message": message, "type": err_type, "code": status}}), status
+def _openai_error(message: str, status: int, err_type: str = "invalid_request_error",
+                  retry_after: "int | None" = None):
+    """The OpenAI-shaped error body. ``retry_after`` adds the standard header so
+    a 503 is an INSTRUCTION ("come back in N seconds") rather than a brush-off —
+    every OpenAI SDK and every well-behaved batch client honours it."""
+    body = jsonify({"error": {"message": message, "type": err_type, "code": status}})
+    if retry_after is None:
+        return body, status
+    return body, status, {"Retry-After": str(int(retry_after))}
+
+
+# How long a capacity-refused caller is told to wait. Read from the ONE knob the
+# relay uses, so the header and the message can never disagree.
+def _capacity_retry_after() -> int:
+    try:
+        from abstract_hugpy_dev.managers.resolvers.remote import (
+            _cold_hold_retry_after_s)
+        return int(_cold_hold_retry_after_s())
+    except Exception:   # noqa: BLE001 — a header default must never break a reply
+        return 20
+
+
+def _is_capacity_message(message: str) -> bool:
+    """Is this terminal error the concurrent-load ADMISSION CAP refusing to start
+    another cold load? Distinct from ``worker_busy`` (a worker at its in-process
+    limit): this one is CENTRAL protecting its own request pool. Both are honest
+    503s; only this one carries a Retry-After from the hold config."""
+    try:
+        from abstract_hugpy_dev.managers.resolvers.remote import (
+            ColdHoldCapacityError)
+        return ColdHoldCapacityError.code in (message or "")
+    except Exception:   # noqa: BLE001 — older core without the cap
+        return "cold_load_capacity" in (message or "")
 
 
 def v1_auth(fn):
@@ -332,6 +363,12 @@ def v1_chat_completions():
         # resolve() raises before the stream starts, e.g. unknown model
         return _openai_error(str(exc).strip("'\""), 404, "invalid_request_error")
     except Exception as exc:
+        # The admission cap raised out of the one-shot relay (rather than being
+        # yielded as an error event): a 503 + Retry-After, and NOT an exception
+        # traceback — nothing failed, we declined to start another load.
+        if _is_capacity_message(f"{exc}"):
+            return _openai_error(f"{exc}", 503, "server_busy",
+                                 retry_after=_capacity_retry_after())
         logger.exception("v1 completion failed")
         # Same classification for an exception that escaped the stream (the
         # one-shot relay raises rather than yielding): a request-shape fault is
@@ -341,6 +378,13 @@ def v1_chat_completions():
         return _openai_error(f"{type(exc).__name__}: {exc}", 500, "api_error")
 
     if error_message and not text_parts:
+        # Cold-hold ADMISSION CAP: central is already holding its maximum number
+        # of concurrent model loads and refused to start another rather than park
+        # this request in one of the site's 24 slots for up to the hold ceiling.
+        # Nothing is broken — 503 + Retry-After, the honest, actionable answer.
+        if _is_capacity_message(error_message):
+            return _openai_error(error_message, 503, "server_busy",
+                                 retry_after=_capacity_retry_after())
         # Cap-aware relay gate (concurrency hardening): a busy in-process runner
         # is not a fault — every holder of the model is momentarily at its safe
         # concurrency limit. Answer 503 (retryable) so a batch client backs off

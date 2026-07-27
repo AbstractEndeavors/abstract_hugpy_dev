@@ -249,6 +249,12 @@ def reconcile_store_route():
     report_path = os.path.join(os.path.dirname(str(MODELS_DISCOVERY_PATH)), suffix)
     report = reconcile_store(apply=apply, report_path=report_path)
     report["report_path"] = report_path
+    if apply:
+        # An applied reconcile MOVES weights between layouts, so every cached
+        # destination is suspect. reconcile's own _persist_registry only calls
+        # refresh_registry when it had registry rows to write — a move-only plan
+        # would otherwise leave the memo pointing at the old dirs.
+        invalidate_model_status_cache("store reconciled")
     return jsonify(report), (200 if apply else 202)
 
 
@@ -259,7 +265,10 @@ def get_model(model_key):
     if model_key not in manifest:
         abort(404, description="Unknown model key.")
     model = manifest[model_key]
-    return jsonify({"key": model_key, **model, **model_status(model)})
+    # The single-model detail read is the EXPLICIT refresh path: it always stats
+    # live (one model is ~10^2 filesystem calls, not ~10^4) and seeds the memo
+    # the listings share, so "open the row" is also how you force a re-read.
+    return jsonify({"key": model_key, **model, **refresh_model_status(model)})
 
 
 @llm_bp.route("/models/<model_key>/download", methods=["POST"])
@@ -345,6 +354,10 @@ def delete_model(model_key):
         })
 
     shutil.rmtree(destination)
+    # DELETE does not go through refresh_registry (the catalog row survives, only
+    # the files go), so it must say so itself — otherwise the listings would keep
+    # reporting "installed" for a model whose weights are gone.
+    invalidate_model_status_cache(f"model deleted: {model_key}")
     return jsonify({"deleted": True, "destination": str(destination)})
 
 
@@ -369,6 +382,11 @@ def prune_model_route(model_key):
         }), 409
 
     result = prune_model(model_key)
+    # Prune only hides a not-installed row (it refuses when files exist), so the
+    # STATUS is unchanged — but it is a mutating store op and the memo is keyed
+    # by routing identity, so drop it rather than reason about whether a pruned
+    # key can come back. One re-walk is the entire cost.
+    invalidate_model_status_cache(f"model pruned: {model_key}")
     return jsonify(result)
 
 

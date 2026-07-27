@@ -788,7 +788,28 @@ _SPILL_ENV = {
 # next model's placement (a dead-wrong knob), unlike the layer/budget knobs
 # whose stickiness is long-standing behavior we don't change here.
 _SPILL_ENV_CLEAR_WHEN_ABSENT = ("alloc_mode", "leniency_pct", "priority_device",
-                                "n_cpu_moe", "bnb_4bit")
+                                "n_cpu_moe", "bnb_4bit",
+                                # n_gpu_layers MUST be cleared too (2026-07-27).
+                                # It was the one spill key that persisted, and
+                                # the env is PROCESS-WIDE on the agent — so one
+                                # ram-only model poisoned every model after it.
+                                #
+                                # Observed: MN-GRAND (44 GB transformers)
+                                # correctly derives ram-only -> {"n_gpu_layers":
+                                # "off"} -> HUGPY_N_GPU_LAYERS=off. Never
+                                # cleared. VACE-Wan2.1-1.3B then arrives as
+                                # max-gpu -> spill {} -> nothing to set ->
+                                # n_gpu_layers_intent() reads the STALE "off" ->
+                                # "cpu" -> a 1.3B model loads entirely in RAM on
+                                # a completely empty card.
+                                #
+                                # "Absent" must mean UNSET, never "inherit
+                                # whatever the last model asked for". Placement
+                                # is per-model; a sticky global is a
+                                # cross-request leak, not a default. Every
+                                # sibling key above already clears; this one was
+                                # simply missed.
+                                "n_gpu_layers")
 
 
 # ── operator resource limits (two-tier) ─────────────────────────────────────
@@ -5800,25 +5821,192 @@ def _worker_fit_check(model_key: str) -> bool:
     return True
 
 
-def _vram_ceiling_frac() -> float:
-    """The real-VRAM ceiling as a fraction of total card VRAM
-    (HUGPY_VRAM_CEILING_FRAC, default 0.90). A load may proceed only if it leaves
-    the card at/under this fraction full — equivalently, at least (1 - frac) of
-    total VRAM free after the weights land. Clamped to a sane (0, 1] so a
-    fat-fingered env can never invert the gate."""
+_DEFAULT_VRAM_CEILING_FRAC = 0.90
+
+
+def _vram_ceiling_frac_explicit() -> "float | None":
+    """The OPERATOR'S HUGPY_VRAM_CEILING_FRAC, or None when it is unset (or
+    unusable). None is the signal that the DEFAULT cushion below governs; a
+    usable value means the operator asked for the fraction-of-the-card meaning
+    and gets it verbatim. Unset/garbage/out-of-range are all "not explicit" —
+    a fat-fingered env can never invert the gate."""
     raw = os.environ.get("HUGPY_VRAM_CEILING_FRAC")
     if raw is None or not str(raw).strip():
-        return 0.90
+        return None
     try:
         val = float(raw)
     except ValueError:
-        logger.warning("ignoring non-numeric HUGPY_VRAM_CEILING_FRAC=%r; using 0.90",
-                       raw)
-        return 0.90
+        logger.warning("ignoring non-numeric HUGPY_VRAM_CEILING_FRAC=%r; using %s",
+                       raw, _DEFAULT_VRAM_CEILING_FRAC)
+        return None
     if not (0.0 < val <= 1.0):
-        logger.warning("HUGPY_VRAM_CEILING_FRAC=%r out of (0,1]; using 0.90", raw)
-        return 0.90
+        logger.warning("HUGPY_VRAM_CEILING_FRAC=%r out of (0,1]; using %s", raw,
+                       _DEFAULT_VRAM_CEILING_FRAC)
+        return None
     return val
+
+
+def _vram_ceiling_frac() -> float:
+    """The real-VRAM ceiling as a fraction of total card VRAM
+    (HUGPY_VRAM_CEILING_FRAC, default 0.90). Unchanged: this is what the
+    PRESSURE sweep asks ("is the card at/over the ceiling right now") and what
+    an explicit operator override means. The ADMISSION reserve is
+    ``_vram_ceiling_reserve_bytes`` — see the note there for why the default no
+    longer derives from this fraction."""
+    val = _vram_ceiling_frac_explicit()
+    return _DEFAULT_VRAM_CEILING_FRAC if val is None else val
+
+
+# ── THE ADMISSION CUSHION (2026-07-27) ──────────────────────────────────────
+# THE BUG. The admission gate was `(free - need) >= total * (1 - 0.90)`, so on
+# ae's 24 GB 3090 it demanded 2.36 GiB of the card still free AFTER the weights
+# landed. Live refusal: "needs 21.1 GB, 21.3 GB free of 23.6 GB (2.4 GB ceiling
+# reserve); evicted 1 idle resident(s) freeing 21.0 GB" — a model the box can
+# genuinely run, refused on a card it had just emptied for it.
+#
+# WHY IT WAS WRONG, in units. `need` is `_incoming_need_detail(...)["total"]` =
+# on-disk weights x 1.15 + KV(resolved ctx) (x any learned calibration). It
+# ALREADY carries the whole context tax. What it does NOT carry is the
+# compute-graph + logits + CUDA-runtime residual that lands beside the KV —
+# and that residual is the ONLY thing this ceiling legitimately protects.
+# Sizing it as 10% of TOTAL therefore (a) re-charged for KV that is already
+# inside `need`, and (b) scaled the cushion with the CARD when the residual
+# does not scale with the card at all. That is the same shape as the flat
+# 2.5 GiB ctx reserve retired in 0.1.218 (spill.vram_ctx_reserve_bytes), just
+# with the proportionality inverted.
+#
+# THE NUMBER. spill measured that residual directly: flux2-klein-9b q4_k_m on
+# computron, 36 layers @ ctx 16384 — 7441 MiB on the card against 4.68 GiB of
+# weights and an EXACT 2.25 GiB KV, leaving a 348 MiB residual that is
+# ctx-independent (llama.cpp sizes the graph off n_ubatch and n_vocab). spill
+# already allows 512 MiB for it (_CTX_COMPUTE_RESERVE_BYTES, ~47% headroom over
+# the measurement) and this gate now uses THAT SAME CONSTANT, imported, so the
+# two fit paths cannot drift. For a big model the `x 1.15` weights fudge inside
+# `need` adds ~2.4 GiB of further slack on a 21 GiB load, which is why a flat
+# cushion stays safe as models grow.
+#
+# THE STACK. `_free_vram_bytes()` is BUDGETABLE free — spill.free_vram_bytes
+# already deducted HUGPY_VRAM_RESERVE_GIB (1.0 GiB) for GPU consumers central
+# cannot see. That floor is real device headroom the load will never touch, so
+# charging the cushion ON TOP of it would be the third margin for the second
+# concern. Same un-stacking ruling spill made for the whole-fit test
+# ("raw free - max(need, floor) >= file"): the guarantee is
+#
+#     raw free after the load  >=  max(external floor, compute cushion)
+#
+# which on the budgetable figure this gate actually reads is
+#
+#     free_budgetable - need   >=  max(0, cushion - floor)
+#
+# On ae (floor 1.0 GiB, cushion 512 MiB) that reserve is 0 and the live case
+# admits with 1.2 GiB of RAW device headroom left — 3.4x the measured residual.
+# On a box with HUGPY_VRAM_RESERVE_GIB=0 the cushion applies in full.
+#
+# NEVER STRICTER THAN BEFORE. The cushion is additionally clamped to today's
+# (1 - 0.90) x total, so max(0, min(cushion, 0.10 x total) - floor)
+# <= 0.10 x total for every card: the new default cannot refuse anything the
+# old default admitted. Small cards therefore keep exactly today's ceiling term
+# (a 4 GiB card: 410 MiB) instead of inheriting a constant sized for a big one
+# — the 0.1.218 lesson, applied in the other direction.
+#
+# DEGRADE-NOT-GUESS is unchanged: unmeasurable total/free/need still fails OPEN
+# at every call site, and an EXPLICIT HUGPY_VRAM_CEILING_FRAC skips all of this
+# and gets `total * (1 - frac)` verbatim, exactly as before.
+_VRAM_CEILING_CUSHION_FALLBACK = 512 * 2**20
+
+
+def _vram_ceiling_cushion_bytes() -> int:
+    """The compute-graph/activation/fragmentation cushion, in bytes.
+
+    ``HUGPY_VRAM_CEILING_CUSHION_GIB`` overrides (module env convention, same
+    GIB shape as HUGPY_VRAM_RESERVE_GIB / HUGPY_VRAM_CTX_RESERVE_GIB); a
+    negative or non-numeric value is ignored. Otherwise spill's MEASURED
+    ``_CTX_COMPUTE_RESERVE_BYTES`` (512 MiB) — imported, not copied, so the
+    admission gate and autofit price the same physical thing identically."""
+    raw = os.environ.get("HUGPY_VRAM_CEILING_CUSHION_GIB")
+    if raw is not None and str(raw).strip():
+        try:
+            val = float(raw)
+            if val >= 0:
+                return int(val * 2**30)
+            logger.warning("ignoring negative HUGPY_VRAM_CEILING_CUSHION_GIB=%r", raw)
+        except ValueError:
+            logger.warning("ignoring non-numeric HUGPY_VRAM_CEILING_CUSHION_GIB=%r",
+                           raw)
+    try:
+        from ..managers.spill import _CTX_COMPUTE_RESERVE_BYTES
+        return int(_CTX_COMPUTE_RESERVE_BYTES)
+    except Exception:  # noqa: BLE001 — never break admission over a cushion read
+        return _VRAM_CEILING_CUSHION_FALLBACK
+
+
+def _external_vram_floor_bytes() -> int:
+    """VRAM already held out of ``_free_vram_bytes()`` for consumers this worker
+    cannot see (spill.vram_reserve_bytes / HUGPY_VRAM_RESERVE_GIB, 1.0 GiB).
+
+    It is REAL post-load device headroom, which is why the cushion un-stacks
+    against it. Unreadable -> 0, i.e. the cushion applies in full (the
+    conservative direction)."""
+    try:
+        from ..managers.spill import vram_reserve_bytes
+        return max(0, int(vram_reserve_bytes()))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _vram_ceiling_reserve_bytes(total: "int | None") -> int:
+    """THE admission reserve: BUDGETABLE free VRAM that must remain after the
+    incoming need lands. See the note above for the derivation.
+
+    * explicit HUGPY_VRAM_CEILING_FRAC -> ``total * (1 - frac)``, verbatim,
+      byte-identical to the pre-2026-07-27 gate.
+    * default -> ``max(0, min(cushion, total * 0.10) - external floor)``.
+    """
+    try:
+        total = int(total or 0)
+    except (TypeError, ValueError):
+        total = 0
+    if total <= 0:
+        return 0
+    frac = _vram_ceiling_frac_explicit()
+    if frac is not None:
+        return int(total * (1.0 - frac))
+    cushion = min(_vram_ceiling_cushion_bytes(),
+                  int(total * (1.0 - _DEFAULT_VRAM_CEILING_FRAC)))
+    return max(0, cushion - _external_vram_floor_bytes())
+
+
+def _vram_empty_card_budget(total: "int | None") -> int:
+    """The largest ``need`` this card could EVER admit (empty card), under the
+    SAME arithmetic the fit gate uses: total, less the external floor that never
+    reaches the budgetable figure, less the admission reserve. Reporting//log
+    only — it is what makes "the full weights can never fit this card" a true
+    statement rather than a differently-computed guess."""
+    try:
+        total = int(total or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, total - _external_vram_floor_bytes()
+               - _vram_ceiling_reserve_bytes(total))
+
+
+def _vram_pressure_reserve_bytes(total: "int | None") -> int:
+    """The IDLE-PRESSURE threshold for ``_vram_headroom_sweep``, deliberately
+    still ``total * (1 - ceiling frac)``.
+
+    This is NOT the admission gate and must not be unified with it. It asks a
+    different question — "is the card under pressure RIGHT NOW, with no load
+    driving admission" — and its answer only ever evicts an idle resident; it
+    never refuses anything. Sizing it with the admission cushion would make it
+    ~0 on any box with the default 1.0 GiB external floor (that floor is already
+    out of the free read), retiring the deadlock-breaker the addendum exists
+    for. With an explicit HUGPY_VRAM_CEILING_FRAC the two agree exactly, as
+    they always did."""
+    try:
+        total = int(total or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, int(total * (1.0 - _vram_ceiling_frac())))
 
 
 def _total_vram_bytes() -> "int | None":
@@ -5861,9 +6049,14 @@ def _worker_slot_fit_check(model_key: str) -> bool:
     need = det.get("total")
     if not need:
         return True                          # unknown weight size -> allow
-    headroom = int(total * (1.0 - _vram_ceiling_frac()))
+    # THE SAME reserve _vram_evict_to_fit admits against (_vram_ceiling_reserve_
+    # bytes). These two are siblings asking one question — "does this need fit
+    # under the ceiling?" — from two entry points (slot routing vs the admission
+    # choke point). They must never disagree, or the slot pool refuses a seat the
+    # admission gate just granted (and spins the ceiling loop for nothing).
+    headroom = _vram_ceiling_reserve_bytes(total)
     # Loading consumes ~need; the card is OK if free-after-load still leaves the
-    # (1 - ceiling) reserve. Equivalent to "post-load fill <= ceiling".
+    # cushion. Equivalent to "post-load fill <= ceiling".
     # MoE: when a split governs the plan the load lands only the non-expert
     # share (+KV) on the card — gate on THAT typed need (expert share vs free
     # RAM, failing open when RAM is unmeasurable). This is what lets the /probe
@@ -7416,7 +7609,14 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
             need = int(need * BNB_4BIT_SIZE_RATIO)
     except Exception:  # noqa: BLE001 — never break admission over the lever
         pass
-    ceiling_reserve = int(total * (1.0 - _vram_ceiling_frac()))
+    # THE admission reserve (2026-07-27): a bounded compute/activation cushion,
+    # un-stacked against the external floor already out of `_free_vram_bytes()`
+    # — NOT a percentage of the card that re-charges for the KV `need` already
+    # carries. Derivation + measurement: see _vram_ceiling_reserve_bytes. Every
+    # downstream consumer in this function (the fit test, the flex deficit, the
+    # eviction need, the partial-offload budget, the refusal report) reads THIS
+    # one binding, so no two of them can price the ceiling differently.
+    ceiling_reserve = _vram_ceiling_reserve_bytes(total)
 
     # ── MoE re-target: typed bytes over the opaque byte-bag ─────────────────
     # When a MoE split governs this model, the plan that will ACTUALLY load is
@@ -7444,7 +7644,12 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
         if ms:
             fr_now = _free_ram_bytes()
             exp_bytes = int(ms.get("cpu_bytes") or 0)
-            impossible_full = int(need) > max(0, int(total) - ceiling_reserve)
+            # "Could the full weights EVER land on this card?" — priced with the
+            # SAME arithmetic the gate uses (total, less the external floor that
+            # never reaches the budgetable free read, less the admission
+            # reserve), so the log line cannot claim "never fits" about a need
+            # the gate would in fact admit on an empty card. Log-only.
+            impossible_full = int(need) > _vram_empty_card_budget(total)
             if fr_now is not None and exp_bytes > fr_now * 0.95:
                 logger.info(
                     "MoE split for %s skipped: expert tensors (~%s) exceed "
@@ -7864,6 +8069,7 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
                 f"(~{_human_bytes(_attributed)} across its model rows and its own "
                 f"CUDA context) with 0 B measured unattributed — nothing foreign "
                 f"is squatting the card, there is simply nothing evictable left")
+    _ext_floor = _external_vram_floor_bytes()
     reason = {
         "state": "refused",
         "model_key": model_key,
@@ -7873,7 +8079,15 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
             + (f"(+{_human_bytes(subject_held)} the subject itself already holds, "
                f"credited -> {_human_bytes(fv_eff)} available to it) "
                if subject_held else "")
-            + f"({_human_bytes(ceiling_reserve)} ceiling reserve); "
+            + f"({_human_bytes(ceiling_reserve)} ceiling reserve"
+            # Say where the rest of the headroom went. With the bounded cushion
+            # the ceiling reserve is often 0 B on a default box, and a bare
+            # "0 B ceiling reserve" reads like the guard is off — it is not: the
+            # external floor below is already OUT of the free figure quoted
+            # above and is the post-load working room.
+            + (f" + {_human_bytes(_ext_floor)} already held back from the free "
+               f"figure for out-of-band GPU consumers" if _ext_floor else "")
+            + "); "
             f"evicted {len(evicted)} idle resident(s) freeing "
             f"{_human_bytes(freed)}"
             + ("; " + "; ".join(holders) if holders else "")
@@ -8545,7 +8759,11 @@ def _vram_headroom_sweep(state: "WorkerState") -> None:
     fv = _free_vram_bytes()
     if fv is None:
         return
-    reserve = int(total * (1.0 - _vram_ceiling_frac()))
+    # PRESSURE, not admission: still the (1 - ceiling) fraction of the card, and
+    # deliberately NOT _vram_ceiling_reserve_bytes — see
+    # _vram_pressure_reserve_bytes for why unifying them would retire this
+    # deadlock-breaker. With an explicit HUGPY_VRAM_CEILING_FRAC they agree.
+    reserve = _vram_pressure_reserve_bytes(total)
     if fv >= reserve:
         return                               # under the ceiling — nothing to do
     # Over the ceiling with no load driving admission. Evict the coldest EVICTABLE

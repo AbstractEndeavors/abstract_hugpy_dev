@@ -44,6 +44,11 @@ def rig(monkeypatch):
     lru = {}
     static = set()
 
+    # The admission ceiling reads all three (2026-07-27 bounded cushion) — a
+    # sibling suite leaking one of them silently re-prices every case here.
+    for _c in ("HUGPY_VRAM_CEILING_FRAC", "HUGPY_VRAM_CEILING_CUSHION_GIB",
+               "HUGPY_VRAM_RESERVE_GIB"):
+        monkeypatch.delenv(_c, raising=False)
     monkeypatch.setattr(A, "_total_vram_bytes", lambda: card["total"])
     monkeypatch.setattr(A, "_free_vram_bytes", lambda: card["free"])
     monkeypatch.setattr(A, "_incoming_need_detail", lambda mk: dict(subject_det))
@@ -84,10 +89,13 @@ def rig(monkeypatch):
 
 # ── self-flex: compress the subject's OWN ctx to fit, evicting NOTHING ───────
 def test_self_ctx_flex_fits_without_evicting(rig):
-    # 24 GiB card, 10% ceiling reserve = 2.4 GiB. 15 GiB free.
-    rig.card["free"] = 15 * GIB
-    # Subject: 8 GiB weights + 6 GiB KV @ ctx 50% -> 14 GiB. At target it leaves
-    # only 1 GiB over the ceiling reserve (needs 2.4) -> does NOT fit.
+    # 24 GiB card. Since 2026-07-27 the DEFAULT admission reserve is a bounded
+    # compute cushion un-stacked against the external floor already out of the
+    # free read (agent._vram_ceiling_reserve_bytes), = 0 here — so the shortfall
+    # this test needs has to come from the NEED, not from the reserve.
+    rig.card["free"] = 13 * GIB
+    # Subject: 8 GiB weights + 6 GiB KV @ ctx 50% -> 14 GiB at target, i.e. 1 GiB
+    # MORE than the card has free -> does NOT fit; flex is the only way in.
     rig.subject_det.update(total=14 * GIB, weights=8 * GIB, kv=6 * GIB, ctx_pct=50)
     rig.static.add("bystander")
     rig.residents["bystander"] = {"vram_bytes": 5 * GIB, "host_mode": "in_process"}

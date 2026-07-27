@@ -46,8 +46,30 @@ def _clear_error(job_id: str) -> None:
 
 
 def update_model_status(model: dict) -> dict:
-    model.update(model_status(model))
+    """Stamp status/destination onto a manifest row — THE listing hot path.
+
+    Reads through the per-model memo (downloader.cached_model_status) instead of
+    re-walking the store for every model on every request. Same keys, same
+    values, same in-place mutation of the caller's dict; only the number of
+    filesystem calls changes. See comms/model_status_cache.py for the TTL,
+    the invalidation events and the cross-process story.
+    """
+    model.update(cached_model_status(model))
     return model
+
+
+def invalidate_model_status_cache(reason: str = "") -> None:
+    """Tell every gunicorn worker that installation status just changed.
+
+    Called from the events that actually move a model between
+    not_installed/partial/installed. Best-effort by design: a cache that cannot
+    be invalidated must never break the operation that changed the store."""
+    try:
+        from .....comms.model_status_cache import invalidate_model_status
+        invalidate_model_status(reason)
+    except Exception:  # noqa: BLE001
+        logger.debug("model-status cache invalidation failed (%s)", reason,
+                     exc_info=True)
 
 
 def _estimate_total_bytes(model: dict) -> int | None:
@@ -306,6 +328,13 @@ def start_cancellable_download(job: Job, model: dict, total_bytes: int | None = 
                     refresh_registry(run_discovery=False)
                 except Exception as exc:
                     logger.warning("post-download registry refresh failed: %s", exc)
+                # not_installed/partial -> installed. refresh_registry already
+                # invalidates, but say it explicitly here too: if the refresh
+                # above raised, the listings must still stop reporting the old
+                # status. Over-invalidating costs one re-walk; under-invalidating
+                # hides a model the operator just downloaded.
+                invalidate_model_status_cache(
+                    f"download completed: {job.model_key}")
                 return
 
             # Failed or stalled — figure out why, then resume or give up.
@@ -319,6 +348,10 @@ def start_cancellable_download(job: Job, model: dict, total_bytes: int | None = 
                     message="Download stalled." if stalled else "Download failed.",
                     error=detail,
                 )
+                # Terminal too: a give-up leaves partial files at the
+                # destination, which is a real not_installed -> partial move.
+                invalidate_model_status_cache(
+                    f"download failed: {job.model_key}")
                 return
 
             backoff = min(2 ** attempt, 30)
@@ -352,6 +385,9 @@ def cancel_download(job_id: str) -> dict:
     if proc is not None and proc.is_alive():
         from ....._platform.procutil import terminate_tree
         terminate_tree(proc)
+    # Cancel is terminal and leaves whatever landed on disk behind — the row's
+    # status can move (not_installed -> partial).
+    invalidate_model_status_cache(f"download cancelled: {job.model_key}")
     return {"cancelled": True}
 
 

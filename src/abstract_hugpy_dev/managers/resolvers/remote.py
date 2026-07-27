@@ -693,6 +693,205 @@ def _cold_hold_poll_s() -> float:
     return _env_float("HUGPY_COLD_HOLD_POLL_S", 2.0)
 
 
+def _env_int(name: str, default: int) -> int:
+    """Positive-int env knob, same discipline as _env_float (garbage / <=0 ⇒
+    default — a knob can misconfigure a deployment, never break it)."""
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        v = int(float(raw))
+        return v if v > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+# ---------------------------------------------------------------------------
+# Cold-hold ADMISSION CAP — the blast-radius bound.
+#
+# Operator incident 2026-07-27: "what is happening so that the site is getting
+# overwhelmed by being called by a single script?" Central stopped answering
+# EVERYTHING, /health included, for over a minute at a time and only recovered on
+# a unit restart.
+#
+# The hold above is the right behaviour for ONE cold call and a catastrophe for
+# twenty-four of them. Central serves the whole site from `gunicorn --workers 3
+# --threads 8` = 24 request slots TOTAL, and a held call pins one of those slots
+# for up to HUGPY_COLD_HOLD_MAX_S (1500s on the live unit — 25 minutes). A script
+# walking the ~66 text-generation models, or an operator clicking retry two dozen
+# times, therefore parks every slot in a hold: /health, /llm/workers, the console
+# and the API all share that one pool, so the site dies wholesale while nothing is
+# actually broken.
+#
+# So the hold is CAPPED. Past N simultaneous holds a new arrival is refused
+# IMMEDIATELY — an honest 503 in milliseconds — instead of queueing into a slot.
+# Bounding the blast radius beats serving every request: a fast 503 is strictly
+# better than a dead site, and the caller can retry into a fleet that is still up.
+#
+# Deliberately NOT a queue. Waiting in a slot for a permit that frees in twenty
+# minutes is the outage, restated.
+#
+# WHAT IS COUNTED — cold holds, not requests. The cap must never refuse healthy
+# traffic, so:
+#   * a permit is taken OPTIMISTICALLY when a relay begins;
+#   * it is released the instant the call proves WARM (the first token), so a
+#     long warm generation never occupies a cold-hold permit;
+#   * when no permit is free the call is refused ONLY if the worker's own
+#     load-state says the model is not loaded. A model that reads HEALTHY is
+#     served uncapped;
+#   * with no load-state provider (standalone worker / bare central) we cannot
+#     tell cold from warm, so we ADMIT. Never refuse on ignorance.
+#
+# A genuine slow load with a patient client is untouched: it is admitted, holds
+# its permit, and runs to completion on the unchanged ceiling/stall clocks. The
+# cap changes only how many of them may run AT ONCE.
+#
+# PER-PROCESS, like _INFLIGHT and _COLD_KICKING (the same v0 honesty): the
+# counter is a module global, so with `--workers 3` the fleet-wide ceiling is
+# 3 x the cap. The default below already has that multiplication done.
+# ---------------------------------------------------------------------------
+
+_HOLDS = 0
+_HOLDS_LOCK = threading.Lock()
+
+
+def _cold_hold_max_concurrent() -> int:
+    """How many cold holds THIS process may run at once. Default 4.
+
+    Sized against the measured deployment rather than picked round: central runs
+    `gunicorn --workers 3 --threads 8`, so each process owns 8 of the site's 24
+    request slots. 4 is half of one process's threads, which means
+
+      * every gunicorn process ALWAYS keeps >=4 threads a hold can never touch,
+        so /health, /llm/workers and the console stay answerable however
+        saturated the load path is (that is the acceptance test), and
+      * the fleet-wide ceiling is 3 x 4 = 12 of 24 slots — the operator's "half".
+
+    Operator-tunable (defaults are promises); garbage or <=0 falls back to 4.
+    """
+    return _env_int("HUGPY_COLD_HOLD_MAX_CONCURRENT", 4)
+
+
+def _cold_hold_retry_after_s() -> int:
+    """``Retry-After`` on a capacity refusal. Default 20s — long enough that a
+    retrying client cannot immediately re-saturate the cap, short enough to be a
+    real instruction rather than a brush-off."""
+    return _env_int("HUGPY_COLD_HOLD_RETRY_AFTER_S", 20)
+
+
+class ColdHoldCapacityError(RuntimeError):
+    """Central is already holding its maximum number of concurrent model loads.
+
+    NOT a fault, and NOT a refusal of the model: the request was never started,
+    so nothing is broken and nothing was lost — the same call succeeds once a
+    load in flight finishes. Message discipline (four misattributing diagnostics
+    in three days, and the recorded rule that a confidently wrong error is worse
+    than a vague one): name the ONE thing that is true — the concurrent-load
+    limit — plus what the model is actually doing, and speculate about NOTHING
+    else. In particular it never says the box is too small, never says a worker
+    is unhealthy, and never says the model failed.
+    """
+
+    code = "cold_load_capacity"
+
+    def __init__(self, model_key: Optional[str], worker: Optional[dict],
+                 held: int, cap: int, loading: bool,
+                 retry_after_s: Optional[int] = None):
+        self.model_key = model_key
+        self.worker = worker or {}
+        self.worker_name = (self.worker.get("name") or self.worker.get("id")
+                            or "its worker")
+        self.held = int(held)
+        self.cap = int(cap)
+        self.loading = bool(loading)
+        self.retry_after_s = int(retry_after_s if retry_after_s is not None
+                                 else _cold_hold_retry_after_s())
+        super().__init__(self.stream_message())
+
+    def stream_message(self) -> str:
+        state = ("is still loading on" if self.loading
+                 else "is not loaded yet on")
+        return (f"cold_load_capacity: '{self.model_key}' {state} "
+                f"'{self.worker_name}', and central is already holding "
+                f"{self.held} concurrent model loads — its limit "
+                f"({self.cap} per server process). Nothing is broken and this "
+                f"request was not started: it is refused straight away rather "
+                f"than queued, so the console and health checks stay "
+                f"responsive. Retry in about {self.retry_after_s}s, or wait for "
+                f"a load already in flight to finish.")
+
+    def as_error(self) -> Dict[str, Any]:
+        return {"error": {
+            "code": self.code,
+            "message": self.stream_message(),
+            "model": self.model_key,
+            "worker": self.worker_name,
+            "worker_id": self.worker.get("id"),
+            "holds_in_flight": self.held,
+            "limit": self.cap,
+            "retry_after_s": self.retry_after_s,
+        }}
+
+
+class _HoldPermit:
+    """One cold-hold admission. ``release()`` is idempotent (mirrors _RelaySlot)."""
+
+    __slots__ = ("_released",)
+
+    def __init__(self):
+        self._released = False
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        _hold_release()
+
+
+def _hold_try_acquire() -> Optional[_HoldPermit]:
+    """Take a cold-hold permit if one is free, else None. Never blocks."""
+    global _HOLDS
+    cap = _cold_hold_max_concurrent()
+    with _HOLDS_LOCK:
+        if _HOLDS >= cap:
+            return None
+        _HOLDS += 1
+    return _HoldPermit()
+
+
+def _hold_release() -> None:
+    global _HOLDS
+    with _HOLDS_LOCK:
+        _HOLDS = max(0, _HOLDS - 1)
+
+
+def _hold_count() -> int:
+    with _HOLDS_LOCK:
+        return _HOLDS
+
+
+def _admit_cold_hold(model_key: str, worker: Optional[dict],
+                     since_ts: float) -> Optional[_HoldPermit]:
+    """Admission for a call that may become a cold hold.
+
+    Returns a permit (admitted, counted), or None (admitted UNCOUNTED — the model
+    is warm, or we cannot tell). Raises ColdHoldCapacityError when the cap is full
+    AND the worker affirmatively reports the model is not loaded — the fast,
+    honest refusal that keeps the rest of the site answerable.
+    """
+    permit = _hold_try_acquire()
+    if permit is not None:
+        return permit
+    ls = _load_state(model_key, (worker or {}).get("id"), since_ts)
+    if ls is None:
+        return None          # can't tell cold from warm ⇒ never refuse on ignorance
+    if ls.get("healthy"):
+        return None          # warm: this gate is about LOADS, not about traffic
+    raise ColdHoldCapacityError(model_key, worker, _hold_count(),
+                                _cold_hold_max_concurrent(),
+                                bool(ls.get("in_progress")))
+
+
 # A load error that is HONEST/PERMANENT — a refusal or a hard load failure that a
 # retry cannot fix. These fail the hold immediately (honest refusal preserved).
 # Everything ELSE that fails before a token is treated as transient (hold+retry),
@@ -1308,79 +1507,100 @@ def make_delegating_runner(framework: str, task: str):
             stall_s = _cold_hold_stall_s()
             last_move = start
             last_err = ""
-            while True:
-                worker, spill_override = _select(self.model_key, pool, task, **_sel_kw)
-                if worker and _vision_task and not _worker_vision_capable(worker):
-                    logger.info("worker %s doesn't advertise vision (engine.supports_vision); "
-                                "serving %s where vision actually works instead",
-                                worker.get("id"), self.model_key)
-                    worker = None
-                if not worker:
-                    break  # no worker selected → refusal / local below (fail fast)
-                # Cap-aware admission: WorkerBusyError (honest 429/503) propagates
-                # unchanged — concurrency saturation is not a cold load.
-                slot = await _acquire_relay_slot_async(self.model_key, pool, worker,
-                                                       spill_override, viable=_viable,
-                                                       task=task)
-                worker, spill_override = slot.worker, slot.spill
-                payload = _worker_payload(task, req, self.model_key, worker.get("id"),
-                                          spill_override=spill_override)
-                if payload is None:
-                    slot.release()
-                    break  # unbuildable (oversized inline) → local, as before
-                action = None                       # "local" | "retry" | None(=done)
-                try:
-                    _res = await _worker_run_once(
-                        worker, payload, self.result_type,
-                        request_id=req.request_id, model_key=self.model_key)
-                    # ONE-SHOT tok/s. The result schema (TaskResult) is
-                    # extra="allow", so a worker's `timings` survives validation
-                    # as an extra attribute and needs no wire version bump in
-                    # this direction; an older worker simply sends none and this
-                    # records nothing. Stamped AFTER a successful relay, so a
-                    # failed call never pollutes the history with a rate that
-                    # was never achieved.
-                    _record_serve_metrics(
-                        worker, self.model_key,
-                        {"timings": getattr(_res, "timings", None)})
-                    return _res
-                except Exception as exc:
-                    if _is_request_shape_error(exc) and not _local_fallback_allowed():
-                        # Malformed for this model's chat template — fail FAST
-                        # and name the real fault. Never held (running it local
-                        # would fail the same way, and holding it is the hang).
+            # Cold-hold ADMISSION CAP: taken once, on the first selected worker,
+            # and released in the finally below. Full + model-not-loaded raises
+            # ColdHoldCapacityError straight out of run() — a fast honest 503,
+            # never a queued slot. See the cap block near _hold_try_acquire.
+            permit = None
+            admitted = False
+            try:
+                while True:
+                    worker, spill_override = _select(self.model_key, pool, task, **_sel_kw)
+                    if worker and _vision_task and not _worker_vision_capable(worker):
+                        logger.info("worker %s doesn't advertise vision (engine.supports_vision); "
+                                    "serving %s where vision actually works instead",
+                                    worker.get("id"), self.model_key)
+                        worker = None
+                    if not worker:
+                        break  # no worker selected → refusal / local below (fail fast)
+                    if hold and not admitted:
+                        admitted = True
+                        permit = _admit_cold_hold(self.model_key, worker, start)
+                    elif hold and permit is None:
+                        # Admitted uncounted (the model read warm) but the call is
+                        # holding anyway — top up opportunistically so the counter
+                        # tells the truth. Never refuses: we are already committed.
+                        permit = _hold_try_acquire()
+                    # Cap-aware admission: WorkerBusyError (honest 429/503) propagates
+                    # unchanged — concurrency saturation is not a cold load.
+                    slot = await _acquire_relay_slot_async(self.model_key, pool, worker,
+                                                           spill_override, viable=_viable,
+                                                           task=task)
+                    worker, spill_override = slot.worker, slot.spill
+                    payload = _worker_payload(task, req, self.model_key, worker.get("id"),
+                                              spill_override=spill_override)
+                    if payload is None:
+                        slot.release()
+                        break  # unbuildable (oversized inline) → local, as before
+                    action = None                       # "local" | "retry" | None(=done)
+                    try:
+                        _res = await _worker_run_once(
+                            worker, payload, self.result_type,
+                            request_id=req.request_id, model_key=self.model_key)
+                        # ONE-SHOT tok/s. The result schema (TaskResult) is
+                        # extra="allow", so a worker's `timings` survives validation
+                        # as an extra attribute and needs no wire version bump in
+                        # this direction; an older worker simply sends none and this
+                        # records nothing. Stamped AFTER a successful relay, so a
+                        # failed call never pollutes the history with a rate that
+                        # was never achieved.
+                        _record_serve_metrics(
+                            worker, self.model_key,
+                            {"timings": getattr(_res, "timings", None)})
+                        return _res
+                    except Exception as exc:
+                        if _is_request_shape_error(exc) and not _local_fallback_allowed():
+                            # Malformed for this model's chat template — fail FAST
+                            # and name the real fault. Never held (running it local
+                            # would fail the same way, and holding it is the hang).
+                            raise RuntimeError(
+                                _request_shape_message(self.model_key, worker, exc)) from exc
+                        if _local_fallback_allowed():
+                            logger.warning("worker run failed (%s); running %s locally",
+                                           exc, self.model_key)
+                            action = "local"
+                        elif (not hold) or _is_permanent_load_error(exc):
+                            raise RuntimeError(
+                                f"worker {worker.get('name') or worker.get('id')} "
+                                f"failed for {self.model_key}: {exc} (local fallback "
+                                f"disabled for worker-assigned models; set "
+                                f"HUGPY_LOCAL_FALLBACK=always to allow)") from exc
+                        else:
+                            last_err = str(exc)
+                            action = "retry"
+                    finally:
+                        slot.release()
+                    if action == "local":
+                        break
+                    # action == "retry": transient hold. Honest-fail / stall / ceiling.
+                    moved, _prog, _msg, honest = _cold_progress(self.model_key, worker, start)
+                    if honest:
                         raise RuntimeError(
-                            _request_shape_message(self.model_key, worker, exc)) from exc
-                    if _local_fallback_allowed():
-                        logger.warning("worker run failed (%s); running %s locally",
-                                       exc, self.model_key)
-                        action = "local"
-                    elif (not hold) or _is_permanent_load_error(exc):
-                        raise RuntimeError(
-                            f"worker {worker.get('name') or worker.get('id')} "
-                            f"failed for {self.model_key}: {exc} (local fallback "
-                            f"disabled for worker-assigned models; set "
-                            f"HUGPY_LOCAL_FALLBACK=always to allow)") from exc
-                    else:
-                        last_err = str(exc)
-                        action = "retry"
-                finally:
-                    slot.release()
-                if action == "local":
-                    break
-                # action == "retry": transient hold. Honest-fail / stall / ceiling.
-                moved, _prog, _msg, honest = _cold_progress(self.model_key, worker, start)
-                if honest:
-                    raise RuntimeError(
-                        f"worker {worker.get('name') or worker.get('id')} failed to "
-                        f"load {self.model_key}: {honest}")
-                if moved:
-                    last_move = time.time()
-                now = time.time()
-                if now > deadline or (now - last_move) > stall_s:
-                    raise RuntimeError(_cold_timeout_message(self.model_key, worker, last_err))
-                await asyncio.sleep(_cold_hold_poll_s())
-                continue
+                            f"worker {worker.get('name') or worker.get('id')} failed to "
+                            f"load {self.model_key}: {honest}")
+                    if moved:
+                        last_move = time.time()
+                    now = time.time()
+                    if now > deadline or (now - last_move) > stall_s:
+                        raise RuntimeError(_cold_timeout_message(self.model_key, worker, last_err))
+                    await asyncio.sleep(_cold_hold_poll_s())
+                    continue
+            finally:
+                # The permit is a cold-hold admission, not a request permit: it is
+                # returned the moment this call stops holding — success, refusal,
+                # honest failure, or a CancelledError from an abandoned client.
+                if permit is not None:
+                    permit.release()
             # Per-box "never serve locally" policy: no worker took this request
             # (none selected, or one failed with fallback allowed), and this box
             # hosts no models — refuse with a clear error instead of loading the
@@ -1509,39 +1729,127 @@ def make_delegating_runner(framework: str, task: str):
             last_move = start
             last_err = ""
             announced_wid = None
-            while True:
-                if cancel_event is not None and cancel_event.is_set():
-                    return  # cancel-while-held: teardown marks the job cancelled
-                worker, spill_override = _select(self.model_key, pool, task, **_sel_kw)
-                if worker and _vision_task and not _worker_vision_capable(worker):
-                    logger.info("worker %s doesn't advertise vision "
-                                "(engine.supports_vision); serving %s where vision "
-                                "actually works instead", worker.get("id"), self.model_key)
-                    worker = None
-                if not worker:
-                    break  # no worker selected → refusal / local below (fail fast)
-                try:
-                    slot = await _acquire_relay_slot_async(self.model_key, pool, worker,
-                                                           spill_override, viable=_viable,
-                                                           task=task)
-                except WorkerBusyError as busy:
-                    # Concurrency saturation is its own honest signal (not a cold
-                    # load) — surfaced as today, unchanged.
-                    yield ErrorEvent(request_id=req.request_id,
-                                     message=busy.stream_message())
-                    return
-                worker, spill_override = slot.worker, slot.spill
-                wid = worker.get("id") or ""
-                if wid != announced_wid:
-                    yield _alloc_status(req.request_id, worker)  # once per worker
-                    announced_wid = wid
-                key = (wid, self.model_key)
+            # Cold-hold ADMISSION CAP — see the block near _hold_try_acquire.
+            # Taken once (on the first selected worker), released on the first
+            # token (the call is warm, no longer a hold) and again in the finally
+            # that wraps this loop. Cap full + model not loaded ⇒ an immediate,
+            # honest ErrorEvent instead of a slot parked for up to the ceiling.
+            permit = None
+            admitted = False
+            try:
+                while True:
+                    if cancel_event is not None and cancel_event.is_set():
+                        return  # cancel-while-held: teardown marks the job cancelled
+                    worker, spill_override = _select(self.model_key, pool, task, **_sel_kw)
+                    if worker and _vision_task and not _worker_vision_capable(worker):
+                        logger.info("worker %s doesn't advertise vision "
+                                    "(engine.supports_vision); serving %s where vision "
+                                    "actually works instead", worker.get("id"), self.model_key)
+                        worker = None
+                    if not worker:
+                        break  # no worker selected → refusal / local below (fail fast)
+                    if hold and not admitted:
+                        admitted = True
+                        try:
+                            permit = _admit_cold_hold(self.model_key, worker, start)
+                        except ColdHoldCapacityError as full:
+                            yield ErrorEvent(request_id=req.request_id,
+                                             message=full.stream_message())
+                            return
+                    elif hold and permit is None:
+                        # Admitted uncounted (the model read warm) but this call is
+                        # holding anyway — top up so the counter tells the truth.
+                        # Never refuses: we are already committed.
+                        permit = _hold_try_acquire()
+                    try:
+                        slot = await _acquire_relay_slot_async(self.model_key, pool, worker,
+                                                               spill_override, viable=_viable,
+                                                               task=task)
+                    except WorkerBusyError as busy:
+                        # Concurrency saturation is its own honest signal (not a cold
+                        # load) — surfaced as today, unchanged.
+                        yield ErrorEvent(request_id=req.request_id,
+                                         message=busy.stream_message())
+                        return
+                    worker, spill_override = slot.worker, slot.spill
+                    wid = worker.get("id") or ""
+                    if wid != announced_wid:
+                        yield _alloc_status(req.request_id, worker)  # once per worker
+                        announced_wid = wid
+                    key = (wid, self.model_key)
 
-                # COALESCE: if another call is already driving this cold load, do
-                # NOT pile a second on-demand load on — release the gate slot and
-                # wait, surfacing progress. (check-and-add is atomic on the one loop.)
-                if hold and key in _COLD_KICKING:
-                    slot.release()
+                    # COALESCE: if another call is already driving this cold load, do
+                    # NOT pile a second on-demand load on — release the gate slot and
+                    # wait, surfacing progress. (check-and-add is atomic on the one loop.)
+                    if hold and key in _COLD_KICKING:
+                        slot.release()
+                        moved, prog, msg, honest = _cold_progress(self.model_key, worker, start)
+                        if honest:
+                            yield ErrorEvent(request_id=req.request_id,
+                                             message=_humanize_worker_error(
+                                                 worker.get("name") or wid, honest))
+                            return
+                        if moved:
+                            last_move = time.time()
+                        now = time.time()
+                        if now > deadline or (now - last_move) > stall_s:
+                            yield ErrorEvent(request_id=req.request_id,
+                                             message=_cold_timeout_message(self.model_key,
+                                                                           worker, last_err))
+                            return
+                        yield _loading_status(req.request_id, self.model_key, worker, prog, msg)
+                        await asyncio.sleep(_cold_hold_poll_s())
+                        continue
+
+                    if hold:
+                        _COLD_KICKING.add(key)
+                    action = None                       # "local" | "retry" | None(=done)
+                    warm = False
+                    try:
+                        async for ev in _relay_attempt(worker, spill_override):
+                            if hold and not warm and getattr(ev, "type", None) == "token":
+                                # First token ⇒ the model is LOADED. Free the cold-kick
+                                # key NOW so coalesced waiters dispatch CONCURRENTLY
+                                # against the warm model instead of serializing behind
+                                # this call's whole generation. (idempotent w/ finally.)
+                                _COLD_KICKING.discard(key)
+                                # …and give the cold-hold permit back for exactly the
+                                # same reason: this call is no longer WAITING FOR A
+                                # LOAD, it is generating. A long WARM stream must
+                                # never occupy an admission the next cold caller
+                                # needs. (release() is idempotent w/ the finally.)
+                                if permit is not None:
+                                    permit.release()
+                                    permit = None
+                                warm = True
+                            yield ev
+                        return  # attempt completed (tokens/done or interrupted) — terminal
+                    except _RelayUnbuildable:
+                        action = "local"                # oversized payload / opted-in local
+                    except _LoadFailed as lf:
+                        yield ErrorEvent(request_id=req.request_id, message=lf.message)
+                        return
+                    except _ColdRetry as cr:
+                        last_err = cr.message
+                        if not hold:
+                            # Feature disabled → today's behavior: surface, no retry.
+                            yield ErrorEvent(request_id=req.request_id,
+                                             message=_humanize_worker_error(
+                                                 worker.get("name") or wid, cr.message))
+                            return
+                        action = "retry"
+                    finally:
+                        # Release the gate slot + free the cold-kick key BEFORE any
+                        # wait, so a coalesced waiter proceeds the instant this kick
+                        # ends (also releases on client-disconnect GeneratorExit).
+                        slot.release()
+                        if hold:
+                            _COLD_KICKING.discard(key)
+                    if action == "local":
+                        break  # → local fallback / refusal below
+                    # action == "retry": the transient hold. Consult load-state for an
+                    # honest fail / progress, emit a loading status, bound by the
+                    # stall/ceiling clocks, then retry.
                     moved, prog, msg, honest = _cold_progress(self.model_key, worker, start)
                     if honest:
                         yield ErrorEvent(request_id=req.request_id,
@@ -1559,65 +1867,12 @@ def make_delegating_runner(framework: str, task: str):
                     yield _loading_status(req.request_id, self.model_key, worker, prog, msg)
                     await asyncio.sleep(_cold_hold_poll_s())
                     continue
-
-                if hold:
-                    _COLD_KICKING.add(key)
-                action = None                       # "local" | "retry" | None(=done)
-                warm = False
-                try:
-                    async for ev in _relay_attempt(worker, spill_override):
-                        if hold and not warm and getattr(ev, "type", None) == "token":
-                            # First token ⇒ the model is LOADED. Free the cold-kick
-                            # key NOW so coalesced waiters dispatch CONCURRENTLY
-                            # against the warm model instead of serializing behind
-                            # this call's whole generation. (idempotent w/ finally.)
-                            _COLD_KICKING.discard(key)
-                            warm = True
-                        yield ev
-                    return  # attempt completed (tokens/done or interrupted) — terminal
-                except _RelayUnbuildable:
-                    action = "local"                # oversized payload / opted-in local
-                except _LoadFailed as lf:
-                    yield ErrorEvent(request_id=req.request_id, message=lf.message)
-                    return
-                except _ColdRetry as cr:
-                    last_err = cr.message
-                    if not hold:
-                        # Feature disabled → today's behavior: surface, no retry.
-                        yield ErrorEvent(request_id=req.request_id,
-                                         message=_humanize_worker_error(
-                                             worker.get("name") or wid, cr.message))
-                        return
-                    action = "retry"
-                finally:
-                    # Release the gate slot + free the cold-kick key BEFORE any
-                    # wait, so a coalesced waiter proceeds the instant this kick
-                    # ends (also releases on client-disconnect GeneratorExit).
-                    slot.release()
-                    if hold:
-                        _COLD_KICKING.discard(key)
-                if action == "local":
-                    break  # → local fallback / refusal below
-                # action == "retry": the transient hold. Consult load-state for an
-                # honest fail / progress, emit a loading status, bound by the
-                # stall/ceiling clocks, then retry.
-                moved, prog, msg, honest = _cold_progress(self.model_key, worker, start)
-                if honest:
-                    yield ErrorEvent(request_id=req.request_id,
-                                     message=_humanize_worker_error(
-                                         worker.get("name") or wid, honest))
-                    return
-                if moved:
-                    last_move = time.time()
-                now = time.time()
-                if now > deadline or (now - last_move) > stall_s:
-                    yield ErrorEvent(request_id=req.request_id,
-                                     message=_cold_timeout_message(self.model_key,
-                                                                   worker, last_err))
-                    return
-                yield _loading_status(req.request_id, self.model_key, worker, prog, msg)
-                await asyncio.sleep(_cold_hold_poll_s())
-                continue
+            finally:
+                # Cold-hold permit returned the moment this call stops holding —
+                # terminal event, refusal, or the GeneratorExit a disconnected
+                # client's teardown cascades through this generator.
+                if permit is not None:
+                    permit.release()
 
             # Per-box "never serve locally" policy: no worker took this request
             # and this box hosts no models — surface a clear error instead of
