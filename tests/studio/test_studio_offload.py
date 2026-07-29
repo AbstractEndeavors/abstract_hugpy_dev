@@ -42,6 +42,11 @@ from dataclasses import asdict
 logging.disable(logging.INFO)
 
 os.environ.setdefault("STUDIO_ALLOW_UNPINNED", "1")
+# The offload suites PROVE THE PLUMBING with the synthetic prover as a stand-in for a
+# GPU render (that is what HUGPY_STUDIO_FORCE_REMOTE exists for), so they must opt in
+# to it explicitly — synthetic became opt-in on 2026-07-27 so a real render can never
+# silently degrade into noise. This is a HARNESS opt-in, never a product default.
+os.environ.setdefault("STUDIO_ALLOW_SYNTHETIC", "1")
 
 _SRC = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),

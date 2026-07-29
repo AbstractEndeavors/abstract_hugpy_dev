@@ -125,7 +125,13 @@ CREATE TABLE IF NOT EXISTS jobs (
     -- `updated` which any write bumps. The orphan-sweep in prune() ages on
     -- THIS clock so a wedged render (updated by mere views/recomputes) still
     -- goes reapable, while a truly-progressing stream never does.
-    progressed_at    REAL
+    progressed_at    REAL,
+    -- Cross-process WORK CLAIM (download daemon, 2026-07-28). A queued job with
+    -- claimed_by IS NULL is up for grabs; claim_next() takes it under a write
+    -- lock so exactly one daemon ever runs a given transfer. NULL for every job
+    -- that is not dispatched through a claim queue (chat, media, ...).
+    claimed_by       TEXT,
+    claimed_at       REAL
 );
 """
 
@@ -213,6 +219,13 @@ class SqliteMirror:
             # fail-open (never reaped by the progress-sweep) until a fresh
             # upsert stamps a real progressed_at.
             conn.execute("ALTER TABLE jobs ADD COLUMN progressed_at REAL")
+        # The work-claim columns (download daemon). NULL on every pre-existing
+        # row = unclaimed, which is exactly right: nothing before this migration
+        # was dispatched through a claim queue.
+        if "claimed_by" not in cols:
+            conn.execute("ALTER TABLE jobs ADD COLUMN claimed_by TEXT")
+        if "claimed_at" not in cols:
+            conn.execute("ALTER TABLE jobs ADD COLUMN claimed_at REAL")
 
     def _note_failure(self, op: str, exc: Exception) -> None:
         self._failures += 1
@@ -414,7 +427,190 @@ class SqliteMirror:
         except Exception as exc:
             self._note_failure("prune", exc)
 
+    # -- work claims (the download daemon's dispatch queue) -------------------
+    #
+    # A job created by the API in `pending` with no claim is WORK WAITING. A
+    # separate process (the downloader daemon) takes it with claim_next(), which
+    # is a compare-and-set under an IMMEDIATE (write) transaction — so two
+    # daemons, or a daemon racing its own restart, can never run one transfer
+    # twice. The claim is a column, NOT part of the JSON blob, so the owner's
+    # ordinary upsert()s (which rewrite `data`) can never clobber it.
+
+    def claim_next(self, kinds: tuple, owner: str) -> Optional[dict[str, Any]]:
+        """Atomically claim the oldest unclaimed `pending` job of *kinds* for
+        *owner*. Returns its JSON snapshot (with the claim stamped on), or None
+        when there is nothing to claim. Best-effort: a mirror fault returns None
+        (the daemon simply idles) rather than raising into its poll loop."""
+        kinds = tuple(kinds or ())
+        if not kinds or not self._ensure():
+            return None
+        placeholders = ",".join("?" for _ in kinds)
+        try:
+            conn = self._connect()
+            try:
+                # IMMEDIATE takes the write lock up front, so the SELECT and the
+                # UPDATE cannot interleave with another daemon's claim.
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT id, data FROM jobs WHERE status='pending' "
+                    f"AND kind IN ({placeholders}) "
+                    "AND (claimed_by IS NULL OR claimed_by='') "
+                    "AND cancel_requested=0 "
+                    "ORDER BY updated ASC LIMIT 1", kinds).fetchone()
+                if not row:
+                    conn.execute("ROLLBACK")
+                    self._ok()
+                    return None
+                job_id, data_json = row
+                now = time.time()
+                conn.execute(
+                    "UPDATE jobs SET claimed_by=?, claimed_at=?, updated=? "
+                    "WHERE id=?", (owner, now, now, job_id))
+                conn.execute("COMMIT")
+            finally:
+                conn.close()
+            self._ok()
+        except Exception as exc:
+            self._note_failure("claim_next", exc)
+            return None
+        try:
+            data = json.loads(data_json) if data_json else {}
+        except Exception:
+            data = {}
+        data["id"] = job_id
+        data["claimed_by"] = owner
+        return data
+
+    def release_claim(self, job_id: str) -> None:
+        """Drop the claim without touching status — the job becomes claimable
+        again on its next pass through the queue (used by requeue/retry)."""
+        if not self._ensure():
+            return
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE jobs SET claimed_by=NULL, claimed_at=NULL, updated=? "
+                    "WHERE id=?", (time.time(), job_id))
+            self._ok()
+        except Exception as exc:
+            self._note_failure("release_claim", exc)
+
+    def claim_of(self, job_id: str) -> Optional[str]:
+        """Who holds the claim on *job_id*, or None (unclaimed / unknown)."""
+        if not self._ensure():
+            return None
+        try:
+            with self._connect() as conn:
+                row = conn.execute("SELECT claimed_by FROM jobs WHERE id=?",
+                                   (job_id,)).fetchone()
+            self._ok()
+            return (row[0] or None) if row else None
+        except Exception as exc:
+            self._note_failure("claim_of", exc)
+            return None
+
+    def requeue(self, job_id: str, message: str = "",
+                kinds: tuple = ()) -> bool:
+        """Put a job BACK on the claim queue: status -> `pending`, claim dropped,
+        cancel flag lowered, run telemetry reset, JSON blob rewritten so every
+        reader sees the queued state. This is the cross-process retry primitive
+        (the requesting process does not own the row and has no local record of
+        it). Optionally constrained to *kinds* so a caller cannot re-queue
+        something that is not its kind of work. Returns True if a row moved."""
+        if not self._ensure():
+            return False
+        try:
+            with self._connect() as conn:
+                row = conn.execute("SELECT data, kind FROM jobs WHERE id=?",
+                                   (job_id,)).fetchone()
+                if not row:
+                    return False
+                if kinds and row[1] not in tuple(kinds):
+                    return False
+                try:
+                    data = json.loads(row[0]) if row[0] else {}
+                except Exception:
+                    data = {}
+                data["id"] = job_id
+                data["status"] = "pending"
+                data["cancel_requested"] = False
+                data["ended_ts"] = None
+                data["error"] = None
+                data["stalled"] = False
+                data["bytes_per_second"] = None
+                if message:
+                    data["message"] = message
+                now = time.time()
+                data["progressed_at"] = now
+                conn.execute(
+                    "UPDATE jobs SET status='pending', data=?, "
+                    "cancel_requested=0, claimed_by=NULL, claimed_at=NULL, "
+                    "updated=?, progressed_at=? WHERE id=?",
+                    (json.dumps(data), now, now, job_id))
+            self._ok()
+            return True
+        except Exception as exc:
+            self._note_failure("requeue", exc)
+            return False
+
+    def adopt_stale(self, kinds: tuple, owner: str,
+                    message: str = "") -> list[str]:
+        """Fail-over on daemon startup: every job of *kinds* that some PREVIOUS
+        owner left mid-flight (an active status, or a `pending` row still holding
+        a stale claim) goes back on the queue so this daemon can resume it.
+
+        Only rows claimed by someone OTHER than *owner* are touched — a daemon
+        restart adopts a dead predecessor's work, and can never yank a row out
+        from under a live sibling that claimed it under its own id. Partial files
+        stay on disk; the resumed transfer adopts the staging dir (see
+        imports/apis/download_models._adopt_or_reap_staging), so nothing re-fetches
+        from zero. Returns the ids re-queued."""
+        kinds = tuple(kinds or ())
+        if not kinds or not self._ensure():
+            return []
+        placeholders = ",".join("?" for _ in kinds)
+        active = ("processing", "streaming", "running")
+        act_ph = ",".join("?" for _ in active)
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    f"SELECT id FROM jobs WHERE kind IN ({placeholders}) "
+                    "AND (claimed_by IS NOT NULL AND claimed_by <> ?) "
+                    f"AND status IN ({act_ph},'pending')",
+                    (*kinds, owner, *active)).fetchall()
+            self._ok()
+        except Exception as exc:
+            self._note_failure("adopt_stale", exc)
+            return []
+        out = []
+        for (job_id,) in rows:
+            if self.requeue(job_id, message=message, kinds=kinds):
+                out.append(job_id)
+        return out
+
     # -- reads ---------------------------------------------------------------
+    def row(self, job_id: str) -> Optional[dict[str, Any]]:
+        """The JSON snapshot of ONE mirrored job (live or terminal), or None.
+        The single-job read complement to live_rows()/terminal_rows() — a route
+        answering GET /jobs/<id> for a job another process owns has no local
+        record to serialize."""
+        if not self._ensure():
+            return None
+        try:
+            with self._connect() as conn:
+                r = conn.execute("SELECT data FROM jobs WHERE id=?",
+                                 (job_id,)).fetchone()
+            self._ok()
+        except Exception as exc:
+            self._note_failure("row", exc)
+            return None
+        if not r or not r[0]:
+            return None
+        try:
+            return json.loads(r[0])
+        except Exception:
+            return None
+
     def cancel_requested(self, job_id: str) -> bool:
         if not self._ensure():
             return False

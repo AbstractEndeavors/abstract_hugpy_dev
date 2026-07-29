@@ -160,6 +160,51 @@ def get_hugpy_flask(name=None,allowed_origins=None,debug=False):
     except (ValueError, AssertionError):
         pass
 
+    # Same /api dual-mount for eviction telemetry. Workers POST their event
+    # batches to /api/llm/evictions/ingest through CentralClient, which may reach
+    # gunicorn directly over WireGuard (no nginx to strip the prefix); the console
+    # reads /api/llm/evictions and /api/llm/evictions/stream through the same
+    # prefix. The bare /llm/evictions... mount (auto-discovered via
+    # routes/__init__) serves the proxied path unchanged.
+    try:
+        from .app.routes.eviction_routes import eviction_bp
+        app.register_blueprint(eviction_bp, url_prefix="/api",
+                               name="eviction_bp_api")
+    except (ValueError, AssertionError):
+        pass
+    except Exception as _exc:  # noqa: BLE001 — telemetry must never break boot
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "eviction telemetry routes not mounted under /api: %s", _exc)
+
+    # Same /api dual-mount for MODEL GROUPS, so the Models tab reads
+    # /api/llm/groups on the same prefix as every other panel read. Read-only —
+    # the tick WRITES go through /settings/model_groups/..., which the operator
+    # gate already covers; there is deliberately no group write route to mount.
+    try:
+        from .app.routes.group_routes import group_bp
+        app.register_blueprint(group_bp, url_prefix="/api",
+                               name="group_bp_api")
+    except (ValueError, AssertionError):
+        pass
+    except Exception as _exc:  # noqa: BLE001 — a read surface must not break boot
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "model-group routes not mounted under /api: %s", _exc)
+
+    # Eviction telemetry: central's OWN emitted events (the video reservation
+    # flush→evict path is the one eviction central drives — it does no local LLM
+    # serving) go straight to the shared store, so they appear in the same
+    # console stream as the fleet's relayed events rather than living only in
+    # this process's ring.
+    try:
+        from ..comms import evictions as _evictions
+        _evictions.install_store_sink()
+    except Exception as _exc:  # noqa: BLE001 — never break boot over telemetry
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "eviction telemetry store sink not installed: %s", _exc)
+
     # Optional: mount the media_intelligence HTTP bridge at /media/analyze.
     #
     # The chat's media-intelligence path (ui mediaIntelligence.ts -> tryServerBridge)

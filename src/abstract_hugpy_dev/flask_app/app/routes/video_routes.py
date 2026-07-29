@@ -35,6 +35,7 @@ from __future__ import annotations
 import dataclasses
 import mimetypes
 import os
+import re
 import secrets
 
 from flask import request, jsonify, send_file
@@ -188,12 +189,14 @@ def _resolve_asset_uri(asset_id):
 
 def _autofit_vram_budget(raw):
     """A BLANK/absent/null ``vram_budget_gb`` means AUTOFIT (return ``None``): the studio
-    render sizes the routing budget to the SERVING WORKER's measured free VRAM at render
-    time, rather than a low guess that is guaranteed to fail (operator doctrine 2026-07-12:
+    render sizes the routing budget to the SERVING WORKER's GPU CAPACITY at render time,
+    rather than a low guess that is guaranteed to fail (operator doctrine 2026-07-12:
     "if a model needs 14GB and it's blank, just do 14, otherwise a fail is 100% likely").
     An EXPLICIT number is the manual override — passed through untouched (a bad value still
     400s in the validating factory). None threads through the spec to render_clip, which
-    resolves it; no worker/VRAM data degrades to the historical synthetic default."""
+    resolves it against capacity and lets the reservation engine evict to free that room;
+    unreadable VRAM REFUSES (operator 2026-07-27) instead of degrading to a synthetic
+    default."""
     if raw is None:
         return None
     if isinstance(raw, str) and not raw.strip():
@@ -498,12 +501,80 @@ def video_studio_i2v():
     height = res.get("height", body.get("height"))
     fps = res.get("fps", body.get("fps"))
     # sane studio default so an empty POST still produces a clip (synthetic spine).
-    width = 512 if width is None else width
-    height = 512 if height is None else height
+    # 832x480 (R_480P), not 512x512. A square 512 default was a GUARANTEED FAIL for
+    # two whole capabilities: it is outside EVERY id-capable and EVERY v2v-capable
+    # model's envelope on this fleet (Wan-VACE maxes at 480p), so an id_lock request
+    # at the default either refused with no_capable_model or — worse — fell through
+    # to the i2v runner, which does not read reference_images, and silently rendered
+    # the wrong person. A default that cannot succeed is a failure promise
+    # (defaults-are-promises); this one is the geometry the studio actually serves.
+    width = 832 if width is None else width
+    height = 480 if height is None else height
     fps = 24 if fps is None else fps
-    # capability defaults to "i2v" (backward-compat); "t2v" (text-to-video) and any
-    # other Capability value are accepted and validated inside make_studio_i2v.
+    # capability defaults to "i2v" (backward-compat). SHAPE is validated inside
+    # make_studio_i2v; VIABILITY is validated right here, first, before anything else
+    # in this handler does any work — see the block immediately below.
     capability = body.get("capability", "i2v")
+
+    # ----------------------------------------------------------------------- #
+    # CAPABILITY GATE — refuse a dead capability HERE, at the boundary, before a
+    # job_id exists (2026-07-27).
+    #
+    # WHY THIS BLOCK IS THE FIRST THING THE HANDLER DOES. ``presets.capability_verdict``
+    # was written to be consumed at the route layer — its own docstring said the route
+    # "refuse[s] at the BOUNDARY (an honest 400 naming what IS served) instead of
+    # enqueuing a job that dies in a runner three layers down" — and then NO route
+    # called it. ``studio/job.py::_VALID_CAPABILITIES`` is still every member of the
+    # Capability enum, so the boundary admitted all 16. MEASURED on this route
+    # 2026-07-27, before this block existed:
+    #
+    #     audio    -> 200 {"job_id": ...}      lipsync  -> 200 {"job_id": ...}
+    #     restore  -> 200 {"job_id": ...}      stream   -> 200 {"job_id": ...}
+    #     keyframe -> 200 {"job_id": ...}      inpaint/outpaint/retake -> 200
+    #
+    # Every one of those burned a media-bus queue slot, showed the caller a job id to
+    # poll, and then failed (or, worse for the four VACE-shaped ones, SUCCEEDED at
+    # rendering something else — a plain full restyle wearing the requested capability
+    # name). The router refuses the same set (CapabilityRouter.resolve's capability
+    # gate), but the router only runs once a job has been ADMITTED, and "the user
+    # discovers this after a job is accepted, queued and started" is the exact failure
+    # this slice exists to delete. So: same verdict, one hop earlier, no queue slot.
+    #
+    # THE WORDING IS THE REGISTRY'S, verbatim. ``verdict.refusal`` already names the
+    # measured blocker AND the fleet menu of what IS renderable; re-phrasing it here
+    # would give the console and the log two different explanations of one fact.
+    #
+    # NOTHING WORKING IS NARROWED. The gate only fires for capabilities NO ratified
+    # RenderPreset covers — 8 of 16 today (audio, inpaint, keyframe, lipsync, outpaint,
+    # restore, retake, stream). t2v / i2v / v2v / id_lock / motion / upres / interp /
+    # assemble pass through untouched and land on exactly the code path they did
+    # before; tests/test_video_presets_route.py asserts both halves against the live
+    # test client.
+    #
+    # AN UNKNOWN capability string is answered here too, rather than falling through
+    # to make_studio_i2v's ValueError, so the caller gets the SAME shape of answer
+    # (a 400 that names the alternatives) whether they asked for a typo or for
+    # something real that this fleet cannot do.
+    # ----------------------------------------------------------------------- #
+    from abstract_hugpy_dev.video_intel.studio import presets as _render_presets
+    from abstract_hugpy_dev.video_intel.studio.enums import Capability as _Capability
+    try:
+        _cap_enum = _Capability(capability)
+    except (ValueError, TypeError):
+        return jsonify({
+            "error": f"unknown capability {capability!r}; this fleet renders: "
+                     f"{_render_presets.available_menu()}",
+            "capability": capability,
+            "available": _render_presets.available_menu(),
+        }), 400
+    _verdict = _render_presets.capability_verdict(_cap_enum)
+    if not _verdict.servable:
+        return jsonify({
+            "error": _verdict.refusal,
+            "capability": _cap_enum.value,
+            "reason": _verdict.reason,
+            "available": _render_presets.available_menu(),
+        }), 400
     # a start_image, if supplied, must resolve inside the storage jail (never an
     # arbitrary-file read) — same seam as /video/ingest. T2V is TEXT-ONLY, so a
     # start_image is meaningless for it: we DELIBERATELY IGNORE it (drop to None),
@@ -599,13 +670,58 @@ def video_studio_i2v():
         return jsonify(
             {"error": "capability id_lock requires at least one reference_image"}), 400
 
-    # OPTIONAL VACE control still (composition blocking) — ONLY valid with id_lock. A
-    # single image + its kind (pose|depth|sketch), jail-resolved + image-classified.
+    # VACE control still (pose|depth|sketch) — a single image + its kind, jail-resolved
+    # and image-classified. Valid for TWO capabilities, and it means something different
+    # in each:
+    #   * id_lock — OPTIONAL composition blocking alongside the identity references;
+    #   * motion  — REQUIRED, and it IS the capability (see the block below).
+    #
+    # ⚠ WIDENED FROM id_lock-ONLY, 2026-07-27, and this is the fix that made `motion`
+    # a real capability instead of a phantom. Until today the gate here was
+    # `capability != "id_lock"`, which meant the four capabilities the old
+    # clip-control-480p preset advertised (motion/inpaint/outpaint/retake) 400'd the
+    # instant a control was supplied — and, with no control, sailed through to render a
+    # PLAIN FULL RESTYLE identical to v2v. The preset table advertised four controlled
+    # edits and the route could serve none of them.
+    #
+    # ``control_image`` is a genuinely distinct VACE branch (wan_vace.py:534-547: the
+    # still is loaded, resized and repeated across num_frames as the pipeline's
+    # `video=` control channel — not v2v's decoded source frames, not id_lock's
+    # reference latents), so motion was made REACHABLE. inpaint/outpaint/retake were
+    # not: no mask, expanded canvas or frame-range input exists anywhere in the spine,
+    # so they became honest refusals at the capability gate above rather than routes.
+    _CONTROL_CAPS = {"id_lock", "motion"}
     control_image = body.get("control_image")
     control_kind = body.get("control_kind")
-    if (control_image is not None or control_kind is not None) and capability != "id_lock":
+    if (control_image is not None or control_kind is not None) \
+            and capability not in _CONTROL_CAPS:
         return jsonify(
-            {"error": "control_image/control_kind are only valid with capability id_lock"}), 400
+            {"error": "control_image/control_kind are only valid with capability "
+                      f"id_lock or motion; got {capability!r}"}), 400
+    # ROUTE RULE: capability motion REQUIRES a control_image — the exact mirror of the
+    # id_lock/reference_images rule below, and for the same reason. A motion request
+    # with no control carries NO conditioning this runner can tell apart from a plain
+    # t2v/v2v render: wan_vace would either take the v2v branch (if a source clip rode
+    # along) or refuse deep in preflight with SOURCE_MISSING after the job had already
+    # been admitted and queued. Naming it here costs the caller one round trip.
+    if capability == "motion" and control_image is None:
+        return jsonify(
+            {"error": "capability motion requires a control_image (pose|depth|sketch) — "
+                      "it is the structural control that makes this a motion render "
+                      "rather than a plain restyle; for a prompt-only clip use t2v, "
+                      "for restyling an existing clip use v2v"}), 400
+    # ...and it must be the ONLY control channel in play. wan_vace picks exactly one
+    # (`if vace_context_frames: elif source_video: elif control_image:` at :498-547), so
+    # a request carrying BOTH a source clip and a control still would silently drop the
+    # control and render a full restyle — the phantom shape this whole slice exists to
+    # delete, reappearing one layer down. Refuse it by name instead.
+    if control_image is not None and source_video is not None:
+        return jsonify(
+            {"error": "control_image and source_video cannot be combined: the VACE "
+                      "control channel takes ONE input and source_video wins, so the "
+                      "control still would be silently ignored and you would get a "
+                      "plain restyle. Send a control_image (motion) or a source_video "
+                      "(v2v), not both"}), 400
     if control_image is not None:
         if not isinstance(control_image, str) or not control_image.strip():
             return jsonify({"error": "control_image must be a non-empty path"}), 400
@@ -647,6 +763,20 @@ def video_studio_i2v():
     # (PINNED_MODEL_UNAVAILABLE / a sharpened gate reason) that rides back on the job —
     # never a silent fallback. Shape (non-empty string) is checked in make_studio_i2v.
     model_id = body.get("model_id")
+    # CLIP LENGTH (2026-07-27): the caller's requested frame count. THE LAST HOP of a
+    # chain that two review rounds found broken one layer lower each time — the field
+    # existed on RenderManifest, then on StudioI2VSpec, then produce_clip grew the
+    # parameter, and each round the route still dropped the body key silently. Absent /
+    # null -> None -> the model's default length. Shape is validated here (a typo guard,
+    # NOT a ceiling: an over-large request CLAMPS to the model's real max with a recorded
+    # reason at render time, because the model is not bound yet at spec-build time).
+    requested_frames = body.get("requested_frames")
+    if isinstance(requested_frames, float) and requested_frames.is_integer():
+        requested_frames = int(requested_frames)
+    if requested_frames is not None and (
+            not isinstance(requested_frames, int) or isinstance(requested_frames, bool)
+            or not (1 <= requested_frames <= 10_000)):
+        return jsonify({"error": "requested_frames must be an integer in [1, 10000]"}), 400
     try:
         spec = make_studio_i2v(
             capability=capability,
@@ -670,6 +800,7 @@ def video_studio_i2v():
             steps=steps,
             cfg=cfg,
             model_id=model_id,
+            requested_frames=requested_frames,
             # IDENTITY LOCK (id_lock): the validated reference image uris + optional VACE
             # control still (both already jail-resolved + image-classified above).
             reference_images=tuple(resolved_refs),
@@ -707,8 +838,15 @@ def video_studio_movie():
     width = res.get("width", body.get("width"))
     height = res.get("height", body.get("height"))
     fps = res.get("fps", body.get("fps"))
-    width = 512 if width is None else width
-    height = 512 if height is None else height
+    # 832x480 (R_480P), not 512x512. A square 512 default was a GUARANTEED FAIL for
+    # two whole capabilities: it is outside EVERY id-capable and EVERY v2v-capable
+    # model's envelope on this fleet (Wan-VACE maxes at 480p), so an id_lock request
+    # at the default either refused with no_capable_model or — worse — fell through
+    # to the i2v runner, which does not read reference_images, and silently rendered
+    # the wrong person. A default that cannot succeed is a failure promise
+    # (defaults-are-promises); this one is the geometry the studio actually serves.
+    width = 832 if width is None else width
+    height = 480 if height is None else height
     fps = 24 if fps is None else fps
 
     goals_in = body.get("goals")
@@ -1006,7 +1144,26 @@ def video_presets():
 # (verified 200 + good prompt enrichment). A caller can still pass any key via
 # body["model"] — and once flux2 is serve-configured on the fleet this should
 # switch back to it. keeper 2026-07-13 (flux2 non-resolution flagged to operator).
-_DEFAULT_PROMPT_ASSIST_MODEL = "Qwen2.5-3B-Instruct-GGUF"
+#
+# SUPERSEDED 2026-07-27 (operator: "the flux2-uncensored should be the default for the
+# text generation in video, this should have thinking turned off and routed through the
+# computron"). The 2026-07-13 reasoning above was CORRECT WHEN WRITTEN and is now stale:
+# flux2-klein was catalog-only then. Verified live today instead of assumed —
+#   GET /llm/workers -> computron slot flux2-klein-9b-uncensored-text-encoder
+#                       serving=True, vram=5,515,509,760 (5.14 GiB), ngl=27/36
+#   POST /video/prompt/assist -> HTTP 200 in 8.5s, a clean 4-sentence prompt
+# Weights have been on computron since 2026-07-18 (~53 GB, every quant; the q4_k_m that
+# fits the 8 GiB 4060 is 5.03 GB) and computron is the ONLY worker holding it — ae carries
+# the image-to-image variant — so "routed through computron" is a consequence of the
+# fleet, not a routing rule anyone has to enforce.
+#
+# ⚠ IT IS A REASONING MODEL, so this default is only safe together with the no-think
+# handling above. Without it the whole 200-token budget goes to <think> and the caller
+# gets a monologue instead of a prompt (measured — see the no_think block).
+#
+# ⚠ DO NOT "fix" this to Flux-Uncensored-V2. That row is ALSO tagged text-generation in
+# the catalog but is a Flux IMAGE LoRA — the same mis-classification class as 41f908d.
+_DEFAULT_PROMPT_ASSIST_MODEL = "flux2-klein-9b-uncensored-text-encoder"
 
 _PROMPT_ASSIST_SYSTEM = (
     "You are an expert image-prompt engineer. Return ONLY the final prompt "
@@ -1068,6 +1225,68 @@ def _prompt_assist_result_text(result) -> str:
     return getattr(result, "text", "") or ""
 
 
+# --------------------------------------------------------------------------- #
+# NO-THINK (operator 2026-07-27: "a specific no_think function would be fine
+# granted it propagates the query and strips <think>...</think> ... or even sends
+# it out as a dict var of its own")
+# --------------------------------------------------------------------------- #
+# WHY THIS IS NOT OPTIONAL. The prompt-assist default is now a REASONING model,
+# and reasoning does not stay in its own lane here: llama.cpp extracts
+# <think>...</think> into message.reasoning_content, and
+# managers/llama/runners/src/ccp_runner.py:43 then DELIBERATELY RE-INLINES it:
+#
+#     if reasoning and "<think>" not in content:
+#         return f"<think>{reasoning}</think>{content}"
+#
+# so it arrives fused into the text. Measured on the live fleet 2026-07-27,
+# flux2-klein-9b-uncensored-text-encoder via computron, draft "a red car on a wet
+# street": the ENTIRE 200-token budget went to reasoning and the reply was
+# "<think>Okay, the user wants me to expand...</think>" with NO prompt at all.
+# Stripping alone would therefore have yielded an EMPTY prompt — which is why the
+# suppression half below matters and a strip-only fix would have looked correct in
+# a unit test and produced nothing in the product.
+#
+# TWO HALVES, BOTH REQUIRED:
+#   1. SUPPRESS at generation. This model's chat_template.jinja carries the Qwen3
+#      idiom -- `{%- if enable_thinking is defined and enable_thinking is false %}`
+#      emits a PRE-CLOSED `<think>\n\n</think>` so the model starts after thinking
+#      is already shut. We cannot reach that kwarg: `chat_template_kwargs` has ZERO
+#      hits across this package, so plumbing one would be a knob nothing reads.
+#      The `/no_think` directive rides the EXISTING message path and does the same
+#      job. VERIFIED on the same model + draft: a clean 4-sentence prompt, no
+#      <think> at all.
+#   2. STRIP defensively, because the model is user-selectable and the next one
+#      picked may ignore the directive. The reasoning is RETURNED, not discarded —
+#      it rides its own `reasoning` key so a caller can show or ignore it, and it
+#      can never be mistaken for the prompt.
+_NO_THINK_DIRECTIVE = "/no_think"
+_THINK_BLOCK_RE = re.compile(r"<think>(.*?)(?:</think>|\Z)", re.DOTALL | re.IGNORECASE)
+
+
+def no_think(text: str) -> tuple[str, str]:
+    """Split a model reply into (prompt_text, reasoning).
+
+    Removes every ``<think>...</think>`` block and returns the surviving prose plus
+    the concatenated reasoning. An UNCLOSED ``<think>`` (the token budget ran out
+    mid-thought — exactly what the live measurement above produced) is treated as
+    reasoning to the end of the string, so a truncated ramble can never be served as
+    a prompt. Returns ("", reasoning) when the reply was nothing but thinking; the
+    caller turns that into an honest error rather than an empty prompt box."""
+    if not text:
+        return "", ""
+    reasoning = "\n".join(m.group(1).strip() for m in _THINK_BLOCK_RE.finditer(text))
+    return _THINK_BLOCK_RE.sub("", text).strip(), reasoning.strip()
+
+
+def _with_no_think(user_text: str) -> str:
+    """PROPAGATE THE QUERY, then ask for it without the monologue. Appending the
+    directive (rather than replacing anything) is what keeps the user's own draft
+    intact — the operator's "granted it propagates the query"."""
+    if _NO_THINK_DIRECTIVE in user_text:
+        return user_text
+    return f"{user_text}\n\n{_NO_THINK_DIRECTIVE}"
+
+
 @video_bp.route("/video/prompt/assist", methods=["POST"])
 def video_prompt_assist():
     body = request.get_json(silent=True) or {}
@@ -1116,12 +1335,27 @@ def video_prompt_assist():
     else:
         user = f"Write one compelling, original {medium} of your choosing."
 
+    # RANDOMIZED STEERING for "generate" (operator 2026-07-27: "i need generate
+    # in the /video (the llm generate) to randomize the prompt"). The instruction
+    # above is IDENTICAL on every call, and a small instruct model asked the same
+    # question returns the same answer — so Generate produced the same handful of
+    # prompts. Temperature alone doesn't fix that: it jitters wording while the
+    # model walks to the same attractor. Changing the QUESTION does. A draft, if
+    # given, keeps the SUBJECT axis (see prompt_seeds.steering_axes) so steering
+    # colours the shot without overwriting what the operator asked for. "detail"
+    # (Enhance) is deliberately NOT steered — its contract is to preserve the draft.
+    if mode == "generate":
+        from ....video_intel.prompt_seeds import steering_clause
+        user += "\n\n" + steering_clause(kind, has_draft=bool(draft))
+
     if hint:
         user += f"\n\nAdditional context to honor: {hint}"
 
+    # NO-THINK, half 1 of 2: suppress the monologue at GENERATION. The user's own draft
+    # rides through untouched — the directive is appended, never substituted.
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user},
+        {"role": "user", "content": _with_no_think(user)},
     ]
 
     # Late imports (mirrors prompt_routes/discord_routes) — dodges circulars
@@ -1148,12 +1382,30 @@ def video_prompt_assist():
         return jsonify({"error": _friendly_stream_error(exc)}), 502
 
     ok = result.get("ok", True) if isinstance(result, dict) else getattr(result, "ok", True)
-    text = _prompt_assist_result_text(result).strip()
-    if not ok or not text:
+    raw = _prompt_assist_result_text(result).strip()
+    if not ok or not raw:
         err = result.get("error") if isinstance(result, dict) else getattr(result, "error", None)
         return jsonify({"error": err or "assist produced no text"}), 502
 
-    return jsonify({"prompt": text, "model": model_key, "kind": kind}), 200
+    # NO-THINK, half 2 of 2: strip defensively, because the model is caller-selectable
+    # and the next one chosen may ignore the directive. The reasoning is not thrown away
+    # — it rides its own key, so it can be shown or ignored but never mistaken for the
+    # prompt (operator: "or even sends it out as a dict var of its own").
+    text, reasoning = no_think(raw)
+    if not text:
+        # Nothing but thinking. Say so honestly rather than handing back an empty prompt
+        # box — this is the failure the live measurement produced before the directive
+        # was wired, and the caller can act on it (retry, or pick a non-reasoning model).
+        return jsonify({
+            "error": ("the assistant returned only reasoning and no prompt — "
+                      f"{model_key!r} appears to have ignored the no-think directive; "
+                      "retry, or choose a different text generator"),
+            "model": model_key,
+            "reasoning": reasoning,
+        }), 502
+
+    return jsonify({"prompt": text, "model": model_key, "kind": kind,
+                    "reasoning": reasoning, "thinking_suppressed": True}), 200
 
 
 # --------------------------------------------------------------------------- #
@@ -1343,6 +1595,201 @@ def studio_preset_apply(preset_id):
             "message": f"no studio preset {preset_id!r}"}}), 404
 
     return jsonify(preset.apply()), 200
+
+
+# --------------------------------------------------------------------------- #
+# 2k) GET /video/render/presets — WHAT THIS FLEET CAN ACTUALLY RENDER TODAY.
+#
+#     Fourth and LAST preset surface on this blueprint, and the only one grounded in
+#     measurement rather than intent. The other three answer "what did we curate?";
+#     this one answers "what will come back as pixels?" — the eight ratified
+#     ``RenderPreset`` rows in video_intel/studio/presets.py, each a PROVEN TUPLE of
+#     (capability, model, precision, geometry, frame budget) measured on the live
+#     fleet 2026-07-27 (CAPABILITY-VIABILITY-MAP.md, MODEL-POOL-INVENTORY.md).
+#
+#     WHY A NEW PATH RATHER THAN EXTENDING AN OLD ONE. /video/presets (scene "ideal
+#     default loads"), /movie/presets (Movie Maker goal timelines) and
+#     /video/studio/presets (the Studio Clips station's prefill bundles) are three
+#     FROZEN wire contracts with live console callers and their own registries
+#     (video_intel/presets.py, video_intel/studio_presets.py). Folding a different
+#     table into any of them would break a pinned shape. So this is additive and
+#     namespaced under /video/render/ — "render presets", the RenderPreset table.
+#
+#     HONEST ABOUT THE GAPS TOO. The list is only half the answer: `unavailable`
+#     carries every ``Capability`` the enum declares and NO preset covers, with the
+#     measured blocker and the full refusal text — straight from the registry's own
+#     ``capability_verdict``, never re-worded here. That is the whole point of the
+#     table: a caller learns "studio cannot render 'audio' on this fleet: the studio
+#     clip contract has NO audio track at all …" at DISCOVERY time instead of
+#     enqueueing a job that dies in a runner three layers down.
+#
+#     Derived at REQUEST time from the registry — there is deliberately no cached or
+#     hardcoded copy in the route layer, so proving a ninth preset is a one-file
+#     change (tests/test_video_presets_route.py pins this by swapping the registry
+#     accessor and demanding the response follow).
+#
+#     Read-only, no side effects, no worker/catalog touch. Auth is the blanket
+#     /video gate (video_auth.install_video_gate): a console session OR a video-share
+#     credential, exactly like every sibling preset GET — nothing new, nothing looser.
+# --------------------------------------------------------------------------- #
+def _render_preset_row(p):
+    """Wire shape for one ``RenderPreset``. A projection of the frozen dataclass —
+    every value is read off ``p``, none is restated here.
+
+    Keys follow the sibling preset surfaces where they overlap (``id``, not the
+    dataclass's ``preset_id``) and the registry's own naming where they do not
+    (``title``, ``evidence``). ``capability`` is the PRIMARY one a caller asks for;
+    ``capabilities`` is the full set — every ratified row serves exactly one today,
+    and the plural key is kept because the row that served FOUR (clip-control-480p)
+    turned out to serve one and render a fifth thing, which is the lesson this shape
+    should keep visible. ``geometry`` is the registry's own human string — "source"
+    on the two ffmpeg enhance presets, which have no geometry of their own (a 0 there
+    would be a lie with a shape)."""
+    return {
+        "id": p.preset_id,
+        "title": p.title,
+        "description": p.description,
+        "capability": p.capability.value,
+        "capabilities": [c.value for c in p.capabilities],
+        "model": p.model_id,
+        "framework": p.framework.value,
+        "task": p.task.value,
+        "precision": p.precision.value,
+        "geometry": p.geometry,
+        "width": p.width,
+        "height": p.height,
+        "fps": p.fps,
+        "default_frames": p.default_frames,
+        "max_frames": p.max_frames,
+        "inputs": list(p.inputs),
+        # PROVEN says this exact path has produced pixels on this fleet, and it is
+        # CHECKED (tests/studio/test_presets.py proves it against the clip store, and
+        # against the rule that a composite can never out-prove what it composes).
+        # False on three rows today — clip-i2v-480p (0 of 47 landed Wan clips came
+        # from any 14B row), movie-480p (its `still` joint binds that same 14B), and
+        # clip-motion-480p (a real VACE branch the route only unlocked on 2026-07-27,
+        # so nothing has come through it yet). Surfacing it is the point: a caller may
+        # prefer a proven path, and now can tell which those are.
+        "proven": p.proven,
+        "evidence": p.evidence,
+        # MOVIE ONLY; empty tuples on every single-clip preset, kept in the shape so
+        # the row is uniform and a client never branches on key presence.
+        "composes": list(p.composes),
+        "joints": list(p.joints),
+    }
+
+
+@video_bp.route("/video/render/presets", methods=["GET"])
+def video_render_presets():
+    from abstract_hugpy_dev.video_intel.studio import presets as render_presets
+
+    # Sorted by capability value so the refusal block is byte-stable across calls —
+    # the same reason ``presets.available_menu`` sorts (a payload that reorders itself
+    # looks like a change to anyone diffing it). The preset list keeps the registry's
+    # RATIFIED order (clips, then movie, then enhance), which is not alphabetical and
+    # is meaningful, so it is passed through untouched.
+    unavailable = []
+    for cap in sorted(render_presets.unservable_capabilities(), key=lambda c: c.value):
+        verdict = render_presets.capability_verdict(cap)
+        unavailable.append({
+            "capability": verdict.capability.value,
+            "reason": verdict.reason,
+            "refusal": verdict.refusal,
+        })
+
+    return jsonify({
+        "presets": [_render_preset_row(p) for p in render_presets.all_presets()],
+        "unavailable": unavailable,
+        # The one-line menu the refusals quote, surfaced on its own so a client can
+        # show "what IS available" without parsing it back out of a refusal string.
+        "menu": render_presets.available_menu(),
+        # Frame-budget arithmetic a caller needs BEFORE spending 6 minutes of denoise:
+        # every Wan pipeline requires num_frames == 4k+1 (the latent VAE compresses
+        # time 4:1), and the runner silently snaps down to the nearest such value.
+        "frame_cadence": render_presets.WAN_FRAME_CADENCE,
+        # WHERE these numbers were sized. Not a routing input — provenance, so a
+        # reader can tell which box the VRAM figures in `evidence` refer to.
+        "render_box": render_presets.RENDER_BOX,
+    }), 200
+
+
+# --------------------------------------------------------------------------- #
+# 2l) GET /video/prompt/assist/models — WHICH TEXT GENERATORS THIS FLEET CAN
+#     ACTUALLY RUN, for the studio's Enhance/Generate picker.
+#
+#     Same doctrine as /video/render/presets: offer only what completes. A picker
+#     built from the raw catalog would be a menu of failures — most rows are
+#     catalog-only and 404 on use, and the catalog additionally MIS-TAGS at least
+#     one image model as text-generation (see _ASSIST_MISTAGGED below). So a row is
+#     offered here only when a live worker actually holds it.
+#
+#     `serving` distinguishes "seated right now, answers in ~1s" from "present on a
+#     worker, first call pays a cold load". That difference is minutes, so the UI
+#     should show it rather than let a user wonder if Enhance hung.
+# --------------------------------------------------------------------------- #
+# Catalog rows that DECLARE text-generation but are not text models. Keyed with the
+# evidence, because the next person will otherwise "fix" the omission.
+_ASSIST_MISTAGGED = {
+    "Flux-Uncensored-V2": ("a Flux IMAGE LoRA mis-tagged text-generation in the "
+                           "catalog — same class as 41f908d (a video diffusion model "
+                           "advertising itself as a chat model)"),
+}
+
+
+@video_bp.route("/video/prompt/assist/models", methods=["GET"])
+def video_prompt_assist_models():
+    from abstract_hugpy_dev.flask_app.app.functions.imports import worker_store
+    from abstract_hugpy_dev.imports.config.models.models_config import get_models_dict
+
+    catalog = get_models_dict(dict_return=True) or {}
+
+    # Which models a LIVE worker holds, and which are seated right now. Only online
+    # workers count: a model on an offline box is not a thing a user can pick today.
+    held: dict[str, bool] = {}
+    try:
+        for w in worker_store.all():
+            if str(getattr(w, "status", None) or (w.get("status") if isinstance(w, dict) else "")) != "online":
+                continue
+            row = w if isinstance(w, dict) else getattr(w, "__dict__", {}) or {}
+            for key in (row.get("models") or ()):
+                held.setdefault(str(key), False)
+            for alloc in (row.get("allocations") or ()):
+                key = str(alloc.get("model_key") or "")
+                if key:
+                    held[key] = bool(alloc.get("serving")) or held.get(key, False)
+    except Exception:                       # noqa: BLE001 — a picker must never 5xx
+        logger.exception("assist model discovery: worker enumeration failed")
+
+    models, excluded = [], []
+    for key, present in sorted(held.items()):
+        cfg = catalog.get(key)
+        if cfg is None:
+            continue                        # held but not in the catalog: not offerable
+        tasks = list((cfg.get("tasks") if isinstance(cfg, dict) else None) or ())
+        if "text-generation" not in tasks:
+            continue
+        why = _ASSIST_MISTAGGED.get(key)
+        if why:
+            excluded.append({"model": key, "reason": why})
+            continue
+        models.append({
+            "model": key,
+            "serving": bool(present),
+            "framework": (cfg.get("framework") if isinstance(cfg, dict) else None),
+            "default": key == _DEFAULT_PROMPT_ASSIST_MODEL,
+        })
+
+    return jsonify({
+        "models": models,
+        "default": _DEFAULT_PROMPT_ASSIST_MODEL,
+        # Surfaced, not silently dropped: a row we deliberately refuse to offer and
+        # why. Silent omission is how a mis-tag survives for months.
+        "excluded": excluded,
+        # Every generator served through this route runs with thinking suppressed
+        # (see the no_think block) — the picker can say so instead of implying that
+        # choosing a reasoning model will fill the prompt box with a monologue.
+        "thinking_suppressed": True,
+    }), 200
 
 
 # --------------------------------------------------------------------------- #

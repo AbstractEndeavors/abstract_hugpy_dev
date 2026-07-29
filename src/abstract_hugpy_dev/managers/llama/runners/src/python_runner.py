@@ -5,6 +5,19 @@ from .imports import *
 # ===========================================================================
 
 
+def _emit_resolve_fail(model_key, resolved_path, reason):
+    """Report a "nothing loadable on disk" refusal on the serve-telemetry
+    stream. Wholly best-effort: this runs on the load path, and a telemetry
+    import failure must not convert a clean FileNotFoundError into a mystery.
+    See comms/evictions.py for why the serve pipeline shares that stream."""
+    try:
+        from abstract_hugpy_dev.comms import evictions as _ev
+        _ev.emit_resolve_fail(model_key, resolved_path, reason,
+                              **_ev.disk_stats(resolved_path or None))
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _build_vision_chat_handler(model_path, mmproj, cfg):
     """Best-effort multimodal chat handler for a vision GGUF, or None.
 
@@ -74,6 +87,12 @@ class LlamaCppPythonRunner(LlamaCppBaseRunner):
             model_path = get_gguf_file(model_dir, self.cfg)
 
         if not model_path:
+            # Same honest checkpoint as the slot child's _build_cmd refusal:
+            # the in-process loader is the OTHER way weights get opened, and a
+            # request that dies here was equally invisible on the console
+            # before (2026-07-28). Observation only.
+            _emit_resolve_fail(model_key, model_dir,
+                               "no GGUF resolved for this model on disk")
             raise FileNotFoundError(f"No GGUF file found for model_key={model_key}")
 
         self.model_path = os.fspath(model_path)
@@ -82,6 +101,11 @@ class LlamaCppPythonRunner(LlamaCppBaseRunner):
         # taking the whole process down instead of failing one request. Guard
         # here — the last check before Llama() touches the file.
         if not os.path.isfile(self.model_path) or os.path.getsize(self.model_path) == 0:
+            _emit_resolve_fail(
+                model_key, self.model_path,
+                "resolved GGUF does not exist"
+                if not os.path.isfile(self.model_path)
+                else "resolved GGUF is 0 bytes (interrupted or failed pull)")
             raise FileNotFoundError(
                 f"{model_key}: GGUF missing or empty at {self.model_path!r} — "
                 "refusing to load (would SIGILL llama.cpp)")

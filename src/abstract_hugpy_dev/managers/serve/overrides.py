@@ -16,7 +16,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import threading
 
 logger = logging.getLogger(__name__)
@@ -148,9 +147,9 @@ def _mmproj_bytes(model_dir: str) -> int:
 
 
 # A split/sharded GGUF ships as N files ``<stem>-<NNNNN>-of-<MMMMM>.gguf``; they
-# are ONE logical model that llama.cpp loads from the first shard.
-_SHARD_RE = re.compile(r"^(?P<stem>.+)-(?P<idx>\d{5})-of-(?P<total>\d{5})\.gguf$",
-                       re.IGNORECASE)
+# are ONE logical model that llama.cpp loads from the first shard. Re-exported
+# from the shared elector so this module and ``get_gguf_file`` cannot drift.
+from ...imports.src.gguf_election import SHARD_RE as _SHARD_RE  # noqa: E402
 
 
 def _servable_gguf_files(model_dir: str) -> list:
@@ -200,35 +199,21 @@ def _gguf_variant_groups(files: list) -> list:
     separate (grouped by containing dir + shard stem), so they rank as distinct
     variants exactly like single-file quants do.
 
-    ``files``: ``[(relpath, bytes), …]``. Returns ``[{filename, bytes, members}]``
-    where ``filename`` is the entrypoint basename and ``members`` are the
-    relpaths that make up the variant (one for a single file, N for shards).
+    ``files``: ``[(relpath, bytes), …]``. Returns the variant dicts described in
+    ``imports.src.gguf_election.group_variants`` — ``{filename, bytes, members,
+    complete, shards, shard_total, missing_shards, incomplete_reason, quant,
+    full_precision}``.
+
+    DELEGATES to the shared elector. This function used to fold shards with its
+    own private copy of the shard regex (the tree had six), and like every other
+    copy it captured the ``-of-MMMMM`` total and never read it — so a directory
+    holding ``q8_0-00001-of-00003`` and nothing else of that quant reported a
+    third of a model as a whole, electable variant. Completeness now comes from
+    the same code that decides the election, which is the only way the two can
+    agree.
     """
-    groups: dict = {}
-    variants = []
-    for rel, sz in files:
-        base = os.path.basename(rel)
-        m = _SHARD_RE.match(base)
-        if not m:
-            variants.append({"filename": base, "bytes": int(sz),
-                             "members": [rel]})
-            continue
-        idx = int(m.group("idx"))
-        # Group by (containing dir, shard stem) so two sharded quant families in
-        # their own subdirs never merge.
-        key = (os.path.dirname(rel), m.group("stem").lower())
-        g = groups.setdefault(key, {"bytes": 0, "members": [],
-                                    "entry_rel": None, "entry_idx": None})
-        g["bytes"] += int(sz)
-        g["members"].append(rel)
-        if g["entry_idx"] is None or idx < g["entry_idx"]:
-            g["entry_idx"] = idx
-            g["entry_rel"] = rel
-    for g in groups.values():
-        variants.append({"filename": os.path.basename(g["entry_rel"]),
-                         "bytes": g["bytes"], "members": sorted(g["members"])})
-    variants.sort(key=lambda v: v["filename"].lower())
-    return variants
+    from ...imports.src.gguf_election import group_variants
+    return group_variants(files)
 
 
 def gguf_variants_detail(model_key: str, model_dir: str, cfg=None) -> dict:
@@ -280,8 +265,22 @@ def gguf_variants_detail(model_key: str, model_dir: str, cfg=None) -> dict:
         eff_variant = variants[0]                    # single variant is unambiguously it
     eff = eff_variant["filename"] if eff_variant else None
     eff_quant = eff_variant["bytes"] if eff_variant else 0
-    out_variants = [{"filename": v["filename"], "bytes": v["bytes"],
-                     "is_effective": (v is eff_variant)} for v in variants]
+    # INCOMPLETE variants stay LISTED — the operator needs to see the litter (a
+    # lone ``-00002-of-00002`` shard, a q8_0 missing two thirds of itself) to
+    # know it is there and reclaim the space. They are simply never electable,
+    # and they say why. Reporting a third of a model as a variant with no
+    # qualifier is how a 3-of-3-shard set read as installed for months.
+    out_variants = []
+    for v in variants:
+        row = {"filename": v["filename"], "bytes": v["bytes"],
+               "is_effective": (v is eff_variant)}
+        if not v.get("complete"):
+            row["complete"] = False
+            row["incomplete_reason"] = v.get("incomplete_reason")
+            row["shards"] = v.get("shards")
+            row["shard_total"] = v.get("shard_total")
+            row["missing_shards"] = v.get("missing_shards")
+        out_variants.append(row)
     # MoE detection + expert/non-expert byte split of the EFFECTIVE quant
     # (spill.gguf_moe_detail — cached per file, so this rides the same
     # discovery/enrichment reads effective_bytes does at no recurring cost).

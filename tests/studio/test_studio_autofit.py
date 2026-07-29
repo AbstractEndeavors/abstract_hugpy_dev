@@ -3,7 +3,15 @@
 Operator doctrine (2026-07-12): a BLANK vram budget must NOT be a guaranteed-fail low
 guess. "Why can it not default to what's needed? If a model needs 14GB and it's blank,
 why would it fail trying 6GB — just do 14, otherwise a fail is 100% likely." A blank
-budget means AUTOFIT: size the routing budget to the SERVING WORKER's measured free VRAM.
+budget means AUTOFIT: size the routing budget to the SERVING WORKER's GPU CAPACITY.
+
+⚠ CAPACITY, NOT FREE (operator ruling 2026-07-27: "it needs to evict like everything
+else, not assess what it thinks it should set a budget for"). Sizing to momentary FREE
+VRAM made the bound MODEL a function of whatever the LLM residents held that second —
+measured on ae: 3.30 / 5.84 / 7.39 / 6.67 GB minutes apart, crossing the 6.00 GB
+cheapest-real-model floor in both directions, so the same request rendered real video or
+a synthetic noise blob depending on the second. Capacity states what the card can hold;
+the reservation engine evicts to free it, or refuses honestly.
 
 This locks the autofit behavior as executable checks in the same script style as
 ``test_studio_offload.py`` / ``test_studio_movie_offload.py`` (plain python, ``__main__``
@@ -16,11 +24,12 @@ What is under test:
   * SPEC threading: make_studio_i2v / make_studio_movie accept None (autofit) as legal,
     still reject bad numbers, and None round-trips through asdict -> from_dict.
   * AUTOFIT RESOLUTION (_resolve_autofit / _autofit_from_worker): a fake registry row with
-    known free VRAM -> effective = free - margin (10% or 2GB, whichever larger); host-only
-    URL match; no worker / no VRAM data -> the historical fallback (0.5); an EXPLICIT budget
-    bypasses the worker lookup entirely.
-  * render_clip STAMPS the resolved (effective_budget_gb, budget_source) — including the
-    IN-PROCESS GPU-less central path (autofit -> fallback -> synthetic).
+    known GPU CAPACITY -> effective = total - margin (10% or 2GB, whichever larger);
+    host-only URL match; no worker / no VRAM data -> "unresolved" with NO fallback number
+    (the render refuses); an EXPLICIT budget bypasses the worker lookup entirely.
+  * render_clip STAMPS the resolved (effective_budget_gb, budget_source), REFUSES an
+    unsizable render (gpu_unavailable) instead of writing a synthetic blob, and treats
+    the synthetic prover as OPT-IN (STUDIO_ALLOW_SYNTHETIC=1).
   * MOVIE: an id-movie with a None budget -> every segment carries the autofit budget
     (>= the VACE floor) + budget_source in movie.json; an EXPLICIT budget is byte-identical
     to today (floored, budget_source "explicit").
@@ -105,9 +114,15 @@ def _fake_workers(rows):
     return lambda: setattr(_WK, "list_workers", orig)
 
 
-def _worker_row(name, url, free_gib):
+def _worker_row(name, url, total_gib, free_gib=0.5):
+    """A registry row whose GPU has ``total_gib`` CAPACITY.
+
+    ``free_gib`` defaults to 0.5 ON PURPOSE — under every real model's floor. Autofit
+    sizes to CAPACITY (operator ruling 2026-07-27), so a regression to the old
+    ``memory_free`` basis makes every budget here collapse to a synthetic-binding number
+    instead of the expected one, and these tests fail loudly rather than silently."""
     return {"name": name, "url": url,
-            "gpus": [{"index": 0, "memory_total": 24 * _GIB,
+            "gpus": [{"index": 0, "memory_total": int(total_gib * _GIB),
                       "memory_free": int(free_gib * _GIB)}]}
 
 
@@ -239,7 +254,7 @@ def _autofit_sizes_to_worker():
         # host-only match must still resolve.
         os.environ["HUGPY_STUDIO_WORKER"] = "http://10.9.9.9:9100"
         spec, eff, src = S._resolve_autofit(_i2v(None))
-        # 24 GiB free, margin = max(2.4, 2.0) = 2.4 -> 21.6
+        # 24 GiB CAPACITY, margin = max(2.4, 2.0) = 2.4 -> 21.6
         assert abs(eff - 21.6) < 1e-6, eff
         assert src == "autofit:ae", src
         assert abs(spec.vram_budget_gb - 21.6) < 1e-6, spec.vram_budget_gb
@@ -270,13 +285,14 @@ def _margin_math():
 
 
 def _no_match_fallback():
-    # worker row exists but a DIFFERENT host -> no match -> fallback
+    # worker row exists but a DIFFERENT host -> no match -> UNRESOLVED (no fallback number)
     restore = _fake_workers([_worker_row("ae", "http://10.0.0.1:9100", 24.0)])
     try:
         os.environ["HUGPY_STUDIO_WORKER"] = "http://192.168.5.5:9100"
         spec, eff, src = S._resolve_autofit(_i2v(None))
-        assert eff == 0.5 and src == "autofit:fallback", (eff, src)
-        assert spec.vram_budget_gb == 0.5
+        assert eff is None and src == "unresolved", (eff, src)
+        # the spec is returned UNCHANGED — no invented budget rides onward
+        assert spec.vram_budget_gb is None
     finally:
         restore()
         _clear_env()
@@ -287,19 +303,19 @@ def _no_worker_env_fallback():
     try:
         _clear_env()  # no HUGPY_STUDIO_WORKER
         _sp, eff, src = S._resolve_autofit(_i2v(None))
-        assert eff == 0.5 and src == "autofit:fallback", (eff, src)
+        assert eff is None and src == "unresolved", (eff, src)
     finally:
         restore()
         _clear_env()
 
 
 def _no_vram_data_fallback():
-    # matched box, but it reports no gpus / no memory_free -> fallback
+    # matched box, but it reports no gpus / no VRAM -> UNRESOLVED
     restore = _fake_workers([{"name": "gpuless", "url": "http://10.9.9.9:9100", "gpus": []}])
     try:
         os.environ["HUGPY_STUDIO_WORKER"] = "http://10.9.9.9:9100"
         _sp, eff, src = S._resolve_autofit(_i2v(None))
-        assert eff == 0.5 and src == "autofit:fallback", (eff, src)
+        assert eff is None and src == "unresolved", (eff, src)
     finally:
         restore()
         _clear_env()
@@ -308,24 +324,53 @@ def _no_vram_data_fallback():
 # --------------------------------------------------------------------------- #
 # (C) render_clip STAMPS the resolved budget (incl. in-process GPU-less central)
 # --------------------------------------------------------------------------- #
-def _render_clip_inprocess_fallback():
-    if not _FFMPEG:
-        print("      (ffmpeg unavailable — skipping)")
-        return
+def _render_clip_unresolved_refuses():
+    """THE REGRESSION FOR THE 2026-07-27 RULING.
+
+    Blank budget + no resolvable studio worker used to become 0.5 -> synthetic -> a
+    104KB noise blob written as a finished clip with a share URL. It must now REFUSE.
+    """
     work = tempfile.mkdtemp(prefix="autofit-inproc-", dir=DEFAULT_ROOT)
     orig_cx = media_bus.is_cancelling
     media_bus.is_cancelling = lambda job_id: False
-    _clear_env()  # no worker -> in-process on this GPU-less box
+    _clear_env()  # no worker -> nothing can size this render
+    os.environ.pop("STUDIO_ALLOW_SYNTHETIC", None)
     try:
         spec = make_studio_i2v(capability="i2v", width=256, height=256, fps=8,
                                vram_budget_gb=None, seed=0, out_root=work)
         outcome = S.render_clip(spec, render_id="autofit-inproc")
-        assert outcome.ok is True, f"synthetic fallback render must succeed; got {outcome.error}"
-        assert outcome.budget_source == "autofit:fallback", outcome.budget_source
-        assert outcome.effective_budget_gb == 0.5, outcome.effective_budget_gb
-        assert os.path.isfile(outcome.path), outcome.path
+        assert outcome.ok is False, "an unsizable render must refuse, never write a blob"
+        assert outcome.error is not None and outcome.error.code == "gpu_unavailable", (
+            outcome.error)
+        assert outcome.budget_source == "unresolved", outcome.budget_source
+        assert outcome.effective_budget_gb is None, outcome.effective_budget_gb
+        assert outcome.path is None, outcome.path
     finally:
         media_bus.is_cancelling = orig_cx
+        _clear_env()
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _render_clip_synthetic_is_opt_in():
+    """A sub-real EXPLICIT budget binds the synthetic prover, so it must refuse unless
+    STUDIO_ALLOW_SYNTHETIC=1 — and must still work when the operator opts in."""
+    work = tempfile.mkdtemp(prefix="autofit-synth-", dir=DEFAULT_ROOT)
+    orig_cx = media_bus.is_cancelling
+    media_bus.is_cancelling = lambda job_id: False
+    _clear_env()
+    os.environ.pop("STUDIO_ALLOW_SYNTHETIC", None)
+    try:
+        spec = make_studio_i2v(capability="i2v", width=256, height=256, fps=8,
+                               vram_budget_gb=0.5, seed=1, out_root=work)
+        outcome = S.render_clip(spec, render_id="autofit-synth-off")
+        assert outcome.ok is False, "synthetic must not render while opt-in is off"
+        assert outcome.error is not None and outcome.error.code == "no_capable_model", (
+            outcome.error)
+        # the refusal must NAME the budget so the operator can act on it
+        assert "0.50" in (outcome.error.message or ""), outcome.error.message
+    finally:
+        media_bus.is_cancelling = orig_cx
+        os.environ.pop("STUDIO_ALLOW_SYNTHETIC", None)
         _clear_env()
         shutil.rmtree(work, ignore_errors=True)
 
@@ -338,6 +383,10 @@ def _render_clip_explicit_stamp():
     orig_cx = media_bus.is_cancelling
     media_bus.is_cancelling = lambda job_id: False
     _clear_env()
+    # 0.5 binds the synthetic prover, and synthetic is opt-in since 2026-07-27. This
+    # check is about the STAMP, not the tier, so it opts in explicitly — which also
+    # covers that the opt-in actually works.
+    os.environ["STUDIO_ALLOW_SYNTHETIC"] = "1"
     try:
         spec = make_studio_i2v(capability="i2v", width=256, height=256, fps=8,
                                vram_budget_gb=0.5, seed=1, out_root=work)
@@ -347,6 +396,7 @@ def _render_clip_explicit_stamp():
         assert outcome.effective_budget_gb == 0.5, outcome.effective_budget_gb
     finally:
         media_bus.is_cancelling = orig_cx
+        os.environ.pop("STUDIO_ALLOW_SYNTHETIC", None)
         _clear_env()
         shutil.rmtree(work, ignore_errors=True)
 
@@ -522,14 +572,16 @@ if __name__ == "__main__":
     check("round-trip: None budget survives asdict -> from_dict (i2v + movie)", _none_roundtrips)
     # (B) autofit resolution
     check("resolve: EXPLICIT budget bypasses the worker lookup entirely", _explicit_bypasses_lookup)
-    check("resolve: None budget sizes to worker free VRAM (host-only match)", _autofit_sizes_to_worker)
+    check("resolve: None budget sizes to worker GPU CAPACITY (host-only match)", _autofit_sizes_to_worker)
     check("resolve: margin = max(10%, 2GB) (40GiB->36.0, 12GiB->10.0)", _margin_math)
-    check("resolve: no host match -> fallback 0.5 / autofit:fallback", _no_match_fallback)
-    check("resolve: no HUGPY_STUDIO_WORKER -> fallback", _no_worker_env_fallback)
-    check("resolve: matched box with no VRAM data -> fallback", _no_vram_data_fallback)
+    check("resolve: no host match -> unresolved (NO fallback budget)", _no_match_fallback)
+    check("resolve: no HUGPY_STUDIO_WORKER -> unresolved", _no_worker_env_fallback)
+    check("resolve: matched box with no VRAM data -> unresolved", _no_vram_data_fallback)
     # (C) render_clip stamping (incl. in-process GPU-less central)
-    check("render_clip: in-process fallback (GPU-less central) -> synthetic + autofit:fallback stamp",
-          _render_clip_inprocess_fallback)
+    check("render_clip: unsizable render REFUSES (gpu_unavailable), never writes a blob",
+          _render_clip_unresolved_refuses)
+    check("render_clip: synthetic is OPT-IN -> sub-real budget refuses with no_capable_model",
+          _render_clip_synthetic_is_opt_in)
     check("render_clip: explicit budget -> 'explicit' stamp", _render_clip_explicit_stamp)
     # (D) movie autofit + movie.json budget_source
     check("movie: id-movie None budget -> segments carry autofit budget >= floor + budget_source",

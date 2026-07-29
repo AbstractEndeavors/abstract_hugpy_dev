@@ -5,6 +5,13 @@ manifest, and the pixels are a cache of it. `canonical_inputs()` / `content_hash
 give a stable reproducibility + dedup + resume key (INV-6) that excludes metadata
 (render_id, timestamps) and includes everything that changes the output.
 
+One exception to "every one is a dataclass": the CLIP-LENGTH POLICY constants
+(``WAN_FRAME_CADENCE`` / ``WAN_MAX_FRAMES`` / ``DEFAULT_FRAMES_REAL`` +
+``snap_wan_frames``) live here too, deliberately — see the long WHY on that
+section. They bound ``RenderManifest.requested_frames``, they are declared next to
+the field they bound, and this is the only module BOTH the renderer and the
+presets/wire layer can import without dragging numpy/PIL into app boot.
+
 No pathlib anywhere. os.path only.
 """
 
@@ -123,6 +130,82 @@ class ProvenanceStub:
 
 
 # ---------------------------------------------------------------------------
+# CLIP-LENGTH POLICY - the one place each length fact is spelled
+# ---------------------------------------------------------------------------
+# ⚠ WHY THESE LIVE IN schemas.py AND NOT NEXT TO resolve_frames (2026-07-27).
+# They were born in ``runners/synthetic.py``, which is the right home for the
+# LOGIC (``resolve_frames`` is still there, still the ONE decider). But the WIRE
+# has to publish the same numbers - ``GET /video/render/presets`` serves a
+# ``default_frames`` / ``max_frames`` per preset row out of ``studio/presets.py``
+# - and the adversarial review that produced this change found the wire publishing
+# 29 while the renderer produced 81. Two literals, 2.8x apart, with no import
+# between them: a caller was told 29 frames and charged for 81 (~2.8x the latent
+# tokens and the GPU minutes). That is a defaults-are-promises violation on the
+# most expensive axis the studio has.
+#
+# The fix is ONE literal per fact, imported by both consumers. It could not live
+# in the runner: ``presets`` is imported at ``import studio`` time (studio/__init__
+# -> router -> presets) while ``runners/synthetic`` imports numpy + PIL at module
+# top, so a presets -> runner import would drag the whole imaging stack into app
+# boot - exactly what this package keeps out on purpose (studio/job.py's header:
+# "no numpy/PIL pulled into app boot from here"). ``schemas`` imports only
+# ``enums``, it is where ``RenderManifest.requested_frames`` is DECLARED, and both
+# the runner and presets already sit downstream of it. So the facts live here and
+# the two consumers import them.
+
+# Wan's latent VAE compresses TIME 4:1, so every Wan pipeline accepts only
+# ``num_frames == 4*k + 1`` (81 = 4*20 + 1). A frame count off this cadence is not
+# "slightly wrong" - the pipeline either rejects it or silently renders a different
+# length than was asked for, which is why the snap happens BEFORE the resume check
+# and the generate call (they must agree on one number).
+WAN_FRAME_CADENCE = 4
+
+# HARD Wan ceiling, independent of the registry. Every Wan row in ``models_seed``
+# declares ``max_frames=81``, and CAPABILITY-VIABILITY-MAP.md (measured on ae's
+# 3090, 2026-07-27) confirms 81 is the real ceiling for all three Wan models that
+# actually have weights on disk. Belt-and-braces over ``ModelConfig.max_frames`` so
+# a future registry typo can never hand a Wan pipeline a 200-frame request.
+WAN_MAX_FRAMES = 81
+
+# DEFAULT clip length for a REAL model when the manifest requests none.
+#
+# 81 frames. Not a guess and not a placeholder: it is Wan's own reference length
+# (81 @ 16fps = 5.0625s), it is the ``max_frames`` every Wan row declares, and it
+# is MEASURED - wan2.1-t2v-1.3b at 832x480 x 81 frames renders in ~352s wall-clock
+# on ae's 3090 (2026-07-27). Operator doctrine "defaults are promises": the
+# previous default was ``fps * 2`` (32 frames -> snapped 29 = ~1.8s), a placeholder
+# written for the no-model noise prover that silently governed every REAL render on
+# this fleet. ~5s for ~6min of GPU is a success path a caller would actually want;
+# a caller who wants a cheap preview has the ``requested_frames`` lever to ask for
+# fewer. Heavier rows (the 14B i2v) pay more wall-clock for the SAME 81 frames -
+# length is the request, not the cost model.
+#
+# ⚠ THIS IS THE NUMBER THE WIRE MUST PUBLISH. ``studio/presets.py`` imports it for
+# every Wan preset's ``default_frames`` rather than restating 81 (or, as it did
+# until this change, 29). If you change it here, the presets endpoint changes with
+# it - that is the entire point.
+DEFAULT_FRAMES_REAL = 81
+
+
+def snap_wan_frames(n_frames: int) -> int:
+    """Nearest legal Wan frame count AT OR BELOW ``n_frames`` (i.e. 4k+1).
+
+    Snap DOWN, never up: up could push past the model's ceiling, which is the one
+    direction that turns a clamp into an OOM. Used by ``runners.synthetic.
+    resolve_frames`` at render time AND by the presets layer, which needs to show a
+    caller the TRUE length before spending ~6 minutes of denoise on it - one
+    implementation so the preview and the render can never disagree.
+
+    NOTE the arithmetic this enforces: 4k+1 is always ODD, so ``frames / fps`` can
+    never be a whole number of seconds at an EVEN fps (81/16 = 5.0625s, not 5s).
+    FRAMES is therefore the exact unit; a duration in seconds is a REQUEST that must
+    be resolved to on-cadence frames with the TRUE resulting duration reported back,
+    never the requested one echoed."""
+    n = max(1, int(n_frames))
+    return ((n - 1) // WAN_FRAME_CADENCE) * WAN_FRAME_CADENCE + 1
+
+
+# ---------------------------------------------------------------------------
 # RenderManifest - the source of truth for a render (INV-1)
 # ---------------------------------------------------------------------------
 
@@ -190,6 +273,45 @@ class RenderManifest:
     # correctness. Carried in the manifest so the runner can consume it + the sidecar can
     # record it (provenance), just never as a content-hash input.
     vace_context_frames: tuple[str, ...] = ()
+    # CLIP LENGTH, as a REQUEST. ``None`` = "unset — use the runner's model-aware
+    # default"; an int = "the caller asked for exactly this many frames". The runner
+    # RESOLVES it (clamp to the model ceiling, snap to the pipeline's 4k+1 temporal
+    # cadence, max(1, n) floor) — see ``runners.synthetic.resolve_frames``, the ONE
+    # place clip length is decided.
+    #
+    # ⚠ REACHABILITY (2026-07-27). The first cut of this field was a LIE: it existed
+    # on the dataclass and in ``canonical_inputs``, the docstrings advertised "a
+    # caller who wants a cheap preview now has a lever", and NO production path could
+    # set it — ``_build_manifest`` / ``make_render_manifest`` (the ONE live build
+    # path) took no such kwarg, ``StudioI2VSpec`` had no length field, and
+    # ``produce_clip`` passed none. Only tests constructed it. It is now threaded end
+    # to end: ``StudioI2VSpec.requested_frames`` -> ``produce_clip(requested_frames=)``
+    # -> ``make_render_manifest(requested_frames=)`` -> here -> ``resolve_frames``.
+    # ONE NAME at every seam on purpose, so no seam has to translate.
+    #
+    # FRAMES, not seconds, is the unit ON PURPOSE: Wan's latent VAE compresses time
+    # 4:1, so its pipelines accept only ``num_frames == 4k+1`` — which is always ODD,
+    # so ``frames / fps`` can never be a whole number of seconds at an EVEN fps
+    # (81/16 = 5.0625s). A seconds request would have to be multiplied by fps and then
+    # snapped anyway, i.e. the delivered duration would silently differ from the number
+    # the caller typed. Frames is what the model actually accepts, it is the unit the
+    # registry ceiling is expressed in (``ModelConfig.max_frames``), and seconds stay
+    # derivable + reported as the TRUE resulting duration (``Artifact.duration_s`` =
+    # resolved_frames / fps) rather than echoing the request back.
+    #
+    # CANONICAL (in the content_hash): a different requested length is a genuinely
+    # different clip, so two requests that differ ONLY in length must not collide on
+    # one content-addressed path (without this, a 33-frame request would RESUME an
+    # existing 81-frame clip). Being canonical makes the manifest SIDECAR round-trip
+    # load-bearing: ``render_manifest_to_dict`` MUST serialize this and
+    # ``render_manifest_from_dict`` MUST restore it, or a rehydrated manifest
+    # re-addresses to a different content hash and resume/dedup break for every
+    # non-default length (the exact defect found on 2026-07-27 — the field was in
+    # ``canonical_inputs`` but absent from both sides of the sidecar). Guarded by
+    # ``tests/studio/test_clip_length.py``'s round-trip check.
+    #
+    # Appended (not inserted) so no positional field shifts for existing sites.
+    requested_frames: int | None = None
 
     def canonical_inputs(self) -> dict:
         """Everything that changes the output; nothing that is mere metadata.
@@ -247,6 +369,15 @@ class RenderManifest:
             # Optional VACE control channel (composition blocking): canonical when set.
             "control_image": self.control_image,
             "control_kind": self.control_kind,
+            # CLIP LENGTH request: a different requested length is a different clip, so
+            # it participates in the hash. None (unset -> model default) participates as
+            # null, which RE-ADDRESSES every previously-rendered clip exactly once —
+            # deliberate and REQUIRED here, not merely tolerated: this change also moves
+            # the real-model default off the fps*2 placeholder (~1.8s) onto the model's
+            # measured ceiling, so an unchanged hash would have RESUMED those old 29-frame
+            # clips as if they were the new 81-frame default. Same one-time cost + rationale
+            # as the empty-prompt / empty-source cases above.
+            "requested_frames": self.requested_frames,
             # NOTE: ``vace_context_frames`` is DELIBERATELY absent here (not a content-hash
             # input) — it is extracted to a job-specific path by the movie runner, so
             # hashing it would break same-job resume + re-address every clip. It conditions

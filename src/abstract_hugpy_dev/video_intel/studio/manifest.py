@@ -84,6 +84,7 @@ def _build_manifest(
     control_image: str = "",
     control_kind: str = "",
     vace_context_frames: tuple[str, ...] = (),
+    requested_frames: int | None = None,
 ) -> RenderManifest:
     """Validate every field, then build the frozen manifest. Raises ``ValueError``
     LOCALLY on any structural violation. Shared by ``make_render_manifest`` (the
@@ -232,6 +233,26 @@ def _build_manifest(
             raise ValueError(
                 f"vace_context_frames[{i}] must be a str; got {type(f).__name__}")
 
+    # CLIP LENGTH REQUEST: None/absent -> None ("unset — use the bound model's default").
+    # SHAPE is programmer error and raises here; RANGE is NOT. A request ABOVE the bound
+    # model's ceiling is a legitimate ask that the runner CLAMPS with a recorded reason
+    # (``resolve_frames``) — the caller cannot know a model's ceiling at manifest-build
+    # time (the model is bound by the router, not by them), so refusing it here would turn
+    # "give me the longest clip you can" into a 500. What IS rejected: a bool (an int
+    # subclass — ``requested_frames=True`` would silently mean 1 frame), a non-int, and a
+    # count below 1 (zero/negative frames is not a clip anyone can want, and the caller CAN
+    # be told that without knowing anything about the model). ``resolve_frames`` keeps its
+    # own max(1, n) floor regardless, for hand-forged manifests that bypass this factory.
+    if requested_frames is not None:
+        if not isinstance(requested_frames, int) or isinstance(requested_frames, bool):
+            raise ValueError(
+                f"requested_frames must be an int or None (unset); "
+                f"got {requested_frames!r}")
+        if requested_frames < 1:
+            raise ValueError(
+                f"requested_frames must be >= 1 when set (a clip has at least one "
+                f"frame); got {requested_frames!r}")
+
     return RenderManifest(
         render_id=render_id,
         capability=capability,
@@ -257,6 +278,7 @@ def _build_manifest(
         control_image=control_image,
         control_kind=control_kind,
         vace_context_frames=vace_context_frames,
+        requested_frames=requested_frames,
     )
 
 
@@ -284,6 +306,7 @@ def make_render_manifest(
     control_image: str = "",
     control_kind: str = "",
     vace_context_frames: tuple[str, ...] = (),
+    requested_frames: int | None = None,
 ) -> RenderManifest:
     """Build a validated ``RenderManifest`` from a resolved ``ModelBinding`` and a
     resolved ``StudioEnv``.
@@ -301,6 +324,16 @@ def make_render_manifest(
     ``binding.weight_hash is None`` is threaded through as-is (allowed only for an
     unpinned/dev model). Everything else is validated in ``_build_manifest``;
     violations raise ``ValueError`` locally.
+
+    ``requested_frames`` is the CLIP-LENGTH LEVER and is a FREE parameter (unlike
+    precision/determinism/env, which are threaded from their authoritative sources):
+    it is the CALLER's ask, not something the router or the boot env can know. It is
+    plumbed exactly like the optional ``steps``/``cfg`` sampler overrides — ``None``
+    means "unset, let the bound model's default decide". ⚠ Until 2026-07-27 this
+    parameter did not exist, so ``RenderManifest.requested_frames`` was unreachable
+    from every production path and every real render was forced to the default; the
+    field, the docstrings advertising the lever, and the content-hash entry were all
+    live while the only way to set it was to hand-construct a manifest in a test.
     """
     if not isinstance(binding, ModelBinding):
         raise ValueError(
@@ -342,6 +375,11 @@ def make_render_manifest(
         control_kind=control_kind,
         # --- VACE-extend temporal context (movie splice motion-carry); NOT hashed ---
         vace_context_frames=tuple(vace_context_frames),
+        # --- CLIP LENGTH: the caller's ask (part of the reproducibility key). None =
+        # unset -> the bound model's default. RESOLVED (clamped/snapped) at render
+        # time by runners.synthetic.resolve_frames, never here: the manifest records
+        # what was ASKED, the Artifact reports what was DELIVERED. ---
+        requested_frames=requested_frames,
     )
 
 
@@ -351,7 +389,15 @@ def make_render_manifest(
 def render_manifest_to_dict(m: RenderManifest) -> dict:
     """A JSON-safe plain dict of the manifest (enums -> their string values,
     nested value objects -> dicts). The inverse of ``render_manifest_from_dict``:
-    ``from_dict(to_dict(m)).content_hash() == m.content_hash()``."""
+    ``from_dict(to_dict(m)) == m``, and therefore
+    ``from_dict(to_dict(m)).content_hash() == m.content_hash()``.
+
+    ⚠ EVERY canonical field MUST appear here. A field that is in
+    ``RenderManifest.canonical_inputs()`` but missing from this dict does not fail
+    loudly — it silently rehydrates to its dataclass default, which re-addresses the
+    manifest and breaks resume/dedup for anyone who set it. That is precisely how
+    ``requested_frames`` shipped broken on 2026-07-27 (hashed, never serialized);
+    ``tests/studio/test_clip_length.py`` now asserts the whole-object round trip."""
     return {
         "render_id": m.render_id,
         "capability": m.capability.value,
@@ -406,6 +452,16 @@ def render_manifest_to_dict(m: RenderManifest) -> dict:
         # even though NOT a content_hash input, so a rehydrated manifest reconstructs the
         # exact conditioning the runner consumed.
         "vace_context_frames": list(m.vace_context_frames),
+        # CLIP LENGTH request: a CONTENT-HASH INPUT, so serializing it is load-bearing,
+        # not cosmetic. ⚠ It was missing from BOTH sides of this round-trip on
+        # 2026-07-27 while ``canonical_inputs`` already hashed it — harmless only while
+        # the field was permanently None (which it was, being unreachable). The moment
+        # the lever became settable, ``from_dict(to_dict(m))`` would have re-addressed
+        # to a DIFFERENT content hash than ``m`` for every non-default length, silently
+        # breaking resume/dedup: a resumed 33-frame render would look like a cache miss
+        # and re-burn ~2 GPU-minutes, and the clip.mp4 sidecar would disagree with the
+        # directory it sits in. ``None`` serializes as JSON null and restores as None.
+        "requested_frames": m.requested_frames,
         "provenance": (
             None if m.provenance is None else {
                 "operator": m.provenance.operator,
@@ -504,4 +560,8 @@ def render_manifest_from_dict(d: dict) -> RenderManifest:
         # VACE-extend context: tolerate manifests serialized before this field existed
         # (absent -> ()).
         vace_context_frames=tuple(d.get("vace_context_frames", ())),
+        # CLIP LENGTH: tolerate sidecars written before this field was serialized
+        # (absent -> None = "unset"), which is also exactly what those older clips
+        # hashed with, so an old manifest.json still rehydrates to its own address.
+        requested_frames=d.get("requested_frames"),
     )

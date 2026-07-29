@@ -41,6 +41,26 @@ from .templates import ReservationTemplate, load_template
 
 logger = logging.getLogger(__name__)
 
+# Eviction telemetry (operator directive 2026-07-28). The reservation flush is
+# the one eviction path CENTRAL itself drives — central does no local serving,
+# but it clears the video card for a render. Those evictions belong on the same
+# live stream as the fleet's, tagged tier="reservation". Best-effort throughout:
+# a telemetry fault must never refuse or delay a render.
+try:
+    from ...comms import evictions as _evt
+except Exception:  # noqa: BLE001
+    _evt = None
+
+
+def _evt_emit(stage: str, **fields) -> None:
+    if _evt is None:
+        return
+    try:
+        _evt.emit_eviction_event(stage, **fields)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 _BYTES_PER_GIB = 1024 ** 3
 
 
@@ -191,6 +211,124 @@ def _pid_models(worker: Dict[str, Any]) -> List[Dict[str, Any]]:
     return []
 
 
+def _planned_gpu_bytes(worker: Dict[str, Any], model_key: str) -> int:
+    """What central ITSELF priced this model's GPU share at when it placed it.
+
+    Central issues every placement and already computes ``planned_split`` for
+    every designated model (72 on ae). When the per-pid VRAM attribution is
+    missing, this is the honest fallback size — not a guess, but the number
+    central used to decide the placement in the first place."""
+    ps = worker.get("planned_split")
+    if not isinstance(ps, dict):
+        return 0
+    row = ps.get(model_key)
+    if not isinstance(row, dict):
+        return 0
+    for field in ("gpu_bytes", "size_bytes"):
+        try:
+            v = int(row.get(field) or 0)
+        except (TypeError, ValueError):
+            v = 0
+        if v > 0:
+            return v
+    return 0
+
+
+def _gpu_residents(worker: Optional[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """``{model_key: {"bytes": int, "host_mode": str}}`` for everything central
+    knows is ON the card. THE ONE resident enumeration in this module.
+
+    ⚠ IT MUST STAY THE ONLY ONE. The first cut of this fix (ec4b8b1) taught the
+    ACCOUNTING path (``_evictable_bytes``) about live slot occupants and left the
+    ACTION path (``_evict_candidates``) walking ``pid_registry`` alone. The result
+    was strictly worse than before the fix: admission started believing 21 GiB was
+    reclaimable, so ``force_admit_safe`` released a render that make-room then
+    could not free a single byte for — an admit-then-OOM, which is the exact class
+    ``vram-admission-no-evict`` exists to forbid. A resident that cannot be NAMED
+    is a resident that must not be COUNTED, so both paths consume this dict.
+
+    THE CENTRAL-SIDE HALF OF THE k30 INVISIBILITY FIX (2026-07-27). The worker's
+    own evict planner (``agent._vram_residents``) unions the pid registry with
+    every LIVE SLOT OCCUPANT, joining the child's real VRAM — because a slot
+    child holds the card whether or not the registry has attributed it yet.
+    Central never got that union: it read ``pid_registry.models`` alone and
+    SKIPPED every row whose ``model_key`` is null, so a slot child holding the
+    whole card counted as ZERO evictable bytes.
+
+    What that cost, measured 2026-07-27: llama-server pid 2261542 held 21.26 of
+    23.56 GiB on ae. Central saw `allocations[].vram_bytes = None`, computed
+    `evictable = 0`, held the operator's movie segment in `awaiting_capacity`,
+    then force-admitted it anyway (``force_admit_safe`` only asks whether another
+    *reservation* is active, and an LLM never files one) straight into an OOM.
+
+    Nothing here is new telemetry. Every input already rides the heartbeat:
+      * ``pid_registry.models``  — attributed model→pid→VRAM rows
+      * ``slots[]``              — the live occupant's ``model_key``
+      * ``planned_split``        — central's own price for that placement
+    The bug was never that central could not know; it was that it did not join.
+    """
+    out: Dict[str, int] = {}
+    if not worker:
+        return out
+    # SKIP LEDGER (operator ask 2026-07-27: "see what gets skipped and why").
+    # Every byte on the card that this function does NOT return is a byte the
+    # eviction planner believes it cannot reclaim — which is exactly how 21 GiB
+    # became invisible. Name each omission and its reason instead of silently
+    # `continue`-ing past it, so the next 21 GiB shows up in a log line and not
+    # in an OOM traceback.
+    skipped: List[str] = []
+    for m in _pid_models(worker):
+        mk = m.get("model_key")
+        try:
+            vb = int(m.get("vram_bytes") or 0)
+        except (TypeError, ValueError):
+            vb = 0
+        if not mk:
+            # cuda_context lump / idle comfy: genuinely no model to target by key.
+            if vb > 0:
+                skipped.append(
+                    f"pid={m.get('pid')} {vb} B host_mode={m.get('host_mode') or '?'} "
+                    f"— no model_key (unattributed; not targetable by /ops/evict)")
+            continue
+        if vb <= 0:
+            skipped.append(f"{mk} — attributed but vram_bytes={m.get('vram_bytes')!r}")
+            continue
+        key = str(mk)
+        if vb > int((out.get(key) or {}).get("bytes") or 0):
+            out[key] = {"bytes": vb, "host_mode": str(m.get("host_mode") or "")}
+    # Union in LIVE slot occupants the registry has not attributed. A slot with a
+    # model_key claim IS a resource allocation; its child holds the VRAM whether
+    # or not the per-pid join has caught up (fresh re-exec, swept record, or a
+    # child the reconcile pass tagged as an anonymous cuda_context lump).
+    for s in (worker.get("slots") or []):
+        if not isinstance(s, dict):
+            continue
+        mk = s.get("model_key")
+        if not mk:
+            continue
+        key = str(mk)
+        if out.get(key):
+            continue                       # already attributed with real bytes
+        try:
+            vb = int(s.get("expected_bytes") or 0)
+        except (TypeError, ValueError):
+            vb = 0
+        # expected_bytes when the slot reports it, else central's own price.
+        sized = vb if vb > 0 else _planned_gpu_bytes(worker, key)
+        if sized <= 0:
+            skipped.append(f"{key} — live slot occupant, but no expected_bytes and "
+                           f"no planned_split price (size unknown)")
+            continue
+        # A slot child is an LLM/diffusers seat, never the comfy process.
+        out[key] = {"bytes": sized, "host_mode": "slot"}
+    if skipped:
+        logger.info("gpu residents on %s: counted %d (%d B) · SKIPPED %d → %s",
+                    worker.get("name") or worker.get("id"), len(out),
+                    sum(r["bytes"] for r in out.values()), len(skipped),
+                    "; ".join(skipped[:6]))
+    return out
+
+
 def _comfy_resident_keys(worker: Dict[str, Any]) -> List[str]:
     """Comfy-attributed residents central can flush via /ops/evict (→ comfy /free).
     An IDLE comfy holds a null model_key (nothing central can target by key — that
@@ -208,15 +346,21 @@ def _evict_candidates(worker: Dict[str, Any], tried: set) -> List[str]:
     largest-first (frees the most, fewest calls). ``force=false`` on the relay
     means the WORKER is the authority on what is actually permissible — a static /
     replying / queued-ahead resident is refused there, never here. cuda_context /
-    comfy(null-key) entries carry no model_key and are skipped."""
+    comfy(null-key) entries carry no model_key and are skipped.
+
+    ⚠ READS THE SAME UNION AS THE ACCOUNTING PATH — do not narrow this back to
+    ``_pid_models``. It walked the registry alone until 2026-07-27 while
+    ``_evictable_bytes`` had already been taught about live slot occupants, and
+    that split is worse than either half: admission believed 21 GiB was
+    reclaimable and make-room then freed nothing, turning a correctly-QUEUED
+    render into an admit-then-OOM. Counted and evictable must be the same set."""
     rows = []
-    for m in _pid_models(worker):
-        mk = m.get("model_key")
-        if not mk or mk in tried:
+    for mk, rec in _gpu_residents(worker).items():
+        if mk in tried:
             continue
-        if str(m.get("host_mode")) == "comfy":
+        if str(rec.get("host_mode")) == "comfy":
             continue  # handled by the comfy-flush pass
-        vb = int(m.get("vram_bytes") or 0)
+        vb = int(rec.get("bytes") or 0)
         if vb <= 0:
             continue
         rows.append((str(mk), vb))
@@ -239,15 +383,39 @@ def _evict(worker: Dict[str, Any], model_key: str, force: bool = False) -> Dict[
     ref-drop) and enforces the protection gate when force=false. Best-effort:
     a transport error reads as 'not evicted' and the loop moves on."""
     url = (worker.get("url") or "").rstrip("/") + "/ops/evict"
+    # Telemetry (2026-07-28): the reservation flush is a real eviction of a real
+    # card and belongs on the operator's live stream like any other, tagged
+    # tier="reservation". Emitted from CENTRAL (which drives this relay), so
+    # `target_worker` names the box whose VRAM is actually being freed — the
+    # event's own worker_id is central.
+    _evt_emit("evict.start", model_key=model_key, tier="reservation",
+              target_worker=worker.get("id") or worker.get("name"), force=force)
+    _t0 = time.time()
     try:
         import httpx
         r = httpx.post(url, json={"model_key": model_key, "force": bool(force)},
                        timeout=45.0)
         if r.status_code == 200:
-            return r.json()
-        return {"evicted": False, "reason": f"HTTP {r.status_code}"}
+            out = r.json()
+        else:
+            out = {"evicted": False, "reason": f"HTTP {r.status_code}"}
     except Exception as exc:  # noqa: BLE001
-        return {"evicted": False, "reason": f"{type(exc).__name__}: {exc}"}
+        out = {"evicted": False, "reason": f"{type(exc).__name__}: {exc}"}
+    _ms = int((time.time() - _t0) * 1000)
+    _tw = worker.get("id") or worker.get("name")
+    if out.get("evicted"):
+        _evt_emit("evict.done", model_key=model_key, tier="reservation",
+                  target_worker=_tw, duration_ms=_ms,
+                  freed_bytes=out.get("vram_freed"))
+    else:
+        # NOT necessarily an error: force=false means the worker's own gate may
+        # have PROTECTED it (static / actively replying). That is a skip, and the
+        # operator wants to read it as one — a refusal to evict is the doctrine
+        # working, not a fault.
+        _evt_emit("candidate.skip", model_key=model_key, tier="reservation",
+                  target_worker=_tw, duration_ms=_ms,
+                  reason=str(out.get("reason") or "worker gate declined"))
+    return out
 
 
 def _evictable_bytes(worker: Optional[Dict[str, Any]]) -> int:
@@ -263,26 +431,28 @@ def _evictable_bytes(worker: Optional[Dict[str, Any]]) -> int:
     ``reserved_bytes``), so this figure is purely the physical make-room ceiling."""
     if not worker:
         return 0
-    total = 0
-    for m in _pid_models(worker):
-        if not m.get("model_key"):
-            continue
-        vb = int(m.get("vram_bytes") or 0)
-        if vb > 0:
-            total += vb
-    return total
+    # Reads the UNION (registry ∪ live slot occupants), not the registry alone —
+    # see _gpu_residents. Before 2026-07-27 this walked pid_registry.models and
+    # `continue`d past every null model_key, so a slot child holding 21 of 23.5
+    # GiB contributed ZERO and the card read as un-freeable.
+    return sum(r["bytes"] for r in _gpu_residents(worker).values())
 
 
 def _refusal_reason(worker: Optional[Dict[str, Any]], peak: int,
                     free: Optional[int], evicted: List[str]) -> Dict[str, Any]:
     remaining = []
     if worker:
-        for m in _pid_models(worker):
-            mk = m.get("model_key")
-            if mk and mk not in evicted and int(m.get("vram_bytes") or 0) > 0:
+        # SAME UNION as the accounting + action paths. Walking _pid_models here
+        # produced the self-contradictory refusal the 2026-07-23 incident already
+        # named once ("evicted 0 idle ... 0 protected still hold the card") — a
+        # refusal that lists no remaining residents while 21 GiB of slot child
+        # holds the card is not a report, it is a riddle.
+        for mk, rec in _gpu_residents(worker).items():
+            vb = int(rec.get("bytes") or 0)
+            if mk not in evicted and vb > 0:
                 remaining.append({"model_key": str(mk),
-                                  "vram_bytes": int(m.get("vram_bytes") or 0),
-                                  "host_mode": str(m.get("host_mode"))})
+                                  "vram_bytes": vb,
+                                  "host_mode": str(rec.get("host_mode") or "")})
     return {
         "reason": "GPU reservation could not clear the card to the run's peak "
                   "(remaining residents are protected: static / actively replying "
@@ -311,6 +481,39 @@ def _ensure_headroom(worker_id: str, worker: Dict[str, Any], peak: Optional[int]
     if free >= peak:
         return True, evicted, None            # already fits — no eviction (shared card)
 
+    # Telemetry run scope: opened only past the three early returns above, so a
+    # reservation that fits emits nothing. Everything _ensure_headroom calls
+    # (including _evict) inherits this run_id, so the console renders the whole
+    # flush→evict sequence as one card.
+    _scope = _evt.run_scope() if _evt is not None else None
+    if _scope is not None:
+        _scope.__enter__()
+    try:
+        return _ensure_headroom_inner(worker_id, worker, peak, evicted, free)
+    finally:
+        if _scope is not None:
+            try:
+                _scope.__exit__(None, None, None)
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _ensure_headroom_inner(worker_id: str, worker: Dict[str, Any], peak: int,
+                           evicted: List[str], free: Optional[int]
+                           ) -> Tuple[bool, List[str], Optional[Dict[str, Any]]]:
+    """The make-room drive itself. Split out only so the telemetry run scope can
+    wrap every return path; the logic is unchanged."""
+    _evt_emit("headroom.start", trigger="reservation", tier="reservation",
+              target_worker=worker.get("id") or worker.get("name"),
+              need_bytes=peak, free_bytes=free)
+    _evt_emit("fit.fail", tier="reservation", need_bytes=peak, free_bytes=free)
+
+    def _done(ok: bool, ev: List[str], reason):
+        _evt_emit("headroom.done", trigger="reservation", evicted=list(ev),
+                  outcome=("fit" if ok else "refused"), reason=reason,
+                  target_worker=worker.get("id") or worker.get("name"))
+        return ok, ev, reason
+
     deadline = time.time() + _makeroom_timeout_s()
     tried: set = set()
 
@@ -322,11 +525,11 @@ def _ensure_headroom(worker_id: str, worker: Dict[str, Any], peak: Optional[int]
         tried.add(mk)
         fa = res.get("vram_free_after")
         if isinstance(fa, (int, float)) and fa >= peak:
-            return True, evicted, None
+            return _done(True, evicted, None)
     worker = _refresh_worker(worker_id) or worker
     free = _free_vram(worker)
     if free is not None and free >= peak:
-        return True, evicted, None
+        return _done(True, evicted, None)
 
     # 2) Eviction engine — on-demand residents largest-first, force=false so the
     #    worker's own gate protects static/replying/queued-ahead. Bounded wait.
@@ -334,7 +537,7 @@ def _ensure_headroom(worker_id: str, worker: Dict[str, Any], peak: Optional[int]
         worker = _refresh_worker(worker_id) or worker
         free = _free_vram(worker)
         if free is not None and free >= peak:
-            return True, evicted, None
+            return _done(True, evicted, None)
         cands = [c for c in _evict_candidates(worker, tried)]
         if not cands:
             # Nothing left we may try. Give an in-flight resident a moment to free
@@ -344,8 +547,8 @@ def _ensure_headroom(worker_id: str, worker: Dict[str, Any], peak: Optional[int]
             worker = _refresh_worker(worker_id) or worker
             free = _free_vram(worker)
             if free is not None and free >= peak:
-                return True, evicted, None
-            return False, evicted, _refusal_reason(worker, peak, free, evicted)
+                return _done(True, evicted, None)
+            return _done(False, evicted, _refusal_reason(worker, peak, free, evicted))
         cand = cands[0]
         res = _evict(worker, cand, force=False)
         tried.add(cand)
@@ -353,7 +556,7 @@ def _ensure_headroom(worker_id: str, worker: Dict[str, Any], peak: Optional[int]
             evicted.append(cand)
             fa = res.get("vram_free_after")
             if isinstance(fa, (int, float)) and fa >= peak:
-                return True, evicted, None
+                return _done(True, evicted, None)
         # else: gated (protected) or no-op — 'tried' keeps us from spinning on it.
         time.sleep(_settle_s())
 
@@ -361,8 +564,8 @@ def _ensure_headroom(worker_id: str, worker: Dict[str, Any], peak: Optional[int]
     worker = _refresh_worker(worker_id) or worker
     free = _free_vram(worker)
     if free is not None and free >= peak:
-        return True, evicted, None
-    return False, evicted, _refusal_reason(worker, peak, free, evicted)
+        return _done(True, evicted, None)
+    return _done(False, evicted, _refusal_reason(worker, peak, free, evicted))
 
 
 # ── lease refresher ──────────────────────────────────────────────────────────
@@ -481,25 +684,56 @@ def can_admit(job_name: str, spec: Any = None,
 
 
 def force_admit_safe(job_name: str) -> bool:
-    """True when best-effort force-admitting ``job_name`` (the scheduler's
-    starvation/deadlock guard for a held HEAD) CANNOT collide with an active
-    reservation: a light task always; a heavy task only when NO reservation
-    currently occupies its target card (``reserved_bytes == 0``). This lets the
-    scheduler unblock a lone held head that only fails the envelope check (it will
-    OFFLOAD — §7.4) while still refusing to run a SECOND heavy run concurrently
-    with one already in flight. Fail-OPEN True on any infra problem."""
+    """True when the scheduler's starvation/deadlock guard may force-admit a held
+    HEAD: a light task always; a heavy task only when its target card is
+    physically CLEARABLE to the run's peak.
+
+    ⚠ THIS USED TO ASK THE WRONG QUESTION (fixed 2026-07-27, operator: *"if it
+    cannot evict, queue; when it can evict, evict and proceed"*). It returned
+    ``reserved_bytes(worker_id) <= 0`` — "is another RESERVATION holding this
+    card?" — which is not the same as "is this card free". An **LLM slot child
+    never files a video reservation**, so a card with 21.26 of 23.56 GiB in use
+    reported ``reserved_bytes == 0``, the guard read it as idle, and the
+    scheduler force-admitted a correctly-held render straight into an OOM. The
+    guard's own rationale ("it will OFFLOAD / the worker gate is the fit
+    authority") did not hold: 1.01 GiB free cannot absorb a ~2 GiB contiguous
+    allocation, and the worker gate cannot count an occupant central never
+    attributed.
+
+    Now: no competing reservation AND ``free + evictable >= peak``. Failing that,
+    the head stays QUEUED (``awaiting_capacity``) until an occupant releases —
+    which is the outcome the operator asked for and, empirically, a short wait:
+    the 21 GiB holder freed itself within minutes.
+
+    Still fail-OPEN on genuinely unreadable infra (no template / no target / no
+    measurable free): an instrument failure must not wedge the queue forever.
+    Unknown-because-unmeasured is a different thing from known-to-be-occupied,
+    and only the latter is a reason to hold."""
     if not _enabled():
         return True
     template = load_template(job_name)
     if template is None:
         return True
-    worker_id, _worker = _resolve_target(template)
-    if worker_id is None:
+    worker_id, worker = _resolve_target(template)
+    if worker_id is None or worker is None:
         return True
     try:
-        return int(reservation_registry.reserved_bytes(worker_id)) <= 0
+        if int(reservation_registry.reserved_bytes(worker_id)) > 0:
+            return False           # a heavy run already holds this card
     except Exception:  # noqa: BLE001
         return True
+    peak = template.peak_bytes()
+    free = _free_vram(worker)
+    if peak is None or free is None:
+        return True                # unmeasured — never wedge the queue on a blind spot
+    clearable = int(free) + _evictable_bytes(worker)
+    if clearable >= int(peak):
+        return True
+    logger.info("force-admit DENIED for %s on %s: clearable=%s (free=%s + "
+                "evictable=%s) < peak=%s — holding in the queue until an "
+                "occupant releases", job_name, worker_id, clearable, free,
+                _evictable_bytes(worker), peak)
+    return False
 
 
 # ── public API (dispatch path only) ──────────────────────────────────────────

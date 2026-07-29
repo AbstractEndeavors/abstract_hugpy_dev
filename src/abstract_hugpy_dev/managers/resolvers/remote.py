@@ -33,6 +33,7 @@ import inspect
 import asyncio
 import logging
 import threading
+import contextvars
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .imports import (
@@ -150,6 +151,77 @@ def _record_serve_metrics(worker: Optional[dict], model_key: str,
     except Exception:  # noqa: BLE001 — recording must never fail a request
         logger.debug("serve-metrics recording skipped for %s", model_key,
                      exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# MODEL GROUPS — member selector (web -> core, optional). OFF BY DEFAULT.
+#
+# A model group picks WHICH ITERATION of a base model serves a request: the
+# transformers repo or the GGUF, and which rung of the GGUF's quant ladder.
+# That is a different question from "which box" — it is answered BEFORE box
+# selection — so it takes its own seam here rather than colliding with
+# ``_select``, which already hosts ``_placement_provider`` for sharding
+# (PLACEMENT-SCHEDULER-PLAN: "reconcile with it, don't collide").
+#
+# ⚠ THE OFF-PATH IS THE CONTRACT (operator directive 2026-07-28). The whole
+# feature is behind one settings flag, default FALSE, plus a hard env off
+# (HUGPY_MODEL_GROUPS=off). The provider's FIRST LINE is that check, so with
+# groups off ``_member_key`` returns None, the consult below is a no-op, and
+# resolution is byte-identical to the pre-feature tree. Guarded by
+# tests/test_model_groups_offpath.py, which was written and green BEFORE this
+# seam existed. Reverting the feature is flipping the flag — not a code change.
+#
+# Unset on the standalone worker / bare central => None => same thing.
+_member_selector: Optional[Callable[..., Optional[str]]] = None
+
+# The EFFECTIVE model key for the request currently in flight, or None for
+# "whatever the caller named". See DelegatingRunner.model_key for why this is a
+# context value and not an attribute: the runner instance is CACHED AND SHARED
+# across every concurrent request for a model, so a group's choice cannot live
+# on it. Default None means every off-path request reads through to the base
+# key with no context lookup cost worth measuring.
+_MEMBER_KEY: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
+    "hugpy_group_member_key", default=None)
+
+
+def set_member_selector(select_fn: Optional[Callable]) -> None:
+    """Register the model-group member selector (web -> core), optional."""
+    global _member_selector
+    _member_selector = select_fn
+    logger.info("model-group member selector registered: %s",
+                getattr(select_fn, "__name__", select_fn))
+
+
+def get_member_selector() -> Optional[Callable]:
+    return _member_selector
+
+
+def _member_key(model_key: str, pool: Optional[str] = None,
+                task: Optional[str] = None) -> Optional[str]:
+    """The group member to route instead of ``model_key``, or None.
+
+    None means "change nothing" and is the answer in every one of these cases:
+    the feature is off, the seam is unregistered, the key is in no group, the
+    group chose the key the caller already named, or ANYTHING went wrong. A
+    routing decision must never be the thing that raises."""
+    if _member_selector is None:
+        return None
+    try:
+        # Arg-count degradation, same convention as every other seam here.
+        for _args in ((model_key, pool, task), (model_key, pool), (model_key,)):
+            try:
+                chosen = _member_selector(*_args)
+                break
+            except TypeError:
+                continue
+        else:
+            return None
+        chosen = (str(chosen).strip() if chosen else "")
+        return chosen or None
+    except Exception as exc:  # noqa: BLE001 — never break a request over routing
+        logger.warning("model-group member selection failed for %s: %s",
+                       model_key, exc)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -675,10 +747,17 @@ def _env_float(name: str, default: float) -> float:
 
 
 def _cold_hold_max_s() -> float:
-    """Hard ceiling for holding a cold call (the 'presumed success' window).
-    Default 300s — long enough for a real GPU load/swap, short enough that a
-    truly wedged load fails honestly. Operator-tunable (defaults are promises)."""
-    return _env_float("HUGPY_COLD_HOLD_MAX_S", 300.0)
+    """HARD CEILING for holding a cold call — the one clock that is NOT
+    progress-aware, and deliberately so: it is the guard against a worker that
+    keeps 'progressing' pathologically (a re-download loop, a busy signal that
+    never resolves) holding a caller forever.
+
+    Default 900s. Raised from 300s on 2026-07-28: with the stall clock now doing
+    the real work (a healthy load extends the hold as long as it demonstrably
+    moves), the ceiling only has to be longer than the slowest legitimate
+    cold provision+load, and 300s was well inside that for a multi-GB pull onto
+    a busy box. Operator-tunable (defaults are promises)."""
+    return _env_float("HUGPY_COLD_HOLD_MAX_S", 900.0)
 
 
 def _cold_hold_stall_s() -> float:
@@ -904,6 +983,14 @@ _PERMANENT_LOAD_MARKERS = (
     "no worker available", "local serving disabled", "hugpy_no_local_serving",
     "unknown model", "vision model loaded in-process", "could not fetch model",
     "not found on central", "unresolvable",
+    # Provisioning gave a NAMED cause (2026-07-28). The worker used to flatten
+    # every provisioning failure into "could not fetch model X from central or
+    # HF"; it now says what actually happened ("could not provision X: disk
+    # full (ENOSPC) on /mnt/storage — 0 B free of 938 GB"). That is still the
+    # same permanent condition, and it must keep failing fast — retrying a
+    # request against a 100%-full drive is exactly the storm this list exists
+    # to prevent.
+    "could not provision",
     # Operator model BLOCK: a distinct, permanent operator refusal — never held
     # or retried (see comms.blocklist.BLOCKED_MARKER; this string mirrors it).
     "blocked from the serving pool",
@@ -1023,21 +1110,129 @@ def _loading_status(request_id: str, model_key: str, worker: Optional[dict],
 
 
 def _cold_timeout_message(model_key: str, worker: Optional[dict],
-                          last_err: str) -> str:
+                          last_err: str,
+                          last_progress: Optional[str] = None,
+                          stalled_for: Optional[float] = None,
+                          ceiling: bool = False) -> str:
     """The honest give-up line when a held load never became ready in time.
 
     The size/stall speculation is only ever appended when the last error is
     actually consistent with a LOAD problem. A request-shape failure that
     somehow reached the ceiling reports itself as what it is — the wrapper must
     never re-label another fault class as a capacity problem.
+
+    ``last_progress`` carries the LAST OBSERVED progress line so the message can
+    say WHERE it stopped ("stalled at 12.1 GB after 90s without progress")
+    rather than only that it stopped. The operator's 2026-07-28 report of this
+    error had no numbers in it at all, which is why it read as an arbitrary
+    timeout on a healthy load — which is exactly what it was.
     """
     if last_err and _is_request_shape_error(last_err):
         return _request_shape_message(model_key, worker, last_err)
     wname = (worker or {}).get("name") or (worker or {}).get("id") or "worker"
     tail = f" (last: {last_err})" if last_err else ""
+    if ceiling:
+        why = (f"the hold hit its hard ceiling — it kept reporting progress but "
+               f"never became ready")
+    elif stalled_for is not None:
+        where = f" at {last_progress}" if last_progress else ""
+        why = (f"no forward progress{where} for {int(stalled_for)}s — the load "
+               f"stalled, or the model is too large for the box")
+    else:
+        why = "the model may be too large for the box or the load stalled"
     return (f"'{model_key}' did not finish loading on '{wname}' in time"
-            f"{tail} — the model may be too large for the box or the load stalled; "
-            f"try again or assign it elsewhere.")
+            f"{tail} — {why}; try again or assign it elsewhere.")
+
+
+# A worker answering "busy" is a worker that is DEMONSTRABLY ALIVE AND WORKING.
+#
+# This is the second half of the 2026-07-28 incident. ae's per-model gen-gate
+# did exactly the right thing — it held the request and returned a structured
+# 503 ModelBusy while the weights loaded — and central read that correct
+# behaviour as silence, let the 90s stall clock run out, and killed the caller.
+# ae finished the load moments later and served the model.
+#
+# A structured busy/503 from the box we are holding on is therefore FORWARD
+# PROGRESS for stall purposes: the worker is up, it recognized the model, and it
+# is serializing us behind its own load. It is deliberately NOT unbounded — the
+# hard ceiling (HUGPY_COLD_HOLD_MAX_S) is what stops a box that answers "busy"
+# forever, which is precisely the pathological-progress case the ceiling exists
+# for.
+_BUSY_MARKERS = (
+    "model_busy", "modelbusy", "is busy:",
+    "503", "service unavailable",
+    "already in the in-process runner",
+)
+
+
+class _WorkerHTTPError(Exception):
+    """A non-2xx from a worker, WITH the worker's own error envelope intact.
+
+    The agent ships every failure AS DATA next to the status code — ModelBusy
+    returns 503 with {"ok":false,"error":{"code":"model_busy",...}}, a
+    BudgetRefusal returns 507 with {"refused":{...}}, a provisioning failure
+    returns its named cause. ``_worker_run_once`` learned to read that body in
+    2026 ("a bare raise_for_status() discarded the body and reduced the console
+    to 'Server error 500' with no cause"); the STREAM path never did, and kept
+    calling bare ``raise_for_status()``.
+
+    That omission is the entry-path defect (operator retest 2026-07-28). With
+    the body thrown away, central sees only the opaque httpx string
+    ``Server error '503 SERVICE UNAVAILABLE' for url '…/infer/stream'`` and:
+
+      * cannot tell "gen-gate is holding me while the model loads" (hold it)
+        from "this box is saturated" from "provisioning failed" (don't) — it was
+        matching on the literal text "503", which works only by accident of what
+        httpx happens to put in the string;
+      * cannot see a genuinely PERMANENT body either — a 507 BudgetRefusal
+        arrives as "Client error '507 …'", matches no permanent marker, and gets
+        HELD for the full ceiling instead of failing fast. Both directions wrong
+        from the same missing parse.
+
+    So the status code AND the parsed body travel together, and classification
+    reads both.
+    """
+
+    def __init__(self, status: int, body: Any, url: str = ""):
+        self.status = int(status)
+        self.body = body if isinstance(body, dict) else {}
+        err = self.body.get("error")
+        if isinstance(err, dict):
+            self.code = str(err.get("code") or "")
+            self.message = str(err.get("message") or "")
+        else:
+            self.code = ""
+            self.message = str(err or "")
+        if not self.message:
+            self.message = f"HTTP {self.status} from {url or 'worker'}"
+        super().__init__(f"HTTP {self.status}: {self.message}")
+
+
+# Worker error CODES that mean "this box is working on it, hold" — read from the
+# structured envelope rather than sniffed out of prose.
+_BUSY_CODES = frozenset({"model_busy", "provisioning", "loading", "warming_up"})
+
+
+def _is_worker_busy_signal(err: Any) -> bool:
+    """Is this failure the worker WORKING (hold) rather than the worker BROKEN?
+
+    Three sources, most authoritative first: the structured error code, the HTTP
+    status, then — for transports that lost both — the prose markers.
+    """
+    if isinstance(err, _WorkerHTTPError):
+        if err.code in _BUSY_CODES:
+            return True
+        # 503 is the agent's "temporarily can't, try shortly" code and is the
+        # ONLY status it uses for a gate hold; a 507/5xx-other is a verdict.
+        if err.status == 503 and not _is_permanent_load_error(err.message):
+            return True
+        return False
+    low = str(getattr(err, "message", None) or err or "").lower()
+    if not low:
+        return False
+    if _is_permanent_load_error(low) or _is_request_shape_error(low):
+        return False          # a named permanent fault is never "still working"
+    return any(m in low for m in _BUSY_MARKERS)
 
 
 def _cold_progress(model_key: str, worker: Optional[dict],
@@ -1224,7 +1419,20 @@ async def _worker_stream(worker: dict, payload: dict, request_id: str):
     timeout = httpx.Timeout(600.0, connect=4.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
         async with client.stream("POST", url, json=payload) as resp:
-            resp.raise_for_status()
+            if resp.status_code >= 400:
+                # Read the worker's own error envelope before discarding the
+                # response — the streaming twin of the parse _worker_run_once
+                # already does. Without it a gen-gate hold (503 model_busy) and
+                # a capacity verdict (507 refused) are the same opaque string to
+                # the caller, and the cold-hold cannot tell "hold this" from
+                # "fail this". See _WorkerHTTPError.
+                body = None
+                try:
+                    await resp.aread()
+                    body = resp.json()
+                except Exception:  # noqa: BLE001 — a bodyless 5xx is still a 5xx
+                    body = None
+                raise _WorkerHTTPError(resp.status_code, body, url)
             async for line in resp.aiter_lines():
                 if not line or not line.startswith("data:"):
                     continue
@@ -1267,13 +1475,16 @@ async def _worker_run_once(worker: dict, payload: dict, result_type, request_id:
             # discarded that body and reduced the console to "Server error
             # '500 …'" with no cause. Surface the worker's own reason — the
             # caller (DelegatingRunner) stamps the worker name onto it.
-            detail = ""
+            # Same envelope, same class as the streaming path — so the one-shot
+            # runner's hold classifies a 503 gen-gate hold exactly as stream()
+            # does instead of matching on prose.
+            body = None
             try:
-                detail = str((resp.json() or {}).get("error") or "")
+                body = resp.json()
             except ValueError:
-                pass
-            if detail:
-                raise RuntimeError(f"HTTP {resp.status_code}: {detail}")
+                body = None
+            if body is not None or resp.status_code >= 500:
+                raise _WorkerHTTPError(resp.status_code, body, url)
             resp.raise_for_status()
         data = resp.json()
     if isinstance(data, dict):
@@ -1464,8 +1675,30 @@ def make_delegating_runner(framework: str, task: str):
 
         def __init__(self, cfg):
             self.cfg = cfg
-            self.model_key = cfg.model_key
+            self._base_model_key = cfg.model_key
             self._local = None
+
+        # MODEL GROUPS: the EFFECTIVE key, per request.
+        #
+        # ⚠ THIS INSTANCE IS SHARED. dispatch caches runners in ``_INSTANCES``
+        # keyed by (model_key, task), so there is exactly ONE DelegatingRunner
+        # per model on the whole process and every concurrent request for that
+        # model is holding it. Assigning ``self.model_key`` to a group's chosen
+        # member — the obvious implementation, and the one this started as —
+        # would therefore rewrite the cached runner PERMANENTLY (the next
+        # request for the original key gets the member without ever consulting
+        # the group) and race two concurrent requests against each other.
+        #
+        # So the member is a per-request CONTEXT value and the instance is
+        # never mutated. ContextVar rather than threading.local because run()
+        # and stream() are async: several requests interleave on ONE event-loop
+        # thread, which a thread-local cannot separate. asyncio copies the
+        # context per Task, so a value set inside one request is invisible to
+        # every other one, and unset — the default, and the state on every
+        # off-path request — reads through to the key the caller named.
+        @property
+        def model_key(self):
+            return _MEMBER_KEY.get() or self._base_model_key
 
         def _local_runner(self):
             if self._local is None:
@@ -1481,6 +1714,14 @@ def make_delegating_runner(framework: str, task: str):
             if _blk:
                 raise RuntimeError(_blk)
             pool = getattr(req, "pool", None)
+            # MODEL GROUPS: swap in the group's chosen iteration, if any. Returns
+            # None — a no-op — whenever groups are off (the default), so this is
+            # the ENTIRE off-path diff at this call site. Deliberately AFTER the
+            # block gate: a blocked key refuses as itself, never by silently
+            # routing to a sibling.
+            _mk = _member_key(self.model_key, pool, task)
+            if _mk and _mk != self.model_key:
+                _MEMBER_KEY.set(_mk)
             # ID-LOCK: a request carrying reference images (paths, or the b64
             # offload transport) is an identity-locked STILL — it MUST land on a
             # box whose comfy has the IPAdapter nodes. Gate selection + reroute on
@@ -1507,6 +1748,9 @@ def make_delegating_runner(framework: str, task: str):
             stall_s = _cold_hold_stall_s()
             last_move = start
             last_err = ""
+            # Last progress line we actually OBSERVED, so a terminal
+            # message can say where it stopped, not just that it did.
+            last_progress = None
             # Cold-hold ADMISSION CAP: taken once, on the first selected worker,
             # and released in the finally below. Full + model-not-loaded raises
             # ColdHoldCapacityError straight out of run() — a fast honest 503,
@@ -1588,11 +1832,22 @@ def make_delegating_runner(framework: str, task: str):
                         raise RuntimeError(
                             f"worker {worker.get('name') or worker.get('id')} failed to "
                             f"load {self.model_key}: {honest}")
-                    if moved:
+                    if _msg:
+                        last_progress = _msg
+                    # A structured busy/503 from this worker is the worker
+                    # WORKING, not the worker silent — see _is_worker_busy_signal.
+                    if moved or _is_worker_busy_signal(last_err):
                         last_move = time.time()
                     now = time.time()
-                    if now > deadline or (now - last_move) > stall_s:
-                        raise RuntimeError(_cold_timeout_message(self.model_key, worker, last_err))
+                    if now > deadline:
+                        raise RuntimeError(_cold_timeout_message(
+                            self.model_key, worker, last_err,
+                            last_progress=last_progress, ceiling=True))
+                    if (now - last_move) > stall_s:
+                        raise RuntimeError(_cold_timeout_message(
+                            self.model_key, worker, last_err,
+                            last_progress=last_progress,
+                            stalled_for=now - last_move))
                     await asyncio.sleep(_cold_hold_poll_s())
                     continue
             finally:
@@ -1625,6 +1880,11 @@ def make_delegating_runner(framework: str, task: str):
                 yield ErrorEvent(request_id=req.request_id, message=_blk)
                 return
             pool = getattr(req, "pool", None)
+            # MODEL GROUPS — the streaming twin of run()'s consult. Same no-op
+            # when the feature is off (the default).
+            _mk = _member_key(self.model_key, pool, task)
+            if _mk and _mk != self.model_key:
+                _MEMBER_KEY.set(_mk)
             # ID-LOCK parity with run(): a request carrying reference images must
             # land on a comfy-with-IPAdapter box; gate selection + reroute on it.
             _id_lock = bool(getattr(req, "reference_images", None)
@@ -1668,6 +1928,13 @@ def make_delegating_runner(framework: str, task: str):
                                 # same template and fail identically.
                                 raise _LoadFailed(_request_shape_message(
                                     self.model_key, worker, ev.message))
+                            # Busy/loading first, same as the transport branch
+                            # below: a worker that reports "still loading" inside
+                            # a 200 SSE is a worker to HOLD for, and that must
+                            # not be reachable by the local-fallback or the
+                            # permanent-error branch.
+                            if _is_worker_busy_signal(ev.message):
+                                raise _ColdRetry(ev.message)
                             if _local_fallback_allowed():
                                 logger.warning("worker %s errored before output (%s); "
                                                "running %s locally", worker.get("id"),
@@ -1713,6 +1980,19 @@ def make_delegating_runner(framework: str, task: str):
                     if _is_request_shape_error(exc):
                         raise _LoadFailed(_request_shape_message(
                             self.model_key, worker, exc))
+                    # BUSY IS A HOLD, AND IT IS DECIDED FIRST (operator retest
+                    # 2026-07-28: "a cold load STILL errors first, then works on
+                    # retry"). A structured 503 on the FIRST attempt means the
+                    # worker's gen-gate is holding us while the model loads —
+                    # the correct answer is to enter the hold, not to hand the
+                    # user an error that tells them to press send again. Ahead
+                    # of BOTH the local-fallback branch and the permanent check
+                    # so neither can turn a load-in-progress into a terminal
+                    # outcome.
+                    if _is_worker_busy_signal(exc):
+                        logger.info("worker %s is busy/loading %s (%s) — holding",
+                                    worker.get("id"), self.model_key, exc)
+                        raise _ColdRetry(str(getattr(exc, "message", None) or exc))
                     if _local_fallback_allowed():
                         logger.warning("worker offload failed (%s); running %s locally",
                                        exc, self.model_key)
@@ -1728,6 +2008,9 @@ def make_delegating_runner(framework: str, task: str):
             stall_s = _cold_hold_stall_s()
             last_move = start
             last_err = ""
+            # Last progress line we actually OBSERVED, so a terminal
+            # message can say where it stopped, not just that it did.
+            last_progress = None
             announced_wid = None
             # Cold-hold ADMISSION CAP — see the block near _hold_try_acquire.
             # Taken once (on the first selected worker), released on the first
@@ -1789,13 +2072,19 @@ def make_delegating_runner(framework: str, task: str):
                                              message=_humanize_worker_error(
                                                  worker.get("name") or wid, honest))
                             return
-                        if moved:
+                        if msg:
+                            last_progress = msg
+                        if moved or _is_worker_busy_signal(last_err):
                             last_move = time.time()
                         now = time.time()
                         if now > deadline or (now - last_move) > stall_s:
                             yield ErrorEvent(request_id=req.request_id,
-                                             message=_cold_timeout_message(self.model_key,
-                                                                           worker, last_err))
+                                             message=_cold_timeout_message(
+                                                 self.model_key, worker, last_err,
+                                                 last_progress=last_progress,
+                                                 stalled_for=(None if now > deadline
+                                                              else now - last_move),
+                                                 ceiling=now > deadline))
                             return
                         yield _loading_status(req.request_id, self.model_key, worker, prog, msg)
                         await asyncio.sleep(_cold_hold_poll_s())
@@ -1856,13 +2145,19 @@ def make_delegating_runner(framework: str, task: str):
                                          message=_humanize_worker_error(
                                              worker.get("name") or wid, honest))
                         return
-                    if moved:
+                    if msg:
+                        last_progress = msg
+                    if moved or _is_worker_busy_signal(last_err):
                         last_move = time.time()
                     now = time.time()
                     if now > deadline or (now - last_move) > stall_s:
                         yield ErrorEvent(request_id=req.request_id,
-                                         message=_cold_timeout_message(self.model_key,
-                                                                       worker, last_err))
+                                         message=_cold_timeout_message(
+                                             self.model_key, worker, last_err,
+                                             last_progress=last_progress,
+                                             stalled_for=(None if now > deadline
+                                                          else now - last_move),
+                                             ceiling=now > deadline))
                         return
                     yield _loading_status(req.request_id, self.model_key, worker, prog, msg)
                     await asyncio.sleep(_cold_hold_poll_s())

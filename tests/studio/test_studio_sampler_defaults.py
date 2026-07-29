@@ -199,8 +199,31 @@ def test_spec_steps_override_recorded_via_bus():
     orig_db, orig_init = media_bus.DB_PATH, media_bus._initialized
     media_bus.DB_PATH = tmp_db
     media_bus._initialized = False
+    # SYNTHETIC IS OPT-IN since c165f12 ("the synthetic gate must refuse NOISE"):
+    # ``run_studio_i2v`` refuses a spec that binds Framework.SYNTHETIC unless
+    # STUDIO_ALLOW_SYNTHETIC=1, so a real render can never silently degrade into a
+    # blob that looks finished. This check WANTS the prover — vram_budget_gb=0.5
+    # binds it deliberately, because what is under test is the steps override
+    # travelling route -> spec -> CapabilityRequest -> produce_clip -> manifest, not
+    # the pixels. So opt in explicitly for the duration and restore the prior env: a
+    # HARNESS opt-in (same idiom as test_studio_offload.py), never a product default.
+    #
+    # ORDER MATTERS, and it is the reason mkdtemp is above the try and the setenv is
+    # the FIRST statement inside it. The opt-in used to be set before mkdtemp, which
+    # left a window: DEFAULT_ROOT is the shared store, mkdtemp against it can and does
+    # raise (EMFILE under the virtiofs store storm, ENOSPC, a stale export), and an
+    # exception there escaped BEFORE the try that owns the restore — leaking
+    # STUDIO_ALLOW_SYNTHETIC=1 into the rest of the process. In a shared-process sweep
+    # that silently re-opens the synthetic gate for every later test, so a runner that
+    # should have REFUSED to emit a noise blob would instead emit one and pass. A
+    # harness opt-in that can outlive its own test is worse than no isolation at all,
+    # because it fails open and quietly. Nothing between mkdtemp and the try may set
+    # process-global state.
+    _SYN = "STUDIO_ALLOW_SYNTHETIC"
+    orig_syn = os.environ.get(_SYN)
     out = tempfile.mkdtemp(prefix="sampler-bus-out-", dir=DEFAULT_ROOT)  # inside jail
     try:
+        os.environ[_SYN] = "1"
         with sqlite3.connect(tmp_db) as _c:
             _c.execute(
                 "CREATE TABLE IF NOT EXISTS media_jobs (job_id TEXT PRIMARY KEY, "
@@ -216,6 +239,10 @@ def test_spec_steps_override_recorded_via_bus():
         assert m["sampler"]["steps"] == 7, m["sampler"]
     finally:
         media_bus.DB_PATH, media_bus._initialized = orig_db, orig_init
+        if orig_syn is None:
+            os.environ.pop(_SYN, None)
+        else:
+            os.environ[_SYN] = orig_syn
         shutil.rmtree(out, ignore_errors=True)
         try:
             os.remove(tmp_db)
@@ -248,27 +275,105 @@ def test_placement_decision_pure():
 # [10] _max_vram_gb reads STUDIO_MAX_VRAM_GB from the manifest's env_snapshot.
 # --------------------------------------------------------------------------- #
 def test_max_vram_from_env_snapshot():
+    """The declared ceiling is read from env_snapshot AND BOTH BIND — but a DEAF DEVICE
+    PROBE FAILS CLOSED (2026-07-27, round-2 review).
+
+    This check used to assert ``_max_vram_gb(<declares 24.0>) == 24.0`` on this GPU-less
+    VM, i.e. that a declaration alone sets the budget. That is now wrong, and it was the
+    dangerous direction. ``resolve_studio_env`` DEFAULTS max_vram_gb to 24.0 and no caller
+    overrides it, so a "24.0" almost always means *nobody said*, not *an operator said*.
+    Under the retired flat margin that fabricated 24.0 was inert (8.2 + 16.0 = 24.2 >
+    24.0 -> offload). Against DERIVED need it is permissive: wan2.1-t2v-1.3b @fp16 needs
+    17.897 GiB, which "fits" 24.0 -> a bare ``pipe.to("cuda")``. On computron's 8 GiB 4060
+    with a probe that went deaf, that is an OOM caused by a failed probe rather than by
+    any real budget. Unknown card => offload.
+
+    So the invariant is now two-sided, and both sides are checked below."""
+    import abstract_hugpy_dev._platform.hardware as _hw
+
     class _M:  # minimal stand-in carrying only env_snapshot
         env_snapshot = (("STUDIO_MAX_VRAM_GB", "24.0"),)
-    assert _max_vram_gb(_M()) == 24.0
 
     class _M2:
         env_snapshot = ()
+
     prev = os.environ.pop("STUDIO_MAX_VRAM_GB", None)
+    orig_probe = _hw.total_vram_bytes
     try:
+        # (a) DEAF PROBE (this VM has no GPU, so this is the real, unmocked path):
+        #     a declaration alone must NOT authorize whole-GPU placement.
+        _hw.total_vram_bytes = lambda: 0
+        assert _max_vram_gb(_M()) is None, \
+            "a declared ceiling must not bind when the device probe is deaf"
         assert _max_vram_gb(_M2()) is None
+
+        # (b) LIVE PROBE: the declaration IS read, and BOTH bind via min() — the
+        #     behaviour the original check was really about, now tested where it applies.
+        _hw.total_vram_bytes = lambda: int(40.0 * (1024 ** 3))   # card bigger than decl
+        assert _max_vram_gb(_M()) == 24.0, "the declared ceiling must bind under a big card"
+        _hw.total_vram_bytes = lambda: int(8.0 * (1024 ** 3))    # card smaller than decl
+        assert _max_vram_gb(_M()) == 8.0, "the CARD must win when it is below the declaration"
+        assert _max_vram_gb(_M2()) == 8.0, "with no declaration the card alone binds"
     finally:
+        _hw.total_vram_bytes = orig_probe
         if prev is not None:
             os.environ["STUDIO_MAX_VRAM_GB"] = prev
 
 
 # --------------------------------------------------------------------------- #
-# [11] OFFLOAD-branch VRAM levers (item 4): _place_pipe engages attention slicing +
-#      VAE tiling/slicing ONLY on the offload branch; each lever is AttributeError-
-#      guarded (duck-typed pipe/VAE, no GPU, no torch).
+# [11] VRAM levers on BOTH branches (item 4, INVARIANT REVERSED 2026-07-27):
+#      _place_pipe engages attention slicing + VAE tiling/slicing on the whole-GPU
+#      branch TOO, not only on offload; each lever stays AttributeError-guarded
+#      (duck-typed pipe/VAE, no GPU, no torch).
+#
+#      WHY THIS TEST CHANGED SIDES. It used to assert "whole-GPU branch must engage
+#      no levers". That was wrong, and load-bearing wrong: ``vae.enable_tiling()`` is
+#      what makes VAE decode a BOUNDED constant instead of a resolution-squared
+#      spike. Untiled, ``AutoencoderKLWan._decode`` runs full-frame fp32 convolutions
+#      and accumulates the whole clip via ``torch.cat`` — that untiled decode, not the
+#      denoise, is the most plausible cause of the 2026-07-07 ae OOM the old flat
+#      16 GB margin was built to avoid.
+#
+#      And the new placement calculation (``_placement_need_gib``, wan_i2v.py) PRICES
+#      decode as bounded — ``_WS_INTERCEPT_GIB + 0.60`` = 1.36 GiB flat, independent of
+#      resolution. That price is only honest if tiling is actually on. Flipping
+#      placement onto measured need while leaving the whole-GPU branch unguarded would
+#      have reproduced the exact incident the change was preventing, so the two moves
+#      are one change and this check is its lock.
+#
+#      DUCK SHAPE = MEASURED SHAPE (corrected 2026-07-27). The default used to be
+#      ``slicing=False``, described in-test as "shaped like the real
+#      AutoencoderKLWan". It is not: verified directly against the INSTALLED build,
+#
+#        >>> import diffusers; diffusers.__version__
+#        '0.39.0'
+#        >>> from diffusers.models.autoencoders.autoencoder_kl_wan import AutoencoderKLWan
+#        >>> hasattr(AutoencoderKLWan, "enable_slicing"), hasattr(AutoencoderKLWan, "enable_tiling")
+#        (True, True)
+#
+#      so a REAL Wan pipe engages all THREE levers and returns
+#      ["attention_slicing", "vae_tiling", "vae_slicing"]. A duck defaulting to
+#      slicing=False modelled a diffusers that is not installed here, which made the
+#      headline assertions encode a false model of the pipeline — the failure mode is
+#      that the test would keep passing if the real third lever silently stopped
+#      engaging. The default now matches the installed build; the no-slicing duck is
+#      retained BELOW, relabelled as what it actually is (a guard probe for a build
+#      that lacks the lever), so the AttributeError-guard coverage is not lost.
+#
+#      ⚠ "attention_slicing" IN THE RETURNED LIST IS NOT EVIDENCE THAT SLICING HAPPENED.
+#      ``DiffusionPipeline.enable_attention_slicing`` exists, so the call succeeds and
+#      the name is appended — but the dispatch is
+#      ``DiffusionPipeline.set_attention_slice``, which filters to submodules with
+#      ``hasattr(m, "set_attention_slice")``, and EVERY component of a Wan pipe lacks
+#      it (verified: WanTransformer3DModel, AutoencoderKLWan, UMT5EncoderModel all
+#      False). It iterates an empty list: a NO-OP on Wan. The lever list records what
+#      was CALLED, not what saved memory. Only ``vae_tiling`` is doing real work here,
+#      which is precisely why the bounded-decode price above rests on tiling alone.
 # --------------------------------------------------------------------------- #
 class _DuckVAE:
-    def __init__(self, tiling=True, slicing=False):
+    # slicing defaults TRUE because AutoencoderKLWan really does expose
+    # enable_slicing in diffusers 0.39.0 — see the note above.
+    def __init__(self, tiling=True, slicing=True):
         self.calls = []
         if tiling:
             self.enable_tiling = lambda: self.calls.append("tiling")
@@ -290,27 +395,50 @@ class _DuckPipe:
         self.calls.append("offload")
 
 
-def test_place_pipe_engages_levers_on_offload_branch():
-    # whole-GPU branch: only .to("cuda") — NO offload, NO memory levers.
-    p_whole = _DuckPipe(vae=_DuckVAE())
-    assert _place_pipe(p_whole, True) == [], "whole-GPU branch must engage no levers"
-    assert ("to", "cuda") in p_whole.calls and "offload" not in p_whole.calls, p_whole.calls
+# The three levers a REAL Wan pipe on diffusers 0.39.0 engages, in call order. Named
+# once so the "this is what the box does" cases below cannot drift apart from each
+# other, and so a diffusers upgrade that changes the surface is ONE edit here rather
+# than a hunt through four assertions.
+_REAL_WAN_LEVERS = ["attention_slicing", "vae_tiling", "vae_slicing"]
 
-    # offload branch, VAE shaped like the real AutoencoderKLWan (tiling YES, slicing
-    # NO -> the slicing lever AttributeErrors and is skipped, never fails the render).
-    vae = _DuckVAE(tiling=True, slicing=False)
+
+def test_place_pipe_engages_levers_on_both_branches():
+    # whole-GPU branch: .to("cuda") and NO offload — but the savers DO engage, because
+    # the bounded-decode price _placement_need_gib charges is only honest with tiling on.
+    whole_vae = _DuckVAE()                      # real AutoencoderKLWan shape
+    p_whole = _DuckPipe(vae=whole_vae)
+    assert _place_pipe(p_whole, True) == _REAL_WAN_LEVERS, \
+        "whole-GPU branch must engage the savers too (tiling bounds VAE decode)"
+    assert ("to", "cuda") in p_whole.calls and "offload" not in p_whole.calls, p_whole.calls
+    # tiling REALLY ran, not just named — and it is the lever that actually bounds
+    # decode, so this is the assertion that backs the placement price.
+    assert whole_vae.calls == ["tiling", "slicing"], whole_vae.calls
+
+    # ...and the guards hold on the whole-GPU branch as well: a pipe with no VAE still
+    # places, it just engages fewer levers. A memory hint must never fail a render.
+    p_whole_novae = _DuckPipe(vae=None, attn=True)
+    assert _place_pipe(p_whole_novae, True) == ["attention_slicing"], p_whole_novae.calls
+    assert ("to", "cuda") in p_whole_novae.calls, p_whole_novae.calls
+
+    # offload branch, VAE shaped like the real AutoencoderKLWan: BOTH VAE levers
+    # exist on diffusers 0.39.0, so all three engage and the offload path is taken.
+    vae = _DuckVAE()
     p = _DuckPipe(vae=vae, attn=True)
     engaged = _place_pipe(p, False)
     assert "offload" in p.calls, p.calls
-    assert engaged == ["attention_slicing", "vae_tiling"], engaged
-    assert "attn" in p.calls and vae.calls == ["tiling"], (p.calls, vae.calls)
+    assert engaged == _REAL_WAN_LEVERS, engaged
+    assert "attn" in p.calls and vae.calls == ["tiling", "slicing"], (p.calls, vae.calls)
 
-    # offload branch, a VAE that DOES expose slicing -> all three engage.
-    p2 = _DuckPipe(vae=_DuckVAE(tiling=True, slicing=True), attn=True)
-    assert _place_pipe(p2, False) == ["attention_slicing", "vae_tiling", "vae_slicing"]
+    # GUARD PROBE, not a model of this box: a VAE lacking enable_slicing (an older or
+    # future diffusers). The lever must AttributeError, be swallowed, and drop out of
+    # the list — never fail the render. Kept after the correction above precisely so
+    # the guard stays covered without pretending to be the installed build.
+    p_noslice = _DuckPipe(vae=_DuckVAE(tiling=True, slicing=False), attn=True)
+    assert _place_pipe(p_noslice, False) == ["attention_slicing", "vae_tiling"], \
+        "a VAE without enable_slicing must skip that lever, not fail the render"
 
     # offload branch, a pipeline WITHOUT enable_attention_slicing -> guarded, skipped.
-    p3 = _DuckPipe(vae=_DuckVAE(tiling=True), attn=False)
+    p3 = _DuckPipe(vae=_DuckVAE(tiling=True, slicing=False), attn=False)
     assert _place_pipe(p3, False) == ["vae_tiling"], "attention slicing must be skipped"
 
     # offload branch, NO vae attribute -> only attention slicing.
@@ -318,8 +446,7 @@ def test_place_pipe_engages_levers_on_offload_branch():
     assert _place_pipe(p4, False) == ["attention_slicing"], "no vae -> attn only"
 
     # the helper is idempotent-safe to call directly on a duck too.
-    assert _engage_memory_savers(_DuckPipe(vae=_DuckVAE(), attn=True)) == [
-        "attention_slicing", "vae_tiling"]
+    assert _engage_memory_savers(_DuckPipe(vae=_DuckVAE(), attn=True)) == _REAL_WAN_LEVERS
 
 
 # --------------------------------------------------------------------------- #
@@ -381,8 +508,8 @@ CHECKS = [
     ("placement decision (pure, no GPU): quantized never .to(); unquantized fits",
      test_placement_decision_pure),
     ("_max_vram_gb reads STUDIO_MAX_VRAM_GB from env_snapshot", test_max_vram_from_env_snapshot),
-    ("offload VRAM levers (item 4): _place_pipe engages attn/VAE slicing+tiling, guarded",
-     test_place_pipe_engages_levers_on_offload_branch),
+    ("VRAM levers (item 4): _place_pipe engages attn/VAE slicing+tiling on BOTH branches, guarded",
+     test_place_pipe_engages_levers_on_both_branches),
     ("cuda allocator (item 7): _prime_cuda_allocator setdefault fills unset, respects preset",
      test_prime_cuda_allocator_setdefault),
 ]

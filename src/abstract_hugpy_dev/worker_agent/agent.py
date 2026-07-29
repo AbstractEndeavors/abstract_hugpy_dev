@@ -534,6 +534,29 @@ class CentralClient:
     def heartbeat(self, worker_id: str, payload: dict) -> dict:
         return self._post(f"/{worker_id}/heartbeat", payload)
 
+    def evictions_ingest(self, events: list) -> dict:
+        """Relay a batch of eviction-telemetry events to central.
+
+        Its own endpoint rather than a heartbeat rider: the beat is every few
+        seconds and is the fleet's liveness signal — pinning sub-second
+        eviction detail to it would either slow the stream to beat cadence or
+        inflate the one payload the fleet cannot afford to make heavy (the
+        2026-07-27 stat storm starved heartbeats exactly this way). Same base,
+        same Bearer, short timeout: telemetry must never hold a thread.
+
+        ``/llm/evictions/ingest`` lives outside the ``/llm/workers`` prefix this
+        client is based on, so the base is trimmed back one segment."""
+        base = self.base.rsplit("/llm/workers", 1)[0]
+        data = json.dumps({"events": events}).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        req = urllib.request.Request(
+            base + "/llm/evictions/ingest", data=data, headers=headers,
+            method="POST")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
 
 # ---------------------------------------------------------------------------
 # Local inference (reuses the same dispatch the central node uses)
@@ -665,8 +688,36 @@ def _ensure_present_streaming(payload: dict, central_url: str | None, state=None
                         "message": f"provisioning failed: {result['err']}"})
             return
         if not result["ok"]:
-            yield _sse({"type": "error",
-                        "message": f"could not fetch model {model_key} from central or HF"})
+            # HONEST PROPAGATION (incident 2026-07-28). This used to be the
+            # flat "could not fetch model X from central or HF" — a sentence
+            # that is true of a full disk, a revoked token, a 404 and a dead
+            # NIC alike, and therefore tells the operator nothing. The drive was
+            # 100% full; finding that out cost an ssh session and a journalctl
+            # read. _provision_now now records the structured cause instead of
+            # discarding it at the boolean boundary, so name it.
+            #
+            # ONE LINE, NO TRACEBACK, and NOT prefixed with the worker name —
+            # the central relay's _humanize_worker_error already stamps
+            # "The '<worker>' worker could not complete this request: " on the
+            # front, and doubling it reads like a bug.
+            #
+            # BOTH wordings below are in remote._PERMANENT_LOAD_MARKERS
+            # ("could not fetch model" / "could not provision"), so the central
+            # relay still classifies this as a permanent, non-retryable load
+            # failure. That matters more than the prose: retrying a request
+            # against a 100%-full drive is a storm, not a recovery.
+            msg = f"could not fetch model {model_key} from central or HF"
+            try:
+                from .provision import last_failure
+                cause = last_failure(model_key) or {}
+                human = (cause.get("human") or cause.get("reason") or "").strip()
+                if human:
+                    msg = (f"could not provision {model_key}: {human}"
+                           if cause.get("errno_name")
+                           else f"could not fetch model {model_key}: {human}")
+            except Exception:  # noqa: BLE001 — a missing cause is not a reason
+                pass           # to lose the error entirely
+            yield _sse({"type": "error", "stage": "provision", "message": msg})
             return
         yield _sse({"type": "status", "stage": "provision",
                     "message": "model ready, loading…", "progress": 1.0})
@@ -955,6 +1006,129 @@ def _apply_central_limits(worker: dict | None) -> None:
         os.environ[env] = str(int(eff)) if key == "threads" else str(eff)
 
 
+# ---------------------------------------------------------------------------
+# MATERIALIZATION — "a runner object exists" is not "the weights are loaded".
+#
+# THE 2026-07-28 FALSEHOOD: the compute tab showed "🔥 serving
+# Qwen2.5-7B-Instruct-GGUF · resident" on computron for a model that had NEVER
+# loaded. Provisioning had failed (full disk), but dispatch had already put a
+# HOLLOW runner wrapper into _INSTANCES — runners are lazy by design, the heavy
+# load happens on first ``.runner`` access — and ``touch_model`` had stamped
+# last_used before the load was attempted. _allocations() then emitted a
+# kind="ram" row with serving=True, and nothing downstream could tell the
+# difference between that and a hot model.
+#
+# Operator doctrine, "residency must be measured". So the heartbeat now states
+# what it actually knows: ``materialized`` is True only for a model whose weights
+# we SAW materialize, False for a runner we know is hollow, and omitted when this
+# build genuinely cannot tell (never guess — an unknown must read as unknown, and
+# central/UI treat absent exactly as they did before).
+# ---------------------------------------------------------------------------
+
+_MATERIALIZED: set = set()
+_MATERIALIZED_LOCK = threading.Lock()
+
+
+def _materialize(runner, model_key: str | None = None) -> None:
+    """Force a lazy runner's weights RESIDENT, with serve telemetry around it.
+
+    Replaces the ``_ensure = getattr(runner, "ensure_loaded", None); if
+    callable(...)`` incantation that appeared verbatim at four call sites. Same
+    behavior — including "a runner without ensure_loaded is a no-op" — plus
+    load.start/load.done/load.fail on the serve-telemetry stream and an honest
+    record of what actually materialized.
+
+    Raises exactly what ``ensure_loaded`` raises: every existing call site has
+    its own error handling and this must not swallow a load failure."""
+    mk = model_key or getattr(runner, "model_key", None) or "?"
+    ensure = getattr(runner, "ensure_loaded", None)
+    if not callable(ensure):
+        return
+    engine = type(runner).__name__
+    t0 = time.time()
+    if _evt is not None:
+        _evt_emit("load.start", model_key=mk, engine=engine)
+    try:
+        ensure()
+    except Exception as exc:  # noqa: BLE001 — observe, then re-raise unchanged
+        if _evt is not None:
+            _evt_emit("load.fail", model_key=mk, engine=engine,
+                      error=f"{type(exc).__name__}: {exc}")
+        raise
+    with _MATERIALIZED_LOCK:
+        _MATERIALIZED.add(str(mk))
+    if _evt is not None:
+        _evt_emit("load.done", model_key=mk, engine=engine,
+                  duration_ms=int((time.time() - t0) * 1000))
+
+
+def _forget_materialized(model_key: str) -> None:
+    """Drop a model's materialized flag — on evict/unload, so a stale True can
+    never outlive the weights it described."""
+    with _MATERIALIZED_LOCK:
+        _MATERIALIZED.discard(str(model_key))
+
+
+def _is_materialized(model_key: str) -> bool | None:
+    """True / False / None(unknown) for "are this model's weights loaded".
+
+    Two independent sources, both NON-FORCING (asking must never trigger the
+    load we are asking about), consulted in this order:
+
+      1. the llama runner cache — an in-process GGUF handle exists iff ``llm``
+         is set on the cached runner. AUTHORITATIVE for the gguf path (most of
+         the fleet) and, crucially, LIVE: ``dispatch.evict`` cascades into
+         ``evict_llama_runner``, so this source self-corrects on unload where a
+         remembered flag would go stale and re-assert residency for weights
+         that are gone.
+      2. ``_MATERIALIZED`` — models whose ``ensure_loaded()`` we watched
+         succeed. The fallback for non-llama runners (transformers/DeepCoder),
+         which expose no comparable cache to interrogate.
+
+    Returns None only when neither source can speak, so an older/odd path
+    degrades to "unknown" rather than to a confident falsehood."""
+    mk = str(model_key)
+    try:
+        from ..managers.llama.runners.get import _LLAMA_INSTANCES, _LLAMA_LOCK
+        with _LLAMA_LOCK:
+            r = _LLAMA_INSTANCES.get(mk)
+        if r is not None:
+            # An HTTP/slot-backed runner holds no weights in THIS process; its
+            # residency is the slot child's and is reported by the slot row.
+            if getattr(r, "base_url", None):
+                return None
+            return getattr(r, "llm", None) is not None
+    except Exception:  # noqa: BLE001
+        pass
+    with _MATERIALIZED_LOCK:
+        if mk in _MATERIALIZED:
+            return True
+    # Nothing remembered a materialization. That is only EVIDENCE of a hollow
+    # runner for the llama/gguf family, where the cache above is exhaustive: a
+    # loaded GGUF is in _LLAMA_INSTANCES, full stop, so absence there means
+    # runner_for() built the lazy shell and .runner was never touched — the
+    # incident shape exactly.
+    #
+    # For every other family we must answer UNKNOWN, not False. A transformers
+    # runner loaded through a plain .run() (no ensure_loaded) leaves no trace in
+    # either source while being genuinely, measurably resident — and the console
+    # treats materialized=False as outranking measurement. Claiming False there
+    # would hide a hot model, which is the same class of lie as the one this is
+    # fixing, pointed the other way.
+    try:
+        from ..managers.dispatch.dispatch import _INSTANCES, _INSTANCES_LOCK
+        with _INSTANCES_LOCK:
+            inst = next((v for k, v in _INSTANCES.items() if k[0] == mk), None)
+        if inst is not None:
+            from ..managers.llama.runners.src.base_runner import LlamaCppBaseRunner
+            is_llama = isinstance(inst, LlamaCppBaseRunner) or hasattr(
+                type(inst), "runner")
+            return False if is_llama else None
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
 def _loaded_detail() -> dict:
     # Size EVERY serving row: start with on-disk dir bytes for all frameworks
     # (transformers/diffusers/llama), then let the GGUF runner detail overlay
@@ -1230,8 +1404,113 @@ def _inprocess_gpu_bytes() -> dict:
             cuda += cc
             cpu += pc
         device = "cuda" if cuda > 0 else ("cpu" if cpu > 0 else None)
-        out[mk] = {"vram_bytes": cuda, "device": device}
+        # cpu_bytes is the CPU-side analog: parameter+buffer bytes this model
+        # holds on device 'cpu' — MEASURED torch allocation (not a file size),
+        # so a ram allocation row can report real host-RAM occupancy for a
+        # transformers/diffusers model that torch can introspect.
+        out[mk] = {"vram_bytes": cuda, "device": device, "cpu_bytes": cpu}
     return out
+
+
+# ── MEASURED host-RAM residency of file-backed model weights (/proc/self/smaps)
+# The agent process mmaps GGUF/safetensors weights, so the model's true host-RAM
+# occupancy right now is the sum of the Rss of ITS mappings — not the file's size
+# on disk. On ae the declared file bytes read 77 GB against 26 GB physically
+# used, because mmap'd pages are (a) shared and (b) only partly faulted in.
+# Parsing smaps is not free (one line per mapping, thousands of lines), so it is
+# read ONCE per heartbeat and shared by every ram row.
+_SMAPS_TTL_S = 8.0
+_SMAPS_CACHE: dict = {"at": 0.0, "value": {}}
+
+
+def _parse_smaps_rss_by_path(text: str) -> dict:
+    """``{pathname: rss_bytes}`` from /proc/<pid>/smaps text — the Rss of every
+    FILE-BACKED mapping, summed per pathname (one file is typically mapped in
+    several segments with different protections).
+
+    Anonymous mappings (no pathname) and pseudo-paths (``[heap]``, ``[stack]``,
+    ``/memfd:…``) are skipped: they belong to no model file. A ``(deleted)``
+    suffix is stripped so a weight file replaced under a live mmap still groups
+    with its path. Pure function of the text so it is directly testable."""
+    out: dict = {}
+    cur = None
+    for line in text.splitlines():
+        if not line:
+            continue
+        # Mapping header: "7f..-7f.. r--p 00000000 08:01 1808   /path/to/file"
+        head = line.split(None, 5)
+        if (len(head) >= 5 and "-" in head[0]
+                and not line[0].isspace() and ":" not in head[0]):
+            path = head[5].strip() if len(head) >= 6 else ""
+            if path.endswith(" (deleted)"):
+                path = path[:-len(" (deleted)")]
+            cur = path if path.startswith("/") else None
+            continue
+        if cur is not None and line.startswith("Rss:"):
+            try:
+                out[cur] = out.get(cur, 0) + int(line.split()[1]) * 1024
+            except (IndexError, ValueError):
+                continue
+    return out
+
+
+def _smaps_rss_by_path() -> dict:
+    """``_parse_smaps_rss_by_path`` over THIS process's smaps, cached at roughly
+    heartbeat cadence. ``{}`` on any failure (non-Linux, /proc hiccup, kernel
+    without smaps) — callers then OMIT the measured field rather than guess."""
+    now = time.time()
+    if now - _SMAPS_CACHE["at"] < _SMAPS_TTL_S:
+        return _SMAPS_CACHE["value"]
+    val: dict = {}
+    try:
+        with open("/proc/self/smaps") as fh:
+            val = _parse_smaps_rss_by_path(fh.read())
+    except Exception:  # noqa: BLE001 — never break the heartbeat on /proc
+        val = {}
+    _SMAPS_CACHE.update(at=now, value=val)
+    return val
+
+
+_MODEL_DIR_CACHE: dict = {}   # model_key -> realpath str | None (misses cached)
+
+
+def _model_store_dir(model_key: str) -> "str | None":
+    """The model's local store directory (realpath), resolved exactly the way the
+    puller/loader do (``route_destination``) so the smaps join sees the same
+    files the loader mmapped. Cached per key — one resolution per model, not per
+    heartbeat. None when unresolvable."""
+    if model_key in _MODEL_DIR_CACHE:
+        return _MODEL_DIR_CACHE[model_key]
+    path = None
+    try:
+        from ..imports import route_destination
+        from ..imports.config.main import get_model_config
+        cfg = get_model_config(model_key, dict_return=True)
+        p = route_destination(cfg)
+        path = os.path.realpath(p) if p else None
+    except Exception:  # noqa: BLE001 — unresolvable: no measurement, no guess
+        path = None
+    _MODEL_DIR_CACHE[model_key] = path
+    return path
+
+
+def _resident_bytes_under_dir(rss_by_path: dict, model_dir: str) -> "int | None":
+    """Measured resident bytes of the mappings that belong to ``model_dir`` —
+    the sum of Rss over every mapped file under that directory.
+
+    ``None`` (not 0) when NOTHING under the dir is mapped: the model's weights
+    are not file-backed in this process (or smaps was unreadable), so there is no
+    measurement to report and the caller omits the field. 0 is never invented."""
+    if not model_dir or not rss_by_path:
+        return None
+    prefix = model_dir.rstrip("/") + "/"
+    total = 0
+    hit = False
+    for path, rss in rss_by_path.items():
+        if path == model_dir or path.startswith(prefix):
+            total += int(rss)
+            hit = True
+    return total if hit else None
 
 
 def _vram_split_from_pidlog(pid_log: "dict | None") -> dict:
@@ -1400,6 +1679,22 @@ def _allocations(slot_statuses: "list | None" = None) -> list:
     ``device`` is null (and device_source absent) when there is genuinely no
     basis, exactly as before.
 
+    Measured host-RAM occupancy on RAM rows (2026-07-28 operator ruling:
+    worker-side MEASUREMENTS are the truth for residency/occupancy). RAM rows
+    carried only ``model_bytes``/``weight_bytes`` — ON-DISK file sizes, which on
+    ae summed to 77 GB of "resident" models against 26 GB physically used,
+    forcing the console to widen its RAM denominator. They now also carry, OMIT-
+    WHEN-UNSET:
+      ``ram_resident_bytes`` (int) — bytes of host RAM this model occupies NOW.
+      ``ram_resident_source`` ('smaps' | 'torch') — how it was measured:
+        'smaps' = Rss of this process's mappings of the model's own files (the
+        mmap'd GGUF/safetensors actually faulted in); 'torch' = parameter+buffer
+        bytes on device 'cpu' for an introspectable torch model.
+    With no measurement BOTH keys are absent and ``model_bytes`` remains the
+    labeled upper-bound fallback — a file size is never laundered into
+    ``ram_resident_bytes``. ``model_bytes``/``weight_bytes`` keep their on-disk
+    meaning verbatim for every existing consumer.
+
     ``slot_statuses`` may be passed in to avoid a second slot round-trip when
     the heartbeat already computed it."""
     out: list = []
@@ -1539,6 +1834,44 @@ def _allocations(slot_statuses: "list | None" = None) -> list:
         }
         if ram_device_source is not None:
             ram_row["device_source"] = ram_device_source   # omit-when-unset
+        # MEASURED host-RAM occupancy (2026-07-28 ruling). model_bytes above is
+        # the model's ON-DISK size — an upper bound, never occupancy. Two real
+        # measurements, in priority order; when neither exists the keys are
+        # OMITTED entirely and model_bytes stays the labeled fallback:
+        #   'smaps' — page residency of this process's mappings of the model's
+        #             own files (mmap'd GGUF/safetensors). What is in RAM NOW.
+        #   'torch' — parameter+buffer bytes the model holds on device 'cpu',
+        #             for a torch model whose weights aren't file-backed.
+        # A file size is NEVER promoted into ram_resident_bytes. (ram_-prefixed: the
+        # storage survey already owns a DISK-meaning resident_bytes — one name
+        # must not carry two units.)
+        try:
+            _rb = None
+            _rsrc = None
+            _mdir = _model_store_dir(mk)
+            if _mdir:
+                _rb = _resident_bytes_under_dir(_smaps_rss_by_path(), _mdir)
+                if _rb is not None:
+                    _rsrc = "smaps"
+            if _rb is None:
+                _cpu = ip.get("cpu_bytes")
+                if _cpu:
+                    _rb, _rsrc = int(_cpu), "torch"
+            if _rb is not None:
+                ram_row["ram_resident_bytes"] = int(_rb)
+                ram_row["ram_resident_source"] = _rsrc
+        except Exception:  # noqa: BLE001 — never break the heartbeat
+            pass
+        # DID THE WEIGHTS EVER LOAD? `serving` above is RECENCY (touched within
+        # _SERVING_WINDOW_S) and dispatch stamps last_used before the load is
+        # attempted, so on its own it cannot distinguish a hot model from a
+        # hollow runner whose provisioning died — which is precisely how a
+        # never-loaded model rendered as "🔥 serving · resident" on 2026-07-28.
+        # OMITTED when unknown: absent must keep meaning exactly what it meant
+        # to every existing consumer, and a guess here is the bug, not the fix.
+        _mat = _is_materialized(mk)
+        if _mat is not None:
+            ram_row["materialized"] = bool(_mat)
         out.append(ram_row)
     return out
 
@@ -3861,9 +4194,7 @@ def _probe_model(model_key: str, state: "WorkerState") -> dict:
         # build loads NOTHING — the probe would read vram_used=0 / fit=False and
         # seat no slot (exactly the hollow shell that made this model unroutable).
         # Force the underlying runner resident so the probe reflects reality.
-        _ensure = getattr(runner, "ensure_loaded", None)
-        if callable(_ensure):
-            _ensure()
+        _materialize(runner)
 
         after = _free_vram_bytes()
         used = (before - after) if (before is not None and after is not None) else None
@@ -4280,9 +4611,7 @@ def _kick_provision(state: "WorkerState", model_key: str,
                             # to first use, so stopping here leaves a hollow shell at
                             # 0 VRAM/RAM that still reads "loaded". static means LIVE
                             # in the resources — force the weights resident now.
-                            _ensure = getattr(runner, "ensure_loaded", None)
-                            if callable(_ensure):
-                                _ensure()
+                            _materialize(runner)
                             logger.info("preloaded %s (resident)", mk)
                     except Exception as exc:
                         logger.warning("preload of %s failed: %s", mk, exc)
@@ -4966,9 +5295,7 @@ def _load_star_if_absent(state: "WorkerState", model_key: str) -> None:
                     logger.info("boot star: loading %s (on-demand, evictable)…",
                                 canonical)
                     runner = runner_for(model_key=canonical)
-                    _ensure = getattr(runner, "ensure_loaded", None)
-                    if callable(_ensure):
-                        _ensure()
+                    _materialize(runner)
                     logger.info("boot star: loaded %s (resident, FIFO-evictable) — "
                                 "stays cold if evicted until restart", canonical)
                 except Exception as exc:  # noqa: BLE001
@@ -6102,6 +6429,38 @@ def _worker_evictable(model_key: str) -> bool:
     return True
 
 
+def _worker_evict_skip_reason(model_key: str) -> str:
+    """WHY ``_worker_evictable`` said no (dispatch.set_evict_reason).
+
+    TELEMETRY ONLY — this decides nothing. It re-reads the same three clauses
+    the predicate above applies, in the same order, purely so a skipped
+    candidate streams to the console with the clause that protected it instead
+    of an opaque "not chosen". Existing vocabulary only: 🔒static and actively-
+    answering are the two protection classes; slot-backing is a mechanism fact
+    (the weights are in another process, so dropping the proxy frees nothing
+    here), not a third class.
+
+    Never raises — an unreadable reason degrades to the generic label rather
+    than disturbing a yield loop it has no business influencing."""
+    try:
+        if _residency(model_key) == "static":
+            return "static"
+        try:
+            if gen_gate.in_flight(model_key) > 0:
+                return "actively-replying"
+        except Exception:  # noqa: BLE001
+            return "busy-unknown"
+        try:
+            from ..managers.llama.runners.get import slot_backed_model_keys
+            if model_key in (slot_backed_model_keys() or set()):
+                return "slot-backed"
+        except Exception:  # noqa: BLE001
+            pass
+    except Exception:  # noqa: BLE001
+        return "not-evictable"
+    return "not-evictable"
+
+
 # ── targeted eviction (evict <model_key>) ───────────────────────────────────
 # Central signals `evict <model_key>` (never a raw PID — PIDs are per-box and get
 # recycled). The worker resolves the model_key to its LIVE hosting handle AT
@@ -6262,6 +6621,14 @@ def _drop_inprocess_model(model_key: str) -> bool:
     except Exception:  # noqa: BLE001
         pass
     _trim_host_ram()
+    # The materialized flag must die WITH the weights (this is the unload
+    # chokepoint every evict path funnels through). Without this, a
+    # transformers/DeepCoder entry in _MATERIALIZED — which has no live cache
+    # to interrogate, unlike GGUF's _LLAMA_INSTANCES — would keep reporting
+    # materialized=True forever after an evict: the exact stale-residency lie
+    # the flag exists to prevent. Unconditional on purpose: if nothing was
+    # found to drop, forgetting is a no-op or corrects an already-stale entry.
+    _forget_materialized(model_key)
     return dropped
 
 
@@ -6836,6 +7203,48 @@ def _reap_gpu_orphans(state: "WorkerState", dry_run: bool = True) -> dict:
 # evictions, not just disk. Surfaced on the heartbeat (see _worker_storage /
 # the beat body). A simple monotonic count + the last event, cheap and honest.
 _VRAM_EVICTIONS: dict = {"count": 0, "last": None, "last_at": 0.0}
+
+
+# ── eviction telemetry (operator directive 2026-07-28) ──────────────────────
+# The heartbeat's _VRAM_EVICTIONS above is a COUNTER — "how many, and the last
+# one" — which is the right shape for a status pill and the wrong shape for
+# watching an eviction happen. This is the companion STREAM: every stage of
+# every pass, relayed to central so the console can render it live. The counter
+# stays exactly as it is; nothing below replaces or reads it.
+#
+# Strictly observational. Every call is swallowed on failure — a worker whose
+# relay is broken must evict exactly as it does today.
+try:
+    from ..comms import evictions as _evt
+except Exception:  # noqa: BLE001
+    _evt = None
+
+
+def _evt_emit(stage: str, **fields) -> None:
+    """Best-effort eviction-telemetry emit. Inherits the ambient run_id that
+    dispatch opened for this pass (thread-local), so make-room events land in
+    the same console card as the yield loop that called us."""
+    if _evt is None:
+        return
+    try:
+        _evt.emit_eviction_event(stage, **fields)
+    except Exception:  # noqa: BLE001 — telemetry never disturbs an eviction
+        pass
+
+
+def _telemetry_tier(host_mode: "str | None") -> str:
+    """Map the worker's ``host_mode`` onto the stream's residency tier — HOW the
+    weights were held. Unknown modes pass through verbatim rather than being
+    forced into a bucket: an honest unfamiliar label beats a wrong familiar
+    one."""
+    hm = str(host_mode or "").strip().lower()
+    if hm in ("slot", "slot-child", "slot_child"):
+        return "slot-child"
+    if hm == "comfy":
+        return "comfy"
+    if hm in ("", "inprocess", "in-process", "in_process"):
+        return "in-process"
+    return hm
 
 
 def _note_vram_eviction(victim: str, subject: str, freed: "int | None",
@@ -7742,6 +8151,17 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
 
     candidates, protected = _partition_residents(state, model_key)
 
+    # TELEMETRY: stream the PROTECTED half. The console's card is only honest if
+    # it shows what was NOT touched and under which clause — "evicted 0, and
+    # here is why" is the question the doctrine actually asks. Emitted here (the
+    # real admission) rather than inside _partition_residents, which is also
+    # called by the autofit estimator where no eviction is being decided.
+    for _p in protected:
+        _evt_emit("candidate.skip", model_key=_p.get("model_key"),
+                  tier=_telemetry_tier(_p.get("host_mode")),
+                  incoming_model=model_key, reason=_p.get("why"),
+                  vram_bytes=_p.get("vram_bytes"))
+
     # ── t21 tolerance-band FLEX before evict (stage 1) ──────────────────────
     # Try to fit WITHIN bands before evicting anyone. ctx is the CHEAPEST flex,
     # so plan_flex (1) compresses the SUBJECT's own ctx toward its band floor,
@@ -7848,13 +8268,21 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
         if chk:
             break
         mk = r["model_key"]
+        _ev_tier = _telemetry_tier(r.get("host_mode"))
+        _evt_emit("evict.start", model_key=mk, tier=_ev_tier,
+                  incoming_model=model_key)
+        _ev_t0 = time.time()
         res = _evict_model(state, mk)        # the SAME verb /ops/evict uses
         if res.get("evicted"):
             fb = res.get("vram_freed")
             freed += int(fb) if fb else 0
             evicted.append(mk)
             _note_vram_eviction(mk, model_key, fb, res.get("host_mode") or "")
+            _evt_emit("evict.done", model_key=mk, tier=_ev_tier,
+                      incoming_model=model_key, freed_bytes=fb,
+                      duration_ms=int((time.time() - _ev_t0) * 1000))
             _trim_host_ram()                 # so the next _fits() sees the room
+            _evt_emit("reclaim.done", incoming_model=model_key)
         else:
             # An eviction that resolved to a no-op ("not resident here", a
             # changed slot handle, a failed unload) must not vanish from the
@@ -7866,6 +8294,10 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
                                  "reason": res.get("reason")})
             logger.warning("VRAM evict-to-fit: eviction of %s did not free it "
                            "(%s: %s)", mk, res.get("host_mode"), res.get("reason"))
+            _evt_emit("evict.fail", model_key=mk, tier=_ev_tier,
+                      incoming_model=model_key,
+                      duration_ms=int((time.time() - _ev_t0) * 1000),
+                      error=str(res.get("reason") or "eviction freed nothing"))
 
     final = _fits()
     if final:
@@ -8706,9 +9138,7 @@ def _fill_empty_slots(state: "WorkerState") -> None:
                 # filler registered a hollow in-process shell and NEVER seated a
                 # slot — both slots stayed empty and chat 404'd on the empty slot
                 # endpoint. ensure_loaded() materialises the runner = the seat.
-                _ensure = getattr(runner, "ensure_loaded", None)
-                if callable(_ensure):
-                    _ensure()
+                _materialize(runner)
             except Exception as exc:  # noqa: BLE001 — one seat must not block the rest
                 logger.warning("slot fill for %s failed: %s", mk, exc)
     finally:
@@ -8743,6 +9173,27 @@ def _vram_headroom_sweep(state: "WorkerState") -> None:
     reserve = _vram_pressure_reserve_bytes(total)
     if fv >= reserve:
         return                               # under the ceiling — nothing to do
+    # TELEMETRY: this pass has no incoming model, so it opens its OWN run scope
+    # with trigger="sweep". Opened only past the under-ceiling early return, so a
+    # quiet box emits nothing at all on its 60s beat.
+    _sweep_scope = _evt.run_scope() if _evt is not None else None
+    if _sweep_scope is not None:
+        _sweep_scope.__enter__()
+    try:
+        _evt_emit("headroom.start", trigger="sweep", incoming_model=None,
+                  free_bytes=fv, total_bytes=total, reserve_bytes=reserve)
+        _vram_headroom_sweep_body(state, total, fv)
+    finally:
+        if _sweep_scope is not None:
+            try:
+                _sweep_scope.__exit__(None, None, None)
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _vram_headroom_sweep_body(state: "WorkerState", total: int, fv: int) -> None:
+    """The sweep's decision + eviction. Split out only so the telemetry run
+    scope above can wrap it; the logic is unchanged."""
     # Over the ceiling with no load driving admission. Evict the coldest EVICTABLE
     # idle resident, applying the SAME protection rules as _vram_evict_to_fit.
     busy_slots = _busy_slot_models()
@@ -8755,16 +9206,26 @@ def _vram_headroom_sweep(state: "WorkerState") -> None:
     cands = []
     for r in residents:
         mk = r["model_key"]
+        _tier = _telemetry_tier(r.get("host_mode"))
         if str(r.get("host_mode")) == "comfy":
+            _evt_emit("candidate.skip", model_key=mk, tier=_tier,
+                      reason="comfy (own headroom path)")
             continue                         # comfy has its own path; never here
         if _residency(mk) == "static":
+            _evt_emit("candidate.skip", model_key=mk, tier=_tier,
+                      reason="static (locked residency)")
             continue
         if _actively_replying(mk, busy_slots):
+            _evt_emit("candidate.skip", model_key=mk, tier=_tier,
+                      reason="actively replying (in-flight/busy)")
             continue
         # No `queued_ahead` here — there is no subject load this pass; a resident
         # with in-flight work is already protected by _actively_replying above.
         cands.append(r)
     if not cands:
+        _evt_emit("headroom.done", trigger="sweep", evicted=[],
+                  outcome="proceeded-unfit",
+                  note="over the ceiling but every resident is protected")
         logger.warning("VRAM headroom: card at/over the %.0f%% ceiling (%s free of "
                        "%s) but nothing evictable — every resident is static or "
                        "actively replying; leaving it (autofit/degrade)",
@@ -8778,11 +9239,27 @@ def _vram_headroom_sweep(state: "WorkerState") -> None:
                 "load driving admission — evicting coldest idle resident %s "
                 "(operator addendum: no human is the eviction policy)",
                 _vram_ceiling_frac() * 100, _human_bytes(fv), victim)
+    _v_tier = _telemetry_tier(cands[0].get("host_mode"))
+    _evt_emit("evict.start", model_key=victim, tier=_v_tier, trigger="sweep")
+    _v_t0 = time.time()
     res = _evict_model(state, victim)
     if res.get("evicted"):
         _note_vram_eviction(victim, "headroom-sweep", res.get("vram_freed"),
                             res.get("host_mode") or "")
+        _evt_emit("evict.done", model_key=victim,
+                  tier=_telemetry_tier(res.get("host_mode") or _v_tier),
+                  freed_bytes=res.get("vram_freed"),
+                  duration_ms=int((time.time() - _v_t0) * 1000))
         _trim_host_ram()
+        _evt_emit("reclaim.done")
+        _evt_emit("headroom.done", trigger="sweep", evicted=[victim],
+                  outcome="fit")
+    else:
+        _evt_emit("evict.fail", model_key=victim, tier=_v_tier,
+                  duration_ms=int((time.time() - _v_t0) * 1000),
+                  error=str(res.get("reason") or "eviction freed nothing"))
+        _evt_emit("headroom.done", trigger="sweep", evicted=[],
+                  outcome="proceeded-unfit")
 
 
 def _residency_sweep_loop(state: "WorkerState") -> None:
@@ -9600,10 +10077,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         from ..managers.dispatch.dispatch import (set_fit_check, set_evictable,
                                                   set_post_evict_hook,
-                                                  set_make_room)
+                                                  set_make_room, set_evict_reason)
         set_fit_check(_worker_fit_check)
         set_evictable(_worker_evictable)
         set_post_evict_hook(_trim_host_ram)
+        # Telemetry only: LABELS a skip _worker_evictable already decided, so the
+        # console can show which clause protected each resident. Decides nothing.
+        set_evict_reason(_worker_evict_skip_reason)
         # CROSS-TIER VRAM make-room (slice 10): the in-process LRU yield is blind
         # to a slot-child squatter — this hook sees ALL residents (pid-registry
         # measured) and evicts the minimum permissible set through the /ops/evict
@@ -9658,6 +10138,24 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("initial registration failed: %s", exc)
         # Keep going — the heartbeat loop will retry, and the server can still
         # serve a worker the operator registers manually.
+
+    # Eviction telemetry relay (operator directive 2026-07-28). Installed AFTER
+    # registration so events carry the id central knows this box by rather than
+    # the hostname fallback. Buffered + batched on its own daemon thread: an
+    # eviction only appends to a bounded ring, so a central that is down or slow
+    # costs this worker nothing but stale events (drop-oldest, never re-queue,
+    # never block). Install failure is logged and ignored — losing the console's
+    # live view must not cost the fleet a worker.
+    try:
+        if _evt is not None:
+            _evt.set_worker_id(state.worker_id)
+            _evt.install_relay(lambda batch: client.evictions_ingest(batch))
+            logger.info("eviction telemetry relay installed (worker_id=%s -> %s)",
+                        state.worker_id, args.central)
+    except Exception as _exc:  # noqa: BLE001
+        logger.warning("eviction telemetry relay not installed: %s — evictions "
+                       "still log to the journal, the console just won't stream "
+                       "this worker", _exc)
 
     hb = threading.Thread(target=_heartbeat_loop, args=(client, state, args), daemon=True)
     hb.start()

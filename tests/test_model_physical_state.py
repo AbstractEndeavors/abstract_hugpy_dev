@@ -1261,17 +1261,22 @@ def _drive_download(monkeypatch, dest_root, exitcode, max_attempts=1):
     real subprocess, network or store walk."""
     dest = Path(dest_root) / "dest"
     dest.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setattr(cd, "route_destination", lambda **_k: str(dest))
-    monkeypatch.setattr(cd, "_estimate_total_bytes_bounded", lambda _m: None)
-    monkeypatch.setattr(cd, "_watch", lambda *_a, **_k: False)
-    monkeypatch.setattr(cd, "_read_error", lambda _j: "synthetic failure")
-    monkeypatch.setattr(cd, "record_downloaded_model", lambda *a, **k: None)
-    monkeypatch.setattr(cd, "refresh_registry", lambda *a, **k: None)
-    monkeypatch.setattr(cd, "MAX_ATTEMPTS", max_attempts)
-    monkeypatch.setattr(cd.mp, "get_context", lambda _n: _FakeCtx(exitcode))
+    # The transfer lifecycle lives in downloader/engine.py now (it runs in the
+    # hugpy-downloader daemon, not in gunicorn); cancelable_downloads only
+    # re-exports it. Patch it where it is DEFINED — a patch on the re-export
+    # would not be seen by the engine's own globals.
+    eng = cd.engine
+    monkeypatch.setattr(eng, "route_destination", lambda **_k: str(dest))
+    monkeypatch.setattr(eng, "_estimate_total_bytes_bounded", lambda _m: None)
+    monkeypatch.setattr(eng, "_watch", lambda *_a, **_k: False)
+    monkeypatch.setattr(eng, "_read_error", lambda _j: "synthetic failure")
+    monkeypatch.setattr(eng, "record_downloaded_model", lambda *a, **k: None)
+    monkeypatch.setattr(eng, "refresh_registry", lambda *a, **k: None)
+    monkeypatch.setattr(eng, "MAX_ATTEMPTS", max_attempts)
+    monkeypatch.setattr(eng.mp, "get_context", lambda _n: _FakeCtx(exitcode))
 
     job = cd.job_store.create("repo-0", kind="download", transport="test")
-    cd.start_cancellable_download(job, _model("repo-0"))
+    eng.start_cancellable_download(job, _model("repo-0"))
     deadline = time.time() + 30
     while time.time() < deadline:
         cur = cd.job_store.get(job.id)

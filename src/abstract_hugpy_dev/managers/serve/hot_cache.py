@@ -68,6 +68,27 @@ from . import chunksum_verify as _cv
 
 logger = logging.getLogger(__name__)
 
+# Eviction telemetry (operator directive 2026-07-28). The hot tier is DISK
+# eviction, and it belongs on the same live stream as VRAM eviction — "the
+# entire process" includes the drive copy going away. Stdlib-only and
+# best-effort: an unavailable emitter leaves this module byte-identical.
+try:
+    from ...comms import evictions as _evt
+except Exception:  # noqa: BLE001
+    _evt = None
+
+
+def _evt_emit(stage: str, **fields) -> None:
+    """Best-effort eviction-telemetry emit. Never raises — the promoter thread
+    must not die, and a promotion must not change outcome, over a telemetry
+    fault."""
+    if _evt is None:
+        return
+    try:
+        _evt.emit_eviction_event(stage, **fields)
+    except Exception:  # noqa: BLE001
+        pass
+
 
 def _verify_staged(src: str, staged: str) -> tuple[str, str]:
     """Content-verify a staged .part against its shared-store source's sidecar.
@@ -568,59 +589,125 @@ def _make_room(need: int, keep_key: str) -> bool:
     with _INDEX_LOCK:
         if fits():
             return True
-        candidates = [(k, v) for k, v in _INDEX["entries"].items() if k != keep_key]
-        # ── THE SHARED EVICT ORDER (spec assets/evictionflow.html, box 2) ────
-        # The hot tier is the THIRD site that must agree with central's preview
-        # and the worker's auto-evict, so it imports the same key rather than
-        # spelling its own. Its old key was bare ``last_called`` ascending; the
-        # shared key's ②/③/④ (idle longest, fewest calls, stable model_key) is a
-        # strict refinement of that — same primary order, with real tiebreaks
-        # where it previously relied on dict insertion order.
-        #
-        # Device = the hot DRIVE: as on the storage path, key ① ("pref ==
-        # other device first") names VRAM or RAM, neither of which is a disk,
-        # so it is a constant here and the order is honest ②/③/④.
-        #
-        # WALK ONLY — no drop pass. This loop evicts INCREMENTALLY and re-tests
-        # ``fits()`` after each real delete (free bytes move for reasons this
-        # index does not model), so a precomputed victim set would be a lie.
-        # The ORDER is what has to be shared; the stopping rule is this site's.
-        from .. import eviction as _ev
-        # Anti-thrash: the hot tier's OWN residency window, which is the exact
-        # shape enacted proposal 2 reuses in ``eviction._partition`` — kept here
-        # (rather than delegated) because this window is keyed on last_called,
-        # not on a load time this index does not record.
-        eligible = [(k, v) for (k, v) in candidates
-                    if (now - float(v.get("last_called", 0) or 0)) >= residency]
-        fresh = len(candidates) - len(eligible)
-        eligible.sort(key=lambda kv: _ev.sort_key(
-            _ev.Resident(model_key=kv[0],
-                         bytes=int(kv[1].get("bytes") or 0) or None,
-                         last_call=float(kv[1].get("last_called", 0) or 0),
-                         calls=int(kv[1].get("calls") or 0)),
-            "disk", now))
-        for k, v in eligible:
-            idle = now - float(v.get("last_called", 0) or 0)
-            freed = _evict_locked(k)
-            logger.info("hot_cache: evicted %s (%.1f GiB, idle %.0f min) to make "
-                        "room for %s", k, freed / GiB, idle / 60.0, keep_key)
-            if fits():
-                _save_index_locked()
-                return True
-        _save_index_locked()
-        if not fits():
-            if fresh:
-                logger.info("hot_cache: SKIP promote %s — need %.1f GiB but only "
-                            "%.1f GiB freeable; %d recent entr%s within the "
-                            "%.0f-min residency window are protected (anti-thrash)",
-                            keep_key, need / GiB, _free_bytes() / GiB, fresh,
-                            "y" if fresh == 1 else "ies", residency / 60.0)
-            else:
-                logger.info("hot_cache: SKIP promote %s — need %.1f GiB, does not "
-                            "fit even after evicting all evictable entries",
-                            keep_key, need / GiB)
-            return False
-        return True
+        # ── eviction telemetry (operator directive 2026-07-28) ──────────────
+        # DISK eviction is part of "the entire process": an operator watching a
+        # model go cold wants to see the hot-NVMe copy reaped, not just the VRAM
+        # seat. Same stream, tagged tier="hot_cache", its own run scope (this
+        # pass has no VRAM headroom pass to belong to unless one is already open
+        # on this thread, in which case run_scope nests under it). Opened only
+        # past the fits() early return, so a cache with room emits nothing.
+        _tel_scope = _evt.run_scope() if _evt is not None else None
+        if _tel_scope is not None:
+            _tel_scope.__enter__()
+        try:
+            return _make_room_locked(need, keep_key, budget, residency, now, fits)
+        finally:
+            if _tel_scope is not None:
+                try:
+                    _tel_scope.__exit__(None, None, None)
+                except Exception:  # noqa: BLE001
+                    pass
+
+
+def _make_room_locked(need: int, keep_key: str, budget: int, residency: float,
+                      now: float, fits) -> bool:
+    """The eviction walk itself — called with ``_INDEX_LOCK`` already held.
+
+    Split out of ``_make_room`` only so the telemetry run scope can wrap it
+    without re-indenting the walk. Behavior is unchanged."""
+    _evt_emit("headroom.start", trigger="hot_cache",
+              incoming_model=keep_key, tier="hot_cache",
+              need_bytes=int(need), budget_bytes=int(budget))
+    _evt_emit("fit.fail", incoming_model=keep_key, tier="hot_cache",
+              need_bytes=int(need), free_bytes=int(_free_bytes()),
+              used_bytes=int(_index_used_bytes()))
+    _tel_evicted: list = []
+    candidates = [(k, v) for k, v in _INDEX["entries"].items() if k != keep_key]
+    # ── THE SHARED EVICT ORDER (spec assets/evictionflow.html, box 2) ────
+    # The hot tier is the THIRD site that must agree with central's preview
+    # and the worker's auto-evict, so it imports the same key rather than
+    # spelling its own. Its old key was bare ``last_called`` ascending; the
+    # shared key's ②/③/④ (idle longest, fewest calls, stable model_key) is a
+    # strict refinement of that — same primary order, with real tiebreaks
+    # where it previously relied on dict insertion order.
+    #
+    # Device = the hot DRIVE: as on the storage path, key ① ("pref ==
+    # other device first") names VRAM or RAM, neither of which is a disk,
+    # so it is a constant here and the order is honest ②/③/④.
+    #
+    # WALK ONLY — no drop pass. This loop evicts INCREMENTALLY and re-tests
+    # ``fits()`` after each real delete (free bytes move for reasons this
+    # index does not model), so a precomputed victim set would be a lie.
+    # The ORDER is what has to be shared; the stopping rule is this site's.
+    from .. import eviction as _ev
+    # Anti-thrash: the hot tier's OWN residency window, which is the exact
+    # shape enacted proposal 2 reuses in ``eviction._partition`` — kept here
+    # (rather than delegated) because this window is keyed on last_called,
+    # not on a load time this index does not record.
+    eligible = [(k, v) for (k, v) in candidates
+                if (now - float(v.get("last_called", 0) or 0)) >= residency]
+    fresh = len(candidates) - len(eligible)
+    # The anti-thrash window is this tier's protection clause; a skipped entry
+    # streams with it so the console can show WHY the drive did not shed.
+    _eligible_keys = {k for (k, _v) in eligible}
+    for _k, _v in candidates:
+        if _k in _eligible_keys:
+            continue
+        _evt_emit("candidate.skip", model_key=_k, tier="hot_cache",
+                  incoming_model=keep_key,
+                  reason="within min-residency window (anti-thrash)",
+                  idle_s=int(now - float(_v.get("last_called", 0) or 0)),
+                  bytes=int(_v.get("bytes") or 0))
+    eligible.sort(key=lambda kv: _ev.sort_key(
+        _ev.Resident(model_key=kv[0],
+                     bytes=int(kv[1].get("bytes") or 0) or None,
+                     last_call=float(kv[1].get("last_called", 0) or 0),
+                     calls=int(kv[1].get("calls") or 0)),
+        "disk", now))
+    for k, v in eligible:
+        idle = now - float(v.get("last_called", 0) or 0)
+        _evt_emit("evict.start", model_key=k, tier="hot_cache",
+                  incoming_model=keep_key, idle_s=int(idle))
+        _t0 = time.time()
+        freed = _evict_locked(k)
+        logger.info("hot_cache: evicted %s (%.1f GiB, idle %.0f min) to make "
+                    "room for %s", k, freed / GiB, idle / 60.0, keep_key)
+        _tel_evicted.append(k)
+        _evt_emit("evict.done", model_key=k, tier="hot_cache",
+                  incoming_model=keep_key, freed_bytes=int(freed),
+                  idle_s=int(idle),
+                  duration_ms=int((time.time() - _t0) * 1000))
+        if fits():
+            _save_index_locked()
+            _evt_emit("headroom.done", incoming_model=keep_key,
+                      tier="hot_cache", evicted=list(_tel_evicted),
+                      outcome="fit")
+            return True
+    _save_index_locked()
+    if not fits():
+        # SKIP promote is a REFUSAL of the hot copy, not of the load — the model
+        # still serves from the shared array. The stream says "refused" about the
+        # promotion so the console does not read it as a failed request.
+        _evt_emit("headroom.done", incoming_model=keep_key, tier="hot_cache",
+                  evicted=list(_tel_evicted), outcome="refused",
+                  reason=("recent entries protected by the anti-thrash window"
+                          if fresh else
+                          "does not fit even after evicting every eligible entry"),
+                  note="promotion skipped; the model serves from the shared store")
+        if fresh:
+            logger.info("hot_cache: SKIP promote %s — need %.1f GiB but only "
+                        "%.1f GiB freeable; %d recent entr%s within the "
+                        "%.0f-min residency window are protected (anti-thrash)",
+                        keep_key, need / GiB, _free_bytes() / GiB, fresh,
+                        "y" if fresh == 1 else "ies", residency / 60.0)
+        else:
+            logger.info("hot_cache: SKIP promote %s — need %.1f GiB, does not "
+                        "fit even after evicting all evictable entries",
+                        keep_key, need / GiB)
+        return False
+    _evt_emit("headroom.done", incoming_model=keep_key, tier="hot_cache",
+              evicted=list(_tel_evicted), outcome="fit")
+    return True
 
 
 # --------------------------------------------------------------------------- #

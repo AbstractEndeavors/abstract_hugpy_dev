@@ -122,6 +122,26 @@ def _stall_seconds() -> float:
         return 90.0
 
 
+def _stalled_expiry_seconds() -> float:
+    """The forward-progress silence after which a WEDGED ACTIVE job is RETIRED,
+    not merely labelled stalled. Env-overridable
+    (``HUGPY_JOB_STALLED_EXPIRY_SECONDS``); default 900s.
+
+    Deliberately an order of magnitude above ``_stall_seconds`` (90s): saying a
+    row LOOKS stalled is cheap and reversible, ending someone's call is not. 900
+    also lines up with the cold-hold hard ceiling — past that, central has
+    already given up on the request, so a job row still claiming to be working
+    is describing nothing that is running."""
+    raw = (os.environ.get("HUGPY_JOB_STALLED_EXPIRY_SECONDS") or "").strip()
+    if not raw:
+        return 900.0
+    try:
+        v = float(raw)
+        return v if v > 0 else 900.0
+    except ValueError:
+        return 900.0
+
+
 def _compute_stalled(status: Any, progressed_at: Any, now: float) -> bool:
     """True when *status* is active/running AND *progressed_at* (epoch seconds) is
     older than the stall threshold. Fail-open: a missing/garbage progressed_at is
@@ -194,6 +214,13 @@ class Job:
     # bridge (video_intel.placement); None for every non-media job, and omitted
     # from to_dict() when None so no chat/download row's wire shape changes.
     placement: Optional[dict] = None
+    # WHAT a queued job needs in order to RUN, for a job that will be executed by
+    # a DIFFERENT process than the one that created it (the download daemon).
+    # `_model` below is runtime-only, so a job handed across the process boundary
+    # through the mirror would arrive with no idea what to download; `payload`
+    # is the serialized half — e.g. {"model": {...}, "total_bytes": N}. Omitted
+    # from to_dict() when None, so no existing row's wire shape changes.
+    payload: Optional[dict] = None
     # Live-stream telemetry (was activity.py).
     tokens: int = 0
     started_ts: float = field(default_factory=time.time)
@@ -280,17 +307,31 @@ class Job:
         # row's shape is byte-identical to before this field existed.
         if self.placement is not None:
             d["placement"] = self.placement
+        if self.payload is not None:
+            d["payload"] = self.payload
         return d
 
     def to_legacy_dict(self) -> dict[str, Any]:
         """The pre-comms /jobs wire shape: legacy status names, error as a
         plain string. The download UI (ModelTable) reads exactly this; new
         surfaces should read to_dict() and canonical states instead."""
-        d = self.to_dict()
-        d["status"] = LEGACY_FOR_CANONICAL.get(d["status"], d["status"])
-        if isinstance(d.get("error"), dict):
-            d["error"] = d["error"].get("message") or d["error"].get("code")
-        return d
+        return to_legacy(self.to_dict())
+
+
+def to_legacy(d: dict[str, Any]) -> dict[str, Any]:
+    """Job.to_dict() shape -> the legacy /jobs wire shape (queued/running/
+    completed, error as a plain string).
+
+    Module-level, not just a Job method, because rows that arrive from the
+    cross-process MIRROR are plain dicts — the process serving GET /jobs does
+    not hold a Job object for a download another process owns. Same output as
+    Job.to_legacy_dict(), which now routes through here so the two can never
+    drift."""
+    d = dict(d or {})
+    d["status"] = LEGACY_FOR_CANONICAL.get(d.get("status"), d.get("status"))
+    if isinstance(d.get("error"), dict):
+        d["error"] = d["error"].get("message") or d["error"].get("code")
+    return d
 
 
 def _default_mirror() -> Optional[SqliteMirror]:
@@ -353,6 +394,72 @@ class JobStore:
         self._maybe_prune_mirror()
         self._ensure_watcher()
         return job
+
+    # -- cross-process work queue -------------------------------------------
+    #
+    # ENQUEUE / CLAIM: a job whose work runs in ANOTHER process (the download
+    # daemon). The creating process must NOT keep an authoritative local record
+    # — snapshot() deliberately prefers a local row over the mirror row of the
+    # same id ("the in-memory record is the truth for them"), so a leftover
+    # `pending` row in the API would permanently MASK the daemon's live progress.
+    # enqueue() therefore mirrors the job and then drops the local copy: from
+    # that instant the mirror row is the only truth, and every reader (including
+    # the enqueuer) sees the owner's state.
+
+    def enqueue(self, model_key: str = "", *, kind: str = "download",
+                **meta: Any) -> Job:
+        """Create a job for ANOTHER process to run, and disown it locally.
+
+        Returns the Job as created (so the caller can serialize the accepted
+        response); the store does not retain it — read it back via snapshot()/
+        get_dict(), which merge the mirror."""
+        job = self.create(model_key, kind=kind, **meta)
+        self.detach(job.id)
+        return job
+
+    def detach(self, job_id: str) -> None:
+        """Forget a job LOCALLY without touching the mirror row. Used to disown
+        an enqueued job (see enqueue) — never to retire one."""
+        with self._lock:
+            self._jobs.pop(job_id, None)
+
+    def claim_next(self, kinds: set | tuple, owner: str) -> Optional[dict]:
+        """Atomically take the oldest queued job of *kinds* for *owner*, through
+        the mirror's compare-and-set. Returns its dict snapshot, or None when
+        there is nothing waiting (or no mirror — with no mirror there is no
+        cross-process queue at all)."""
+        if self.mirror is None:
+            return None
+        try:
+            return self.mirror.claim_next(tuple(kinds), owner)
+        except Exception:
+            return None
+
+    def adopt_stale(self, kinds: set | tuple, owner: str,
+                    message: str = "") -> list[str]:
+        """Re-queue work a DEAD owner left mid-flight (daemon fail-over)."""
+        if self.mirror is None:
+            return []
+        try:
+            return self.mirror.adopt_stale(tuple(kinds), owner, message)
+        except Exception:
+            return []
+
+    def requeue(self, job_id: str, message: str = "",
+                kinds: set | tuple = ()) -> bool:
+        """Put a job back on the claim queue (the cross-process retry). Clears
+        any local record too, so the requeuing process cannot mask the mirror
+        row it just reset."""
+        if self.mirror is None:
+            return False
+        try:
+            ok = self.mirror.requeue(job_id, message=message,
+                                     kinds=tuple(kinds))
+        except Exception:
+            return False
+        if ok:
+            self.detach(job_id)
+        return ok
 
     # -- mutation ----------------------------------------------------------
     def update(self, job_id: str, **changes: Any) -> Optional[Job]:
@@ -630,8 +737,29 @@ class JobStore:
         with self._lock:
             return list(self._jobs.values())
 
+    def get_dict(self, job_id: str) -> Optional[dict]:
+        """One job's dict snapshot, MIRROR-MERGED: the local record if we hold
+        it, else the sibling-owned mirror row (live OR terminal). get() can only
+        ever answer for jobs this process owns — a route serving GET /jobs/<id>
+        for a download the daemon owns must use this."""
+        job = self.get(job_id)
+        if job is not None:
+            return job.to_dict()
+        if self.mirror is None:
+            return None
+        try:
+            d = self.mirror.row(job_id)
+        except Exception:
+            return None
+        if d:
+            now = time.time()
+            d["stalled"] = bool(d.get("stalled")) or _compute_stalled(
+                d.get("status"), d.get("progressed_at"), now)
+        return d
+
     def snapshot(self, *, kinds: Optional[set[str]] = None,
-                 live_only: bool = True) -> list[dict]:
+                 live_only: bool = True,
+                 terminal_kinds: Optional[tuple] = None) -> list[dict]:
         """JSON-safe view for queue UIs. Waiting first, then longest-running —
         the exact ordering the console's activity view has always shown.
         With a mirror, live jobs owned by sibling processes are merged in
@@ -667,9 +795,15 @@ class JobStore:
             # finished media job on the full (live_only=False) view — and ONLY
             # for MEDIA_KINDS, so chat/download terminal behavior is unchanged.
             if not live_only:
+                # Which kinds' terminal rows cross the process boundary. Default
+                # MEDIA_KINDS (unchanged). The download manager passes
+                # ("download",) because completion now happens in the DAEMON:
+                # without this the console would watch a download climb to 99%
+                # and then have the row vanish at the finish line.
+                tk = MEDIA_KINDS if terminal_kinds is None else tuple(terminal_kinds)
                 try:
                     seen = {d.get("id") for d in out}   # local + live-merged ids
-                    for d in self.mirror.terminal_rows(MEDIA_KINDS):
+                    for d in self.mirror.terminal_rows(tk):
                         if d.get("id") in seen:
                             continue
                         if kinds is not None and d.get("kind") not in kinds:
@@ -695,16 +829,38 @@ class JobStore:
         Expires LOCAL pending rows with no worker and stale progressed_at, and —
         via the mirror — mirror-only rows (the immortal cross-process case). Ages
         on progressed_at, never `updated` (no view-driven resurrection). Returns
-        the ids retired this pass. Best-effort: never raises into a view."""
+        the ids retired this pass.
+
+        ALSO expires WEDGED ACTIVE jobs — the 2026-07-28 defect. A chat job sat
+        ``status=processing stage=provision`` for 45+ minutes with elapsed frozen
+        at 0.1 and "downloading … (?/?)", and nothing retired it: this sweep
+        only ever looked at rows that were BOTH ``pending`` AND worker-less, and
+        that job was neither. It rendered as stalled (``_compute_stalled`` was
+        telling the truth the whole time) and stayed forever, because being
+        honestly labelled stalled and being RETIRED were two different things
+        with only the first implemented. The operator ended it by hand.
+
+        The guard against retiring healthy work is ``progressed_at`` itself: it
+        advances only on real movement (a status transition, a numeric progress
+        ADVANCE, a stage change, a token — never a log line, never a plain field
+        write), so a long download that is actually downloading keeps resetting
+        this clock and is never touched. The threshold is deliberately far above
+        the display-stall clock: 90s makes a row SAY stalled, expiry ENDS a call,
+        and those two decisions should not share a number.
+
+        Best-effort: never raises into a view."""
         from .shared import _pending_expiry_seconds
         expired: list[str] = []
         try:
             cutoff = time.time() - _pending_expiry_seconds()
+            wedge_cutoff = time.time() - _stalled_expiry_seconds()
             msg = ("never dispatched — model unresolvable or no capable worker "
                    "(auto-expired)")
+            wedged: list[tuple] = []
             with self._lock:
                 for jid, job in list(self._jobs.items()):
-                    if (normalize_status(job.status) == "pending"
+                    status = normalize_status(job.status)
+                    if (status == "pending"
                             and not job.worker
                             and float(job.progressed_at or 0) < cutoff):
                         job.status = "expired"
@@ -713,12 +869,38 @@ class JobStore:
                             job.ended_ts = time.time()
                         job.updated_at = _utcnow_iso()
                         expired.append(jid)
-                        job._pending_prior = "pending"
+                        continue
+                    # WEDGED ACTIVE: dispatched (or not) but demonstrably not
+                    # moving. Named honestly — the stage it died in and how long
+                    # it sat there, so the row explains itself in the queue view.
+                    if (status in _STALL_ACTIVE
+                            and float(job.progressed_at or 0) < wedge_cutoff):
+                        idle = int(time.time() - float(job.progressed_at or 0))
+                        where = f" in stage {job.stage!r}" if job.stage else ""
+                        job.status = "expired"
+                        job.message = (
+                            f"no forward progress{where} for {idle}s — the job "
+                            f"wedged and was auto-expired (last message: "
+                            f"{(job.message or 'none')[:160]})")
+                        if job.ended_ts is None:
+                            job.ended_ts = time.time()
+                        job.updated_at = _utcnow_iso()
+                        wedged.append((jid, status))
             for jid in expired:
                 job = self._jobs.get(jid)
                 if job is not None:
                     self._emit(job, "pending")
                     self._mirror_upsert(job)
+            for jid, prior in wedged:
+                job = self._jobs.get(jid)
+                if job is not None:
+                    self._emit(job, prior)
+                    self._mirror_upsert(job)
+                    # Inside the guard on purpose: a jid whose job vanished
+                    # between the locked pass and here got no emit and no mirror
+                    # write, and reporting it as expired would claim work that
+                    # never happened.
+                    expired.append(jid)
         except Exception:
             pass
         # Mirror-only pending rows (a row no process holds in memory — the exact

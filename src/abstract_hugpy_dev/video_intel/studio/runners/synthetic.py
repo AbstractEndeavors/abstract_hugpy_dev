@@ -15,11 +15,20 @@ Invariants honored:
   * Determinism  — same manifest ⇒ identical frame bytes (``synthesize_frame`` is
                    a pure function of seed + geometry + frame index).
 
-Clip length is a function of the MANIFEST only (``fps * 2`` seconds, capped by the
-bound model's ``max_frames``) so identical manifests yield identical-length clips
-— a request's ``min_frames`` is honored upstream by the ROUTER (it rejects models
-whose ``max_frames`` is below the floor), never by silently lengthening the clip
-here, which would divorce clip length from the content hash (INV-6).
+Clip length is a function of the MANIFEST only — ``manifest.requested_frames`` when
+the caller asked for a length, else the bound model's default, clamped to that
+model's real ceiling (``resolve_frames`` below) — so identical manifests still yield
+identical-length clips, and the requested length is part of the content hash (INV-6)
+rather than divorced from it. A request's ``min_frames`` is still honored upstream by
+the ROUTER (it rejects models whose ``max_frames`` is below the floor), never by
+silently lengthening the clip here.
+
+That length REQUEST now has a real path to get here (2026-07-27):
+``StudioI2VSpec.requested_frames`` -> ``produce_clip(requested_frames=)`` ->
+``make_render_manifest(requested_frames=)`` -> ``RenderManifest.requested_frames``
+-> ``resolve_frames``. Before that the field existed and was hashed but no caller
+could set it, so every real render on this fleet was forced to the default — the
+lever the docstrings advertised did not exist.
 
 No pathlib anywhere. os.path only.
 """
@@ -27,6 +36,7 @@ No pathlib anywhere. os.path only.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import shutil
@@ -39,12 +49,27 @@ import numpy as np
 from PIL import Image
 
 from ..artifacts import Artifact
-from ..enums import Task
+from ..enums import Framework, Task
 from ..errors import Err, ErrorCode, Ok, Result, StageError
 from ..manifest import render_manifest_to_dict
 from ..registry import MODEL_REGISTRY
-from ..schemas import ProvenanceStub, RenderManifest
+# CLIP-LENGTH POLICY comes from ``schemas`` (the leaf module), NOT from a literal
+# here — the wire (``studio/presets.py`` -> GET /video/render/presets) must publish
+# the SAME numbers this runner renders at, and it cannot import this module without
+# dragging numpy/PIL into app boot. See the long WHY on schemas' clip-length section.
+# Re-exported by this import (``runners.synthetic.DEFAULT_FRAMES_REAL`` resolves) so
+# either import site works and there is still exactly one literal.
+from ..schemas import (
+    DEFAULT_FRAMES_REAL,
+    ProvenanceStub,
+    RenderManifest,
+    WAN_FRAME_CADENCE,
+    WAN_MAX_FRAMES,
+    snap_wan_frames,
+)
 from ..storage import atomic_write_text
+
+logger = logging.getLogger(__name__)
 
 # Serialize ONLY the mp4 assembly subprocess (house convention, mirrors
 # scene.py's _SCENE_SEM). Frame synthesis is pure-python/numpy and not gated.
@@ -147,15 +172,133 @@ def synthesize_frame(
 # --------------------------------------------------------------------------- #
 # Manifest-derived geometry (clip length is a pure function of the manifest)
 # --------------------------------------------------------------------------- #
-def _geometry(manifest: RenderManifest) -> tuple[int, int, int, int]:
-    """(width, height, fps, n_frames) from the top ladder rung + bound model cap."""
+# ``WAN_FRAME_CADENCE`` (4), ``WAN_MAX_FRAMES`` (81), ``DEFAULT_FRAMES_REAL`` (81)
+# and ``snap_wan_frames`` are IMPORTED from ``..schemas`` (see the import block).
+# They used to be private literals here, which is how the wire and the renderer
+# drifted 2.8x apart: ``GET /video/render/presets`` published 29 frames while this
+# module rendered 81. One literal, two importers, no drift — do NOT restate them.
+#
+# THE DEFAULT IS 81 FRAMES for a real model: Wan's own reference length, the
+# ``max_frames`` every Wan row declares, and MEASURED at ~352s wall-clock for
+# wan2.1-t2v-1.3b @ 832x480 x 81 frames on ae's 3090 (2026-07-27). 81 @ 16fps =
+# 5.0625s. A caller who wants a cheap preview asks for fewer via
+# ``manifest.requested_frames`` — which, since 2026-07-27, they can actually do.
+#
+# The 4k+1 snap happens HERE (``resolve_frames``) and ``wan_i2v._wan_geometry``
+# snaps AGAIN on top of it. That is idempotent by construction (snapping an
+# already-4k+1 value is a no-op), which is the property that keeps the resume check
+# and the generate call agreeing on one exact frame count.
+
+# DEFAULT clip length for the SYNTHETIC prover: the historical ``fps * 2`` (~2s).
+#
+# ⚠ DELIBERATELY DIFFERENT FROM ``DEFAULT_FRAMES_REAL``, and that divergence is the
+# one place two clip-length numbers are allowed to coexist. The reason they differ is
+# that they are not the same KIND of number:
+#   * 81 is a PRODUCT PROMISE. It costs ~352s of a 3090 and it is what a caller who
+#     asked for a clip actually wants, so the wire publishes it and the renderer
+#     honours it.
+#   * fps*2 is a TEST COST. The synthetic runner is a SPINE PROVER — no GPU, no
+#     weights, one pure-numpy frame + one PNG write per frame — so its output is
+#     noise that proves the plumbing, never a product surface. 81 frames of plasma is
+#     ~3.4x the PNG encoding of a 24-frame prover clip and proves nothing the 2s clip
+#     does not, and keeping the historical multiplier leaves every synthetic clip
+#     already on disk the length it has always been.
+# Because the prover is not a product surface, this number is NOT published on the
+# wire (no preset binds a synthetic model unless STUDIO_ALLOW_SYNTHETIC=1), so there
+# is nothing here for the wire to disagree with. It stays module-private for exactly
+# that reason: nothing outside this runner has any business reading it.
+_DEFAULT_SYNTHETIC_FPS_MULT = 2
+
+
+def resolve_frames(manifest: RenderManifest) -> tuple[int, str]:
+    """The clip's frame count PLUS the one-line REASON it ended up there.
+
+    THE one place clip length is decided (``_geometry`` below and, through it,
+    ``wan_i2v._wan_geometry`` / the VACE runner all land here). Resolution order:
+
+      1. ``manifest.requested_frames`` when set, else the model-aware default
+         (``DEFAULT_FRAMES_REAL`` for a real model, ``fps * 2`` for the prover);
+      2. the ``max(1, n)`` floor (unchanged behaviour);
+      3. CLAMP to the model's real ceiling — ``cfg.max_frames`` from MODEL_REGISTRY,
+         and additionally ``WAN_MAX_FRAMES`` for a Wan binding;
+      4. SNAP down to the 4k+1 temporal cadence for a real pipeline.
+
+    An out-of-range request CLAMPS and records why — it is NEVER an error. That is
+    INV-3 in spirit: a caller asking a 3-second model for 500 frames wants a clip,
+    not a 500, so they get the 81 the model can actually deliver and a reason string
+    saying so. The reason is logged at INFO whenever the resolved count differs from
+    what was asked for, so a short clip is always traceable to a decision.
+
+    NOTE the ceiling is frames-only: ``cfg.max_duration_s`` is DELIBERATELY not a
+    clamp input. The Wan rows declare 5.0s while their measured-good 81 frames run
+    5.0625s @ 16fps — clamping on the rounded planning figure would give 5.0*16 = 80
+    frames, snapped to 77, cutting the MEASURED default for no physical reason. This
+    is the seconds-vs-frames trap in miniature: 4k+1 is odd, so no on-cadence count
+    lands on a whole second at an even fps, and a seconds-shaped ceiling can only ever
+    round the real one DOWN.
+
+    RETURNS the count the runner will actually render, which is also what the caller
+    is told: ``Artifact.duration_s`` is computed from THIS number (resolved / fps),
+    never from the request — a clamped or snapped ask reports its TRUE duration."""
     top = manifest.resolution_ladder[0]
-    fps = top.fps
-    n = fps * 2                               # a short ~2s clip
     cfg = MODEL_REGISTRY.get(manifest.model_id)
-    if cfg is not None and cfg.max_frames:
-        n = min(n, cfg.max_frames)
-    return top.width, top.height, fps, max(1, n)
+    # The prover is identified by its FRAMEWORK, not by ``cfg.synthetic`` (which is
+    # also True on the last-resort ffmpeg enhancer rows — different runners entirely,
+    # they never reach here) and not by a registry lookup (an unknown model_id must
+    # still resolve to the real default, never to the prover's cheap one).
+    is_prover = manifest.framework is Framework.SYNTHETIC
+
+    requested = manifest.requested_frames
+    if requested is None:
+        if is_prover:
+            n = top.fps * _DEFAULT_SYNTHETIC_FPS_MULT
+            reason = f"default: synthetic prover fps*{_DEFAULT_SYNTHETIC_FPS_MULT}"
+        else:
+            n = DEFAULT_FRAMES_REAL
+            reason = f"default: {DEFAULT_FRAMES_REAL} frames (model capability)"
+    else:
+        n = int(requested)
+        reason = f"requested {n}"
+
+    if n < 1:                                  # unchanged max(1, n) floor behaviour
+        reason += f"; floored {n} -> 1"
+        n = 1
+
+    ceiling = cfg.max_frames if (cfg is not None and cfg.max_frames) else None
+    if manifest.framework is Framework.WAN:
+        ceiling = WAN_MAX_FRAMES if ceiling is None else min(ceiling, WAN_MAX_FRAMES)
+    if ceiling is not None and n > ceiling:
+        reason += f"; clamped {n} -> {ceiling} (model ceiling)"
+        n = ceiling
+
+    if not is_prover:
+        # 4k+1 cadence: a real latent pipeline REQUIRES it. The prover has no VAE, so
+        # snapping its noise would shorten every existing synthetic clip to buy nothing.
+        # ``snap_wan_frames`` is the SHARED implementation (schemas) — the presets layer
+        # calls the same function to show a caller the TRUE length before spending ~6
+        # minutes of denoise, so the preview and the render cannot disagree.
+        snapped = snap_wan_frames(n)
+        if snapped != n:
+            reason += (f"; snapped {n} -> {snapped} "
+                       f"({WAN_FRAME_CADENCE}k+1 temporal cadence)")
+            n = snapped
+
+    if requested is not None and n != requested:
+        # RECORD the clamp/snap rather than failing it (and rather than silently
+        # handing back a different length than was asked for).
+        logger.info(
+            "studio clip length: %s -> %d frames [model=%s]", reason, n, manifest.model_id)
+    return n, reason
+
+
+def _geometry(manifest: RenderManifest) -> tuple[int, int, int, int]:
+    """(width, height, fps, n_frames) from the top ladder rung + the RESOLVED clip
+    length (``resolve_frames``: the manifest's request, or the bound model's default,
+    clamped to that model's ceiling). Signature deliberately unchanged — ``wan_i2v``
+    imports this exact function, so real Wan renders pick the lever up for free."""
+    top = manifest.resolution_ladder[0]
+    n, _reason = resolve_frames(manifest)
+    return top.width, top.height, top.fps, n
 
 
 def _assemble_mp4(frame_dir: str, tmp_mp4: str, fps: int) -> tuple[bool, str]:

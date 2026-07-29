@@ -446,7 +446,12 @@ def run_wan_vace(
     # .to() a quantized pipeline). flow_shift is the manifest's recorded scheduler shift.
     model_gb = cfg.vram.as_map().get(manifest.precision)
     place_whole = _should_place_whole_on_gpu(
-        manifest.precision, model_gb, _max_vram_gb(manifest))
+        manifest.precision, model_gb, _max_vram_gb(manifest),
+        # Pass the identity + geometry so the decision uses MEASURED component bytes
+        # (DiT + UMT5 + VAE [+ CLIP] + token-scaled activations) instead of the
+        # registry's DiT-only number plus a flat fudge. Without these it silently
+        # falls back to the legacy test.
+        model_id=manifest.model_id, width=width, height=height, n_frames=n_frames)
     flow_shift = manifest.sampler.shift
 
     # Cooperative mid-render cancel wiring (T1). diffusers 0.39's

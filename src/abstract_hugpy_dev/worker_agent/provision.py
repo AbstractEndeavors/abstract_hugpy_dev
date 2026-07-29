@@ -1568,6 +1568,113 @@ def _ensure_model_present_inner(model_key: str, central_url: str | None,
         lock.release()
 
 
+# ---------------------------------------------------------------------------
+# Provisioning telemetry + the preserved failure CAUSE.
+#
+# THE 2026-07-28 INCIDENT, in one sentence: computron's drive was 100% full,
+# ``fetch_from_central`` and the archive fallback both died with
+# ``OSError: [Errno 28] No space left on device``, ``_provision_now`` knew that
+# exactly — it is right there in ``central_reason`` — and then returned a bare
+# ``False``, at which point every word of the diagnosis was gone. The operator's
+# chat said "could not fetch model X from central or HF" and finding the truth
+# cost an ssh session and a journalctl read.
+#
+# So: the reason survives the boolean boundary now. ``_provision_now`` records a
+# structured cause here before returning False, and the agent's streaming error
+# path reads it to compose an honest one-line message. Signatures are unchanged
+# — a stashed cause is additive, where widening the return type would touch six
+# call sites across two processes for no gain.
+#
+# Bounded and self-trimming: a cause is only interesting until the next attempt
+# at the same model, and a worker that fails to provision thousands of distinct
+# keys must not grow a dict forever.
+# ---------------------------------------------------------------------------
+
+_FAILURES: dict = {}
+_FAILURES_LOCK = threading.Lock()
+_FAILURES_MAX = 256
+
+
+def _evt():
+    """The telemetry emitter, or None. Imported lazily and defensively: this
+    module runs inside the slot child and in standalone CLI provisions where
+    the comms package may not be importable, and telemetry is never a reason
+    for a provision to fail."""
+    try:
+        from ..comms import evictions as _e
+        return _e
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _dest_hint(model_key: str) -> str | None:
+    """Best-effort local destination for ``model_key`` — the path whose
+    FILESYSTEM we report free/total for. Only a hint: ``disk_stats`` walks up to
+    the nearest existing ancestor, so the models root answers the question even
+    when the model's own directory was never created."""
+    try:
+        from .imports import get_model_path
+        return get_model_path(model_key)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _record_failure(model_key: str, source: str, reason: str,
+                    exc: BaseException | None = None,
+                    dest_path: str | None = None) -> dict:
+    """Remember WHY provisioning failed, in a form a human can read.
+
+    ``human`` is the operator-grade one-liner ("disk full (ENOSPC) on
+    /mnt/storage — 0 B free of 938 GB") when the failure is one we can say
+    something sharp about; otherwise it is the raw reason, which is still far
+    better than the flattened "from central or HF"."""
+    ev = _evt()
+    human = ""
+    errno_nm = ""
+    if ev is not None and exc is not None:
+        try:
+            errno_nm = ev.errno_name(exc) or ""
+            human = ev.describe_disk_error(exc, dest_path) or ""
+        except Exception:  # noqa: BLE001
+            human, errno_nm = "", ""
+    rec = {
+        "model_key": model_key, "source": source, "reason": reason,
+        "errno_name": errno_nm or None,
+        "error_class": type(exc).__name__ if exc is not None else None,
+        "human": human or reason,
+        "dest_path": dest_path,
+        "ts": time.time(),
+    }
+    try:
+        with _FAILURES_LOCK:
+            if len(_FAILURES) >= _FAILURES_MAX:
+                oldest = sorted(_FAILURES.items(),
+                                key=lambda kv: kv[1].get("ts") or 0)[:_FAILURES_MAX // 2]
+                for k, _v in oldest:
+                    _FAILURES.pop(k, None)
+            _FAILURES[str(model_key)] = rec
+    except Exception:  # noqa: BLE001
+        pass
+    return rec
+
+
+def last_failure(model_key: str) -> dict | None:
+    """The most recent recorded provisioning failure for ``model_key``, or None.
+
+    Read by the agent's streaming error path so the chat message can name the
+    actual cause instead of the generic "could not fetch"."""
+    with _FAILURES_LOCK:
+        rec = _FAILURES.get(str(model_key))
+    return dict(rec) if rec else None
+
+
+def clear_failure(model_key: str) -> None:
+    """Forget a recorded cause — called on a successful provision so a stale
+    "disk full" can never be reported against a model that has since landed."""
+    with _FAILURES_LOCK:
+        _FAILURES.pop(str(model_key), None)
+
+
 def _provision_now(canonical: str, central_url: str | None, progress=None) -> bool:
     """Do the actual fetch (central archive -> per-file -> HF). Caller holds the
     per-model provisioning lock.
@@ -1587,6 +1694,64 @@ def _provision_now(canonical: str, central_url: str | None, progress=None) -> bo
     # files can never happen unnoticed again.
     hf_ok = _hf_fallback_always()            # escape hatch pre-decides HF
     central_reason = "no central URL configured"
+    # Telemetry (observation only — every call below is total; see comms/
+    # evictions.py). The run scope JOINS whatever pass is already open so the
+    # provisioning rows land in the SAME console card as the eviction rows that
+    # follow, which is the whole point: one card = one request = where it died.
+    ev = _evt()
+    dest = _dest_hint(canonical)
+    scope = ev.serve_scope() if ev is not None else None
+    if scope is not None:
+        scope.__enter__()
+    try:
+        return _provision_sources(canonical, central_url, progress, ev, dest)
+    finally:
+        if scope is not None:
+            try:
+                scope.__exit__(None, None, None)
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _provision_sources(canonical: str, central_url: str | None, progress,
+                       ev, dest: str | None) -> bool:
+    """The source chain itself. Split out of ``_provision_now`` only so the
+    telemetry run-scope wraps it without indenting the whole decision body."""
+    hf_ok = _hf_fallback_always()            # escape hatch pre-decides HF
+    central_reason = "no central URL configured"
+
+    def _t_start(source: str):
+        if ev is not None:
+            ev.emit_provision_start(canonical, source, dest_path=dest)
+
+    def _t_done(source: str, t0: float):
+        if ev is not None:
+            ev.emit_provision_done(canonical, source,
+                                   duration_ms=int((time.time() - t0) * 1000))
+        clear_failure(canonical)
+
+    # Has THIS attempt already captured an errno-bearing (i.e. OS-level) cause?
+    # A full disk fails identically from every source, so the first source to
+    # hit ENOSPC has already diagnosed the box; a later "HF returned 404" is a
+    # symptom, not the cause, and must not overwrite it.
+    sharp = {"seen": False}
+
+    def _t_fail(source: str, reason: str, exc: BaseException | None = None):
+        """Emit provision.fail AND remember the cause for the chat message.
+
+        These two always happen together — the operator watching the feed and
+        the operator reading the chat must never be told different stories."""
+        if ev is not None:
+            ev.emit_provision_fail(canonical, source, exc=exc, dest_path=dest,
+                                   detail=reason)
+        has_errno = bool(ev is not None and exc is not None
+                         and ev.errno_name(exc))
+        if sharp["seen"] and not has_errno:
+            return                      # don't downgrade an OS-level diagnosis
+        _record_failure(canonical, source, reason, exc=exc, dest_path=dest)
+        if has_errno:
+            sharp["seen"] = True
+
     if central_url is None:
         # No central configured at all: HF is the only source (a worker cut off
         # from the fleet). This is the survival path, not a side door.
@@ -1597,37 +1762,49 @@ def _provision_now(canonical: str, central_url: str | None, progress=None) -> bo
         #    link; a big weights file is split across many connections).
         if progress:
             progress(0, 0, "source=central")
+        _t0 = time.time()
+        _t_start("central-transfer")
         try:
             if fetch_from_central(central_url, canonical, progress=progress):
                 logger.info("PROVENANCE: %s provisioned from CENTRAL (parallel)",
                             canonical)
+                _t_done("central-transfer", _t0)
                 return True
             central_alive = True             # returned False = a 409/empty VERDICT
             central_reason = "central does not have the files (per-file 409/empty)"
+            _t_fail("central-transfer", central_reason)
         except CentralUnreachable as exc:
             central_reason = f"central unreachable (parallel): {exc}"
+            _t_fail("central-transfer", central_reason, exc)
             logger.warning("central parallel transfer of %s: central UNREACHABLE "
                            "(%s); trying archive", canonical, exc)
         except Exception as exc:
             central_alive = True             # any other error = central RESPONDED
             central_reason = f"parallel transfer failed: {type(exc).__name__}: {exc}"
+            _t_fail("central-transfer", central_reason, exc)
             logger.warning("central parallel transfer of %s failed: %s; "
                            "trying archive", canonical, exc)
         # 2) whole-directory tar stream — single-connection fallback.
+        _t0 = time.time()
+        _t_start("archive")
         try:
             if fetch_archive_from_central(central_url, canonical, progress=progress):
                 logger.info("PROVENANCE: %s provisioned from CENTRAL (archive)",
                             canonical)
+                _t_done("archive", _t0)
                 return True
             central_alive = True
             central_reason = "central cannot provide the files (archive refused)"
+            _t_fail("archive", central_reason)
         except CentralUnreachable as exc:
             central_reason = f"central unreachable (archive): {exc}"
+            _t_fail("archive", central_reason, exc)
             logger.warning("central archive of %s: central UNREACHABLE (%s)",
                            canonical, exc)
         except Exception as exc:
             central_alive = True
             central_reason = f"archive transfer failed: {type(exc).__name__}: {exc}"
+            _t_fail("archive", central_reason, exc)
 
         # THE GATE. Central ALIVE (any verdict) => its "no" is authoritative;
         # NO HF, unless the emergency escape hatch is set. Central UNREACHABLE
@@ -1641,18 +1818,36 @@ def _provision_now(canonical: str, central_url: str | None, progress=None) -> bo
                          canonical, central_reason)
             if progress:
                 progress(0, 0, f"source=refused ({central_reason[:120]})")
+            # KEEP the sharper cause already recorded by the parallel/archive
+            # attempt. Those recorded an exception and therefore an errno; this
+            # gate has only a prose reason, and overwriting an "ENOSPC / disk
+            # full" record with "central gave a verdict" would re-flatten the
+            # exact diagnosis this whole change exists to preserve. Only record
+            # here when nothing sharper was captured.
+            if not (last_failure(canonical) or {}).get("errno_name"):
+                _record_failure(canonical, "central-transfer",
+                                f"{central_reason} (HF fallback forbidden by "
+                                f"chain of command)", dest_path=dest)
             return False
 
     logger.warning("PROVENANCE: %s falling back to HUGGING FACE — %s",
                    canonical, central_reason)
+    _t0 = time.time()
+    _t_start("hf")
     try:
         if progress:
             progress(0, 0, f"source=hf ({central_reason[:120]})")
         fetch_from_hf(canonical)
         logger.warning("PROVENANCE: %s provisioned from HUGGING FACE (%s)",
                        canonical, central_reason)
+        _t_done("hf", _t0)
         return True
     except Exception as exc:
+        # LAST source exhausted. This failure — not the central one that
+        # preceded it — is the one the operator's chat should name, unless HF
+        # merely repeated a local problem (a full disk fails identically from
+        # every source, and "disk full" beats "HF said 404" every time).
+        _t_fail("hf", f"HF fetch failed: {type(exc).__name__}: {exc}", exc)
         logger.error("could not provision %s from central or HF: %s "
                      "(central: %s)", canonical, exc, central_reason)
         return False

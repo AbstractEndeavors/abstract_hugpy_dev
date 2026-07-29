@@ -250,9 +250,12 @@ def test_inv3_router_returns_err_not_raise():
 # --------------------------------------------------------------------------- #
 def test_fix2_commercial_auto_not_whitelisted_away():
     router = CapabilityRouter()
-    # INTERP is served ONLY by rife (MIT, auto-commercial). allowed_licenses lists
-    # a DIFFERENT license. Pre-fix, the unconditional whitelist rejected rife and
-    # returned Err(LICENSE_VIOLATION); post-fix it binds rife.
+    # INTERP is served by rife-practical (MIT) and ffmpeg-minterpolate (Apache-2.0).
+    # BOTH are commercial_auto=True, and NEITHER license appears in allowed_licenses
+    # below — which is the whole point: allowed_licenses names only LTX_COMMERCIAL,
+    # so if the whitelist were applied unconditionally every INTERP candidate would
+    # be rejected and this would be Err(LICENSE_VIOLATION). That it resolves at all
+    # is the fix.
     res = router.resolve(CapabilityRequest(
         capability=Capability.INTERP,
         target_resolution=R720,
@@ -264,7 +267,22 @@ def test_fix2_commercial_auto_not_whitelisted_away():
         "FIX-2: an Apache/MIT auto-commercial model must still bind under "
         "commercial_use even when allowed_licenses lists only other licenses"
     )
-    assert res.unwrap().model_id == "rife-practical"
+    # ASSERT THE PROPERTY, NOT THE WINNER. This line used to read
+    # `== "rife-practical"`, which quietly made a LICENSE test depend on the
+    # RANKING order. When rife was correctly demoted on 2026-07-27 (its runner is an
+    # unconditional-Err stub — runners/rife_interpolate.py; see
+    # tests/studio/test_studio_enhance.py "RANKING, REVERSED"), this test went red
+    # despite its own subject being untouched: the is_ok() above still passed.
+    # Binding the assertion to commercial_auto instead means a future re-ranking of
+    # INTERP cannot make a license test fail for a non-license reason.
+    bound = res.unwrap()
+    assert MODEL_REGISTRY[bound.model_id].commercial_auto, (
+        f"FIX-2: the bound model must be the auto-commercial one that "
+        f"allowed_licenses does NOT list; got {bound.model_id} "
+        f"(license={MODEL_REGISTRY[bound.model_id].license.value})")
+    assert MODEL_REGISTRY[bound.model_id].license not in {LicenseClass.LTX_COMMERCIAL}, (
+        "FIX-2 would be vacuous if the bound license were the whitelisted one — "
+        "the test only proves anything while the winner is OUTSIDE allowed_licenses")
 
 
 # --------------------------------------------------------------------------- #

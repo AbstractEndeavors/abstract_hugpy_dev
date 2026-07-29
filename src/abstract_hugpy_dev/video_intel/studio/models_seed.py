@@ -164,11 +164,22 @@ set_capability_tasks({
     Capability.I2V: (Task.I2V, Task.AUDIO_VIDEO, Task.STREAM_I2V),
     # IDENTITY LOCK: VACE reference-to-video is the flagship id_lock path (the only
     # runner that CONSUMES reference images), so Task.VACE_CONTROL is PREFERRED (first).
-    # Task.I2V stays as a fallback so the i2v rows that claim ID_LOCK remain valid, but
-    # in practice VACE always wins: the cheapest VACE model (vace-1.3b INT8=6 @480p) fits
-    # a lower budget than any i2v model at the same resolution, and the router binds the
-    # first task with a fitting model — so id_lock never silently routes to a runner that
-    # would ignore the references.
+    # Task.I2V stays as a fallback so the i2v rows that claim ID_LOCK remain valid.
+    #
+    # ⚠ THE OLD COMMENT HERE WAS FALSE AND COST AN IDENTITY (corrected 2026-07-27).
+    # It claimed "in practice VACE always wins ... so id_lock never silently routes to
+    # a runner that would ignore the references". That holds only INSIDE vace-1.3b's
+    # 480p envelope. Ask for id_lock at ANY larger geometry — including the studio
+    # routes' own former 512x512 default — and NO VACE model fits, so the router falls
+    # through to Task.I2V and binds wan2.1-i2v-14b-720p, whose runner never reads
+    # reference_images. The result was a plausible clip of the WRONG PERSON, with no
+    # error at all.
+    #
+    # The fallback is kept (an i2v row claiming ID_LOCK is still a legal binding) but it
+    # can no longer drop an identity silently: run_wan_i2v now REFUSES a manifest
+    # carrying reference_images it cannot consume. The guard lives at the point of harm
+    # so it survives any future routing change — do not rely on a preference order to
+    # keep this safe.
     Capability.ID_LOCK: (Task.VACE_CONTROL, Task.I2V),
     Capability.KEYFRAME: (Task.I2V,),
     Capability.MOTION: (Task.VACE_CONTROL, Task.MOTION_MODULE),

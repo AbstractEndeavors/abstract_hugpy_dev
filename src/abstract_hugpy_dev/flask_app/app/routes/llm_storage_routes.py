@@ -233,6 +233,20 @@ def get_model(model_key):
                     **refresh_fields(model, model_key)})
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Downloads: ENQUEUE / READ / CANCEL only.
+#
+# The API does not download. It creates a queued job of kind "download" and the
+# hugpy-downloader-dev daemon claims and runs it (abstract_hugpy_dev/downloader/).
+# No transfer child parented to a gunicorn worker, no monitor/watch threads, no
+# per-second store walk and no HF network call on a request path — those are what
+# starved the pool that also serves /llm/workers/<id>/heartbeat and made every
+# worker read `offline` during a download.
+#
+# There is deliberately NO in-process fallback when the daemon is down: falling
+# back would quietly resurrect the exact bug. The job stays visibly queued and
+# says so (queue.annotate_waiting).
+# ──────────────────────────────────────────────────────────────────────────
 @llm_bp.route("/models/<model_key>/download", methods=["POST"])
 def start_download(model_key):
     model = get_model_config(model_key,dict_return=True)
@@ -240,37 +254,48 @@ def start_download(model_key):
         abort(404, description="Unknown model key.")
     logger.info(model)
     body = request.get_json(silent=True) or {}
-    job = job_store.create(model_key, kind="download", transport="web")
-    start_cancellable_download(job, model, total_bytes=body.get("total_bytes"))
+    job = enqueue_download(model_key, model,
+                           total_bytes=body.get("total_bytes"))
     return jsonify(job.to_legacy_dict())
 
 
 @llm_bp.route("/jobs", methods=["GET"])
 def list_jobs():
-    # The store is shared with chat/inference jobs now — this surface is the
-    # download manager's, so only download jobs belong on it (legacy wire
-    # shape: queued/running/completed, error as string — ModelTable reads it).
-    return jsonify([job.to_legacy_dict() for job in job_store.all()
-                    if job.kind == "download"])
+    # MIRROR-MERGED: live download rows are owned by the daemon process and exist
+    # only in the shared mirror, and terminal ones must stay visible too (a job
+    # that vanished at 100% instead of reading "completed" would be worse than
+    # before). Legacy wire shape preserved: queued/running/completed, error as a
+    # string — the console's ModelTable reads exactly this.
+    return jsonify(list_downloads())
 
 
 @llm_bp.route("/jobs/<job_id>", methods=["GET"])
 def get_job(job_id):
-    job = job_store.get(job_id)
-    if not job:
+    d = get_download(job_id)
+    if d is None:
         abort(404, description="Unknown job ID.")
-    return jsonify(job.to_legacy_dict())
+    return jsonify(d)
 
 
 @llm_bp.route("/jobs/<job_id>/cancel", methods=["POST"])
 def cancel_job(job_id):
-    return jsonify(cancel_download(job_id))
+    """Cancel CROSS-PROCESS: raises the shared cancel flag the daemon's store
+    watcher is already listening on, and force-marks an owner-less row terminal
+    so a cancel can never answer true while nothing changes."""
+    res = cancel_download(job_id)
+    if res.get("reason") == "unknown job":
+        abort(404, description="Unknown job ID.")
+    return jsonify(res)
 
 
 @llm_bp.route("/jobs/<job_id>/retry", methods=["POST"])
 def retry_job(job_id):
-    """Resume a failed/cancelled download from its partial files on disk."""
-    return jsonify(retry_download(job_id))
+    """Re-queue a failed/cancelled download; the daemon picks it back up and
+    resumes from the partial files on disk (same job id, same payload)."""
+    res = retry_download(job_id)
+    if res.get("reason") == "unknown job":
+        abort(404, description="Unknown job ID.")
+    return jsonify(res)
 
 
 @llm_bp.route("/llm/repos/download", methods=["POST"])
@@ -296,8 +321,7 @@ def download_repo():
         from ..functions.imports.utils.manifest import key_for_hub_id
         model_key = key_for_hub_id(body.hub_id)
 
-    job = job_store.create(model_key, kind="download", transport="web")
-    start_cancellable_download(job, model, total_bytes=body.total_bytes)
+    job = enqueue_download(model_key, model, total_bytes=body.total_bytes)
     return jsonify({**job.to_legacy_dict(), "model_key": model_key})
 
 

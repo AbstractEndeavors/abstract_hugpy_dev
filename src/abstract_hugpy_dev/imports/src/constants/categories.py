@@ -12,6 +12,14 @@ HF_TASK_TO_TASKS = {
     "feature-extraction": ["feature-extraction", "sentence-similarity", "keyword-extraction"],
     "sentence-similarity": ["feature-extraction", "sentence-similarity", "keyword-extraction"],
     "text-to-image": ["text-to-image"],
+    # VIDEO (2026-07-27). Advertised truthfully, NOT servable by the LLM plane:
+    # there is no ("transformers","text-to-video") RUNNER_PAIR, so these rows are
+    # visible in the catalogue and excluded from chat routing — the studio arm
+    # (video_intel/studio) serves them through its own registry. Before this, a
+    # Wan T2V model fell through _base_tasks' "conservative floor" and advertised
+    # ["text-generation"]: a video diffusion model offering itself as a chat model.
+    "text-to-video": ["text-to-video"],
+    "image-to-video": ["image-to-video"],
     # NOTE: "image-to-image" is intentionally NOT a DISCOVERY pipeline_tag key.
     # A raw HF pipeline_tag=image-to-image (native EDIT models like
     # Qwen-Image-Edit) is still not auto-advertised from that tag alone. Instead,

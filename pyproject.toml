@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "abstract_hugpy_dev"
-version = "0.1.221"
+version = '0.1.223'
 description = "Self-hosted LLM console: model registry & downloads, streaming chat, OpenAI-compatible /v1 API with on-site keys, GPU worker fleet with cross-machine RPC sharding"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -104,7 +104,18 @@ audio = ["openai-whisper"]        # automatic-speech-recognition (transcribe)
 # (Flux2KleinPipeline, QwenImageEditPlusPipeline) need diffusers>=0.39 +
 # transformers>=5.12 (Qwen3 text encoders); q4 checkpoints need bitsandbytes.
 imagegen = ["diffusers>=0.39", "accelerate", "transformers>=5.12",
-            "bitsandbytes>=0.46.1"]
+            # bitsandbytes floor RAISED 0.46.1 -> 0.48.0 on 2026-07-27. 0.46.1 was
+            # below the version diffusers 0.39 requires to MOVE an 8-bit pipeline
+            # (pipeline_utils.py:562 gates module.to(device) on bnb >= 0.48.0 AND
+            # transformers > 4.58.0). Under the old floor a studio INT8 render that
+            # chose whole-GPU placement got a WARNING and a split pipeline — VAE +
+            # text encoder on CUDA, the quantized DiT stranded on the CPU — then a
+            # device-mismatch RuntimeError at the first denoise step, after a
+            # multi-GB load. wan_i2v._installed_quantized_move_ok guards this at
+            # RUNTIME too (belt and braces: the pin governs fresh installs, the guard
+            # governs boxes that are already provisioned). ae runs 0.49.2, so the
+            # fleet already satisfies this and the bump is not a converge event.
+            "bitsandbytes>=0.48.0"]
 # Deterministic ingest amenities (no model): /ml/extract reads PDF/DOCX/text,
 # /ml/fetch reads readable text from a URL. PDF rides base PyPDF2/pdfplumber;
 # requests is base — only python-docx + beautifulsoup4 are extra.
@@ -144,6 +155,10 @@ Homepage = "https://hugpy.ai"
 
 [project.scripts]
 hugpy = "abstract_hugpy_dev.cli:main"
+# The model-download daemon (hugpy-downloader-dev.service). Downloads run in
+# THIS process, never inside the console API's gunicorn — see
+# src/abstract_hugpy_dev/downloader/__init__.py.
+hugpy-downloader = "abstract_hugpy_dev.downloader.daemon:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -23,6 +23,7 @@ No pathlib anywhere. os.path only.
 """
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from typing import Optional
@@ -32,6 +33,8 @@ from abstract_hugpy_dev.imports.src.constants.constants import DEFAULT_ROOT
 from ..._platform import env_value
 from .enums import Capability
 from .env import StudioEnv
+
+logger = logging.getLogger(__name__)
 
 # Where studio clips land by default: a content-addressed tree UNDER the media
 # store root, so the produced clip.mp4 is inside media_store.ingest's storage
@@ -60,6 +63,22 @@ _DEFAULT_VRAM_BUDGET_GB = 0.5
 # route's 400 AND every non-route caller (make_studio_i2v is the single validator).
 _MIN_STEPS, _MAX_STEPS = 1, 100
 _MIN_CFG, _MAX_CFG = 0.0, 20.0
+
+# CLIP LENGTH sanity range (route passthrough), deliberately WIDE. This is a
+# TYPO/DoS guard, NOT the model ceiling — those are two different jobs:
+#   * The MODEL ceiling (81 for Wan, 49 for cogvideox-5b, ...) is only knowable AFTER
+#     the router binds a model, which happens long after this spec is built. An
+#     over-ceiling ask is therefore NOT a caller error: ``resolve_frames`` CLAMPS it
+#     with a recorded reason and renders the longest clip the bound model can do
+#     ("give me the longest you can" must not be a 400).
+#   * This bound only catches what is nonsense at ANY ceiling: zero/negative frames
+#     (not a clip), and a fat-fingered 100000000 that would otherwise ride all the way
+#     to a runner. 10_000 sits comfortably above every non-sentinel ``max_frames`` in
+#     the registry (the largest real one is framepack-i2v-hy at 3600), so nothing a
+#     model could actually deliver is refused here.
+# bool is an int subclass and is rejected explicitly — ``requested_frames=True`` would
+# otherwise mean "1 frame".
+_MIN_REQUESTED_FRAMES, _MAX_REQUESTED_FRAMES = 1, 10_000
 
 _VALID_CAPABILITIES = frozenset(c.value for c in Capability)
 
@@ -135,6 +154,24 @@ class StudioI2VSpec:
     # render (every non-movie caller). Threaded into the manifest for the VACE runner;
     # NOT part of the render content_hash (see RenderManifest.vace_context_frames).
     vace_context_frames: tuple[str, ...] = ()
+    # CLIP LENGTH, in FRAMES — the caller's ask. None = "unset": the studio spine uses
+    # the BOUND model's default (81 frames for a real model — Wan's reference length,
+    # measured ~352s on ae's 3090 at 832x480; ``fps * 2`` for the synthetic prover).
+    # A number here is threaded verbatim into ``RenderManifest.requested_frames`` and
+    # RESOLVED at render time by ``studio.runners.synthetic.resolve_frames`` (clamp to
+    # the bound model's real ceiling, snap to the 4k+1 temporal cadence, max(1,n) floor,
+    # each with a recorded reason). Plumbed EXACTLY like ``steps``/``cfg``: an optional
+    # scalar the route passes through, range-checked here (see the constants above) so
+    # every caller gets the same guard, never just the HTTP route.
+    #
+    # ⚠ THIS FIELD DID NOT EXIST until 2026-07-27, which is what made the whole lever a
+    # lie: ``RenderManifest.requested_frames`` was hashed and documented, but no spec
+    # could carry a length, so every real render on this fleet was forced to the
+    # default. FRAMES (not seconds) is the unit because Wan's 4k+1 cadence is always
+    # ODD — ``frames/fps`` is never a whole number of seconds at an even fps (81/16 =
+    # 5.0625s), so seconds can only ever be a REQUEST resolved to frames, with the TRUE
+    # duration reported back on the Artifact.
+    requested_frames: Optional[int] = None
 
 
 def make_studio_i2v(
@@ -158,6 +195,7 @@ def make_studio_i2v(
     control_image: Optional[str] = None,
     control_kind: Optional[str] = None,
     vace_context_frames: Optional[tuple] = None,
+    requested_frames: Optional[int] = None,
 ) -> StudioI2VSpec:
     """Validate every field and build the frozen ``StudioI2VSpec``. Raises
     ``ValueError``/``TypeError`` LOCALLY on any structural violation (house
@@ -215,6 +253,18 @@ def make_studio_i2v(
     # errors-as-data (ErrorCode.PINNED_MODEL_UNAVAILABLE) at run time, not here.
     if model_id is not None and not (isinstance(model_id, str) and model_id.strip()):
         raise ValueError(f"model_id must be a non-empty string or None; got {model_id!r}")
+    # CLIP LENGTH: None = unset (the bound model's default fills it). A value is
+    # range-checked here — the same guard for every caller (route, preset apply, bus
+    # rehydrate, movie runner), mirroring the steps/cfg treatment above. This bound is a
+    # typo guard, NOT the model ceiling: an over-ceiling ask is legal and CLAMPS at
+    # render time with a recorded reason (see _MIN/_MAX_REQUESTED_FRAMES).
+    if requested_frames is not None:
+        if not isinstance(requested_frames, int) or isinstance(requested_frames, bool) \
+                or not (_MIN_REQUESTED_FRAMES <= requested_frames <= _MAX_REQUESTED_FRAMES):
+            raise ValueError(
+                f"requested_frames must be an int in [{_MIN_REQUESTED_FRAMES}, "
+                f"{_MAX_REQUESTED_FRAMES}] or None (unset -> the bound model's default); "
+                f"got {requested_frames!r}")
 
     # IDENTITY LOCK reference images: None -> (); coerce a list/tuple to a tuple (so an
     # asdict->json->from_dict round-trip lands a tuple). Each must be a non-empty string;
@@ -291,6 +341,7 @@ def make_studio_i2v(
         control_image=control_image,
         control_kind=control_kind,
         vace_context_frames=vace_context_frames,
+        requested_frames=requested_frames,
     )
 
 
@@ -319,10 +370,47 @@ def studio_i2v_from_dict(d: dict) -> StudioI2VSpec:
         control_image=d.get("control_image"),
         control_kind=d.get("control_kind"),
         vace_context_frames=d.get("vace_context_frames"),
+        # CLIP LENGTH: absent -> None (unset). Tolerates specs enqueued before this
+        # field existed AND specs relayed to a studio GPU worker running an older
+        # build — both land on the bound model's default, i.e. today's behaviour.
+        requested_frames=d.get("requested_frames"),
     )
 
 
-def resolve_studio_env(out_root: str, *, master_fps: int, max_vram_gb: float = 24.0) -> StudioEnv:
+_FALLBACK_MAX_VRAM_GB = 24.0
+
+
+def _device_vram_gb() -> Optional[float]:
+    """Installed VRAM on THIS box, in GB, or None when unmeasurable.
+
+    ⚠ WHY THIS EXISTS (2026-07-27). ``resolve_studio_env`` took
+    ``max_vram_gb: float = 24.0`` and **neither caller ever overrode it** — see
+    ``runners/studio_i2v.py::run_produce_clip``, which is the code path on BOTH the
+    central and the GPU-worker side. So every studio placement decision the fleet
+    has ever made was measured against a hardcoded 24.0, *including on computron,
+    an 8 GiB RTX 4060*. The studio believed every box was a 3090.
+
+    That is a defaults-are-promises violation on its own terms: the number that
+    decides whether a pipeline goes whole-on-GPU or streams from the CPU was not
+    read from any device.
+
+    Sourced from ``_platform.hardware.total_vram_bytes`` — the same probe pair
+    (torch ``mem_get_info`` → ``nvidia-smi``) the free-VRAM read uses, so the
+    ceiling and the headroom come from ONE truth. It degrades to ``None``, never
+    to 0, so "unmeasurable" stays distinguishable from "no card" and the caller
+    keeps today's conservative behaviour instead of concluding zero headroom."""
+    try:
+        from ..._platform.hardware import total_vram_bytes
+        total = total_vram_bytes()
+    except Exception:  # noqa: BLE001 — a probe failure must never fail a render
+        return None
+    if not total or total <= 0:
+        return None
+    return float(total) / (1024 ** 3)
+
+
+def resolve_studio_env(out_root: str, *, master_fps: int,
+                       max_vram_gb: float = _FALLBACK_MAX_VRAM_GB) -> StudioEnv:
     """Resolve a concrete ``StudioEnv`` from sensible worker defaults (INV-5) WITHOUT
     requiring any STUDIO_* environment variable: every required field is filled with
     a resolved value (paths under the media-store root, house mastering defaults),
@@ -347,6 +435,15 @@ def resolve_studio_env(out_root: str, *, master_fps: int, max_vram_gb: float = 2
     on the strict ``env.py`` loader (INV-5 untouched); it is honoring an explicit operator
     override on the worker-defaults path, and the resulting value is what ``to_snapshot()``
     records — so the manifest snapshot still matches what actually resolved."""
+    # ⚠ max_vram_gb STAYS A STABLE CONSTANT HERE — do NOT make it device-derived.
+    # StudioEnv.to_snapshot() emits STUDIO_MAX_VRAM_GB (env.py _REQUIRED), and
+    # schemas.py:231 puts env_snapshot INSIDE the clip content_hash. Sourcing this
+    # from the card would therefore RE-ADDRESS every clip the moment two boxes
+    # disagree (ae reads 23.56, computron 8.0), breaking resume/dedup: an identical
+    # spec would re-render instead of reusing its clip. The PLACEMENT decision does
+    # need the real card — it reads it live in the runner
+    # (runners/wan_i2v._max_vram_gb), which is outside the manifest and so outside
+    # addressing. Same split _hot_weights_root() already uses.
     weights_root = env_value("STUDIO_WEIGHTS_ROOT") or os.path.join(STUDIO_ROOT, "weights")
     return StudioEnv(
         output_root=os.path.abspath(out_root),

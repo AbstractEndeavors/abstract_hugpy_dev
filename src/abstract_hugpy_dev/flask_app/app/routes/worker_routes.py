@@ -640,8 +640,12 @@ def workers_list():
         _wildcards = {}
     for w in rows:
         w["required_pkg_version"] = required
-        w["version_ok"] = (required is None
-                           or w.get("pkg_version") == required)
+        # Tri-state on purpose (console pill): True = converged on the pin,
+        # False = skew, None = central pins nothing so there is NOTHING to
+        # compare against — "no pin" must read neutral, not as a green
+        # "verified in sync" the fleet never actually proved.
+        w["version_ok"] = (None if required is None
+                           else w.get("pkg_version") == required)
         w["boot_prewarm"] = _stars.get(w.get("id")) or None
         w["wildcard"] = bool(_wildcards.get(w.get("id")))
     # Call-time attribution (2026-07-14): stamp each worker's pid_registry

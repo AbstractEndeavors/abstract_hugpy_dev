@@ -66,6 +66,13 @@ _SENSITIVE = [
     # Worker enrollment tokens (minting/revoking enrollment — CRITICAL)
     ({"GET", "POST"},            re.compile(r"^/llm/enroll-tokens$")),
     ({"DELETE"},                 re.compile(r"^/llm/enroll-tokens/[^/]+$")),
+    # Model review (review_routes): /run spends disk, bandwidth and GPU time on
+    # weights chosen by the caller, and /criteria writes the saved queries the
+    # unattended timer later executes — both are operator intent, not public
+    # reads. /screen and the result GETs stay open: metadata only, no side
+    # effects. Anonymous /run would be a remote "fill the model store" button.
+    ({"POST"},                   re.compile(r"^/llm/review/run$")),
+    ({"PUT"},                    re.compile(r"^/llm/review/criteria/[^/]+$")),
     # Worker admission / control — operator actions (register & heartbeat are
     # M2M and deliberately NOT here). Admission is what makes a worker
     # dispatch-eligible, so gating it closes anonymous self-admission → SSRF.

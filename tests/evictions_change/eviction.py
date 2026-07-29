@@ -1,0 +1,1220 @@
+"""THE shared eviction function — one implementation, every call site.
+
+Operator spec: ``assets/evictionflow.html`` ("Allocation & Eviction Flow",
+2026-07-25). This module is the executable form of its box 2, and nothing else
+in the tree may re-implement the ordering.
+
+── THE CORE IDEA ────────────────────────────────────────────────────────────
+``max-*`` is a DEVICE PREFERENCE, and the SAME preference that decides where an
+incoming model lands decides what gets pushed out to make room. The incoming
+model fills its designated device to the fullest available; the preference
+decides who leaves.
+
+    admit M (size Z, preference P ∈ {max-gpu, max-ram})
+      Z > X + Y (both devices combined)?  -> reject, infeasible on this card
+      D := P's device (max-gpu->VRAM, max-ram->RAM);  O := the other device
+      D_free >= Z?                        -> place all of Z on D
+      else EVICT(D, need = Z - D_free); freed enough?
+          -> place all of Z on D
+          else place what fits on D; R := Z - placed
+               O_free >= R?               -> place R on O (split residency)
+               else EVICT(O, need = R - O_free); freed enough?
+                   -> place R on O
+                   else refuse, REPORTING THE BLOCKING RESIDENTS
+
+``plan_admission`` below is that flowchart; ``evict_plan`` is the blue
+subroutine both of its call sites run.
+
+── THE SORT (box 2) ─────────────────────────────────────────────────────────
+    pool := residents on d, minus 🔒static
+    sort lexicographic:
+      ① pref == other device first  (mismatched residents go first)
+      ② time since last call, longest first (never-called anchors at load time)
+      ③ total calls, fewest
+      ④ model_key — stable final tiebreak
+    WALK: accumulate victims in that order until freed >= n or pool exhausted
+    DROP PASS, same order: remove any victim the remaining set already covers
+    fully unload each remaining victim; return freed
+
+WHAT THIS REPLACES. Every eviction site in the tree previously sorted
+``(last_picked, -bytes, model_key)`` — oldest-first then LARGEST-FIRST. The
+largest-first term is exactly what the spec's walk-then-drop replaces: it made
+the *biggest* cold model the preferred victim, which clears a budget in the
+fewest deletes but has no relationship to what the admission actually needs.
+The spec orders by COST TO THE FLEET (cliff order, then idleness, then call
+count) and then removes the surplus, which is a different and better answer.
+
+── THE THREE INVARIANTS (spec's own words, and how they are enforced here) ──
+
+**Parity.** Central's preview and the worker's auto-evict run THE SAME
+function. That is why this module is PURE — no I/O, no globals, no clock reads,
+no environment. Every input (sizes, free bytes, idle times, call counts,
+preferences) is passed in by the caller, so a central preview and a worker
+auto-evict over the same fixture produce byte-identical victim sets. Idle times
+come from ONE ledger — central's call log, shipped to the worker at emission
+(``model_last_picked`` / ``model_call_stats`` on the heartbeat reply) — never
+from each side's own clock. Divergent victim sets are the bug this prevents;
+``tests/test_eviction_parity.py`` asserts it directly.
+
+**Least reaping.** ``_walk`` then ``_drop``. If y1 is first by order but y2
+must go anyway and y2 alone covers the need, y1 is spared. The drop pass ONLY
+REMOVES — it iterates the walked set and never consults the pool beyond the
+frontier — so a hot model past the walk frontier is never taken just for being
+conveniently sized. This asymmetry is load-bearing; a "pick the best-fitting
+subset" optimiser would violate it.
+
+**Full unload.** A victim is unloaded ENTIRELY, never spill-chained onto the
+other device. Its contribution to ``freed`` is its own resident size, never a
+function of recursive state elsewhere. That is what keeps the choice externally
+derivable: you can recompute any decision from the inputs alone.
+
+**Cliff order** is the rationale for key ①. A resident whose preference names
+the OTHER device is already off the cliff by design — it asked to live
+elsewhere and is only here opportunistically. A resident whose preference
+matches this device loses its measured 135->36 tok/s when it goes, so it sorts
+LAST. Mismatched first is not a tiebreak; it is the point.
+
+── THE THREE OPEN ITEMS ─────────────────────────────────────────────────────
+The spec marks three things "not yet decided" and states a PROPOSAL for each.
+This module ENACTS those proposals so the behaviour is testable, and names them
+here so the operator can rule and change exactly one place:
+
+  1. IN-FLIGHT GUARD (``Resident.in_flight``). The spec's pool excludes only
+     🔒static, which makes a model mid-generation a legal victim, and a long
+     stream look idle if "last call" means request START. ENACTED PROPOSAL:
+     last-activity = ``max(request start, last token emitted)`` (the caller
+     supplies it as ``last_call``), and ``in_flight`` removes the resident from
+     the pool REGARDLESS of rank. Rationale for unevictable-not-deprioritised:
+     a rank penalty still evicts it when it is the only candidate, which is the
+     failure it exists to prevent.
+  2. THRASH FLOOR — RETIRED 2026-07-27 (operator: "is there still some timeblock
+     on a model being evicted? if so eliminate it"). A ``min_residency_s`` floor
+     briefly removed freshly-loaded residents from the pool for 300s. It was a
+     THIRD protection class, and a clock-driven one, which contradicts both
+     standing rulings: protection is exactly ``static`` OR ``in_flight``
+     (2026-07-23), and "when designing anything that unloads/evicts/expires a
+     model, ask what demanded the resources — if the answer is a timer, it's
+     wrong by default" (minimize-loading doctrine).
+
+     What it was actually defending against still stands — a fresh load has zero
+     calls and anchors its idle clock at load time, so it sorts high in the
+     never-called bucket — but the answer is RANK, not a veto. ``sort_key``
+     already orders by (last-activity anchor, calls); a zero-call fresh load
+     only wins the
+     victim lottery when nothing better exists, and in that case evicting it is
+     correct, because the alternative is refusing the admission outright. A veto
+     turns "this is the least-bad victim" into "no victim at all".
+  3. DROPDOWN DISAGREEMENT is not here — it is a defect in
+     ``alloc_modes.feasible_default_mode`` and is fixed there.
+
+── DEGRADE-NOT-GUESS ────────────────────────────────────────────────────────
+An unmeasurable input never produces a guessed eviction. ``Resident.bytes`` of
+None (an occupant we could not size) makes the resident UNEVICTABLE-BY-PLAN: it
+stays in the pool report as blocking, but is never walked, because evicting it
+would free an unknown amount and the caller could not verify the plan. A None
+``free`` or ``size`` at the admission level short-circuits to
+``action="degrade"`` and the caller keeps today's behaviour.
+
+── AUDIT TRACE ──────────────────────────────────────────────────────────────
+Every public plan now carries a deterministic ``trace``. It records normalized
+inputs, capacity branches, every resident's partition outcome, full sort keys
+and ranks, each walk accumulation, every drop-pass keep/spare decision, both
+device eviction calls, blockers, and the final placement. ``trace_jsonl`` turns
+those events into the versioned ``eviction.trace.v1`` schema without emitting
+I/O.
+
+Planning cannot prove that a worker actually unloaded a victim. The worker
+therefore continues the same sequence at ``plan.next_trace_seq`` and records
+``unload.start``, ``unload.success``/``unload.error``, and
+``memory.remeasured`` with ``execution_trace_event``. A single caller-supplied
+``trace_id`` then joins preview, plan, executor, and post-unload measurement.
+"""
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from typing import Any, Iterable, Mapping, Optional, Union
+
+# The two devices this vocabulary knows. "vram" is the GPU, "ram" is host RAM.
+VRAM = "vram"
+RAM = "ram"
+DEVICES = (VRAM, RAM)
+
+# Mode -> the device that mode PREFERS. The spec's P ∈ (max-gpu, max-ram) is
+# the interesting pair; the "-only" modes are prohibitions rather than
+# preferences but still name a device, and `explicit` names one via its
+# priority_device (the caller resolves that before calling in).
+#
+# NOTE (per the brief): BOTH `{}` (derived max-gpu) and
+# `{"alloc_mode": "max-gpu"}` (explicit max-gpu, fixed 2026-07-25 b0e02ff) mean
+# max-gpu for preference purposes. They differ in PROVENANCE, not preference,
+# so `preferred_device` is fed the resolved mode NAME and never the raw spill.
+_MODE_DEVICE = {
+    "max-gpu": VRAM,
+    "gpu-only": VRAM,
+    "max-ram": RAM,
+    "ram-only": RAM,
+}
+
+# Least reaping (the DROP PASS) — the spec read literally: drop any walked
+# victim the remaining set already covers, so ONE unload of 35 GiB satisfies a
+# 15 GiB need instead of two smaller ones. That is fewer disturbances but LESS
+# HEADROOM: the surplus 20 GiB is freed either way under the old greedy walk,
+# and on a tight disk the operator may want it.
+#
+# DEFAULT True == today's shipped behaviour, unchanged. False restores the
+# pre-drop-pass greedy walk EXACTLY: `kept = walked`, nothing spared. This is a
+# FLEET-WIDE policy, never per-worker — see `evict_plan`'s note on why.
+DEFAULT_LEAST_REAPING = True
+
+# Every planner and executor record uses the same versioned, JSON-safe schema.
+# The planner NEVER emits I/O itself: it returns immutable TraceEvent values.
+# Callers decide where those records go (journald, JSONL, OpenTelemetry, etc.).
+TRACE_SCHEMA = "eviction.trace.v1"
+
+
+@dataclass(frozen=True)
+class TraceEvent:
+    """One deterministic audit event.
+
+    ``seq`` is local to one ``trace_id``. Planner events are allocated in
+    execution order. The executor continues at ``Placement.next_trace_seq`` so
+    one admission can be reconstructed without relying on log timestamps.
+
+    Wall-clock logging timestamps deliberately stay outside this object. The
+    policy's supplied ``now`` is included in event data where relevant; adding
+    fresh clock reads here would break central/worker parity.
+    """
+
+    seq: int
+    scope: str
+    stage: str
+    outcome: str
+    data: Mapping[str, Any] = field(default_factory=dict)
+    trace_id: Optional[str] = None
+    schema: str = TRACE_SCHEMA
+
+    def as_dict(self) -> dict:
+        return {
+            "schema": self.schema,
+            "trace_id": self.trace_id,
+            "seq": self.seq,
+            "scope": self.scope,
+            "stage": self.stage,
+            "outcome": self.outcome,
+            "data": dict(self.data),
+        }
+
+
+class _Trace:
+    """In-memory recorder shared by one admission and both EVICT calls."""
+
+    def __init__(self, trace_id: Optional[str] = None) -> None:
+        self.trace_id = None if trace_id is None else str(trace_id)
+        self.events: list[TraceEvent] = []
+
+    def add(self, scope: str, stage: str, outcome: str, **data: Any) -> TraceEvent:
+        event = TraceEvent(
+            seq=len(self.events),
+            scope=scope,
+            stage=stage,
+            outcome=outcome,
+            data=data,
+            trace_id=self.trace_id,
+        )
+        self.events.append(event)
+        return event
+
+
+def _trace_dicts(events: "Iterable[TraceEvent]") -> list[dict]:
+    return [event.as_dict() for event in events]
+
+
+def trace_jsonl(
+    value: "Union[TraceEvent, EvictPlan, Placement, Iterable[TraceEvent]]",
+) -> str:
+    """Serialize planner/executor audit events as stable compact JSONL.
+
+    This is serialization only—no file, logger, environment, or clock access.
+    A call site can emit it with ``logger.info("%s", trace_jsonl(result))``.
+    For one-record-per-log-entry, iterate ``result.trace`` and call
+    ``trace_event_json`` for each event.
+    """
+
+    if isinstance(value, TraceEvent):
+        events = [value]
+    elif isinstance(value, (EvictPlan, Placement)):
+        events = value.trace
+    else:
+        events = list(value)
+    return "\n".join(trace_event_json(event) for event in events)
+
+
+def trace_event_json(event: TraceEvent) -> str:
+    """Serialize exactly one audit event for structured logger ingestion."""
+
+    return json.dumps(
+        event.as_dict(),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+def execution_trace_event(
+    *,
+    trace_id: Optional[str],
+    seq: int,
+    stage: str,
+    outcome: str,
+    device: str,
+    model_key: Optional[str] = None,
+    **data: Any,
+) -> TraceEvent:
+    """Build an executor-side event using the planner's audit schema.
+
+    The worker calls this AROUND the real unload operation. Recommended stages:
+    ``unload.start``, ``unload.success``, ``unload.error``, and
+    ``memory.remeasured``. This helper performs no unload and emits no I/O.
+    """
+
+    return TraceEvent(
+        seq=max(0, int(seq)),
+        scope=f"execution.{str(device).strip().lower()}",
+        stage=str(stage),
+        outcome=str(outcome),
+        data={
+            "model_key": None if model_key is None else str(model_key),
+            "device": str(device),
+            **data,
+        },
+        trace_id=None if trace_id is None else str(trace_id),
+    )
+
+
+def preferred_device(mode: Any, *, default: str = VRAM) -> str:
+    """The device an allocation mode PREFERS — the spec's P -> D mapping.
+
+    ``explicit`` has no fixed answer (its device comes from priority_device),
+    so the caller resolves it to a name before calling; an unknown/unset mode
+    degrades to ``default`` (VRAM), which is the blank max-gpu default and
+    therefore today's behaviour."""
+    m = str(mode or "").strip().lower()
+    return _MODE_DEVICE.get(m, default)
+
+
+def other_device(device: str) -> str:
+    """O := the other device. The spec uses this in both admission branches."""
+    return RAM if str(device).strip().lower() == VRAM else VRAM
+
+
+@dataclass(frozen=True)
+class Resident:
+    """One occupant of one device, as BOTH sides describe it.
+
+    This is the parity contract: central builds these from its worker record
+    and its call log; the worker builds them from its measured residents and
+    the ledger central shipped it. Identical fields in -> identical victims out.
+
+      model_key       stable identity, and the spec's final tiebreak ④.
+      bytes           MEASURED resident footprint on this device. None = an
+                      occupant of unknown size: reported as blocking, never
+                      walked (degrade-not-guess).
+      pref            this resident's preferred device (see preferred_device).
+                      A pref naming the OTHER device sorts FIRST — key ①.
+      last_call       last-activity epoch, from the ONE ledger. Per enacted
+                      proposal 1 the caller passes
+                      ``max(request start, last token emitted)``, never bare
+                      request start. None/0 = never called -> the caller passes
+                      ``resident_since`` in its place (the spec: "never-called
+                      anchors at load time").
+      calls           total call count from the same ledger — key ③.
+      static          🔒static residency: THE only lock. The spec's pool is
+                      "residents on d, minus static".
+      in_flight       enacted proposal 1: mid-generation -> not a candidate.
+      resident_since  load-time epoch and the never-called idle anchor.
+      why             free-text carried into the blocking report.
+    """
+    model_key: str
+    bytes: Optional[int] = None
+    pref: str = VRAM
+    last_call: Optional[float] = None
+    calls: int = 0
+    static: bool = False
+    in_flight: bool = False
+    resident_since: Optional[float] = None
+    why: str = ""
+
+    def idle_anchor(self) -> float:
+        """The epoch key ② measures from. A called model anchors at its last
+        call; a NEVER-called one anchors at load time, exactly as the spec says
+        ("never-called = since load"). Neither known -> 0.0, the coldest
+        possible anchor, which is right for a leftover nobody can account for.
+        """
+        for v in (self.last_call, self.resident_since):
+            try:
+                f = float(v)          # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                continue
+            if f > 0:
+                return f
+        return 0.0
+
+
+@dataclass
+class EvictPlan:
+    """The result of EVICT(d, n) — a PLAN, never an action. Callers execute it.
+
+      victims   model_keys to FULLY unload, in the order they were chosen.
+      freed     bytes the plan frees (sum of the victims' own sizes — full
+                unload, never a spill-chained function of the other device).
+      need      what was asked for.
+      enough    freed >= need. False = the caller must refuse and REPORT
+                ``blocking``.
+      blocking  residents that could not be walked, each with a ``why``:
+                the static locks, the in-flight, and the unmeasurable. This is
+                the spec's "refuse — report blocking
+                residents", pre-assembled.
+      spared    walked-then-dropped by the least-reaping pass. Diagnostic:
+                naming who was SAVED is how the invariant is auditable in a log.
+      trace     deterministic, ordered explanation of every planner stage.
+                Excluded from dataclass equality so observability cannot change
+                policy comparisons.
+    """
+    device: str
+    need: int
+    victims: list = field(default_factory=list)
+    freed: int = 0
+    enough: bool = False
+    blocking: list = field(default_factory=list)
+    spared: list = field(default_factory=list)
+    trace: list[TraceEvent] = field(default_factory=list, repr=False, compare=False)
+
+    @property
+    def trace_id(self) -> Optional[str]:
+        return self.trace[0].trace_id if self.trace else None
+
+    @property
+    def next_trace_seq(self) -> int:
+        return max((event.seq for event in self.trace), default=-1) + 1
+
+    def as_dict(self, *, include_trace: bool = False) -> dict:
+        out = {"device": self.device, "need": self.need,
+               "victims": list(self.victims), "freed": self.freed,
+               "enough": self.enough, "blocking": list(self.blocking),
+               "spared": list(self.spared)}
+        if include_trace:
+            out["trace"] = _trace_dicts(self.trace)
+        return out
+
+
+def sort_key(r: Resident, device: str, now: float) -> tuple:
+    """THE lexicographic sort key — box 2, verbatim, and the ONE definition.
+
+    Every eviction site imports this rather than spelling a tuple, because
+    three hand-written copies of one key is precisely how Parity was lost
+    before. Do not inline it.
+
+      ① pref == other device first  -> 0 for mismatched, 1 for matched. The
+         cliff order: a mismatched resident is already off the cliff by design;
+         a matched one loses 135->36 tok/s, so it sorts LAST.
+      ② time since last call, LONGEST first -> oldest idle-anchor epoch first.
+         For one shared ``now``, sorting elapsed idle descending is exactly
+         equivalent to sorting the anchor ascending. ``now`` stays in the
+         signature so the contract and trace carry the common decision instant.
+      ③ total calls, FEWEST first.
+      ④ model_key — stable, total, and deterministic across processes.
+
+    NOTE what is deliberately ABSENT: size. The old key's ``-bytes``
+    (largest-first) is replaced by the walk-then-drop pass, which is what makes
+    least-reaping possible without ever reaching past the frontier.
+    """
+    matched = 1 if str(r.pref or "").strip().lower() == str(device).strip().lower() else 0
+    return (matched, r.idle_anchor(), int(r.calls or 0), str(r.model_key))
+
+
+def _resident_trace_data(
+    r: Resident,
+    *,
+    device: str,
+    now: float,
+    input_index: Optional[int] = None,
+) -> dict:
+    """JSON-safe policy inputs for one resident—no inferred measurements."""
+
+    anchor = r.idle_anchor()
+    try:
+        decision_now = float(now)
+        idle_seconds: Optional[float] = decision_now - anchor
+    except (TypeError, ValueError):
+        decision_now = 0.0
+        idle_seconds = None
+    data = {
+        "model_key": str(r.model_key),
+        "bytes": r.bytes,
+        "pref": str(r.pref),
+        "device": str(device),
+        "pref_matches_device": (
+            str(r.pref or "").strip().lower()
+            == str(device).strip().lower()
+        ),
+        "last_call": r.last_call,
+        "resident_since": r.resident_since,
+        "idle_anchor": anchor,
+        "decision_now": decision_now,
+        "idle_seconds": idle_seconds,
+        "calls": r.calls,
+        "static": bool(r.static),
+        "in_flight": bool(r.in_flight),
+    }
+    if input_index is not None:
+        data["input_index"] = input_index
+    return data
+
+
+# ── MEASURED DECODE RATE (operator, 2026-07-25) ──────────────────────────────
+# "in the end it is about maximizing tok/s ... lets start recording this".
+#
+# ⚠ READ THIS BEFORE ASSUMING IT IS PART OF THE SORT: it is NOT. ``sort_key``
+# above is unchanged and takes no tok/s input. This parser exists only so the
+# ONE ledger can ACCUMULATE a decode-rate history that a future policy might
+# rank on. Recording changes no victim, no placement, no order.
+#
+# It lives in THIS module — rather than beside the central-side writers — for
+# the same reason ``sort_key`` does: eviction.py is the parity substrate both
+# central's preview and the worker's auto-evict already import. A parser that
+# only central could reach would be the first crack in "one ledger, one
+# definition", which is precisely the failure this module was created to end.
+def tok_s_from_timings(payload: Any) -> Optional[float]:
+    """The engine's OWN decode rate from a llama-server reply, or None.
+
+    llama-server returns a ``timings`` block on EVERY completion, and
+    ``predicted_per_second`` is authoritative decode tok/s measured inside the
+    engine. It costs nothing to keep: no instrumentation in the serving path, no
+    wall-clock arithmetic of ours (which would fold in queueing, network and
+    prompt-eval time and would not be decode rate at all). It was simply being
+    thrown away.
+
+    Verified against llama.cpp ``tools/server/server-task.cpp``: present on the
+    one-shot response body AND pushed onto the FINAL streaming chunk
+    unconditionally, so both transports can be read the same way.
+
+    Falls back to ``predicted_n / predicted_ms`` for a build that reports the
+    raw counters but not the derived rate.
+
+    Returns None for ANYTHING it does not fully recognize — a missing block, a
+    non-dict, a non-numeric, a zero-token generation. The serving path is live;
+    degrade-not-guess, and never raise.
+    """
+    if not isinstance(payload, dict):
+        return None
+    t = payload.get("timings")
+    if not isinstance(t, dict):
+        return None
+    try:
+        rate = t.get("predicted_per_second")
+        if rate is not None:
+            f = float(rate)
+            return f if f > 0.0 and f == f and f != float("inf") else None
+        n, ms = t.get("predicted_n"), t.get("predicted_ms")
+        if n is None or ms is None:
+            return None
+        n_f, ms_f = float(n), float(ms)
+        # predicted_n == 0 is a generation that produced no tokens: it reports
+        # nothing about decode speed, so it is absent rather than 0 tok/s.
+        if n_f <= 0 or ms_f <= 0:
+            return None
+        return (n_f * 1000.0) / ms_f
+    except (TypeError, ValueError):
+        return None
+
+
+def _partition(
+    pool: "Iterable[Resident]",
+    *,
+    now: float,
+    device: str,
+    trace: _Trace,
+    scope: str,
+) -> "tuple[list, list]":
+    """Split residents into (walkable, blocking-with-a-why).
+
+    The spec's pool is "residents on d, minus 🔒static". Exactly two further
+    exclusions survive, each named in the blocking report so a refusal explains
+    itself:
+      * in_flight       — enacted proposal 1
+      * unmeasurable    — degrade-not-guess (never free an unknown amount)
+
+    There is deliberately NO time-based exclusion (the 300s thrash floor was
+    retired 2026-07-27 — see the module docstring). ``now`` is still taken
+    because the ranking downstream is time-aware; nothing here vetoes on age.
+    """
+    walkable: list = []
+    blocking: list = []
+    for input_index, r in enumerate(pool):
+        resident_data = _resident_trace_data(
+            r, device=device, now=now, input_index=input_index
+        )
+        if r.static:
+            reason = r.why or "static (locked residency)"
+            blocking.append({"model_key": r.model_key, "bytes": r.bytes,
+                             "why": reason})
+            trace.add(scope, "partition", "blocked",
+                      reason=reason, resident=resident_data)
+            continue
+        if r.in_flight:
+            # ENACTED PROPOSAL 1 (spec "Open"): unevictable regardless of rank.
+            reason = "in flight (mid-generation)"
+            blocking.append({"model_key": r.model_key, "bytes": r.bytes,
+                             "why": reason})
+            trace.add(scope, "partition", "blocked",
+                      reason=reason, resident=resident_data)
+            continue
+        try:
+            b = int(r.bytes)          # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            b = 0
+        if b <= 0:
+            # DEGRADE-NOT-GUESS: an occupant we cannot size. Evicting it would
+            # free an unknown amount, so the plan cannot be verified against
+            # `need`. Report it as blocking; never walk it.
+            reason = "unmeasurable footprint — not planned"
+            blocking.append({"model_key": r.model_key, "bytes": r.bytes,
+                             "why": reason})
+            trace.add(scope, "partition", "blocked",
+                      reason=reason, resident=resident_data)
+            continue
+        walkable.append((input_index, r))
+        trace.add(scope, "partition", "walkable", resident=resident_data)
+    return walkable, blocking
+
+
+def evict_plan(device: str, need: int, residents: "Iterable[Resident]", *,
+               now: float,
+               least_reaping: bool = DEFAULT_LEAST_REAPING,
+               trace_id: Optional[str] = None,
+               ) -> EvictPlan:
+    """EVICT(device d, need n) — the ONE shared function. PURE.
+
+    Both admission call sites (D and O) run this identically; so do central's
+    preview and the worker's auto-evict. See the module docstring for the three
+    invariants this upholds.
+
+    ``now`` is REQUIRED and never defaulted to ``time.time()``: a default clock
+    read is exactly how central and the worker would drift apart, and the spec
+    names that as the failure mode Parity exists to prevent.
+
+    ``least_reaping`` is PASSED IN, never read from the environment here,
+    because this module is pure and a self-read would be a second clock. It
+    changes THE DROP PASS, which every site runs — including central's
+    ``storage_proposal``. If worker A ran it ON and central previewed it OFF,
+    their victim lists would differ on the very fixture
+    ``tests/test_eviction_parity.py`` exists to police. It is therefore
+    FLEET-WIDE: one central setting, shipped to every worker on the heartbeat
+    (the ``blocked_models`` idiom), never a per-worker key.
+
+    ``trace_id`` is caller-supplied correlation only. It is never generated
+    here, so tracing introduces no random or clock input into policy.
+
+    There is no residency-floor argument: nothing here vetoes a victim on age
+    (retired 2026-07-27, see the module docstring)."""
+    trace = _Trace(trace_id)
+    return _evict_plan(
+        device,
+        need,
+        residents,
+        now=now,
+        least_reaping=least_reaping,
+        trace=trace,
+        scope=f"evict.{str(device).strip().lower()}",
+    )
+
+
+def _evict_plan(
+    device: str,
+    need: int,
+    residents: "Iterable[Resident]",
+    *,
+    now: float,
+    least_reaping: bool,
+    trace: _Trace,
+    scope: str,
+) -> EvictPlan:
+    """Internal EVICT using an admission-wide recorder and sequence."""
+
+    start_event = len(trace.events)
+    need = max(0, int(need or 0))
+    resident_pool = list(residents)
+    plan = EvictPlan(device=device, need=need)
+    trace.add(
+        scope,
+        "start",
+        "received",
+        device=device,
+        need=need,
+        now=now,
+        least_reaping=bool(least_reaping),
+        resident_count=len(resident_pool),
+    )
+    walkable, blocking = _partition(
+        resident_pool,
+        now=now,
+        device=device,
+        trace=trace,
+        scope=scope,
+    )
+    plan.blocking = blocking
+    trace.add(
+        scope,
+        "partition.summary",
+        "complete",
+        walkable_count=len(walkable),
+        blocking_count=len(blocking),
+        blocking=list(blocking),
+    )
+    if need <= 0:
+        plan.enough = True
+        trace.add(
+            scope,
+            "result",
+            "enough",
+            reason="no bytes requested",
+            victims=[],
+            spared=[],
+            freed=0,
+            need=need,
+        )
+        plan.trace = list(trace.events[start_event:])
+        return plan
+
+    walkable.sort(key=lambda item: sort_key(item[1], device, now))
+    for rank, (input_index, resident) in enumerate(walkable, start=1):
+        trace.add(
+            scope,
+            "rank",
+            "candidate",
+            rank=rank,
+            sort_key=list(sort_key(resident, device, now)),
+            resident=_resident_trace_data(
+                resident,
+                device=device,
+                now=now,
+                input_index=input_index,
+            ),
+        )
+
+    # ── WALK: accumulate victims IN ORDER until freed >= n or pool exhausted ─
+    walked: list[tuple[int, Resident]] = []
+    freed = 0
+    for rank, candidate in enumerate(walkable, start=1):
+        if freed >= need:
+            break
+        input_index, resident = candidate
+        freed_before = freed
+        walked.append(candidate)
+        freed += int(resident.bytes or 0)
+        trace.add(
+            scope,
+            "walk",
+            "take",
+            rank=rank,
+            model_key=resident.model_key,
+            input_index=input_index,
+            bytes=int(resident.bytes or 0),
+            freed_before=freed_before,
+            freed_after=freed,
+            need=need,
+            enough_after=freed >= need,
+        )
+    trace.add(
+        scope,
+        "walk.frontier",
+        "reached" if freed >= need else "pool_exhausted",
+        walked=[resident.model_key for _, resident in walked],
+        not_walked=[
+            resident.model_key for _, resident in walkable[len(walked):]
+        ],
+        freed=freed,
+        need=need,
+    )
+
+    # ── DROP PASS, same order: remove any victim the REMAINING set covers ────
+    # Least reaping. This ONLY removes — it never looks past `walked`, so the
+    # frontier rule holds by construction: a hot resident beyond where the walk
+    # reached cannot be pulled in, however conveniently sized it is.
+    #
+    # GATED (operator switch, 2026-07-25). least_reaping=False skips the pass
+    # entirely — `kept` stays exactly `walked` and `spared` stays empty, which
+    # is byte-identical to the pre-drop-pass greedy walk. The switch is the
+    # ONLY difference; the WALK and the sort are untouched in both states, so
+    # OFF is a strict superset of ON's victims and never a different ordering.
+    kept = list(walked)
+    if least_reaping:
+        for candidate in list(walked):  # same order the walk produced
+            _, resident = candidate
+            remaining = sum(
+                int(kept_resident.bytes or 0)
+                for kept_candidate, kept_resident in kept
+                if kept_candidate != candidate[0]
+            )
+            if remaining >= need:
+                kept.remove(candidate)
+                plan.spared.append(resident.model_key)
+                trace.add(
+                    scope,
+                    "drop",
+                    "spare",
+                    model_key=resident.model_key,
+                    input_index=candidate[0],
+                    candidate_bytes=int(resident.bytes or 0),
+                    remaining_if_spared=remaining,
+                    need=need,
+                )
+            else:
+                trace.add(
+                    scope,
+                    "drop",
+                    "keep",
+                    model_key=resident.model_key,
+                    input_index=candidate[0],
+                    candidate_bytes=int(resident.bytes or 0),
+                    remaining_if_spared=remaining,
+                    need=need,
+                    reason="remaining victims would not cover need",
+                )
+    else:
+        trace.add(
+            scope,
+            "drop",
+            "disabled",
+            walked=[resident.model_key for _, resident in walked],
+            reason="least_reaping is false",
+        )
+
+    plan.victims = [resident.model_key for _, resident in kept]
+    plan.freed = sum(int(resident.bytes or 0) for _, resident in kept)
+    plan.enough = plan.freed >= need
+    trace.add(
+        scope,
+        "result",
+        "enough" if plan.enough else "insufficient",
+        victims=list(plan.victims),
+        spared=list(plan.spared),
+        freed=plan.freed,
+        need=need,
+        blocking=list(plan.blocking),
+    )
+    plan.trace = list(trace.events[start_event:])
+    # NOT enough means everything walkable went and it still fell short. No
+    # extra work is needed here: `blocking` was already populated by
+    # `_partition` with the residents that could not be walked AND their
+    # reasons, which is exactly what the spec's "refuse — report blocking
+    # residents" terminal needs.
+    return plan
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Box 1 — admission & placement. The flowchart, executable.
+# ─────────────────────────────────────────────────────────────────────────────
+@dataclass
+class Placement:
+    """The verdict of ``plan_admission`` — box 1's terminal states.
+
+      action    "place"    -> resident, honored (all of Z on D)
+                "split"    -> split residency (what fits on D, remainder on O)
+                "reject"   -> infeasible on this card (Z > X + Y)
+                "refuse"   -> the devices could not be cleared; `blocking` says
+                              who stood in the way
+                "degrade"  -> an input was unmeasurable; the CALLER KEEPS
+                              TODAY'S BEHAVIOUR (never a guessed eviction)
+      on_device / on_other  bytes placed on D and on O.
+      evict     the per-device EvictPlan(s) actually run, in call order.
+      trace     one ordered admission-wide trace, including both EVICT calls.
+    """
+    action: str
+    device: str = VRAM
+    on_device: int = 0
+    on_other: int = 0
+    evict: list = field(default_factory=list)
+    blocking: list = field(default_factory=list)
+    note: str = ""
+    trace: list[TraceEvent] = field(default_factory=list, repr=False, compare=False)
+
+    @property
+    def victims(self) -> list:
+        """Every model this admission would unload, in the order chosen."""
+        out: list = []
+        for p in self.evict:
+            out.extend(p.victims)
+        return out
+
+    @property
+    def trace_id(self) -> Optional[str]:
+        return self.trace[0].trace_id if self.trace else None
+
+    @property
+    def next_trace_seq(self) -> int:
+        return max((event.seq for event in self.trace), default=-1) + 1
+
+    def as_dict(self, *, include_trace: bool = False) -> dict:
+        out = {"action": self.action, "device": self.device,
+               "on_device": self.on_device, "on_other": self.on_other,
+               "evict": [
+                   p.as_dict(include_trace=include_trace) for p in self.evict
+               ],
+               "victims": self.victims, "blocking": list(self.blocking),
+               "note": self.note}
+        if include_trace:
+            out["trace"] = _trace_dicts(self.trace)
+        return out
+
+
+def plan_admission(size: "Optional[int]", mode: Any, *,
+                   vram_free: "Optional[int]", ram_free: "Optional[int]",
+                   vram_total: "Optional[int]" = None,
+                   ram_total: "Optional[int]" = None,
+                   residents: "Optional[Iterable[Resident]]" = None,
+                   now: float = 0.0,
+                   least_reaping: bool = DEFAULT_LEAST_REAPING,
+                   trace_id: Optional[str] = None,
+                   incoming_model_key: Optional[str] = None,
+                   ) -> Placement:
+    """Box 1 of the spec — the SINGLE-POOL convenience form. PURE.
+
+    Device occupancy is not a property of a Resident (a model's ``pref`` says
+    where it WANTS to live, not where it currently is), so the real entry point
+    ``plan_admission_split`` takes the two device pools separately. This wrapper
+    is for the common caller that only knows about ONE pool — the residents of
+    the PREFERRED device — and it assigns ``residents`` to that pool, leaving
+    the other empty.
+
+    Consequence worth stating plainly: with an empty O pool, the second
+    EVICT call site can free nothing, so an admission that needs room on the
+    other device lands on ``split`` (if O has free space) or ``refuse``. That is
+    correct for a caller who genuinely has no O-side inventory; a caller that
+    does have one MUST use ``plan_admission_split`` or it will under-report what
+    could be reclaimed.
+
+    DEGRADE-NOT-GUESS: unknown size, or unknown free on the device we must
+    place on, returns ``action="degrade"``. The caller then does exactly what
+    it does today — never a guessed eviction."""
+    return plan_admission_split(
+        size, mode, vram_free=vram_free, ram_free=ram_free,
+        vram_total=vram_total, ram_total=ram_total,
+        vram_residents=(residents if preferred_device(mode) == VRAM else None),
+        ram_residents=(residents if preferred_device(mode) == RAM else None),
+        now=now, least_reaping=least_reaping, trace_id=trace_id,
+        incoming_model_key=incoming_model_key)
+
+
+def plan_admission_split(size: "Optional[int]", mode: Any, *,
+                         vram_free: "Optional[int]", ram_free: "Optional[int]",
+                         vram_total: "Optional[int]" = None,
+                         ram_total: "Optional[int]" = None,
+                         vram_residents: "Optional[Iterable[Resident]]" = None,
+                         ram_residents: "Optional[Iterable[Resident]]" = None,
+                         now: float = 0.0,
+                         least_reaping: bool = DEFAULT_LEAST_REAPING,
+                         trace_id: Optional[str] = None,
+                         incoming_model_key: Optional[str] = None,
+                         ) -> Placement:
+    """Box 1 with the two device pools passed explicitly. THE real entry point.
+
+    Walks the flowchart exactly:
+
+        Z > X + Y ?                       -> reject
+        D := P's device;  O := the other
+        D_free >= Z ?                     -> place all of Z on D
+        else EVICT(D, Z - D_free); enough? -> place all of Z on D
+             else place what fits on D; R := Z - placed
+                  O_free >= R ?            -> place R on O (split)
+                  else EVICT(O, R - O_free); enough? -> place R on O
+                       else refuse, reporting the blocking residents
+
+    ``trace_id`` should be the admission/job/request identifier already owned
+    by the caller. ``incoming_model_key`` names the model being seated. Neither
+    field changes policy; both only make fleet logs joinable.
+    """
+    def _i(v):
+        try:
+            return int(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    trace = _Trace(trace_id)
+    Z = _i(size)
+    device = preferred_device(mode)
+    other = other_device(device)
+    trace.add(
+        "admission",
+        "start",
+        "received",
+        incoming_model_key=(
+            None if incoming_model_key is None else str(incoming_model_key)
+        ),
+        requested_size=size,
+        normalized_size=Z,
+        mode=str(mode),
+        preferred_device=device,
+        other_device=other,
+        vram_free=vram_free,
+        ram_free=ram_free,
+        vram_total=vram_total,
+        ram_total=ram_total,
+        now=now,
+        least_reaping=bool(least_reaping),
+    )
+
+    def _finish(out: Placement) -> Placement:
+        trace.add(
+            "admission",
+            "result",
+            out.action,
+            incoming_model_key=(
+                None if incoming_model_key is None else str(incoming_model_key)
+            ),
+            device=out.device,
+            on_device=out.on_device,
+            on_other=out.on_other,
+            victims=list(out.victims),
+            blocking=list(out.blocking),
+            note=out.note,
+        )
+        out.trace = list(trace.events)
+        return out
+
+    if Z is None or Z <= 0:
+        trace.add(
+            "admission",
+            "size.check",
+            "degrade",
+            requested_size=size,
+            normalized_size=Z,
+            reason="unknown or non-positive model size",
+        )
+        return _finish(
+            Placement(action="degrade", device=device,
+                      note="unknown model size — keeping today's behaviour "
+                           "(degrade-not-guess)")
+        )
+
+    free = {VRAM: _i(vram_free), RAM: _i(ram_free)}
+    total = {VRAM: _i(vram_total), RAM: _i(ram_total)}
+    pools = {VRAM: list(vram_residents or []), RAM: list(ram_residents or [])}
+    trace.add(
+        "admission",
+        "inputs.normalized",
+        "complete",
+        size=Z,
+        free=dict(free),
+        total=dict(total),
+        resident_counts={
+            VRAM: len(pools[VRAM]),
+            RAM: len(pools[RAM]),
+        },
+    )
+
+    # Z > X + Y ? -> reject, infeasible on this card. Only when BOTH totals are
+    # measured: a single unknown total cannot support a rejection (a rejection
+    # from a guess takes a working model out of the pool, which is strictly
+    # worse than a late honest refusal).
+    if total[VRAM] is not None and total[RAM] is not None:
+        total_capacity = total[VRAM] + total[RAM]
+        feasible = Z <= total_capacity
+        trace.add(
+            "admission",
+            "capacity.check",
+            "pass" if feasible else "reject",
+            size=Z,
+            vram_total=total[VRAM],
+            ram_total=total[RAM],
+            combined_total=total_capacity,
+        )
+        if not feasible:
+            return _finish(
+                Placement(
+                    action="reject",
+                    device=device,
+                    note=(f"infeasible on this card: {Z} bytes exceeds "
+                          f"VRAM+RAM ({total[VRAM]}+{total[RAM]})"),
+                )
+            )
+    else:
+        trace.add(
+            "admission",
+            "capacity.check",
+            "not_decidable",
+            size=Z,
+            vram_total=total[VRAM],
+            ram_total=total[RAM],
+            reason="one or both device totals are unknown",
+        )
+
+    if free[device] is None:
+        trace.add(
+            "admission",
+            "preferred_free.check",
+            "degrade",
+            device=device,
+            free=None,
+            size=Z,
+            reason=f"unknown free {device}",
+        )
+        return _finish(
+            Placement(action="degrade", device=device,
+                      note=f"unknown free {device} — keeping today's "
+                           "behaviour (degrade-not-guess)")
+        )
+
+    # D_free >= Z ? -> place all of Z on D, resident · honored.
+    if free[device] >= Z:
+        trace.add(
+            "admission",
+            "preferred_free.check",
+            "fits",
+            device=device,
+            free=free[device],
+            size=Z,
+            shortfall=0,
+        )
+        return _finish(
+            Placement(action="place", device=device, on_device=Z,
+                      note=f"fits {device} free")
+        )
+
+    out = Placement(action="place", device=device)
+    primary_need = Z - free[device]
+    trace.add(
+        "admission",
+        "preferred_free.check",
+        "eviction_required",
+        device=device,
+        free=free[device],
+        size=Z,
+        shortfall=primary_need,
+    )
+
+    # EVICT(D, need = Z - D_free)
+    p1 = _evict_plan(
+        device,
+        primary_need,
+        pools[device],
+        now=now,
+        least_reaping=least_reaping,
+        trace=trace,
+        scope=f"evict.primary.{device}",
+    )
+    out.evict.append(p1)
+    trace.add(
+        "admission",
+        "primary_evict.assess",
+        "enough" if p1.enough else "insufficient",
+        device=device,
+        need=p1.need,
+        victims=list(p1.victims),
+        spared=list(p1.spared),
+        freed=p1.freed,
+        blocking=list(p1.blocking),
+    )
+    if p1.enough:
+        out.on_device = Z
+        out.note = f"evicted {len(p1.victims)} on {device} to seat all of Z"
+        return _finish(out)
+
+    # Place what fits on D; R := Z - placed. FULL UNLOAD means `freed` is the
+    # victims' own sizes, so `placed` is derivable from the inputs alone.
+    placed = free[device] + p1.freed
+    R = Z - placed
+    out.on_device = placed
+    trace.add(
+        "admission",
+        "remainder.compute",
+        "split_required",
+        preferred_device=device,
+        preferred_free=free[device],
+        preferred_evicted=p1.freed,
+        placed_on_preferred=placed,
+        remainder=R,
+    )
+
+    if free[other] is None:
+        out.action = "degrade"
+        out.note = (f"unknown free {other} — cannot plan the remainder; "
+                    "keeping today's behaviour")
+        trace.add(
+            "admission",
+            "other_free.check",
+            "degrade",
+            device=other,
+            free=None,
+            remainder=R,
+            reason=f"unknown free {other}",
+        )
+        return _finish(out)
+
+    # O_free >= R ? -> place R on O (split residency).
+    if free[other] >= R:
+        out.action = "split"
+        out.on_other = R
+        out.note = (f"split residency: {placed} on {device}, {R} on {other}")
+        trace.add(
+            "admission",
+            "other_free.check",
+            "fits",
+            device=other,
+            free=free[other],
+            remainder=R,
+            shortfall=0,
+        )
+        return _finish(out)
+
+    # EVICT(O, need = R - O_free)
+    other_need = R - free[other]
+    trace.add(
+        "admission",
+        "other_free.check",
+        "eviction_required",
+        device=other,
+        free=free[other],
+        remainder=R,
+        shortfall=other_need,
+    )
+    p2 = _evict_plan(
+        other,
+        other_need,
+        pools[other],
+        now=now,
+        least_reaping=least_reaping,
+        trace=trace,
+        scope=f"evict.other.{other}",
+    )
+    out.evict.append(p2)
+    trace.add(
+        "admission",
+        "other_evict.assess",
+        "enough" if p2.enough else "insufficient",
+        device=other,
+        need=p2.need,
+        victims=list(p2.victims),
+        spared=list(p2.spared),
+        freed=p2.freed,
+        blocking=list(p2.blocking),
+    )
+    if p2.enough:
+        out.action = "split"
+        out.on_other = R
+        out.note = (f"split residency after evicting {len(p2.victims)} on "
+                    f"{other}: {placed} on {device}, {R} on {other}")
+        return _finish(out)
+
+    # Refuse — REPORT THE BLOCKING RESIDENTS. Both devices' blockers, because
+    # the operator's question is "what is holding my card", not "which of the
+    # two sub-steps failed".
+    out.action = "refuse"
+    out.on_device = 0
+    out.on_other = 0
+    out.blocking = list(p1.blocking) + list(p2.blocking)
+    out.note = (f"refused: needed {Z}, could seat {placed} on {device} and "
+                f"{free[other] + p2.freed} on {other}")
+    return _finish(out)

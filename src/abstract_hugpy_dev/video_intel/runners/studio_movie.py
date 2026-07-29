@@ -822,9 +822,10 @@ def run_generate_studio_movie(spec: StudioMovieSpec, job_id: str) -> JobResult:
             "context_frames": seg_context_frames,
             "context_drop": seg_context_drop,
             # RESOLVED effective per-segment budget + its source ("explicit" |
-            # "autofit:<worker>" | "autofit:fallback"): the number the router actually used
-            # (autofit-sized to the worker's free VRAM when the movie budget was blank, else
-            # the explicit/floored seg_budget). Honesty in movie.json.
+            # "autofit:<worker>" | "unresolved"): the number the router actually used
+            # (autofit-sized to the worker's GPU CAPACITY when the movie budget was blank —
+            # the reservation engine evicts to free it — else the explicit/floored
+            # seg_budget). Honesty in movie.json.
             "vram_budget_gb": (outcome.effective_budget_gb
                                if outcome.effective_budget_gb is not None else seg_budget),
             "budget_source": outcome.budget_source,

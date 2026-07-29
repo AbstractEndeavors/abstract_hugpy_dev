@@ -157,6 +157,7 @@ def produce_clip(
     control_image: str | None = None,
     control_kind: str | None = None,
     vace_context_frames: tuple[str, ...] | None = None,
+    requested_frames: int | None = None,
     should_cancel: Callable[[], bool] | None = None,
 ) -> Result[Artifact, StageError]:
     """Resolve ``request``, build its manifest, and run the bound runner.
@@ -236,6 +237,13 @@ def produce_clip(
         # other conditioning inputs — NOT part of the content_hash (see the field docstring
         # on RenderManifest). None -> ().
         vace_context_frames=tuple(vace_context_frames or ()),
+        # CLIP LENGTH (2026-07-27): the caller's requested frame count, threaded into the
+        # manifest so ``resolve_frames`` can honour it. None = unset -> the model's default
+        # length. THIS SEAM IS THE WHOLE POINT: before it existed, RenderManifest declared
+        # ``requested_frames`` but no production path could set it, so every real render was
+        # pinned to one hardcoded length and the field was a dead knob. A review found the
+        # dead knob; adding the field without this line would have recreated it one layer up.
+        requested_frames=requested_frames,
     )
 
     runner = _DISPATCH.get((binding.framework, binding.task))

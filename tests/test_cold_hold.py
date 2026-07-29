@@ -368,7 +368,16 @@ def _load_state_provider_checks(W):
         "loaded_models": ["Qwen2.5-3B-Instruct-GGUF"],
         "loading": ["Big-Model-GGUF"],
         "provisioning": ["Downloading-GGUF"],
-        "provision_progress": {"Downloading-GGUF": {"progress": 0.25, "message": "downloading"}},
+        # The shape a WORKER actually writes (agent.py's _prog callback):
+        # done_bytes / total_bytes / frac. This fixture used to carry
+        # {"progress": .., "message": ..} — keys no worker has ever sent — and
+        # the reader asked for those same invented keys, so the two agreed with
+        # each other and disagreed with reality: every held call reported
+        # progress=None and showed a bare spinner. Corrected 2026-07-28 with the
+        # progress-aware hold; the check below now asserts real bytes.
+        "provision_progress": {"Downloading-GGUF": {"done_bytes": 1 * 2**30,
+                                                    "total_bytes": 4 * 2**30,
+                                                    "frac": 0.25}},
         "load_reports": {
             "Fresh-Fail-GGUF": {"ok": False, "error": "CUDA out of memory", "ts": now},
             "Stale-Fail-GGUF": {"ok": False, "error": "old blip", "ts": now - 10_000},
@@ -387,8 +396,10 @@ def _load_state_provider_checks(W):
               f("Big-Model-GGUF", "w1", 0) == {"healthy": False, "in_progress": True,
                                                "progress": None, "message": None, "error": None})
         d = f("Downloading-GGUF", "w1", 0)
-        check("provisioning model carries download progress + message",
-              d["in_progress"] and d["progress"] == 0.25 and d["message"] == "downloading")
+        check("provisioning model carries download progress + BYTES",
+              d["in_progress"] and d["progress"] == 0.25
+              and "1.0 GB" in (d["message"] or "")
+              and "4.0 GB" in (d["message"] or ""))
         check("FRESH honest load error is surfaced",
               f("Fresh-Fail-GGUF", "w1", now - 1)["error"] == "CUDA out of memory")
         check("STALE load error (ts < since_ts) is NOT surfaced (no false fresh-fail)",

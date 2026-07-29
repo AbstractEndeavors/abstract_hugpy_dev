@@ -39,13 +39,28 @@ V0 SIMPLIFICATIONS (stated here + in the runner header + the report):
   * ``model_id`` / ``steps`` / ``cfg`` are movie-level defaults, but a node MAY
     OVERRIDE them per segment (honored when set — not dead fields). ``negative``
     and ``seed`` are likewise per-segment-overridable over the movie default.
-  * NO PER-SEGMENT DURATION/FRAMES FIELD. ``StudioI2VSpec`` itself carries none —
-    clip length is a pure function of the manifest (``fps * 2`` seconds, capped by
-    the bound model), derived by the studio spine — so this schema faithfully
-    mirrors it and adds no dead length knob. ``branch_frame`` is therefore bounded
-    by the parent clip's ACTUAL frame count, checkable only at RUN time (the schema
-    validates ``branch_frame >= 0``; ``branch_frame < parent_frames`` is a runtime
-    error-as-data from the runner).
+  * NO PER-SEGMENT DURATION/FRAMES FIELD — STILL, BUT FOR A NARROWER REASON NOW.
+    Clip length is a pure function of the manifest, derived by the studio spine
+    (``RenderManifest.requested_frames`` when the caller asks for a length, else the
+    bound model's default — 81 frames for a real model, ``fps * 2`` FRAMES for the
+    synthetic prover — clamped to that model's ceiling and snapped to the 4k+1
+    temporal cadence; see ``studio/runners/synthetic.resolve_frames``).
+
+    ⚠ CORRECTION (2026-07-27): the previous wording here — "``StudioI2VSpec`` itself
+    carries none" — is no longer true. ``StudioI2VSpec.requested_frames`` EXISTS and
+    is threaded spec -> ``produce_clip`` -> manifest -> runner. What is still missing
+    is the MOVIE side of that thread: ``video_intel/runners/studio_movie.py`` builds
+    one ``StudioI2VSpec`` per segment and does not set ``requested_frames``, so every
+    segment renders at the bound model's default. A movie-level + per-goal length knob
+    is therefore ONE runner change away, not a schema redesign — and it is
+    deliberately NOT a field here until that runner threads it, because a knob the
+    runner ignores is a dead field that lies to the caller (exactly the defect class
+    the single-clip lever was just fixed for: a documented, hashed, unreachable
+    ``requested_frames``). Add the field and the runner thread TOGETHER or not at all.
+
+    ``branch_frame`` is consequently bounded by the parent clip's ACTUAL frame count,
+    checkable only at RUN time (the schema validates ``branch_frame >= 0``;
+    ``branch_frame < parent_frames`` is a runtime error-as-data from the runner).
 
 No pathlib anywhere. os.path only (there is none here — pure data).
 """

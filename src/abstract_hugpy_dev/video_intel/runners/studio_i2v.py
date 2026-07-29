@@ -106,14 +106,22 @@ _STATUS_TIMEOUT_S = 20.0
 # the LARGER of 10% or 2GB — 2GB dominates on small cards, 10% dominates on big ones.
 _AUTOFIT_MARGIN_FRACTION = 0.10
 _AUTOFIT_MARGIN_FLOOR_GB = 2.0
-# ``gpus[].memory_free`` is stored in BYTES (nvidia-smi MiB * 1024*1024, see
-# _platform.hardware.detect_gpus), so convert with GiB (1024**3) — the honest inverse of
-# the MiB source and the more conservative GB number (won't over-state the budget).
+# ``gpus[].memory_total`` / ``memory_free`` are stored in BYTES (nvidia-smi MiB *
+# 1024*1024, see _platform.hardware.detect_gpus), so convert with GiB (1024**3) — the
+# honest inverse of the MiB source and the more conservative GB number.
 _BYTES_PER_GIB = 1024 ** 3
-# No worker / no VRAM data -> today's default (0.5 => synthetic-if-available). Mirrors
-# studio.job._DEFAULT_VRAM_BUDGET_GB so an unresolvable autofit degrades EXACTLY to the
-# historical blank behavior (the UI banner already warns loudly), never a new breakage.
-_AUTOFIT_FALLBACK_BUDGET_GB = 0.5
+
+# SYNTHETIC IS OPT-IN (operator, 2026-07-27). ``synthetic-i2v``/``synthetic-t2v`` are
+# provers: their output is noise derived from seed + geometry. They are registered as a
+# last resort for i2v/t2v ONLY (v2v/id_lock register none and refuse honestly — that is
+# the behaviour being copied here). Unless this is explicitly set, a render that binds a
+# synthetic model REFUSES instead of writing a blob that looks finished. The two
+# ``*-synthetic`` presets set it per-request; nothing else should.
+_ALLOW_SYNTHETIC_ENV = "STUDIO_ALLOW_SYNTHETIC"
+
+
+def _allow_synthetic() -> bool:
+    return os.environ.get(_ALLOW_SYNTHETIC_ENV) == "1"
 
 
 def _pkg_version() -> str:
@@ -179,8 +187,9 @@ class ClipOutcome:
     # budget the router actually resolved for this render (== the explicit budget, OR the
     # worker's measured-free-minus-margin when the spec budget was blank/None), and
     # ``budget_source`` labels HOW it was chosen: ``"explicit"`` (a pinned number),
-    # ``"autofit:<worker>"`` (sized to a named worker's free VRAM), or ``"autofit:fallback"``
-    # (no worker / no VRAM data -> today's synthetic default). Stamped by ``render_clip`` on
+    # ``"autofit:<worker>"`` (sized to a named worker's GPU CAPACITY, which the reservation
+    # engine then evicts to free), or ``"unresolved"`` (no worker / no VRAM data — the
+    # render REFUSES; there is no fallback budget). Stamped by ``render_clip`` on
     # BOTH ok and err outcomes; the movie runner records them per segment in movie.json.
     # Defaulted so every other construction site (worker-payload normalize, in-process) is
     # unchanged — render_clip fills them via dataclasses.replace.
@@ -242,6 +251,11 @@ def run_produce_clip(spec, should_cancel):
         # dicts (no steps/cfg fields) working.
         steps=getattr(spec, "steps", None),
         cfg=getattr(spec, "cfg", None),
+        # CLIP LENGTH: same getattr idiom as steps/cfg, for the same reason — an older
+        # spec dict without the field keeps working. This is the last seam between the
+        # HTTP spec and the manifest; without it StudioI2VSpec.requested_frames is a
+        # knob nothing reads (the exact defect a 2026-07-27 review found one layer down).
+        requested_frames=getattr(spec, "requested_frames", None),
         start_image=spec.start_image,
         prompt=getattr(spec, "prompt", "") or "",
         negative_prompt=getattr(spec, "negative", "") or "",
@@ -388,10 +402,26 @@ def _url_host(url: str) -> str:
 
 def _autofit_from_worker(base: str) -> "tuple[float, str] | None":
     """``(effective_budget_gb, worker_name)`` for the registry worker whose ``url`` host
-    matches ``base`` — its MEASURED free VRAM minus the safety margin — or ``None`` when no
-    worker matches / it reports no usable VRAM (autofit then falls back to the default).
+    matches ``base`` — its GPU **CAPACITY** minus the safety margin — or ``None`` when no
+    worker matches / it reports no usable VRAM.
 
-    The free-VRAM source is the worker record's per-GPU ``gpus[].memory_free`` (bytes,
+    ⚠ CAPACITY, NOT FREE (operator ruling 2026-07-27: *"it needs to evict like everything
+    else, not assess what it thinks it should set a budget for"*). This used to size to
+    ``memory_free``, which made the ROUTING BUDGET a function of whatever the LLM
+    residents happened to be holding that second. Measured on ae the same day, minutes
+    apart: 3.30 / 5.84 / 7.39 / 6.67 GB — crossing the 6.00 GB cheapest-real-model floor
+    in BOTH directions, so an identical request bound a real Wan model or the synthetic
+    prover depending on the second it was submitted.
+
+    Sizing to capacity states what the CARD can hold; the reservation engine
+    (``video_intel/reservation/engine.py``, which already has a ``studio_i2v`` template)
+    then makes room for it the same way every other allocation does — comfy flush, then
+    ``/ops/evict`` largest-first with ``force=false`` so the worker's own gate keeps
+    🔒static / actively-replying / queued-ahead residents safe — and raises
+    ``ReservationRefused`` if it genuinely cannot clear the card. Need, then eviction,
+    then an honest refusal: never a quietly smaller model.
+
+    The capacity source is the worker record's per-GPU ``gpus[].memory_total`` (bytes,
     freshest heartbeat). A single render binds ONE device, so we size to the LARGEST single
     GPU's free VRAM (== ``gpus[0]`` on the single-GPU boxes today), never the multi-GPU sum
     (which would over-state what one render can use). Lazy import of central's worker store:
@@ -412,17 +442,17 @@ def _autofit_from_worker(base: str) -> "tuple[float, str] | None":
         if _url_host(w.get("url") or "") != host:
             continue
         gpus = [g for g in (w.get("gpus") or []) if isinstance(g, dict)]
-        frees = [g.get("memory_free") for g in gpus
-                 if isinstance(g.get("memory_free"), (int, float)) and g.get("memory_free") > 0]
-        if not frees:
-            return None      # matched the box but it reports no VRAM -> fall back
-        free_gib = max(frees) / _BYTES_PER_GIB
-        margin = max(free_gib * _AUTOFIT_MARGIN_FRACTION, _AUTOFIT_MARGIN_FLOOR_GB)
-        effective = free_gib - margin
+        totals = [g.get("memory_total") for g in gpus
+                  if isinstance(g.get("memory_total"), (int, float)) and g.get("memory_total") > 0]
+        if not totals:
+            return None      # matched the box but it reports no VRAM -> caller refuses
+        total_gib = max(totals) / _BYTES_PER_GIB
+        margin = max(total_gib * _AUTOFIT_MARGIN_FRACTION, _AUTOFIT_MARGIN_FLOOR_GB)
+        effective = total_gib - margin
         if effective <= 0:
-            return None      # a card with less free than the margin -> fall back
+            return None      # a card smaller than the margin -> caller refuses
         return effective, str(w.get("name") or w.get("id") or "worker")
-    return None              # no registry row for this worker URL -> fall back
+    return None              # no registry row for this worker URL -> caller refuses
 
 
 def _resolve_autofit(spec) -> "tuple[object, float, str]":
@@ -432,10 +462,17 @@ def _resolve_autofit(spec) -> "tuple[object, float, str]":
     * An EXPLICIT budget is a passthrough — the spec is returned UNCHANGED (byte-identical
       delegation payload + routing), ``budget_source == "explicit"``.
     * A None budget is AUTOFIT: resolve the target worker via the pluggable seam and size
-      the budget to its measured free VRAM (minus margin). No worker resolvable / no VRAM
-      data (including an IN-PROCESS render on the GPU-less control-plane central, where the
-      seam yields no worker) -> the historical default (0.5 => synthetic-if-available),
-      ``budget_source == "autofit:fallback"``. Otherwise ``"autofit:<worker>"``.
+      the budget to that card's CAPACITY (minus margin) — what the card can hold once the
+      reservation engine has made room, NOT what happens to be free right now.
+      ``budget_source == "autofit:<worker>"``.
+    * No worker resolvable / no VRAM data -> ``(spec, None, "unresolved")``. There is
+      deliberately NO fallback number.
+
+    ⚠ THE FALLBACK IS GONE (operator, 2026-07-27). This used to substitute
+    ``_AUTOFIT_FALLBACK_BUDGET_GB = 0.5`` — a value whose only property is that it sits
+    under every real model's floor and therefore binds the synthetic prover. "I could not
+    measure the worker" is an ERROR, not a budget; manufacturing one turned an
+    infrastructure hiccup into a finished-looking noise blob. The caller refuses instead.
 
     The None is resolved to a NUMBER here, BEFORE any router probe (``resolves_to_real_model``
     / ``produce_clip`` both key on ``vram_budget_gb``), via ``dataclasses.replace`` so the
@@ -445,13 +482,12 @@ def _resolve_autofit(spec) -> "tuple[object, float, str]":
     base = resolve_studio_worker(spec)
     resolved = _autofit_from_worker(base) if base else None
     if resolved is None:
-        eff = _AUTOFIT_FALLBACK_BUDGET_GB
-        logger.info("studio autofit: no worker VRAM for %r -> fallback budget %.2fGB "
-                    "(synthetic-if-available)", base or "(no worker)", eff)
-        return replace(spec, vram_budget_gb=eff), eff, "autofit:fallback"
+        logger.warning("studio autofit: no GPU capacity readable for %r — refusing "
+                       "rather than inventing a budget", base or "(no worker)")
+        return spec, None, "unresolved"
     eff, name = resolved
-    logger.info("studio autofit: sized budget to %.2fGB from worker %s free VRAM (- margin)",
-                eff, name)
+    logger.info("studio autofit: sized budget to %.2fGB from worker %s GPU CAPACITY "
+                "(- margin); the reservation engine makes room for it", eff, name)
     return replace(spec, vram_budget_gb=eff), eff, f"autofit:{name}"
 
 
@@ -462,6 +498,45 @@ def _wants_remote(spec) -> bool:
     if os.environ.get(_FORCE_REMOTE_ENV) == "1":
         return True
     return resolves_to_real_model(spec)
+
+
+def _binds_synthetic(spec) -> "bool | None":
+    """Did the router bind a SYNTHETIC prover for ``spec``? ``None`` = it did not bind
+    anything (router Err, or a probe failure).
+
+    Deliberately distinct from ``not resolves_to_real_model(spec)``, which folds those
+    two cases together. They need opposite handling: a synthetic binding is the silent
+    dross path this gate exists to stop, whereas an unroutable request already has a
+    precise router error (NO_CAPABLE_MODEL / VRAM_EXCEEDED) that must reach the caller
+    UNCHANGED — v2v and id_lock register no synthetic model at all and have always
+    surfaced exactly that. Replacing it with a generic 'no real model fits' would throw
+    away the reason."""
+    try:
+        from ..studio.registry import MODEL_REGISTRY
+        from ..studio.router import CapabilityRouter
+
+        res = CapabilityRouter().resolve(build_capability_request(spec))
+        if res.is_err():
+            return None
+        cfg = MODEL_REGISTRY.get(res.unwrap().model_id)
+        if cfg is None:
+            return None
+        # ⚠ GATE ON THE FRAMEWORK, NOT ON cfg.synthetic. The `synthetic` flag carries
+        # TWO different meanings in models_seed and this gate only means one of them:
+        #   * Framework.SYNTHETIC (synthetic-i2v / synthetic-t2v) — output is noise
+        #     derived from seed + geometry. Nothing real. THIS is what to refuse.
+        #   * Framework.FFMPEG (ffmpeg-minterpolate, ffmpeg-lanczos-upscale) and
+        #     CODEFORMER — REAL transforms of REAL pixels, flagged synthetic only so
+        #     the premium RIFE/LTX rows outrank them ("LAST-RESORT" in their own
+        #     comments). Refusing these is refusing a working render.
+        # Gating on cfg.synthetic (as this did on 2026-07-27) killed UPRES and
+        # INTERPOLATE outright: their premium runners return Err unconditionally
+        # (weights/deps missing), so the ffmpeg last-resort IS the working path, and
+        # the opt-in gate blocked it. Two live product surfaces, dead, from a flag
+        # that meant "rank me last" being read as "I produce dross".
+        return bool(getattr(cfg.family, "value", cfg.family) == "synthetic")
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def resolves_to_real_model(spec) -> bool:
@@ -785,6 +860,36 @@ def render_clip(spec, *, render_id: str, should_cancel=None, progress_sink=None,
 
     def _stamp(outcome: ClipOutcome) -> ClipOutcome:
         return replace(outcome, effective_budget_gb=eff_gb, budget_source=budget_source)
+
+    # --- REFUSE rather than invent a budget (operator 2026-07-27) -------------------
+    # A blank budget we could not resolve used to become 0.5 -> synthetic -> a noise blob
+    # written as a finished clip. An unmeasurable worker is an honest failure.
+    if budget_source == "unresolved":
+        return _stamp(ClipOutcome(ok=False, error=JobError(
+            code="gpu_unavailable",
+            message=("cannot size this render: no studio GPU worker is resolvable or it "
+                     "reports no VRAM. Set HUGPY_STUDIO_WORKER to a live GPU worker, or "
+                     "pass an explicit vram_budget_gb."),
+            retryable=True)))
+
+    # --- SYNTHETIC IS OPT-IN (operator 2026-07-27) ----------------------------------
+    # Checked BEFORE delegation so it fires on both paths. Without this the router's
+    # last-resort synthetic binding ALSO flipped `_wants_remote` to False, which sent the
+    # render to the GPU-LESS central in-process path — where noise is the only possible
+    # output. So a busy card silently relocated real work off the GPU and returned a blob.
+    # i2v/t2v are the only capabilities that can do this; v2v/id_lock register no
+    # synthetic model and have always refused honestly — this makes the two agree.
+    #
+    # Gated on _binds_synthetic (not `not resolves_to_real_model`) so an UNROUTABLE
+    # request keeps its precise router error instead of this generic one.
+    if _binds_synthetic(spec) is True and not _allow_synthetic():
+        return _stamp(ClipOutcome(ok=False, error=JobError(
+            code="no_capable_model",
+            message=(f"no real model fits {eff_gb:.2f} GB for this render "
+                     f"(budget source: {budget_source}) — the router bound the synthetic "
+                     f"prover, which produces noise, not a render. Raise vram_budget_gb, "
+                     f"or set {_ALLOW_SYNTHETIC_ENV}=1 if you actually want the prover."),
+            retryable=False)))
 
     # --- studio render offload (option a): resolve the worker ONCE, then decide. -----
     base = resolve_studio_worker(spec)

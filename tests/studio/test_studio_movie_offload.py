@@ -45,6 +45,11 @@ import tempfile
 logging.disable(logging.INFO)
 
 os.environ.setdefault("STUDIO_ALLOW_UNPINNED", "1")
+# The offload suites PROVE THE PLUMBING with the synthetic prover as a stand-in for a
+# GPU render (that is what HUGPY_STUDIO_FORCE_REMOTE exists for), so they must opt in
+# to it explicitly — synthetic became opt-in on 2026-07-27 so a real render can never
+# silently degrade into noise. This is a HARNESS opt-in, never a product default.
+os.environ.setdefault("STUDIO_ALLOW_SYNTHETIC", "1")
 # Start from a known-clean offload env; each check sets exactly what it needs.
 os.environ.pop("HUGPY_STUDIO_WORKER", None)
 os.environ.pop("HUGPY_STUDIO_FORCE_REMOTE", None)

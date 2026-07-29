@@ -2019,6 +2019,172 @@ def _serveable_match(model_key: str, wanted: set, serveable) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# ROUTING RANK — residency and allocation are ROUTING FACTS, not trivia.
+#
+# Operator incident 2026-07-28: a chat for Qwen2.5-7B-Instruct-GGUF — resident
+# AND allocated on computron, served from there an hour earlier — was routed to
+# ae, which had nothing on disk, cold-provisioned it, and blew the caller's hold
+# on the way. Verdict: "the allocations are not being adhered to."
+#
+# The old rank had exactly ONE residency term:
+#
+#     warm = model_key in (w.get("loaded_models") or [])
+#
+# and it was wrong in two ways that both bit here:
+#
+#   1. EXACT string match, in a file where every other match site goes through
+#      _match_keys/_serveable_match. A worker that reports the bare base name
+#      while the request carries the ~-qualified registry key (or vice versa)
+#      reads as COLD even while it is actively serving the model. That is the
+#      k30 invisible-mismatch class, still live in the one place that decides
+#      where a call goes.
+#   2. ALLOCATION was never consulted at all. A model with a slot seat or an
+#      in-RAM allocation on a box — the compute tab's allocations, which ride
+#      the heartbeat — was invisible to routing the moment it fell out of
+#      loaded_models (and a slot-child never appears there in the first place:
+#      see the on-demand-slot-child-not-in-loaded-models landmine).
+#
+# With both terms blind, two wildcard boxes tie all the way down to
+# ``last_picked`` — plain round-robin — and the call lands wherever the dice
+# fall. Hence: cold-provision a 4.7GB model onto ae while the box that already
+# had it resident sat idle.
+#
+# The ranking is now, strictly in order:
+#
+#   0. DESIGNATION — a home (designated/resident/granted) worker before any
+#      wildcard catch. HARD (operator ruling, designation-is-advisory RULING
+#      CORRECTED): when a designation exists the call never leaves it; if the
+#      designated box cannot serve, the refusal names that box's reason
+#      (explain_no_worker) rather than silently spilling.
+#   1. RESIDENT  — measured-resident RIGHT NOW (alias-tolerant).
+#   2. ALLOCATED — holds an approved allocation for the model (alias-tolerant).
+#   3. capability rank exactly as before (star, GPU, least-recently-picked, id).
+#
+# This is a RANKING fix only. Nothing here admits a worker that the eligibility
+# gates (workers_for_model) would have excluded, and no tier can rescue a box
+# that failed a hard gate.
+# ---------------------------------------------------------------------------
+
+def _resident_on(worker: Dict[str, Any], model_key: str, wanted: set) -> bool:
+    """MEASURED-RESIDENT: this worker reports ``model_key`` loaded RIGHT NOW.
+
+    Alias-tolerant via the same ``_serveable_match`` predicate every other match
+    site uses (the whole point of the fix — see the block comment above), and it
+    also honours a live SLOT/loaded allocation row, because a slot-seated child
+    serves without ever appearing in ``loaded_models``.
+    """
+    if _serveable_match(model_key, wanted, worker.get("loaded_models") or []):
+        return True
+    for row in _allocation_rows(worker):
+        if not _serveable_match(model_key, wanted, [row.get("model_key") or ""]):
+            continue
+        # A slot row is residency only while its child is actually up; an
+        # in-RAM row is residency by construction (the weights are in RAM).
+        if row.get("kind") == "slot":
+            if row.get("healthy") or row.get("serving") or row.get("busy"):
+                return True
+            continue
+        return True
+    return False
+
+
+def _allocation_rows(worker: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The worker's heartbeat allocation rows, defensively typed ([] on junk)."""
+    rows = worker.get("allocations")
+    if not isinstance(rows, list):
+        return []
+    return [r for r in rows if isinstance(r, dict)]
+
+
+def _allocated_on(worker: Dict[str, Any], model_key: str, wanted: set) -> bool:
+    """This worker holds an APPROVED ALLOCATION for ``model_key``.
+
+    An allocation outlives a load: the compute tab's allocation rows (slot seats
+    and in-RAM residents, which ride the heartbeat) and the system-authored
+    placement ``grants`` both say "this model belongs on this box", and both
+    survive the model dropping out of ``loaded_models``. Routing must honour
+    that before it prices a cold box on capability alone — the allocation IS the
+    prior decision about where this model runs.
+
+    Deliberately NOT sourced from ``model_alloc_modes``: that map carries a
+    derived mode for every DESIGNATED model, so reading it here would make this
+    tier a duplicate of the designation tier rather than an independent signal.
+    """
+    for row in _allocation_rows(worker):
+        if _serveable_match(model_key, wanted, [row.get("model_key") or ""]):
+            return True
+    grants = worker.get("grants")
+    if isinstance(grants, dict) and grants:
+        if _serveable_match(model_key, wanted, list(grants)):
+            return True
+    return False
+
+
+def _route_tier(worker: Dict[str, Any], model_key: str, wanted: set) -> str:
+    """The reason this worker is where it is in the order — the telemetry label.
+
+    Most-specific-fact-first, which is NOT the sort order: designation sorts
+    ahead of everything (it is a hard scope), but when a designated box is ALSO
+    resident, "resident" is the more informative thing to tell the operator.
+    """
+    if _resident_on(worker, model_key, wanted):
+        return "resident"
+    if _allocated_on(worker, model_key, wanted):
+        return "allocated"
+    if not worker.get("_wildcard_catch"):
+        return "designated"
+    return "capability"
+
+
+def _routing_rank(worker: Dict[str, Any], model_key: str, wanted: set,
+                  starred: bool) -> tuple:
+    """The shared sort key for every routing decision (primary pick + reroute).
+
+    ONE function so ``pick_for_model`` and ``candidates_for_model`` can never
+    drift apart — the relay's reroute walk must agree with the pick it is
+    falling back from, or a "reroute" silently becomes a re-decision.
+    """
+    return (
+        # ① designation is a HARD scope: home before any wildcard catch.
+        1 if worker.get("_wildcard_catch") else 0,
+        # ② measured-resident now — no reload, no cold provision.
+        0 if _resident_on(worker, model_key, wanted) else 1,
+        # ③ holds an approved allocation for this model.
+        0 if _allocated_on(worker, model_key, wanted) else 1,
+        # ④..⑦ capability rank, unchanged.
+        0 if starred else 1,
+        0 if _has_usable_gpu(worker) else 1,
+        worker.get("last_picked", 0),
+        worker.get("id", ""),
+    )
+
+
+def _emit_route_select(model_key: str, chosen: Dict[str, Any],
+                       ordered: List[Dict[str, Any]], wanted: set) -> None:
+    """Telemetry: WHY this box. Rides the eviction feed (GET /llm/evictions).
+
+    Best-effort and totally guarded — a telemetry failure must never cost a
+    request. Alternatives are the runners-up in rank order, capped so a large
+    fleet can't bloat the ring.
+    """
+    try:
+        from ......comms.evictions import emit_eviction_event
+        alts = [{"worker": (w.get("name") or w.get("id") or ""),
+                 "tier": _route_tier(w, model_key, wanted)}
+                for w in ordered if w.get("id") != chosen.get("id")][:6]
+        emit_eviction_event(
+            "route.select",
+            model_key=model_key,
+            chosen_worker=(chosen.get("name") or chosen.get("id") or ""),
+            tier=_route_tier(chosen, model_key, wanted),
+            alternatives=alts or None,
+        )
+    except Exception:  # noqa: BLE001 — telemetry never breaks routing
+        logger.debug("route.select telemetry skipped for %s", model_key,
+                     exc_info=True)
+
+
 def _wildcard_map() -> Dict[str, bool]:
     """The per-worker WILDCARD ("take all comers") opt-in map {worker_id: True}.
 
@@ -3157,8 +3323,16 @@ class WorkerStore:
                first and spills onto wildcard ("take all comers") boxes only
                when no home worker survives the gates; it busts only when
                neither can serve. No separate overflow machinery exists.
-            2. workers that already report the model as loaded (warm),
-            3. otherwise the least-recently-picked online assignee.
+            2. MEASURED-RESIDENT workers — the model is loaded there right now
+               (alias-tolerant; a live slot seat counts).
+            3. ALLOCATED workers — an approved allocation / placement grant for
+               the model lives on that box even if it isn't loaded this second.
+            4. otherwise capability rank as before: ⭐ star, GPU, then the
+               least-recently-picked online assignee.
+
+        Tiers 2 and 3 are the 2026-07-28 fix; see the ROUTING RANK block comment
+        above ``_resident_on`` for the incident and why the old single ``warm``
+        term missed both.
 
         Returns ``None`` when no online worker (in the requested pool) is assigned
         to the model, which signals the caller to fall back to local execution.
@@ -3209,16 +3383,13 @@ class WorkerStore:
             if matched:
                 candidates = matched
 
-        # Efficiency-aware ranking (capability already filtered above). Prefer,
-        # in order: a HOME match (designated/resident/granted) over a wildcard
-        # catch (the overflow-by-ordering mechanism — see the docstring), then
-        # a worker that already has the model warm (avoids a multi-GB reload),
-        # then a worker whose ⭐ boot star == this model (the ambiguity tie-break:
-        # nothing warm → prefer the box that boot-loads it anyway), then one with
-        # a usable GPU over CPU-only, then the least-recently-picked (spreads
-        # load). Stable id tiebreak so the order never wobbles. (Full
-        # need-vs-capacity placement is the allocator's job; this is the
-        # lightweight default pick.)
+        # Ranking (capability already filtered above) — the shared _routing_rank
+        # key: designation, then MEASURED-RESIDENT, then ALLOCATED, then the
+        # capability rank that was always here (⭐ boot star as the ambiguity
+        # tie-break, GPU over CPU-only, least-recently-picked to spread load,
+        # stable id so the order never wobbles). See the ROUTING RANK block
+        # comment above _resident_on. (Full need-vs-capacity placement is the
+        # allocator's job; this is the lightweight default pick.)
         # Read the star store ONCE per pick (never per candidate), alias-tolerant
         # via _match_keys (same unification Slice A uses): a star recorded under a
         # ~-qualified key still matches a bare-key request and vice versa.
@@ -3230,15 +3401,15 @@ class WorkerStore:
             return bool(s) and bool(wanted_forms & _match_keys(str(s)))
 
         def _rank(w: Dict[str, Any]):
-            warm = model_key in (w.get("loaded_models") or [])
-            return (1 if w.get("_wildcard_catch") else 0,
-                    0 if warm else 1,
-                    0 if _starred(w) else 1,
-                    0 if _has_usable_gpu(w) else 1,
-                    w.get("last_picked", 0),
-                    w.get("id", ""))
+            return _routing_rank(w, model_key, wanted_forms, _starred(w))
         candidates.sort(key=_rank)
         chosen = candidates[0]
+
+        # WHY this box (operator incident 2026-07-28) — emitted on the PICK, not
+        # on the reroute walk, so the feed carries exactly one selection event
+        # per dispatch and the operator can read residency/allocation adherence
+        # straight off /llm/evictions instead of inferring it from outcomes.
+        _emit_route_select(model_key, chosen, candidates, wanted_forms)
 
         # Persist the pick so round-robin survives across processes.
         with self._transaction() as workers:
@@ -3333,10 +3504,13 @@ class WorkerStore:
         """Ranked ONLINE workers that can serve ``model_key`` — the cap-aware
         relay router's alternatives list (concurrency hardening 2026-07-11).
 
-        Same eligibility + ranking as ``pick_for_model`` (home before wildcard
-        catch — the relay's fallback walk must also prefer home, so overflow
-        stays overflow — then warm, then ⭐ star, then GPU, then
-        least-recently-picked), but WITHOUT the ``last_picked`` write: central's
+        Same eligibility + ranking as ``pick_for_model`` — literally the same
+        ``_routing_rank`` key (home before wildcard catch, so the relay's
+        fallback walk keeps overflow as overflow; then MEASURED-RESIDENT, then
+        ALLOCATED, then ⭐ star / GPU / least-recently-picked). Sharing the one
+        key is deliberate: a reroute that ranked differently from the pick it is
+        falling back from would be a re-decision, not a reroute. WITHOUT the
+        ``last_picked`` write, though, and no route.select event: central's
         in-flight gate iterates this to reroute around a worker that is at its
         advertised in-process concurrency cap, and re-stamping every candidate on
         each probe would corrupt the round-robin. Online only — a reroute target
@@ -3362,13 +3536,7 @@ class WorkerStore:
             return bool(s) and bool(wanted_forms & _match_keys(str(s)))
 
         def _rank(w: Dict[str, Any]):
-            warm = model_key in (w.get("loaded_models") or [])
-            return (1 if w.get("_wildcard_catch") else 0,
-                    0 if warm else 1,
-                    0 if _starred(w) else 1,
-                    0 if _has_usable_gpu(w) else 1,
-                    w.get("last_picked", 0),
-                    w.get("id", ""))
+            return _routing_rank(w, model_key, wanted_forms, _starred(w))
 
         return sorted(candidates, key=_rank)
 
@@ -3660,17 +3828,174 @@ def record_serve_metrics(worker_id: str, model_key: str,
     return worker_store.record_serve_metrics(worker_id, model_key, tok_s=tok_s)
 
 
+# ---------------------------------------------------------------------------
+# LIVE /health PROBE for the cold-load hold (operator incident 2026-07-28).
+#
+# The hold's progress signal used to come only from the worker RECORD, i.e. from
+# heartbeats. That is precisely the wrong source during a cold load: the boxes
+# that take a long time to load are the boxes that are busy, and a busy worker
+# is the one whose heartbeats starve (the "ae goes deaf" failure class — a
+# 503-storm crowds out the beat). So central's picture froze exactly when it
+# most needed to be live, the hold saw "no movement", and the 90s stall clock
+# killed a load that finished healthy moments later.
+#
+# The worker's own /health already answers with `provisioning`,
+# `provision_progress` and `loaded_models`. Polling it is READ-ONLY and needs no
+# worker release, so the hold reads the truth from the source.
+#
+# Two disciplines make this safe on the serving hot path:
+#   * NEVER BLOCK. load_state_for_model is called synchronously from inside the
+#     async hold loop; a blocking HTTP GET there would stall the shared event
+#     loop for every other request on the box. So the probe runs on a daemon
+#     thread and this function only ever reads the CACHE — the first call after
+#     a gap returns slightly stale data and triggers a refresh, which is exactly
+#     the right trade for a loop that polls every ~2s anyway.
+#   * ONE IN FLIGHT PER WORKER, rate-limited. A held call cannot turn into a
+#     probe storm against a box that is already struggling.
+# ---------------------------------------------------------------------------
+
+_HEALTH_CACHE: Dict[str, Dict[str, Any]] = {}
+_HEALTH_INFLIGHT: set = set()
+_HEALTH_LOCK = threading.Lock()
+
+
+def _health_probe_enabled() -> bool:
+    """Off switch for the live probe (``HUGPY_COLD_HOLD_HEALTH=off``). Default
+    ON: without it the hold is blind through the whole weights-load phase."""
+    return (os.environ.get("HUGPY_COLD_HOLD_HEALTH", "").strip().lower()
+            not in ("off", "0", "false", "no"))
+
+
+def _health_probe_interval_s() -> float:
+    """Minimum seconds between /health probes of the SAME worker. Default 3s —
+    slower than the hold's ~2s poll, so a held call reuses a cached answer more
+    often than it fetches one."""
+    try:
+        v = float((os.environ.get("HUGPY_COLD_HOLD_HEALTH_POLL_S") or "3").strip())
+        return v if v > 0 else 3.0
+    except (TypeError, ValueError):
+        return 3.0
+
+
+def _health_probe_timeout_s() -> float:
+    """Per-probe HTTP timeout. Deliberately short: a probe that hangs tells the
+    hold nothing a timely 'no answer' wouldn't."""
+    try:
+        v = float((os.environ.get("HUGPY_COLD_HOLD_HEALTH_TIMEOUT_S") or "4").strip())
+        return v if v > 0 else 4.0
+    except (TypeError, ValueError):
+        return 4.0
+
+
+def _fetch_health(worker_id: str, url: str) -> None:
+    """Probe body — runs on a daemon thread; stores into the cache. Never raises."""
+    data = None
+    try:
+        import json as _json
+        from urllib.request import urlopen
+        with urlopen(url.rstrip("/") + "/health",
+                     timeout=_health_probe_timeout_s()) as resp:
+            data = _json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001 — an unreachable worker is data, not a crash
+        data = None
+    with _HEALTH_LOCK:
+        if isinstance(data, dict):
+            _HEALTH_CACHE[worker_id] = {"ts": time.time(), "data": data}
+        else:
+            # Record the ATTEMPT even on failure so the rate limit still applies
+            # to an unreachable box (no probe storm against a dead worker).
+            prev = _HEALTH_CACHE.get(worker_id) or {}
+            _HEALTH_CACHE[worker_id] = {"ts": time.time(),
+                                        "data": prev.get("data"),
+                                        "stale": True}
+        _HEALTH_INFLIGHT.discard(worker_id)
+
+
+def _live_health(worker: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Cached /health body for ``worker``, kicking a background refresh when the
+    cached copy is older than the probe interval. None when disabled, when the
+    worker has no url, or before the first probe has landed."""
+    if not _health_probe_enabled():
+        return None
+    wid = worker.get("id") or ""
+    url = worker.get("url") or ""
+    if not wid or not url:
+        return None
+    now = time.time()
+    with _HEALTH_LOCK:
+        entry = _HEALTH_CACHE.get(wid) or {}
+        due = (now - float(entry.get("ts") or 0)) >= _health_probe_interval_s()
+        if due and wid not in _HEALTH_INFLIGHT:
+            _HEALTH_INFLIGHT.add(wid)
+            kick = True
+        else:
+            kick = False
+        data = entry.get("data")
+    if kick:
+        try:
+            threading.Thread(target=_fetch_health, args=(wid, url),
+                             name=f"health-probe-{wid[:8]}", daemon=True).start()
+        except Exception:  # noqa: BLE001 — thread exhaustion must not break a hold
+            with _HEALTH_LOCK:
+                _HEALTH_INFLIGHT.discard(wid)
+    return data if isinstance(data, dict) else None
+
+
+def _progress_line(model_key: str, worker_name: str,
+                   entry: Optional[Dict[str, Any]]) -> tuple:
+    """(fraction, human line) for a provision_progress entry — ('8.2 GB of
+    11.4 GB transferred'). The worker records ``done_bytes``/``total_bytes``/
+    ``frac``; the OLD reader asked for ``progress``/``message``, keys that have
+    never existed on that entry, so every held call showed a bare spinner and
+    every give-up message said 'last: 503' with no numbers. Bytes are the honest
+    unit here: a fraction alone can't tell 'stalled at 12.1 GB' from 'stalled at
+    0 B', and that distinction is the whole diagnostic."""
+    if not isinstance(entry, dict):
+        return None, None
+    done = entry.get("done_bytes")
+    total = entry.get("total_bytes")
+    frac = entry.get("frac")
+    try:
+        frac = float(frac) if frac is not None else (
+            (float(done) / float(total)) if done and total else None)
+    except (TypeError, ValueError, ZeroDivisionError):
+        frac = None
+    if done is None and frac is None:
+        return None, None
+    if done:
+        moved = _fmt_bytes_short(done)
+        line = (f"loading {model_key} on {worker_name} — {moved} transferred"
+                if not total else
+                f"loading {model_key} on {worker_name} — {moved} of "
+                f"{_fmt_bytes_short(total)} transferred")
+    else:
+        line = f"loading {model_key} on {worker_name} — starting transfer"
+    return frac, line
+
+
+def _fmt_bytes_short(n: Any) -> str:
+    try:
+        n = float(n or 0)
+    except (TypeError, ValueError):
+        return "0 B"
+    for unit, size in (("TB", 2**40), ("GB", 2**30), ("MB", 2**20), ("KB", 2**10)):
+        if n >= size:
+            return f"{n / size:.1f} {unit}"
+    return f"{int(n)} B"
+
+
 def load_state_for_model(model_key: str, worker_id: str,
                          since_ts: float = 0.0) -> Optional[Dict[str, Any]]:
     """The cold-load HOLD's view (t36) of ``model_key`` on ``worker_id``.
 
-    Reads the worker's LIVE heartbeat state — no worker-side change — and returns
-    a compact status the core hold loop (resolvers.remote) consults:
+    Reads the worker's live state — heartbeat record PLUS a read-only /health
+    probe (see the block comment above; no worker-side change either way) — and
+    returns a compact status the core hold loop (resolvers.remote) consults:
 
       {"healthy": bool,       # resident/loaded now (ready to serve)
        "in_progress": bool,    # weights loading OR still downloading now
        "progress": float|None, # download fraction when provisioning
-       "message": str|None,    # human progress line (from provision_progress)
+       "message": str|None,    # human progress line, with BYTES
        "error": str|None}      # a FRESH (ts>=since_ts) honest load failure
 
     ``error`` is only the worker's own last_load_error (load_reports, ok False)
@@ -3683,6 +4008,7 @@ def load_state_for_model(model_key: str, worker_id: str,
         if not w:
             return None
         wanted = _match_keys(model_key)
+        wname = w.get("name") or worker_id
 
         def _member(coll) -> Optional[str]:
             for m in (coll or []):
@@ -3699,10 +4025,30 @@ def load_state_for_model(model_key: str, worker_id: str,
         if isinstance(pp, dict):
             for k, v in pp.items():
                 if (k == model_key or (_match_keys(k) & wanted)) and isinstance(v, dict):
-                    progress = v.get("progress")
-                    message = v.get("message")
+                    progress, message = _progress_line(model_key, wname, v)
                     in_prog = True
                     break
+
+        # LIVE OVERLAY. Anything /health says is newer than the record, and it
+        # keeps answering while heartbeats starve — which is the whole reason
+        # this exists. Purely ADDITIVE: it can turn "no movement" into movement,
+        # never the reverse, so a probe that fails or lags can only leave the
+        # hold exactly as blind as it was before, never blinder.
+        hb = _live_health(w)
+        if isinstance(hb, dict):
+            if _member(hb.get("loaded_models")):
+                loaded = loaded or model_key
+            if _member(hb.get("provisioning")):
+                in_prog = True
+            hpp = hb.get("provision_progress")
+            if isinstance(hpp, dict):
+                for k, v in hpp.items():
+                    if (k == model_key or (_match_keys(k) & wanted)) and isinstance(v, dict):
+                        p2, m2 = _progress_line(model_key, wname, v)
+                        if p2 is not None or m2 is not None:
+                            progress, message = p2, m2
+                        in_prog = True
+                        break
 
         error = None
         reports = w.get("load_reports") or {}
@@ -3990,6 +4336,25 @@ try:
         import logging as _logging
         _logging.getLogger(__name__).info(
             "serve metrics sink not registered (older core): %s", _exc5)
+    # MODEL GROUPS member selector (operator ruling 2026-07-28) — which
+    # ITERATION of a base model serves a request. Central-only; optional in
+    # older cores — guarded.
+    #
+    # ⚠ REGISTERING IS NOT ENABLING. The selector's first line is the kill
+    # switch (settings model_groups.enabled, default FALSE; HUGPY_MODEL_GROUPS=
+    # off is a hard off), so with groups off it returns None on every call and
+    # resolution is byte-identical to the pre-feature tree. Registration is
+    # unconditional ON PURPOSE: the operator must be able to flip the flag
+    # through the settings API and have it take effect on the comms bus without
+    # a restart, which a registration-time check would break.
+    try:
+        from ......managers.resolvers.remote import set_member_selector
+        from .model_groups import member_for_model as _group_member
+        set_member_selector(_group_member)
+    except Exception as _exc6:  # older core / import trouble — groups stay off
+        import logging as _logging
+        _logging.getLogger(__name__).info(
+            "model-group member selector not registered: %s", _exc6)
 except Exception as _exc:  # never let registration break importing the pool
     import logging as _logging
     _logging.getLogger(__name__).warning("worker provider registration failed: %s", _exc)

@@ -31,6 +31,7 @@ import asyncio
 import logging
 import os
 import threading
+import time
 from typing import Any, Dict, List, Optional, Tuple
 from ..resolvers import resolve
 from .imports import *
@@ -125,7 +126,90 @@ _POST_EVICT = None       # () -> None: reclaim host RAM / CUDA cache after an ev
 # evicts the minimum permissible set through the /ops/evict verb — closing the
 # blind admit-then-OOM the incident exposed. None -> the old in-process-only path.
 _MAKE_ROOM = None
+# (model_key) -> str|None: WHY a candidate was rejected by _EVICTABLE ("static",
+# "actively-replying", "slot-backed", ...). Eviction telemetry only — the yield
+# DECISION is still _EVICTABLE's alone. Registered separately (rather than by
+# widening _EVICTABLE's return) so the predicate's contract is untouched and an
+# unregistered reason hook simply reports "not-evictable".
+_EVICT_REASON = None
 _CONTENTION_LOCK = threading.Lock()
+
+
+# --- eviction telemetry (observation only; never gates a load) --------------
+# The operator must be able to WATCH a headroom pass happen (directive
+# 2026-07-28). Every stage below emits a structured event AND a journal line.
+# comms.evictions is stdlib-only and flask-free, so importing it here keeps
+# dispatch importable on bare central and in tests exactly as before; if the
+# import fails for any reason, _emit degrades to a no-op and the eviction path
+# is byte-identical to its pre-telemetry self.
+try:
+    from ...comms import evictions as _evt
+except Exception:                            # noqa: BLE001
+    _evt = None
+
+
+def _emit(stage: str, **fields) -> None:
+    """Best-effort telemetry. Swallows everything — a load must never fail,
+    slow down, or change outcome because an event could not be published."""
+    if _evt is None:
+        return
+    try:
+        _evt.emit_eviction_event(stage, **fields)
+    except Exception:                        # noqa: BLE001
+        pass
+
+
+def _current_group() -> "Optional[dict]":
+    """The ambient model-group demand, or None. ``getattr`` rather than a direct
+    call so a peer running a comms module that predates model groups degrades to
+    "no group" instead of an AttributeError on the eviction path."""
+    fn = getattr(_evt, "current_group", None) if _evt is not None else None
+    if fn is None:
+        return None
+    try:
+        return fn()
+    except Exception:                        # noqa: BLE001
+        return None
+
+
+def _new_run_id() -> str:
+    if _evt is None:
+        return ""
+    try:
+        return _evt.new_run_id()
+    except Exception:                        # noqa: BLE001
+        return ""
+
+
+class _run_scope:
+    """Bind the pass's run_id for this thread so the worker's cross-tier
+    make-room hook, the slot pool and the hot-cache reaper all emit INTO this
+    pass without dispatch having to thread an argument through their signatures.
+    Degrades to a bare no-op context when telemetry is unavailable."""
+
+    def __init__(self, run_id: str) -> None:
+        self._inner = None
+        if _evt is not None and run_id:
+            try:
+                self._inner = _evt.run_scope(run_id)
+            except Exception:                # noqa: BLE001
+                self._inner = None
+
+    def __enter__(self):
+        if self._inner is not None:
+            try:
+                self._inner.__enter__()
+            except Exception:                # noqa: BLE001
+                self._inner = None
+        return self
+
+    def __exit__(self, *exc):
+        if self._inner is not None:
+            try:
+                self._inner.__exit__(*exc)
+            except Exception:                # noqa: BLE001
+                pass
+        return None
 
 
 def set_fit_check(fn) -> None:
@@ -161,7 +245,28 @@ def set_make_room(fn) -> None:
     _MAKE_ROOM = fn
 
 
-def _next_lru_evictable(exclude: str) -> Optional[str]:
+def set_evict_reason(fn) -> None:
+    """Register the telemetry-only skip-reason lookup: ``fn(model_key) -> str``,
+    the reason ``_EVICTABLE`` rejected that candidate ("static",
+    "actively-replying", "slot-backed", ...). Purely observational — it is read
+    only to LABEL a skip the predicate already decided, never to decide one.
+    Unregistered -> skips report the generic "not-evictable"."""
+    global _EVICT_REASON
+    _EVICT_REASON = fn
+
+
+def _skip_reason(model_key: str) -> str:
+    """The label for a rejected candidate. Never raises: an unreadable reason
+    degrades to the generic string rather than disturbing the yield loop."""
+    if _EVICT_REASON is None:
+        return "not-evictable"
+    try:
+        return str(_EVICT_REASON(model_key) or "not-evictable")
+    except Exception:                        # noqa: BLE001
+        return "not-evictable"
+
+
+def _next_lru_evictable(exclude: str, run_id: str = "") -> Optional[str]:
     """The least-recently-used yieldable on-demand in-process resident, or None.
 
     Candidates are the model_keys currently holding a runner in ``_INSTANCES``,
@@ -174,14 +279,25 @@ def _next_lru_evictable(exclude: str) -> Optional[str]:
         return None
     residents = {mk for (mk, _task) in loaded_model_keys()}
     residents.discard(exclude)
-    cands = [mk for mk in residents if _EVICTABLE(mk)]
+    # Telemetry (2026-07-28): report the REJECTED residents too, with WHY. The
+    # winner alone is not the story the doctrine cares about — "what was
+    # protected, and under which clause" is. Sorted so a run's skip rows render
+    # in a stable order rather than set-iteration order.
+    cands = []
+    for mk in sorted(residents):
+        if _EVICTABLE(mk):
+            cands.append(mk)
+        else:
+            _emit(_evt.STAGE_CANDIDATE_SKIP if _evt else "candidate.skip",
+                  run_id=run_id, model_key=mk, tier="in-process",
+                  incoming_model=exclude, reason=_skip_reason(mk))
     if not cands:
         return None
     cands.sort(key=lambda mk: _LAST_USED.get(mk, 0.0))
     return cands[0]
 
 
-def ensure_headroom_for_load(model_key: str) -> List[str]:
+def ensure_headroom_for_load(model_key: str, trigger: str = "load") -> List[str]:
     """CONTENTION eviction — the default (clock-free) residency trigger.
 
     Called right before a NEW runner is built (see ``_get_or_build_runner``).
@@ -204,28 +320,63 @@ def ensure_headroom_for_load(model_key: str) -> List[str]:
     hook (set_make_room) runs a SECOND pass that also evicts SLOT-CHILD squatters
     (subprocess VRAM the in-process path cannot see) and REFUSES an unfittable
     load before any CUDA allocation (raising LoadRefusal). Without the hook the
-    behavior is byte-identical to before."""
+    behavior is byte-identical to before.
+
+    TELEMETRY (2026-07-28): the whole pass runs inside one ``run_id`` scope so
+    every stage — fit failures, protected residents and WHY, each yield, the
+    cross-tier verdict — streams to the console as one correlated card. Purely
+    observational: see ``comms.evictions``."""
+    run_id = _new_run_id()
+    with _run_scope(run_id):
+        return _headroom_pass(model_key, trigger, run_id)
+
+
+def _headroom_pass(model_key: str, trigger: str, run_id: str) -> List[str]:
+    """The pass itself. Split out only so the public entry point can hold the
+    telemetry run scope open across it (including the raising paths) without
+    re-indenting the eviction logic."""
     evicted: List[str] = []
+    outcome = "fit"
+    # ``group`` is present only when a MODEL GROUP's ticked standard is what
+    # demanded this pass (member selector opened an evictions.group_scope) —
+    # that is how an operator tells "the speed tick refused to spill" from an
+    # ordinary contention eviction. Absent otherwise, and absence is the norm:
+    # a plain contention pass has no group and renders exactly as before.
+    _emit("headroom.start", run_id=run_id, incoming_model=model_key,
+          trigger=trigger, group=_current_group())
     if _FIT_CHECK is not None:
         with _CONTENTION_LOCK:
             while not _FIT_CHECK(model_key):
-                cand = _next_lru_evictable(exclude=model_key)
+                _emit("fit.fail", run_id=run_id, incoming_model=model_key)
+                cand = _next_lru_evictable(exclude=model_key, run_id=run_id)
                 if cand is None:
                     break                    # nothing to yield in-process -> below
                 logger.info("contention evict: yielding LRU on-demand resident %s to "
                             "make room for %s (doctrine 2026-07-11: keep models hot, "
                             "yield only under memory pressure)", cand, model_key)
+                _emit("evict.start", run_id=run_id, model_key=cand,
+                      tier="in-process", incoming_model=model_key)
+                _t0 = time.time()
                 try:
                     evict(cand)
-                except Exception:            # noqa: BLE001 — one bad evict must not wedge the load
+                except Exception as _exc:    # noqa: BLE001 — one bad evict must not wedge the load
                     logger.warning("contention evict of %s failed", cand, exc_info=True)
+                    _emit("evict.fail", run_id=run_id, model_key=cand,
+                          tier="in-process", incoming_model=model_key,
+                          error=str(_exc))
                     break
+                _emit("evict.done", run_id=run_id, model_key=cand,
+                      tier="in-process", incoming_model=model_key,
+                      duration_ms=int((time.time() - _t0) * 1000))
                 evicted.append(cand)
                 if _POST_EVICT is not None:
                     try:
                         _POST_EVICT()        # trim so the next fit re-check sees the freed room
                     except Exception:        # noqa: BLE001
                         logger.warning("post-evict reclaim failed", exc_info=True)
+                    else:
+                        _emit("reclaim.done", run_id=run_id,
+                              incoming_model=model_key)
 
     # CROSS-TIER make-room + honest refusal (slice 10). The in-process yield above
     # cannot see a slot child; this hook sees ALL residents and evicts the minimum
@@ -233,13 +384,22 @@ def ensure_headroom_for_load(model_key: str) -> List[str]:
     if _MAKE_ROOM is not None:
         try:
             verdict = _MAKE_ROOM(model_key)
-        except LoadRefusal:
+        except LoadRefusal as _ref:
+            _emit("makeroom.verdict", run_id=run_id, incoming_model=model_key,
+                  action="refuse", reason=getattr(_ref, "reason", None))
+            _emit("headroom.done", run_id=run_id, incoming_model=model_key,
+                  evicted=list(evicted), outcome="refused")
             raise
         except Exception:                    # noqa: BLE001 — a broken hook never blocks a load
             logger.warning("cross-tier make-room failed for %s", model_key,
                            exc_info=True)
             verdict = None
         if isinstance(verdict, dict):
+            _emit("makeroom.verdict", run_id=run_id, incoming_model=model_key,
+                  action=verdict.get("action"), reason=verdict.get("reason"),
+                  evicted=list(verdict.get("evicted") or []),
+                  freed_bytes=verdict.get("freed_bytes"),
+                  note=verdict.get("note"))
             evicted.extend(v for v in (verdict.get("evicted") or [])
                            if v not in evicted)
             # action == "partial": the full weights don't fit, but the worker
@@ -248,8 +408,24 @@ def ensure_headroom_for_load(model_key: str) -> List[str]:
             # pinned n_gpu_layers via spill.gguf_gpu_layers (set on the served
             # path by the same admission), so we neither raise nor re-price.
             if verdict.get("action") == "refuse":
+                _emit("headroom.done", run_id=run_id, incoming_model=model_key,
+                      evicted=list(evicted), outcome="refused")
                 raise LoadRefusal(verdict.get("reason") or
                                   {"reason": "won't fit on GPU", "model_key": model_key})
+            if verdict.get("action") == "partial":
+                outcome = "partial"
+    # "proceeded-unfit": the in-process yield ran out of permissible residents
+    # and no make-room hook is registered, so the load goes ahead against a
+    # headroom the fit-guard last said was short. Naming it is the point — that
+    # is precisely the admit-then-OOM shape the operator wants visible.
+    if outcome == "fit" and _FIT_CHECK is not None and _MAKE_ROOM is None:
+        try:
+            if not _FIT_CHECK(model_key):
+                outcome = "proceeded-unfit"
+        except Exception:                    # noqa: BLE001 — unmeasurable -> report fit
+            pass
+    _emit("headroom.done", run_id=run_id, incoming_model=model_key,
+          evicted=list(evicted), outcome=outcome)
     return evicted
 
 

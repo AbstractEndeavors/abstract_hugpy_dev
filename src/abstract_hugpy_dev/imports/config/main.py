@@ -138,21 +138,19 @@ def get_gguf_file(path: str, cfg: ModelConfig, prefer: Optional[str] = None) -> 
     if len(ggufs) == 1:
         return ggufs[0]
 
-    # 3) Multiple, no designation: pick DETERMINISTICALLY (not arbitrary glob
-    #    order). Prefer the first shard of a split gguf, else a common quant.
-    shard0 = sorted(g for g in ggufs if "00001-of-" in os.path.basename(g).lower())
-    if shard0:
-        return shard0[0]
-
-    def _rank(g: str):
-        b = os.path.basename(g).lower()
-        for i, q in enumerate(("q4_k_m", "q4_k_s", "q5_k_m", "q6_k", "q8_0",
-                               "q4_0", "q5_0", "f16", "bf16", "f32")):
-            if q in b:
-                return (i, b)
-        return (99, b)
-
-    return sorted(ggufs, key=_rank)[0]
+    # 3) Multiple, no designation: ELECT one. See imports/src/gguf_election.py
+    #    for the rule and the incident that produced it — in short: fold shard
+    #    sets into variants, refuse to elect an INCOMPLETE shard set, and rank
+    #    quantized ahead of full precision.
+    #
+    #    The rule this replaces tried "first shard of a split gguf" BEFORE the
+    #    quant rank and broke ties lexically. On a directory holding a complete
+    #    fp16 4-shard split beside a complete q4_k_m 2-shard split, ``f`` sorts
+    #    before ``q`` — so it elected 15.2 GB of fp16 over a 4.7 GB q4_k_m on a
+    #    fleet whose smallest card is 8 GB (2026-07-28). Sharding is packaging;
+    #    it was never a reason to prefer a quantization.
+    from ..src.gguf_election import elect_path
+    return elect_path(ggufs) or sorted(ggufs)[0]
 
 
 def model_looks_downloaded(path: str, cfg: Optional[ModelConfig] = None) -> bool:

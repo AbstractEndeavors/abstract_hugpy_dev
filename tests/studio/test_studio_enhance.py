@@ -10,12 +10,40 @@ Invariants under test:
   * The FFMPEG last-resort runners are REAL on this GPU-less box: minterpolate
     (motion-compensated) interpolation to a target fps, and lanczos spatial upscale
     to a target resolution — content-addressed, atomic, resume-on-hash.
-  * The router ranks the PREMIUM models (rife-practical / ltxv-spatial-upscaler)
-    strictly above the ffmpeg last-resort (synthetic=True): ffmpeg binds only when
-    no premium model fits the budget; a fitting premium model outranks it.
-  * The premium runners degrade gracefully (errors-as-data) on this box:
+  * A WORKING runner outranks a STUB, at EVERY budget. This invariant is the exact
+    REVERSAL of the one this file locked until 2026-07-27, and the reversal is the
+    point — see "RANKING, REVERSED" below.
+  * The stub runners degrade gracefully (errors-as-data) when dispatched DIRECTLY:
     rife -> DEPS_MISSING (Practical-RIFE not vendored), ltx -> WEIGHTS_MISSING (HF
-    license-gated 401 weights not staged). Never a raise.
+    license-gated 401 weights not staged). Never a raise. Dispatched directly and
+    no longer through ``produce_clip``, because the router now routes AROUND them —
+    which is the whole fix, so reaching them via the router is no longer possible.
+
+RANKING, REVERSED (2026-07-27). This file used to assert that a "premium" model
+(rife-practical / ltxv-spatial-upscaler-0.9.7) strictly OUTRANKS the ffmpeg
+last-resort whenever it fits the budget. That assertion was locking in a live
+outage. Both "premium" rows resolve to runner modules that return ``Err`` on EVERY
+path — ``runners/rife_interpolate.py`` and ``runners/ltx_upscale.py`` contain zero
+``return Ok(...)`` statements between them (proved structurally from each module's
+AST by ``tests/studio/test_presets.py``; the router reads the same conclusion from
+``presets.STUB_RUNNER_MODULES``). Because the k1 gate (``registry.runner_available``)
+only asks ``find_spec``, a stub module PASSES it, and ``_score``'s ``real_first``
+then ranked the stub ABOVE the working ffmpeg row. Measured on ae, the only render
+box, 2026-07-27: upres bound ltxv-spatial-upscaler at every budget >= 8 GB and
+interp bound rife-practical at every budget >= 3 GB, while ae's autofit budget is a
+stable ~21.6 GB — so UPRES and INTERP were dead at 100% of real budgets, failing
+only AFTER a job had been admitted, queued and started.
+
+The ffmpeg rows are not a consolation prize: minterpolate is motion-compensated
+interpolation and lanczos is a real spatial resample, both real transforms of real
+pixels, on a box with no GPU required. "Premium" was a claim about the model card;
+"works" is a claim about the tree. The tests below now rank on the second.
+
+These tests therefore assert ffmpeg binds at budgets where the stub DOES fit — the
+precise condition that produced the outage — and carry a tripwire: each asserts the
+bound-away model is still listed in ``presets.STUB_RUNNER_MODULES``, so if anyone
+ever vendors Practical-RIFE or wires the LTX upscaler for real, this file FAILS and
+tells them to re-derive the ranking rather than silently keeping ffmpeg pinned.
   * A source-less enhance is a SPEC error (SOURCE_MISSING), checked BEFORE the box
     capability, for both capabilities.
   * The prompt rides in the content_hash for provenance but NEVER alters output bits
@@ -56,20 +84,38 @@ from abstract_hugpy_dev.imports.src.constants.constants import DEFAULT_ROOT  # n
 from abstract_hugpy_dev.video_intel import media_bus  # noqa: E402
 from abstract_hugpy_dev.video_intel.studio.enums import (  # noqa: E402
     Capability,
+    DeterminismClass,
     Framework,
     Precision,
     Task,
 )
 from abstract_hugpy_dev.video_intel.studio.env import StudioEnv  # noqa: E402
+# STUB_RUNNER_MODULES is the SAME frozen set the router consults, deliberately: the
+# ranking assertions below are conditional on stub-ness, and reading the router's own
+# input keeps this file from drifting into a second, private opinion about which
+# runners are real. test_presets.py proves the set structurally (per-module AST), so
+# nothing here has to re-derive it.
+from abstract_hugpy_dev.video_intel.studio.presets import (  # noqa: E402
+    STUB_RUNNER_MODULES,
+)
 from abstract_hugpy_dev.video_intel.studio.produce import produce_clip  # noqa: E402
 from abstract_hugpy_dev.video_intel.studio.registry import (  # noqa: E402
     runner_for,
     validate_registry,
 )
 from abstract_hugpy_dev.video_intel.studio.router import CapabilityRouter  # noqa: E402
+from abstract_hugpy_dev.video_intel.studio.runners.ltx_upscale import (  # noqa: E402
+    run_ltx_upscale,
+)
+from abstract_hugpy_dev.video_intel.studio.runners.rife_interpolate import (  # noqa: E402
+    run_rife_interpolate,
+)
 from abstract_hugpy_dev.video_intel.studio.schemas import (  # noqa: E402
     CapabilityRequest,
+    RenderManifest,
     Resolution,
+    SamplerConfig,
+    SeedBundle,
 )
 
 _FFMPEG = shutil.which("ffmpeg") is not None
@@ -175,15 +221,35 @@ def test_router_interp_tiny_binds_ffmpeg():
 
 
 # --------------------------------------------------------------------------- #
-# [2] Router: interp @ 6GB -> rife-practical. The REAL premium model fits and
-#     strictly OUTRANKS the ffmpeg last-resort (synthetic=True) via real_first.
+# [2] Router: interp at EVERY budget -> ffmpeg-minterpolate. The WORKING runner
+#     outranks the rife STUB even at budgets where the stub fits (rife declares
+#     3GB; ae's real autofit budget is ~21.6GB). Formerly asserted the reverse —
+#     see "RANKING, REVERSED" in the module docstring.
 # --------------------------------------------------------------------------- #
-def test_router_interp_big_binds_rife_real_outranks_ffmpeg():
-    b = CapabilityRouter().resolve(_req(Capability.INTERP, R_INTERP, 6.0)).unwrap()
-    assert b.model_id == "rife-practical", (
-        f"a fitting premium interp model must outrank the ffmpeg last-resort; got {b.model_id}")
-    assert b.framework == Framework.RIFE, b.framework
-    assert b.task == Task.INTERPOLATE, b.task
+def test_router_interp_working_ffmpeg_outranks_rife_stub():
+    # TRIPWIRE: the expectation below is TRUE ONLY WHILE rife is a stub. If someone
+    # vendors Practical-RIFE, rife_interpolate stops being an unconditional-Err
+    # module, leaves STUB_RUNNER_MODULES, and the ranking question genuinely
+    # re-opens — fail here and say so rather than keep ffmpeg pinned by inertia.
+    assert "abstract_hugpy_dev.video_intel.studio.runners.rife_interpolate" in \
+        STUB_RUNNER_MODULES, (
+            "rife_interpolate is no longer registered as an unconditional-Err stub. "
+            "The 'working outranks stub' expectation below no longer applies to it: "
+            "re-derive the interp ranking against the now-real runner instead of "
+            "editing this assertion away.")
+
+    # 3.0GB is above rife's declared VRAM floor and 21.6GB is ae's measured autofit
+    # budget: both are budgets at which the stub USED to bind and take interp to
+    # zero. 0.5GB is the trivially-safe case, kept so a regression that only breaks
+    # the fitting budgets is still distinguishable from one that breaks everything.
+    for budget in (0.5, 3.0, 6.0, 21.6):
+        b = CapabilityRouter().resolve(_req(Capability.INTERP, R_INTERP, budget)).unwrap()
+        assert b.model_id == "ffmpeg-minterpolate", (
+            f"at {budget}GB interp must bind the WORKING ffmpeg transform, not the "
+            f"unconditional-Err rife stub (runners/rife_interpolate.py has zero "
+            f"return Ok paths); got {b.model_id}")
+        assert b.framework == Framework.FFMPEG, b.framework
+        assert b.task == Task.INTERPOLATE, b.task
 
 
 # --------------------------------------------------------------------------- #
@@ -198,15 +264,31 @@ def test_router_upres_tiny_binds_ffmpeg():
 
 
 # --------------------------------------------------------------------------- #
-# [4] Router: upres @ 12GB -> ltxv-spatial-upscaler-0.9.7. The REAL premium model
-#     fits (FP16 @ 12GB) and outranks the ffmpeg last-resort.
+# [4] Router: upres at EVERY budget -> ffmpeg-lanczos-upscale. The WORKING runner
+#     outranks the ltx STUB even at budgets where the stub fits (FP16 @ >=8GB).
+#     NOTE the ltx weights ARE on disk (3.1GB, Lightricks/ltxv-spatial-upscaler-
+#     0.9.7) — this row is dead on WIRING, not on bytes, which is exactly why
+#     ltx_upscale.py returning WEIGHTS_MISSING misdirected the diagnosis for weeks.
 # --------------------------------------------------------------------------- #
-def test_router_upres_big_binds_ltx_real_outranks_ffmpeg():
-    b = CapabilityRouter().resolve(_req(Capability.UPRES, R_UPRES, 12.0)).unwrap()
-    assert b.model_id == "ltxv-spatial-upscaler-0.9.7", (
-        f"a fitting premium upres model must outrank the ffmpeg last-resort; got {b.model_id}")
-    assert b.framework == Framework.LTX, b.framework
-    assert b.task == Task.UPSCALE, b.task
+def test_router_upres_working_ffmpeg_outranks_ltx_stub():
+    # TRIPWIRE — see the twin in test_router_interp_working_ffmpeg_outranks_rife_stub.
+    assert "abstract_hugpy_dev.video_intel.studio.runners.ltx_upscale" in \
+        STUB_RUNNER_MODULES, (
+            "ltx_upscale is no longer registered as an unconditional-Err stub. "
+            "The 'working outranks stub' expectation below no longer applies to it: "
+            "re-derive the upres ranking against the now-real runner instead of "
+            "editing this assertion away.")
+
+    # 8.0/12.0GB clear the ltx FP16 floor and 21.6GB is ae's measured autofit
+    # budget — the stub bound at all three and took upres to zero.
+    for budget in (0.5, 8.0, 12.0, 21.6):
+        b = CapabilityRouter().resolve(_req(Capability.UPRES, R_UPRES, budget)).unwrap()
+        assert b.model_id == "ffmpeg-lanczos-upscale", (
+            f"at {budget}GB upres must bind the WORKING ffmpeg transform, not the "
+            f"unconditional-Err ltx stub (runners/ltx_upscale.py has zero return Ok "
+            f"paths); got {b.model_id}")
+        assert b.framework == Framework.FFMPEG, b.framework
+        assert b.task == Task.UPSCALE, b.task
 
 
 # --------------------------------------------------------------------------- #
@@ -337,20 +419,56 @@ def test_resume_on_hash():
 
 
 # --------------------------------------------------------------------------- #
-# [10] Premium graceful (interp): interp @ 6GB with a REAL source binds rife-practical
-#      and dispatches to run_rife_interpolate, which degrades to Err(DEPS_MISSING) on
-#      this box (Practical-RIFE not vendored). Never raises.
+# Direct-dispatch manifest for the two stub runners.
+#
+# WHY NOT produce_clip: these two checks used to reach rife/ltx by asking the router
+# for a budget the stub fit and letting produce_clip dispatch. That path is GONE BY
+# DESIGN as of 2026-07-27 — the router now routes around both stubs at every budget
+# (see [2]/[4] above), so a router-mediated call can no longer land in them, and the
+# old `assert b.model_id == "rife-practical"` sanity line was asserting the very bug
+# that was fixed. The runners' graceful-degradation contract still matters (the
+# router's refusal machinery is only honest if the modules underneath return data
+# rather than raising), so it is now exercised where it actually lives: a direct
+# call, with a hand-built manifest and no router in the loop.
+# --------------------------------------------------------------------------- #
+def _stub_manifest(capability: Capability, model_id: str, framework: Framework,
+                   task: Task, res: Resolution, source_video: str) -> RenderManifest:
+    """A minimal valid manifest aimed straight at a stub runner. Only source_video,
+    model_id and capability are read on the preflight paths under test; the rest are
+    present because RenderManifest is frozen and total."""
+    return RenderManifest(
+        render_id=f"stub-{capability.value}",
+        capability=capability,
+        model_id=model_id,
+        weight_hash=None,
+        framework=framework,
+        task=task,
+        precision=Precision.FP16,
+        seeds=SeedBundle(global_seed=7, stage_seeds=(("base", 7),)),
+        sampler=SamplerConfig(sampler="euler", scheduler="normal", steps=1, cfg=1.0),
+        resolution_ladder=(res,),
+        determinism_class=DeterminismClass.SEEDED_APPROX,
+        env_snapshot=(),
+        source_video=source_video,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# [10] Stub graceful (interp): run_rife_interpolate called DIRECTLY with a real
+#      source degrades to Err(DEPS_MISSING) on this box (Practical-RIFE not
+#      vendored). Errors-as-data: never a raise, so the router can rank it away
+#      instead of the bus discovering it mid-job.
 # --------------------------------------------------------------------------- #
 def test_premium_rife_graceful_deps_missing():
     if not _FFMPEG:
-        print("      (ffmpeg unavailable — skipping premium rife check)")
+        print("      (ffmpeg unavailable — skipping stub rife check)")
         return
-    b = CapabilityRouter().resolve(_req(Capability.INTERP, R_INTERP, 6.0)).unwrap()
-    assert b.model_id == "rife-practical", b.model_id  # sanity: the Err below IS from it
     out_root = tempfile.mkdtemp(prefix="studio-enh-rife-")
     try:
-        res = produce_clip(_req(Capability.INTERP, R_INTERP, 6.0),
-                           env=_studio_env(), out_root=out_root, source_video=_SRC_MP4)
+        res = run_rife_interpolate(
+            _stub_manifest(Capability.INTERP, "rife-practical", Framework.RIFE,
+                           Task.INTERPOLATE, R_INTERP, _SRC_MP4),
+            out_root)
         assert res.is_err(), f"rife on this box must be Err (not Ok); got {res}"
         assert res.error.code.value == "deps_missing", (
             f"rife must degrade to deps_missing (Practical-RIFE not vendored); "
@@ -360,20 +478,22 @@ def test_premium_rife_graceful_deps_missing():
 
 
 # --------------------------------------------------------------------------- #
-# [11] Premium graceful (upres): upres @ 12GB with a REAL source binds
-#      ltxv-spatial-upscaler and dispatches to run_ltx_upscale, which degrades to
-#      Err(WEIGHTS_MISSING) on this box (HF license-gated 401 weights). Never raises.
+# [11] Stub graceful (upres): run_ltx_upscale called DIRECTLY with a real source
+#      degrades to Err(WEIGHTS_MISSING). The code is MISLEADING and knowingly
+#      asserted as-is: the 3.1GB of weights ARE on disk and the runner finds them —
+#      the row is dead on wiring, not on bytes. Locked here so that when the runner
+#      is wired for real the code is forced to change with it.
 # --------------------------------------------------------------------------- #
 def test_premium_ltx_graceful_weights_missing():
     if not _FFMPEG:
-        print("      (ffmpeg unavailable — skipping premium ltx check)")
+        print("      (ffmpeg unavailable — skipping stub ltx check)")
         return
-    b = CapabilityRouter().resolve(_req(Capability.UPRES, R_UPRES, 12.0)).unwrap()
-    assert b.model_id == "ltxv-spatial-upscaler-0.9.7", b.model_id
     out_root = tempfile.mkdtemp(prefix="studio-enh-ltx-")
     try:
-        res = produce_clip(_req(Capability.UPRES, R_UPRES, 12.0),
-                           env=_studio_env(), out_root=out_root, source_video=_SRC_MP4)
+        res = run_ltx_upscale(
+            _stub_manifest(Capability.UPRES, "ltxv-spatial-upscaler-0.9.7",
+                           Framework.LTX, Task.UPSCALE, R_UPRES, _SRC_MP4),
+            out_root)
         assert res.is_err(), f"ltx on this box must be Err (not Ok); got {res}"
         assert res.error.code.value == "weights_missing", (
             f"ltx must degrade to weights_missing (HF-gated weights not staged); "
@@ -465,12 +585,12 @@ def test_enhance_imports_are_gpu_stack_free():
 CHECKS = [
     ("router: interp@0.5GB -> ffmpeg-minterpolate (ffmpeg, interpolate)",
      test_router_interp_tiny_binds_ffmpeg),
-    ("router: interp@6GB -> rife-practical (REAL premium outranks ffmpeg last-resort)",
-     test_router_interp_big_binds_rife_real_outranks_ffmpeg),
+    ("router: interp@0.5/3/6/21.6GB -> ffmpeg-minterpolate (WORKING outranks rife STUB)",
+     test_router_interp_working_ffmpeg_outranks_rife_stub),
     ("router: upres@0.5GB -> ffmpeg-lanczos-upscale (ffmpeg, upscale)",
      test_router_upres_tiny_binds_ffmpeg),
-    ("router: upres@12GB -> ltxv-spatial-upscaler (REAL premium outranks ffmpeg last-resort)",
-     test_router_upres_big_binds_ltx_real_outranks_ffmpeg),
+    ("router: upres@0.5/8/12/21.6GB -> ffmpeg-lanczos-upscale (WORKING outranks ltx STUB)",
+     test_router_upres_working_ffmpeg_outranks_ltx_stub),
     ("registry: validate_registry() passes + 4 enhancement entrypoints wired (ffmpeg x2, rife+ltx re-pointed)",
      test_registry_valid_and_entrypoints_wired),
     ("REAL interp: 8f@8fps -> 16fps, ffprobe fps~=16 + frames>source + near-2x (mci, not dup)",
@@ -481,9 +601,9 @@ CHECKS = [
      test_prompt_in_hash_but_not_in_pixels),
     ("resume-on-hash: identical interp re-run serves the existing clip (resumed=True)",
      test_resume_on_hash),
-    ("premium graceful: interp@6GB (rife) -> Err(deps_missing), never raises",
+    ("stub graceful: run_rife_interpolate direct -> Err(deps_missing), never raises",
      test_premium_rife_graceful_deps_missing),
-    ("premium graceful: upres@12GB (ltx) -> Err(weights_missing), never raises",
+    ("stub graceful: run_ltx_upscale direct -> Err(weights_missing), never raises",
      test_premium_ltx_graceful_weights_missing),
     ("source-first: interp with no source_video -> Err(source_missing)",
      test_interp_no_source_is_source_missing),

@@ -186,6 +186,15 @@ _SEQ2SEQ = {"t5", "led", "bart", "pegasus", "mbart", "mt5", "longt5"}
 _EMBED   = {"bert", "new", "roberta", "mpnet", "nomic_bert"}
 _ASR     = {"whisper"}
 _VISION  = {"qwen2_5_vl", "minicpmv4_6", "mllama", "idefics3", "internvl"}
+# VIDEO diffusion model_types. Wan's own config.json SAYS what it is —
+# {"_class_name": "WanModel", "model_type": "t2v", "_diffusers_version": "0.30.0"} —
+# and _base_tasks already reads model_type. It just had no video vocabulary, so
+# every Wan row fell through to the "conservative floor" and advertised
+# ["text-generation"]: a video diffusion model offering itself as a chat model,
+# which then earned it a 4-bit bitsandbytes lever, an LLM ctx, an LLM VRAM price,
+# and eligibility for chat routing. Believe the model when it names itself.
+_VIDEO_T2V = {"t2v", "ti2v"}
+_VIDEO_I2V = {"i2v", "vace"}
 
 def _safe_path_part(value):
     value = value.strip().replace("\\", "/")
@@ -275,6 +284,8 @@ def _base_tasks(framework, row):
     if m in _EMBED:   return ["feature-extraction", "sentence-similarity"]
     if m in _ASR:     return ["automatic-speech-recognition"]
     if m in _VISION:  return ["image-text-to-text", "text-generation"]
+    if m in _VIDEO_T2V: return ["text-to-video"]
+    if m in _VIDEO_I2V: return ["image-to-video"]
     return ["text-generation"]                          # conservative floor
 
 
@@ -320,6 +331,96 @@ def _correct_gguf_vision(framework, tasks, row):
     return tasks                                        # not on disk, no declared mmproj
 
 
+def _correct_video_task(framework, tasks, row):
+    """A model whose own config says it is VIDEO must not advertise text-generation.
+
+    CONTENT-AUTHORITATIVE OVERRIDE, deliberately shaped like ``_correct_gguf_vision``:
+    it corrects an ALREADY-DERIVED task list from what is on disk, because by the
+    time we get here the task may not have come from ``_base_tasks`` at all.
+
+    ⚠ WHY A CORRECTOR AND NOT JUST A model_type BRANCH. ``_base_tasks`` short-circuits
+    on a stored value:
+
+        tasks = row.get("tasks")
+        if tasks: return tasks
+
+    Discovery stamps ``tasks`` from the STORAGE LAYOUT PATH (the sticky-task-from-path
+    landmine), so every Wan row arrived carrying ``["text-generation"]`` and the
+    model_type check below it never ran. Teaching ``_base_tasks`` about video was
+    necessary and NOT sufficient — it fixed only rows that reach it undecided.
+
+    Fires only when the config's own ``model_type`` names a video architecture, so a
+    real text model can never be re-labelled by this. Absent/unreadable config → the
+    task list is returned untouched."""
+    if framework == "gguf" or "text-generation" not in tasks:
+        return tasks
+    mt = (row.get("model_type") or "").lower()
+    if not mt:
+        enriched = _enrich_model_type(framework, row)
+        mt = (enriched.get("model_type") or "").lower()
+    if mt in _VIDEO_T2V:
+        return ["text-to-video"]
+    if mt in _VIDEO_I2V:
+        return ["image-to-video"]
+    return tasks
+
+
+def _enrich_model_type(framework, row):
+    """Fill ``model_type`` from the model's OWN ``config.json`` when the row lacks it.
+
+    CONTENT-AUTHORITATIVE, the same discipline ``_correct_gguf_vision`` applies to
+    the mmproj question: read what is on disk rather than trusting the path or a
+    hub tag. Returns the row unchanged (never mutated in place) when there is
+    nothing to add or nothing readable.
+
+    WHY (2026-07-27): every Wan row reached ``_base_tasks`` with NO ``model_type``
+    and NO ``pipeline_tag``, so it fell through to the "conservative floor" and
+    advertised ``["text-generation"]`` — a video diffusion model offering itself as
+    a chat model, which then earned a 4-bit bitsandbytes lever, an LLM ctx, an LLM
+    VRAM price and eligibility for chat routing. The truth was in the file the
+    whole time:
+
+        Wan2.1-T2V-1.3B/config.json
+        {"_class_name": "WanModel", "_diffusers_version": "0.30.0",
+         "model_type": "t2v", "dim": 1536, "ffn_dim": 8960, "num_layers": 30}
+
+    Only fills a MISSING field — an explicit row value always wins — and only for
+    non-gguf rows (a GGUF's type comes from its own header, and ``_base_tasks``
+    handles that branch before it ever reaches ``model_type``)."""
+    if framework == "gguf" or row.get("model_type"):
+        return row
+    d = row.get("dir")
+    if not d:
+        return row
+    mt = None
+    # (a) the raw repo: config.json carries {"model_type": "t2v"|"vace"|...}
+    try:
+        with open(os.path.join(d, "config.json"), "r", encoding="utf-8") as fh:
+            mt = json.load(fh).get("model_type")
+    except Exception:  # noqa: BLE001 — unreadable/absent/malformed → try (b)
+        mt = None
+    # (b) the DIFFUSERS REPACK has no config.json model_type — it carries
+    #     model_index.json {"_class_name": "WanVACEPipeline"|"WanPipeline"|...}.
+    #     Both shapes exist side by side on this fleet (Wan2.1-VACE-1.3B vs
+    #     Wan2.1-VACE-1.3B-diffusers), so reading only one leaves the other
+    #     mis-classified. Map the pipeline class to the same vocabulary.
+    if not (isinstance(mt, str) and mt.strip()):
+        try:
+            with open(os.path.join(d, "model_index.json"), "r", encoding="utf-8") as fh:
+                cls = str(json.load(fh).get("_class_name") or "").lower()
+        except Exception:  # noqa: BLE001
+            cls = ""
+        if cls.startswith("wan"):
+            # WanVACEPipeline / WanImageToVideoPipeline -> reference/image driven;
+            # WanPipeline -> text driven.
+            mt = "vace" if ("vace" in cls or "imagetovideo" in cls) else "t2v"
+    if not isinstance(mt, str) or not mt.strip():
+        return row
+    enriched = dict(row)
+    enriched["model_type"] = mt.strip().lower()
+    return enriched
+
+
 def derive_model_config_row(name, row):
     """One discovery/manifest row -> ModelConfig-ready dict, or (None, reason)."""
     hub_id = _clean_repo_id(row.get("hub_id") or row.get("folder") or name)
@@ -335,8 +436,10 @@ def derive_model_config_row(name, row):
         return None, f"peft adapter base {peft_base!r} not on disk; acquire it first"
 
     framework = _derive_framework(name, hub_id, row)
+    row = _enrich_model_type(framework, row)   # believe the model when it names itself
     tasks = _derive_tasks(framework, row)
     tasks = _correct_gguf_vision(framework, tasks, row)   # mmproj-authoritative, not pipeline_tag/path
+    tasks = _correct_video_task(framework, tasks, row)    # config-authoritative: t2v/vace are NOT chat models
     primary = row.get("primary_task") if row.get("primary_task") in tasks else tasks[0]
     no_runner = [t for t in tasks if (framework, t) not in RUNNER_PAIRS]
     on_disk = bool(row.get("dir"))

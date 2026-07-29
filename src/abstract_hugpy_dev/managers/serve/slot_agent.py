@@ -394,6 +394,25 @@ def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None,
     # passes an isfile check but SIGILLs llama.cpp's native loader on spawn —
     # fail cleanly here instead of core-dumping the child.
     if not path or not os.path.isfile(path) or os.path.getsize(path) == 0:
+        # Say WHY on the telemetry stream before raising. This refusal is the
+        # LAST honest checkpoint before llama.cpp — provisioning claimed to be
+        # done (or was never asked) and yet there is nothing loadable at the
+        # path we would hand the loader. Without this event the console showed
+        # a load that simply never produced an eviction pass, which reads as
+        # "nothing happened" (2026-07-28). Observation only; the raise below is
+        # unchanged.
+        try:
+            from ...comms import evictions as _ev
+            if not path:
+                _why = "no GGUF resolved for this model on disk"
+            elif not os.path.isfile(path):
+                _why = "resolved GGUF does not exist"
+            else:
+                _why = "resolved GGUF is 0 bytes (interrupted or failed pull)"
+            _ev.emit_resolve_fail(model_key, path, _why,
+                                  **_ev.disk_stats(path or None))
+        except Exception:  # noqa: BLE001 — telemetry never blocks a refusal
+            pass
         raise FileNotFoundError(
             f"{model_key}: no usable GGUF on disk (resolved {path!r}) — missing "
             "or empty; refusing to spawn llama.cpp (would SIGILL)")
