@@ -267,7 +267,7 @@ def build_messages(task: dict[str, Any]) -> list[dict[str, str]]:
 
 
 # ── parsing the model's reply ───────────────────────────────────────────────
-_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.S)
+# (the fence regex moved to utils/json_scavenge with the candidate walk)
 
 
 def _extract_json_array(text: str) -> Any:
@@ -277,27 +277,21 @@ def _extract_json_array(text: str) -> Any:
     in order: the whole string; a fenced block; the outermost [...] span. This
     is recovery of a WELL-FORMED array that arrived with garnish — NOT a
     tolerance for malformed content. If none of these yield a list, we raise and
-    the caller degrades to status:"error" (never a guess)."""
+    the caller degrades to status:"error" (never a guess).
+
+    The candidate walk itself is now the package seam
+    ``utils/json_scavenge.extract_json_array`` (``review/judge`` held a second
+    copy; the studio spread path wanted a third). Behaviour is unchanged,
+    including the lone-object near-miss tolerance — what stays HERE is the
+    raise, because the contract error type is this module's."""
     if not isinstance(text, str) or not text.strip():
         raise TodoContractError("model returned an empty reply")
-    candidates = [text.strip()]
-    m = _FENCE_RE.search(text)
-    if m:
-        candidates.append(m.group(1).strip())
-    start, end = text.find("["), text.rfind("]")
-    if start != -1 and end > start:
-        candidates.append(text[start:end + 1])
-    for cand in candidates:
-        try:
-            parsed = json.loads(cand)
-        except Exception:
-            continue
-        if isinstance(parsed, list):
-            return parsed
-        # A lone object is a near-miss we accept as a 1-item array; anything
-        # else (a bare string/number) is not a list of items and is refused.
-        if isinstance(parsed, dict):
-            return [parsed]
+    from abstract_hugpy_dev.utils.json_scavenge import extract_json_array
+    # A lone object is a near-miss we accept as a 1-item array; anything else
+    # (a bare string/number) is not a list of items and is refused.
+    parsed = extract_json_array(text, accept_lone_object=True)
+    if parsed is not None:
+        return parsed
     raise TodoContractError(
         "model reply did not contain a JSON array of items")
 
@@ -366,11 +360,18 @@ def handle_task(task: Any, complete: Any) -> dict[str, Any]:
     except TodoContractError as e:
         return {"status": "error", "result": f"todo-keeper: refused task: {e}"}
 
+    # NO-THINK (utils/no_think.py). This is a strict JSON-array contract at
+    # temperature 0 — "we are extracting structure, not writing prose". The
+    # fence/brace scavenger in parse_model_items exists precisely BECAUSE models
+    # wrap output in prose; a <think> block is that failure in its worst form.
+    # Suppress at generation, then strip defensively before the parser sees it.
+    from ..utils.no_think import apply_no_think, strip_think
     try:
-        reply = complete(build_messages(norm))
+        reply = complete(apply_no_think(build_messages(norm)))
     except Exception as e:  # inference is a network call to the fleet
         return {"status": "error",
                 "result": f"todo-keeper: inference failed: {e}"}
+    reply, _reasoning = strip_think(reply or "")
 
     try:
         items = parse_model_items(reply, kind=norm["kind"])

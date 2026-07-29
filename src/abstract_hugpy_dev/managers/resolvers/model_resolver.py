@@ -347,8 +347,10 @@ def validate_registry() -> None:
     is not allowed to take the whole service down (2026-07-03: a discovered
     'chatterbox' row declaring text-to-speech with no runner made every
     import — and thus any service restart — fail). Unservable discovered
-    entries are DROPPED with a loud error log instead, mirroring the
-    merge-time "registry: dropped" convention.
+    entries are logged loudly and KEPT (2026-07-29 — they used to be popped
+    from MODEL_REGISTRY only, which desynced it from MODEL_REGISTRY_DICT and
+    made the model listable but undesignatable; see the comment at the log
+    call). This function no longer mutates the registry: it reports.
     """
     errors: list[str] = []
 
@@ -384,11 +386,21 @@ def validate_registry() -> None:
         if model_key in _STAPLES:
             errors.extend(entry_errors)     # code bug — fail import
         else:
-            MODEL_REGISTRY.pop(model_key, None)
+            # KEPT, not dropped (2026-07-29). Popping only MODEL_REGISTRY left
+            # it ASYMMETRIC with MODEL_REGISTRY_DICT (never popped, and
+            # refresh_registry re-adds the row to BOTH anyway) — so the model
+            # listed in /models and counted on disk, but get_model_config(k)
+            # in OBJECT form raised "Unknown model" and every designation
+            # refusal blamed the DISK instead of the missing runner. Operator
+            # standing order: a model may be inefficient, never silently
+            # unavailable. Refusal belongs at the point of use — resolve()
+            # already refuses this exact pair loudly and precisely with
+            # "No runner for (framework, task)".
             logger.error(
-                "registry: dropped discovered model %s — cannot be served "
-                "(%s). Register the missing runner/builder pair and it will "
-                "be picked up on the next import.",
+                "registry: discovered model %s cannot be SERVED here (%s). "
+                "The row is KEPT and remains listable/designatable; any "
+                "attempt to resolve it refuses with the missing runner/builder "
+                "pair. Register that pair and it becomes servable.",
                 model_key, "; ".join(e.strip() for e in entry_errors))
 
     if errors:

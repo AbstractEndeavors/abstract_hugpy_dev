@@ -65,6 +65,11 @@ def _completion_kwargs(payload: dict) -> dict:
         kwargs["max_chunks"] = int(payload["max_chunks"])
     elif max_tokens:
         kwargs["max_chunks"] = 1
+    # Per-request allocation triggers (operator ask 2026-07-29): 4-bit / MoE /
+    # alloc-mode overrides for THIS call. Whitelisting + wire-scrubbing happen
+    # at the relay (_relay_payload) — the single enforcement point.
+    if isinstance(payload.get("alloc"), dict) and payload["alloc"]:
+        kwargs["alloc"] = payload["alloc"]
     return kwargs
 
 

@@ -91,7 +91,84 @@ def list_models():
         update_model_sizes(model, mk)
         output.append(model)
 
+    # VERBOSE view (operator ask 2026-07-29): join each model with the per-worker
+    # serving facts the Workers panel renders — Memory, Alloc, 4-bit, MoE, Seat,
+    # Residency, 📌 — so ONE call relays everything known about a model in the
+    # pool. `?verbose=1` for the whole roster; same join per key on
+    # GET /models/<key>. Read-only: relays the registry rows verbatim, derives
+    # nothing new (measured stays measured, planned stays planned).
+    if request.args.get("verbose") in ("1", "true", "yes"):
+        try:
+            _joins = _verbose_worker_join({m.get("model_key") for m in output})
+            for m in output:
+                m["workers"] = _joins.get(m.get("model_key"), [])
+        except Exception:  # noqa: BLE001 — the join must never 500 the listing
+            logger.exception("verbose worker join failed")
+
     return jsonify(output)
+
+
+def _verbose_worker_join(model_keys: set) -> dict:
+    """model_key -> [per-worker serving row]. One registry read for the whole
+    roster; every field is the worker's own report, relayed under the name the
+    console column uses."""
+    from ..functions.imports.utils.workers import list_workers
+    out: dict = {mk: [] for mk in model_keys if mk}
+    for w in list_workers():
+        wname, wid = w.get("name"), w.get("id")
+        designated = set(w.get("models") or [])
+        spill_by = w.get("spill_by_model") or {}
+        alloc_modes = w.get("model_alloc_modes") or {}
+        bnb_by = w.get("bnb_by_model") or {}
+        moe_by = w.get("moe_by_model") or {}
+        loaded = set(w.get("loaded_models") or [])
+        allocs = {a.get("model_key"): a for a in (w.get("allocations") or [])
+                  if isinstance(a, dict)}
+        seats = {s.get("model_key"): s for s in (w.get("slots") or [])
+                 if isinstance(s, dict) and s.get("model_key")}
+        storage_rows = {r.get("model_key"): r
+                        for r in ((w.get("storage") or {}).get("models") or [])
+                        if isinstance(r, dict)}
+        star = w.get("boot_prewarm")
+        for mk in out:
+            touched = (mk in designated or mk in loaded or mk in allocs
+                       or mk in seats or mk in storage_rows)
+            if not touched:
+                continue
+            alloc = allocs.get(mk) or {}
+            seat = seats.get(mk) or {}
+            st = storage_rows.get(mk) or {}
+            out[mk].append({
+                "worker": wname, "worker_id": wid, "status": w.get("status"),
+                "designated": mk in designated,
+                # Alloc — the designation's spill (mode, budgets, ngl, bands)
+                "alloc": spill_by.get(mk) or {},
+                "alloc_mode": alloc_modes.get(mk),
+                # 4-bit / MoE levers as the worker reports them
+                "bnb_4bit": bnb_by.get(mk),
+                "moe": moe_by.get(mk),
+                # Memory — measured residency (vram/weight bytes, gpu_pct, lane)
+                "allocation": alloc or None,
+                "loaded": mk in loaded,
+                "serving": alloc.get("serving"),
+                # Seat — the slot child holding this model, if any
+                "seat": ({"slot_id": seat.get("slot_id"),
+                          "healthy": seat.get("healthy"),
+                          "busy": seat.get("busy"),
+                          "n_gpu_layers": seat.get("n_gpu_layers"),
+                          "n_cpu_moe": seat.get("n_cpu_moe"),
+                          "ctx": seat.get("ctx"),
+                          "last_load_error": seat.get("last_load_error")}
+                         if seat else None),
+                # Residency / 📌 — the storage report's disposition
+                "pinned": st.get("pinned"),
+                "protected": st.get("protected"),
+                "assigned": st.get("assigned"),
+                "on_disk_bytes": st.get("bytes"),
+                "provisioning": st.get("provisioning"),
+                "keep_warm_star": (star == mk) or None,
+            })
+    return out
 
 
 # ── Disk discovery (the console's "Discover models" button) ───────────────
@@ -229,8 +306,16 @@ def get_model(model_key):
     # the persisted record the listings read, so "open the row" is how an
     # operator forces a re-read of a shared, mutable store — and it repairs the
     # listing for everyone else at the same time.
-    return jsonify({"key": model_key, **model,
-                    **refresh_fields(model, model_key)})
+    detail = {"key": model_key, **model, **refresh_fields(model, model_key)}
+    # The single-model read is ALWAYS verbose (operator ask 2026-07-29): the
+    # per-worker serving facts (alloc/4-bit/MoE/seat/residency/📌) ride every
+    # detail fetch — one call, everything known about the model in the pool.
+    try:
+        mk = model.get("model_key") or model_key
+        detail["workers"] = _verbose_worker_join({mk}).get(mk, [])
+    except Exception:  # noqa: BLE001 — the join must never 500 the detail read
+        logger.exception("verbose worker join failed for %s", model_key)
+    return jsonify(detail)
 
 
 # ──────────────────────────────────────────────────────────────────────────

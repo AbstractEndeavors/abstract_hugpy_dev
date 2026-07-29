@@ -14,7 +14,9 @@ Covers:
     ram-only, 5/24 -> max-gpu, 200/24/124 -> max-gpu (fits neither), unknown ->
     max-gpu);
   * feasible_modes matrix per engine (incl. the 68/24/124 case -> exactly
-    (ram-only, max-ram); max-gpu eliminated for oversized transformers; unknown
+    (ram-only, max-gpu, max-ram); only gpu-only is eliminated for an oversized
+    transformers model — max-gpu is a spill PREFERENCE, not a whole-card
+    requirement (operator ruling 2026-07-29); unknown
     data -> coarse trio + max-ram feasible; max-ram is engine-AGNOSTIC as of
     2026-07-24, only explicit stays engine-gated for non-GGUF);
   * an explicit persisted mode wins over derivation;
@@ -105,12 +107,21 @@ check("gguf 5/24: every mode feasible (fits GPU, RAM, and combined)",
 # a non-GGUF model too. explicit stays engine-gated off (banded leniency floor
 # has no transformers analogue).
 ft = feasible_modes("transformers", 68 * GIB, 24 * GIB, 124 * GIB)
-check("transformers 68/24/124 -> feasible EXACTLY (ram-only, max-ram) — gpu-only "
-      "& max-gpu eliminated (won't fit GPU alone); max-ram fits combined; "
-      "explicit engine-gated off",
-      ft == ("ram-only", "max-ram"))
-check("=> max-gpu is NOT an offered mode for the 68/24 transformers case",
-      "max-gpu" not in ft)
+check("transformers 68/24/124 -> feasible EXACTLY (ram-only, max-gpu, max-ram) — "
+      "only gpu-only eliminated (it alone means GPU-or-nothing); max-gpu and "
+      "max-ram both fit combined; explicit engine-gated off",
+      ft == ("ram-only", "max-gpu", "max-ram"))
+# OPERATOR RULING 2026-07-29, verbatim: "max-gpu just means it prefers
+# maximizing the gpu for spill. gpu only dictates that it ONLY is on the gpu or
+# nothing." So the fits-the-card-WHOLE test belongs to gpu-only ALONE; max-gpu
+# is a PREFERENCE and is feasible whenever the model fits GPU+RAM combined —
+# the same rule max-ram already used, on the same non-GGUF spill loaders.
+# Previously max-gpu was eliminated here, which stripped THE DEFAULT mode from
+# every oversized non-GGUF model and made 8 of ae's designations unassignable
+# (/assign 409 "not feasible") after the in-VM migration.
+check("=> max-gpu IS offered for the 68/24 transformers case (preference, not "
+      "a whole-card requirement)",
+      "max-gpu" in ft)
 check("=> explicit is NEVER offered for a non-GGUF model (stays engine-gated)",
       "explicit" not in ft)
 ft2 = feasible_modes("transformers", 5 * GIB, 24 * GIB, 124 * GIB)
@@ -235,28 +246,62 @@ check("seam: a worker missing totals fails open to {} (max-gpu) — never a "
 # module wrappers used by the surface
 check("derived_default_for reads the RAW record -> ram-only for the 68/24 case",
       W.derived_default_for(w["id"], "tf-big") == "ram-only")
-check("feasible_modes_for -> (ram-only, max-ram) for the 68/24 transformers case "
-      "(max-ram opened for non-GGUF 2026-07-24; fits combined 148 GiB)",
-      W.feasible_modes_for(w["id"], "tf-big") == ("ram-only", "max-ram"))
+check("feasible_modes_for -> (ram-only, max-gpu, max-ram) for the 68/24 "
+      "transformers case (max-ram opened for non-GGUF 2026-07-24; max-gpu "
+      "joined it 2026-07-29 — a spill PREFERENCE, not a whole-card test; both "
+      "fit combined 148 GiB)",
+      W.feasible_modes_for(w["id"], "tf-big") == ("ram-only", "max-gpu", "max-ram"))
 check("feasibility_context surfaces the raw numbers for an honest 409",
       W.feasibility_context(w["id"], "tf-big") ==
       {"engine": "transformers", "model_bytes": 68 * GIB,
        "gpu_total_bytes": 24 * GIB, "ram_total_bytes": 124 * GIB,
        # MoE (2026-07-24): the expert-split GPU need; None for non-MoE.
-       "moe_split_gpu_bytes": None})
+       "moe_split_gpu_bytes": None,
+       # bnb (2026-07-29): which size the decision priced — a 409 quoting fp16
+       # bytes while 4-bit is on would read as a bug in the numbers.
+       "bnb": False})
+
+# ── 4-bit re-prices FEASIBILITY, not just the allocation (2026-07-29) ────────
+# Operator: "its auto should change upon 4-bit delegation". default_allocation
+# has priced the 4-bit footprint since 2026-07-26; feasible_modes did not, so
+# the allocator planned ~15 GiB for a 51.7 GiB model while the gate refused the
+# mode on the fp16 size. sdxl-turbo on ae's 24 GiB card is exactly that case.
+SDXL = 52 * GIB                       # ~ the real stabilityai~sdxl-turbo dir
+f_fp16 = feasible_modes("transformers", SDXL, 24 * GIB, 88 * GIB, bnb=False)
+f_4bit = feasible_modes("transformers", SDXL, 24 * GIB, 88 * GIB, bnb=True)
+check("4-bit OFF: a 52 GiB transformers model cannot hold the 24 GiB card whole "
+      "-> gpu-only eliminated",
+      "gpu-only" not in f_fp16)
+check("4-bit ON: the same model prices at ~15.6 GiB (0.30 ratio) and gpu-only "
+      "BECOMES feasible — the gate now moves with the lever",
+      "gpu-only" in f_4bit)
+check("4-bit never eliminates a mode that was feasible at full size "
+      "(re-pricing can only widen the set)",
+      set(f_fp16) <= set(f_4bit))
+check("GGUF ignores the bnb lever entirely (llama.cpp carries its own quant)",
+      feasible_modes("gguf", SDXL, 24 * GIB, 88 * GIB, bnb=True)
+      == feasible_modes("gguf", SDXL, 24 * GIB, 88 * GIB, bnb=False))
 
 # ── the /assign feasibility gate + bulk skip ─────────────────────────────────
 import importlib
 wr = importlib.import_module(
     "abstract_hugpy_dev.flask_app.app.routes.worker_routes")
 
-# max-gpu on the 68/24 transformers case is INFEASIBLE -> refused, numbers named
+# max-gpu on the 68/24 transformers case is FEASIBLE (2026-07-29): it means
+# "prefer the GPU, spill the rest", so it only needs GPU+RAM combined. The gate
+# must therefore ALLOW it — refusing it stripped the default mode from every
+# oversized non-GGUF model and made them unassignable.
 okf, reason = wr._alloc_mode_feasible_for_worker({}, w["id"], "tf-big")
-check("gate: max-gpu (blank derive) on 68/24 transformers -> refused",
-      okf is False)
+check("gate: max-gpu (blank derive) on 68/24 transformers -> ALLOWED (spill "
+      "preference, fits combined)", okf is True and reason is None)
+# gpu-only is the mode that genuinely cannot fit -> still refused, numbers named
+okg, reasong = wr._alloc_mode_feasible_for_worker(
+    {"n_gpu_layers": -1}, w["id"], "tf-big")
+check("gate: gpu-only on the same case -> refused (GPU-or-nothing, 68 > 24)",
+      okg is False)
 check("gate: the refusal NAMES the mode, the numbers, and the feasible set",
-      "max-gpu" in reason and "68.0GiB" in reason and "24.0GiB" in reason
-      and "ram-only" in reason)
+      "gpu-only" in reasong and "68.0GiB" in reasong and "24.0GiB" in reasong
+      and "ram-only" in reasong)
 # the feasible pick is allowed
 okf2, reason2 = wr._alloc_mode_feasible_for_worker(
     {"n_gpu_layers": "off"}, w["id"], "tf-big")
@@ -282,8 +327,9 @@ d1 = store.register(name="durable-box", url="http://d:9100",
                     pkg_version="0.1.203", gpus=GPUS_24, ram_total=124 * GIB)
 did = d1["id"]
 store.assign_model(did, "tf-big")            # designate the oversized transformers
-check("durable: first register with totals -> feasibility resolves (ram-only, max-ram)",
-      W.feasible_modes_for(did, "tf-big") == ("ram-only", "max-ram"))
+check("durable: first register with totals -> feasibility resolves "
+      "(ram-only, max-gpu, max-ram)",
+      W.feasible_modes_for(did, "tf-big") == ("ram-only", "max-gpu", "max-ram"))
 rec = store._load()[did]
 check("durable: register persisted the last-known GPU total as a durable fact",
       rec.get("gpu_total_bytes_known") == 24 * GIB
@@ -300,8 +346,8 @@ check("durable: an empty-probe re-register did NOT erase the durable totals",
 check("durable: live gpus[] IS now empty (the transient reading), proving the "
       "fallback — not stale live data — carries feasibility",
       not rec2.get("gpus"))
-check("durable: feasibility STILL resolves (ram-only, max-ram) across the re-register window",
-      W.feasible_modes_for(did, "tf-big") == ("ram-only", "max-ram"))
+check("durable: feasibility STILL resolves (ram-only, max-gpu, max-ram) across the re-register window",
+      W.feasible_modes_for(did, "tf-big") == ("ram-only", "max-gpu", "max-ram"))
 check("durable: the derived default STILL serves as ram-only across the window",
       W.derived_default_for(did, "tf-big") == "ram-only"
       and store.spill_for(did, "tf-big") == {"n_gpu_layers": "off"})
@@ -324,7 +370,7 @@ d3 = store.register(name="durable-box", url="http://d2:9100",
 check("durable: a returning id with a LOST row inherits totals from memory",
       store._load()[did].get("gpu_total_bytes_known") == 24 * GIB)
 check("durable: feasibility works immediately on the restored row (pre-first-beat)",
-      W.feasible_modes_for(did, "tf-big") == ("ram-only", "max-ram"))
+      W.feasible_modes_for(did, "tf-big") == ("ram-only", "max-gpu", "max-ram"))
 
 # a GENUINELY-NEW worker id (never seen, no memory) still fails open + self-logs.
 import logging as _logging

@@ -1,7 +1,10 @@
 # hugpy-review@<criteria>.service — USER-unit variant of the nightly reviewer.
 #
 # WHY A USER UNIT: the target box (ae) has no sudo, so nothing can be written to
-# /etc/systemd/system. Everything here is identical to the system unit except
+# /etc/systemd/system. Paths are the LIVE ae worker's (the systemctl --user
+# hugpy-worker unit under /home/solcatcher/hugpy-worker — NOT the inactive
+# system unit's /var/lib/hugpy-worker, which is hugpyw-owned mode 750 and
+# unwritable rootless). Everything here is identical to the system unit except
 # User=/Group=, which are INVALID in a user unit (the manager already runs as
 # the user) and would make systemd refuse to load the file.
 #
@@ -19,16 +22,16 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-WorkingDirectory=/var/lib/hugpy-worker
+WorkingDirectory=/home/solcatcher/hugpy-worker
 Environment=PYTHONUNBUFFERED=1
 # The reviewer loads GGUFs with llama_cpp, which lives in the worker venv.
-Environment=REVIEW_LLAMA_PYTHON=/home/solcatcher/hugpy/hugpy-worker/venv/bin/python
+Environment=REVIEW_LLAMA_PYTHON=/home/solcatcher/hugpy-worker/venv/bin/python
 
 # ── the local record ──────────────────────────────────────────────────────
 # The on-box sqlite. Durable across reboots and independent of the network, so
 # a run is never lost because central was unreachable. It is NOT what the
 # console reads — see REVIEW_CENTRAL_URL below.
-Environment=REVIEW_DB=/var/lib/hugpy-worker/review/reviews.db
+Environment=REVIEW_DB=/home/solcatcher/hugpy-worker/review/reviews.db
 
 # ── the source of truth ───────────────────────────────────────────────────
 # After each run the pipeline pushes the run + its results to central's DB,
@@ -51,8 +54,8 @@ Environment=REVIEW_CENTRAL_TOKEN=REPLACE_WITH_WORKER_ENROLL_TOKEN
 # Name the pushed rows are attributed to on central. Defaults to the hostname.
 Environment=REVIEW_PUSH_HOST=ae
 
-ExecStart=/home/solcatcher/hugpy/hugpy-worker/venv/bin/python -m abstract_hugpy_dev.review \
-          run %i --report /var/lib/hugpy-worker/review-%i.md
+ExecStart=/home/solcatcher/hugpy-worker/venv/bin/python -m abstract_hugpy_dev.review \
+          run %i --report /home/solcatcher/hugpy-worker/review-%i.md
 # A run downloads weights and loads them on the GPU; give it room but never let
 # a wedged load pin the card indefinitely.
 TimeoutStartSec=4h

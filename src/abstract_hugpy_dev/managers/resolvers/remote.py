@@ -321,6 +321,38 @@ def _select(model_key: str, pool: Optional[str] = None,
     return _pick_worker(model_key, pool, task, require_comfy_id_lock), None
 
 
+def _requested_worker_name(req) -> Optional[str]:
+    """The per-request WORKER pin, riding the same ``alloc`` dict as the other
+    triggers (operator ask 2026-07-29: "it'll need its worker allocation"):
+    ``{"alloc": {"worker": "ae", ...}}``. Not in _REQUEST_ALLOC_KEYS on purpose
+    — it steers ROUTING, never the spill wire."""
+    a = getattr(req, "alloc", None)
+    if isinstance(a, dict):
+        w = a.get("worker")
+        if isinstance(w, str) and w.strip():
+            return w.strip()
+    return None
+
+
+def _resolve_requested_worker(want: str, model_key: str,
+                              pool: Optional[str], task: Optional[str]) -> dict:
+    """The worker row for an explicitly requested worker, by name or id.
+
+    An explicit pin is a CONTRACT: if the named worker cannot serve, the call
+    fails naming why — it is never silently rerouted to a different box or to
+    local (an A/B against a named card that quietly ran elsewhere would be a
+    lie in the data). The message carries 'requested worker', which
+    _PERMANENT_LOAD_MARKERS classifies as permanent: fail fast, no hold."""
+    rows = _candidates(model_key, pool, task)
+    for w in rows:
+        if want in (w.get("name"), w.get("id")):
+            return w
+    have = ", ".join(str(w.get("name") or w.get("id")) for w in rows) or "none"
+    raise RuntimeError(
+        f"requested worker '{want}' cannot serve '{model_key}': not among the "
+        f"online task-capable workers holding it (eligible: {have})")
+
+
 def _spill_for(worker_id: Optional[str], model_key: str) -> dict:
     if _spill_provider is None or not worker_id:
         return {}
@@ -539,6 +571,15 @@ def _candidates(model_key: str, pool: Optional[str] = None,
 
 
 _NOOP_RELEASE = lambda: None  # noqa: E731 — a tiny sentinel is clearer inline
+
+# Per-REQUEST alloc triggers a client may override (operator ask 2026-07-29).
+# Exactly the worker's _SPILL_ENV vocabulary that is safe per-call — placement
+# levers only. Deliberately excluded: rpc_servers/tensor_split/main_gpu (shard
+# topology belongs to the allocator, not a chat request).
+_REQUEST_ALLOC_KEYS = frozenset({
+    "alloc_mode", "bnb_4bit", "n_cpu_moe", "n_gpu_layers",
+    "gpu_mem_gib", "cpu_mem_gib", "threads",
+})
 
 
 class _RelaySlot:
@@ -994,6 +1035,33 @@ _PERMANENT_LOAD_MARKERS = (
     # Operator model BLOCK: a distinct, permanent operator refusal — never held
     # or retried (see comms.blocklist.BLOCKED_MARKER; this string mirrors it).
     "blocked from the serving pool",
+    # Per-request worker pin that cannot bind (_resolve_requested_worker): the
+    # named box is offline / not holding the model. Retrying cannot conjure it;
+    # honest fast failure keeps A/B data truthful.
+    "requested worker",
+    # STRUCTURALLY INVALID MODEL FILE (incident 2026-07-29). The weights on disk
+    # do not match the metadata that describes them, so the loader rejects the
+    # file itself — deterministically, in well under a second, identically on
+    # every worker and every attempt. Found via the studio-aptitude sweep:
+    #   check_tensor_dims: tensor 'token_embd.weight' has wrong shape;
+    #   expected 4096, 32005, got 384, 32000
+    # which reaches central as "Failed to load model from file: <path>".
+    #
+    # Absent from this list, that verdict was classified TRANSIENT, so the
+    # cold-hold held the call while the worker burned 3 slot attempts + a 120s
+    # backoff + an in-process fallback that failed the same way — and central
+    # re-requested every ~3s. The caller waited 900s for an answer that was
+    # already known at t+0.75s. A corrupt file is not a stall: no retry can
+    # reshape a tensor, so fail fast and say so.
+    "failed to load model from file", "error loading model",
+    "check_tensor_dims", "wrong shape", "missing tensor",
+    "unknown model architecture", "unsupported model architecture",
+    # The SLOT path's wording for the same condition: slot_agent now separates a
+    # child that DIED (the loader rejected the file) from one that hung, and says
+    # "hard load failure" for the former. Previously both read "did not become
+    # healthy (stall/hard-cap)" — a stall, i.e. transient — which is precisely
+    # how a permanently-broken model kept earning retries.
+    "hard load failure",
 )
 
 
@@ -1327,6 +1395,18 @@ def _worker_payload(task: str, req, model_key: str, worker_id: Optional[str],
     Returns None to signal "can't offload this turn, run local".
     """
     payload: Dict[str, Any] = {"_force_local": True, **req.model_dump()}
+    # Per-REQUEST alloc triggers (operator ask 2026-07-29). ALWAYS pop the key —
+    # even when unset it dumps as alloc=None, and released workers run
+    # extra="forbid": an unknown key on the wire rejects ALL relayed chat (the
+    # 2026-07-17 None-key incident, same landmine). The whitelisted remainder is
+    # merged OVER the assignment spill below — a per-call trigger wins for this
+    # call, everything not overridden keeps the designation's value.
+    _req_alloc = payload.pop("alloc", None)
+    if isinstance(_req_alloc, dict):
+        _req_alloc = {k: v for k, v in _req_alloc.items()
+                      if k in _REQUEST_ALLOC_KEYS and v is not None}
+    else:
+        _req_alloc = {}
     # A request type may carry its OWN `task` field (TranscribeRequest.task is
     # whisper's transcribe/translate MODE) — dumped last, it clobbered the
     # DISPATCH task key and every whisper offload died on the worker with
@@ -1336,6 +1416,10 @@ def _worker_payload(task: str, req, model_key: str, worker_id: Optional[str],
         payload["whisper_task"] = payload.pop("task")
     payload["task"] = task
     spill = spill_override if spill_override is not None else _spill_for(worker_id, model_key)
+    if _req_alloc:
+        spill = {**(spill or {}), **_req_alloc}
+        logger.info("per-request alloc override for %s on %s: %s",
+                    model_key, worker_id, _req_alloc)
     if spill:
         payload["spill"] = spill
     if not _inline_file(payload):
@@ -1545,6 +1629,9 @@ def make_peer_runner(peer, framework: str, task: str):
             # model replies, failing validation.
             import httpx
             payload = {"delegated": True, "task": task, **req.model_dump()}
+            # Same wire scrub as _relay_payload: a peer on a released build
+            # forbids unknown keys, and alloc dumps even when None.
+            payload.pop("alloc", None)
             url = peer.base_url.rstrip("/") + "/api/llm/execute"
             timeout = httpx.Timeout(float(self.cfg.timeout_s or 3600), connect=4.0)
             async with httpx.AsyncClient(timeout=timeout) as client:
@@ -1734,6 +1821,16 @@ def make_delegating_runner(framework: str, task: str):
             _sel_kw = {"require_comfy_id_lock": True} if _id_lock else {}
             _viable = (_worker_vision_capable if _vision_task
                        else _worker_comfy_id_lock_capable if _id_lock else None)
+            # Per-request worker pin also gates the cap-full REROUTE: without
+            # this, _reserve_once could legally move a pinned request onto a
+            # different box the moment the named one is at capacity — the exact
+            # silent reroute the pin contract forbids.
+            _pin = _requested_worker_name(req)
+            if _pin:
+                _cap_viable = _viable
+                _viable = (lambda w, _p=_pin, _v=_cap_viable:
+                           (w.get("name") == _p or w.get("id") == _p)
+                           and (_v is None or _v(w)))
 
             # Cold-load HOLD (t36), one-shot flavor: a FEASIBLE-but-COLD model
             # whose on-demand load trips a TRANSIENT failure is HELD and retried
@@ -1757,9 +1854,16 @@ def make_delegating_runner(framework: str, task: str):
             # never a queued slot. See the cap block near _hold_try_acquire.
             permit = None
             admitted = False
+            _want_worker = _requested_worker_name(req)
             try:
                 while True:
-                    worker, spill_override = _select(self.model_key, pool, task, **_sel_kw)
+                    if _want_worker:
+                        # Explicit per-request worker pin: binds routing, or
+                        # fails naming why — never silently rerouted.
+                        worker, spill_override = _resolve_requested_worker(
+                            _want_worker, self.model_key, pool, task), None
+                    else:
+                        worker, spill_override = _select(self.model_key, pool, task, **_sel_kw)
                     if worker and _vision_task and not _worker_vision_capable(worker):
                         logger.info("worker %s doesn't advertise vision (engine.supports_vision); "
                                     "serving %s where vision actually works instead",
@@ -1892,6 +1996,16 @@ def make_delegating_runner(framework: str, task: str):
             _sel_kw = {"require_comfy_id_lock": True} if _id_lock else {}
             _viable = (_worker_vision_capable if _vision_task
                        else _worker_comfy_id_lock_capable if _id_lock else None)
+            # Per-request worker pin also gates the cap-full REROUTE: without
+            # this, _reserve_once could legally move a pinned request onto a
+            # different box the moment the named one is at capacity — the exact
+            # silent reroute the pin contract forbids.
+            _pin = _requested_worker_name(req)
+            if _pin:
+                _cap_viable = _viable
+                _viable = (lambda w, _p=_pin, _v=_cap_viable:
+                           (w.get("name") == _p or w.get("id") == _p)
+                           and (_v is None or _v(w)))
 
             # -- ONE worker-relay attempt ------------------------------------
             # Yields StreamEvents (allocation banner is emitted by the loop, not
@@ -2019,11 +2133,18 @@ def make_delegating_runner(framework: str, task: str):
             # honest ErrorEvent instead of a slot parked for up to the ceiling.
             permit = None
             admitted = False
+            _want_worker = _requested_worker_name(req)
             try:
                 while True:
                     if cancel_event is not None and cancel_event.is_set():
                         return  # cancel-while-held: teardown marks the job cancelled
-                    worker, spill_override = _select(self.model_key, pool, task, **_sel_kw)
+                    if _want_worker:
+                        # Explicit per-request worker pin — same contract as the
+                        # one-shot path: bind or fail naming why, never reroute.
+                        worker, spill_override = _resolve_requested_worker(
+                            _want_worker, self.model_key, pool, task), None
+                    else:
+                        worker, spill_override = _select(self.model_key, pool, task, **_sel_kw)
                     if worker and _vision_task and not _worker_vision_capable(worker):
                         logger.info("worker %s doesn't advertise vision "
                                     "(engine.supports_vision); serving %s where vision "

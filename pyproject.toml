@@ -8,7 +8,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "abstract_hugpy_dev"
-version = "0.1.224"
+# Single-sourced from src/abstract_hugpy_dev/__init__.py:__version__ (read
+# statically by setuptools — see [tool.setuptools.dynamic] below). Bump it
+# THERE. A hardcoded number here is how 0.1.224 shipped with metadata 0.1.224
+# and a 0.1.223 module constant, pinning every worker at version_ok:false.
+dynamic = ["version"]
 description = "Self-hosted LLM console: model registry & downloads, streaming chat, OpenAI-compatible /v1 API with on-site keys, GPU worker fleet with cross-machine RPC sharding"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -159,6 +163,11 @@ hugpy = "abstract_hugpy_dev.cli:main"
 # THIS process, never inside the console API's gunicorn — see
 # src/abstract_hugpy_dev/downloader/__init__.py.
 hugpy-downloader = "abstract_hugpy_dev.downloader.daemon:main"
+
+[tool.setuptools.dynamic]
+# Read statically (AST) out of __init__.py — the package is NOT imported at
+# build time, so this stays cheap and cannot fail on missing build-env deps.
+version = { attr = "abstract_hugpy_dev.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["src"]

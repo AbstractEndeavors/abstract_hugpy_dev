@@ -1118,3 +1118,45 @@ def test_headroom_sweep_keeps_the_percentage_threshold(rig):
     rig.lru["idle"] = 5.0
     A._vram_headroom_sweep(_State())
     assert rig.evicted == ["idle"]
+
+
+# ── PLACEMENT-INTENT RE-PRICE (operator incident 2026-07-29) ─────────────────
+# skilledu~Qwen3-32B, designated RAM-only (n_gpu_layers "off"), was refused
+# "won't fit on GPU: needs 70.2 GB, 21.5 GB free" — and an idle resident was
+# EVICTED on the way — for a load whose max_memory map was about to place 0 B
+# on the card. Admission must price what the loader will actually land there
+# (the same invariant the 4-bit re-price and the MoE re-target already state).
+def test_ram_only_intent_skips_gpu_admission_entirely(rig, monkeypatch):
+    monkeypatch.setenv("HUGPY_N_GPU_LAYERS", "off")          # the designation
+    rig.card["free"] = int(21.5 * GIB)
+    rig.card["need"] = int(70.2 * GIB)                       # full fp16 total
+    rig.residents["innocent-idle"] = {"vram_bytes": int(5.8 * GIB),
+                                      "host_mode": "in-process"}
+    rig.lru["innocent-idle"] = 5.0
+    plan = A._vram_evict_to_fit(_State(), "skilledu~Qwen3-32B")
+    assert plan["action"] == "proceed"
+    assert rig.evicted == []                                 # nobody pays for a no-op
+    assert "innocent-idle" in rig.residents                  # still resident
+    assert "0 B on the GPU" in (plan.get("note") or "")
+
+
+def test_max_ram_admission_prices_only_the_gpu_remainder(rig, monkeypatch):
+    # The 4-bit twin of the incident: max-ram with an 18G CPU budget, need 21.1G
+    # -> the loader puts ~3.1G on the GPU; 15.7G free must ADMIT, not refuse.
+    monkeypatch.setenv("HUGPY_ALLOC_MODE", "max-ram")
+    monkeypatch.setenv("HUGPY_CPU_MEM_GIB", "18")
+    rig.card["free"] = int(15.7 * GIB)
+    rig.card["need"] = int(21.1 * GIB)
+    plan = A._vram_evict_to_fit(_State(), "skilledu~Qwen3-32B")
+    assert plan["action"] == "proceed"
+    assert rig.evicted == []
+
+
+def test_gpu_and_auto_intents_still_price_the_full_need(rig, monkeypatch):
+    # The re-price must not leak generosity: without a RAM-side intent the same
+    # oversized need still refuses (nothing evictable here).
+    monkeypatch.setenv("HUGPY_N_GPU_LAYERS", "-1")
+    rig.card["free"] = int(21.5 * GIB)
+    rig.card["need"] = int(70.2 * GIB)
+    plan = A._vram_evict_to_fit(_State(), "skilledu~Qwen3-32B")
+    assert plan["action"] == "refuse"

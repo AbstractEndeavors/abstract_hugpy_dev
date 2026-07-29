@@ -14,6 +14,16 @@ class LocalEngineUnavailable(RuntimeError):
 
 _LLAMA_INSTANCES: Dict[str, "LlamaCppBaseRunner"] = {}
 _LLAMA_LOCK = threading.Lock()
+# Builds are SLOW (slot-child spawn, evict-to-fit, a 46G cold load — minutes)
+# and used to run UNDER _LLAMA_LOCK. That serialized the data plane against
+# every registry READER: the heartbeat's loaded_runner_detail only wants a
+# microsecond dict snapshot, but it queued behind the whole build — so under
+# heavy load the worker went DEAF (missed beats -> central marks it offline
+# while it is busily serving; the 2026-07-29 ae flap, same class as k53).
+# Now: _LLAMA_LOCK is only ever micro-held (get/put/snapshot, the discipline
+# evict_llama_runner already had), and builds serialize on THIS lock instead —
+# one build at a time, exactly the old semantics, invisible to readers.
+_LLAMA_BUILD_LOCK = threading.Lock()
 
 
 def evict_llama_runner(model_key: str) -> bool:
@@ -117,10 +127,21 @@ def get_llama_runner(model_key: str) -> "LlamaCppBaseRunner":
             f"get_llama_runner expects model_key: str, got {type(model_key).__name__}"
         )
 
+    # Fast path: registry lock micro-held for the lookup only.
     with _LLAMA_LOCK:
         runner = _LLAMA_INSTANCES.get(model_key)
-        if runner is None:
-            runner = _build_runner(model_key)
+    if runner is not None:
+        return runner
+    # Slow path: the BUILD lock serializes builds (unchanged policy — one heavy
+    # load at a time); the registry lock is never held across it, so heartbeat/
+    # status snapshot readers stay responsive through a minutes-long load.
+    with _LLAMA_BUILD_LOCK:
+        with _LLAMA_LOCK:
+            runner = _LLAMA_INSTANCES.get(model_key)   # built while we waited?
+        if runner is not None:
+            return runner
+        runner = _build_runner(model_key)
+        with _LLAMA_LOCK:
             _LLAMA_INSTANCES[model_key] = runner
         return runner
 

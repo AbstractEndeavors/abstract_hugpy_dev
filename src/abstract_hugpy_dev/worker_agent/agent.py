@@ -63,6 +63,10 @@ from ..central import central_base_url
 # concurrent requests can't race the same non-reentrant native context and SEGV
 # the whole worker (the computron 2026-07-11 core-dump class).
 from . import gen_gate
+# Worker-side ROLLING AGGREGATE (operator ruling 2026-07-29). Import-safe by
+# design: aggregate.py pulls only stdlib + _platform.paths, so it can sit in
+# the serving path without dragging the runner stack.
+from . import aggregate as _aggregate
 # request_id -> asyncio.Event, so POST /infer/cancel can stop an in-flight
 # stream mid-generation. Populated by _stream_sync, tripped by the cancel route.
 # Cancellation now rides the shared comms JobStore (attach_cancel/cancel) —
@@ -3289,6 +3293,15 @@ def build_app(state: "WorkerState") -> Flask:
     @app.route("/infer", methods=["POST"])
     def infer():
         payload = request.get_json(silent=True) or {}
+        # ROLLING AGGREGATE (operator ruling 2026-07-29): the worker aggregates
+        # its OWN serve stats so central never has to poll for them. Captured
+        # here, before _ensure_present can rewrite the payload, and recorded on
+        # every exit path below. Pure arithmetic on a request already finished —
+        # it adds no work to the serving path and cannot fail it (every
+        # aggregate entry point swallows its own errors).
+        _agg_key = payload.get("model_key")
+        _agg_task = payload.get("task")
+        _agg_t0 = time.time()
         # Errors as DATA, never a raw Flask 500: the raw error page hides the
         # worker-side traceback from central entirely (2026-07-03: three
         # opaque delegation failures in one day were undiagnosable from
@@ -3303,9 +3316,23 @@ def build_app(state: "WorkerState") -> Flask:
             # No-op for a slot-backed model (its child schedules itself). On a
             # bounded-wait timeout this raises ModelBusy -> honest 503 below.
             with gen_gate.gate_for_payload(payload):
-                return jsonify(_run_once(payload))
+                result = _run_once(payload)
+            _aggregate.record_serve(
+                _agg_key, ok=bool(result.get("ok", True)),
+                latency_ms=(time.time() - _agg_t0) * 1000.0,
+                tokens_out=_aggregate.tokens_out_of(result),
+                error=None if result.get("ok", True) else result.get("error"),
+                task=_agg_task)
+            return jsonify(result)
         except gen_gate.ModelBusy as busy:
             # Honest structured busy — the runner is at capacity, not broken.
+            # Recorded as a failure with its own verbatim reason: "the box was
+            # at capacity" is precisely the pool-health fact this file exists
+            # to surface.
+            _aggregate.record_serve(
+                _agg_key, ok=False,
+                latency_ms=(time.time() - _agg_t0) * 1000.0,
+                error=f"ModelBusy: {busy}", task=_agg_task)
             return jsonify(busy.as_error(
                 {"id": state.worker_id, "name": state.name})), 503
         except BudgetRefusal as exc:
@@ -3314,6 +3341,10 @@ def build_app(state: "WorkerState") -> Flask:
             # its own honest code (507 Insufficient Storage) and the structured
             # reason. Central can then route elsewhere instead of retrying a
             # box that will never have room.
+            _aggregate.record_serve(
+                _agg_key, ok=False,
+                latency_ms=(time.time() - _agg_t0) * 1000.0,
+                error=f"BudgetRefusal: {exc.reason.get('reason')}", task=_agg_task)
             return jsonify({
                 "ok": False,
                 "error": exc.reason.get("reason"),
@@ -3324,6 +3355,13 @@ def build_app(state: "WorkerState") -> Flask:
             import traceback
             tb = traceback.format_exc()
             logger.error("infer failed: %s", tb)
+            # VERBATIM in the aggregate — the operator's standing want. A
+            # paraphrased error has repeatedly cost a diagnosis, so the rolling
+            # file keeps the real text (bounded, elision marked).
+            _aggregate.record_serve(
+                _agg_key, ok=False,
+                latency_ms=(time.time() - _agg_t0) * 1000.0,
+                error=f"{type(exc).__name__}: {exc}", task=_agg_task)
             return jsonify({
                 "ok": False,
                 "error": f"{type(exc).__name__}: {exc}",
@@ -3348,13 +3386,26 @@ def build_app(state: "WorkerState") -> Flask:
         # The token is then held for the WHOLE life of the stream and released in
         # the generator's finally — a streamed response occupies the runner until
         # its last token. No-op token for a slot-backed model. See gen_gate.
+        _agg_key = payload.get("model_key")
+        _agg_task = payload.get("task")
+        _agg_t0 = time.time()
         try:
             gate_token = gen_gate.acquire_for_payload(payload)
         except gen_gate.ModelBusy as busy:
+            _aggregate.record_serve(
+                _agg_key, ok=False,
+                latency_ms=(time.time() - _agg_t0) * 1000.0,
+                error=f"ModelBusy: {busy}", task=_agg_task)
             return jsonify(busy.as_error(
                 {"id": state.worker_id, "name": state.name})), 503
 
         def _generate():
+            # A stream's outcome is only known in the generator's finally — the
+            # same place the gate token is released, and for the same reason: a
+            # streamed response occupies the runner (and can fail, or be
+            # abandoned by the client) right up to its last token. Recording
+            # anywhere earlier would book a success the worker had not yet had.
+            _agg_err = None
             try:
                 yield _sse({"type": "request", "request_id": req_id})
                 # Stream provisioning progress first (download from central/HF),
@@ -3362,10 +3413,20 @@ def build_app(state: "WorkerState") -> Flask:
                 yield from _ensure_present_streaming(payload, state.central_url,
                                                      state=state)
                 yield from _stream_sync(payload, request_id=req_id)
+            except BaseException as exc:   # noqa: BLE001 — re-raised below
+                _agg_err = f"{type(exc).__name__}: {exc}"
+                raise
             finally:
                 # Release on normal end, error, OR client disconnect (Flask closes
                 # the generator) — the gate must never leak a permit.
                 gate_token.release()
+                # tokens_out is deliberately NOT counted for a stream: the token
+                # total is not stated on this path, and an estimate in a health
+                # file is worse than an honest absence.
+                _aggregate.record_serve(
+                    _agg_key, ok=_agg_err is None,
+                    latency_ms=(time.time() - _agg_t0) * 1000.0,
+                    error=_agg_err, task=_agg_task)
 
         return Response(
             stream_with_context(_generate()),
@@ -3469,6 +3530,29 @@ def build_app(state: "WorkerState") -> Flask:
                             "restarting": True})
         return jsonify({"ok": False, "error": {
             "code": "PipFailed", "message": f"pip rc={rc}", "detail": tail}}), 502
+
+    @app.route("/ops/aggregate", methods=["GET"])
+    def ops_aggregate():
+        """Serve the ROLLING AGGREGATE — central pulls this ON READ.
+
+        The whole point of the 2026-07-29 ruling: central asks ONCE, when a
+        human is actually looking, and gets everything the worker has been
+        accumulating for itself — instead of fanning per-model detail polls at
+        the box on a timer and starving its heartbeat.
+
+        Same trust model as every other /ops/* route (central's relay + its
+        operator gate + audit; the worker trusts the WireGuard link). GET and
+        read-only: it can neither load nor evict anything.
+
+        Flushes first so a reader gets the current numbers rather than whatever
+        the debounce last wrote — one small file write, on a request a human
+        made. Falls back to the live in-memory document if the file can't be
+        read (a flush race must degrade to facts, not a 404)."""
+        agg = _aggregate.get_aggregate()
+        agg.maybe_flush(force=True)
+        doc = agg.read_file() or agg.document()
+        return jsonify({"ok": True, "aggregate": doc,
+                        "summary": agg.heartbeat_summary()})
 
     @app.route("/ops/pip", methods=["POST"])
     def ops_pip():
@@ -7999,6 +8083,29 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
             need = int(need * BNB_4BIT_SIZE_RATIO)
     except Exception:  # noqa: BLE001 — never break admission over the lever
         pass
+    # PLACEMENT-INTENT RE-PRICE (operator incident 2026-07-29). Same invariant as
+    # the 4-bit re-price above and the MoE re-target below: admission MUST price
+    # what will ACTUALLY land on the card. A RAM-only designation (n_gpu_layers
+    # "off" -> the loader builds a 0-GiB GPU budget; max-ram -> only the
+    # remainder over the CPU budget) was being priced at the FULL fp16 total:
+    # "won't fit on GPU: needs 70.2 GB" — and an idle resident was evicted on
+    # the way to that refusal — for a load about to put 0 B on the GPU.
+    # planned_gpu_need_bytes mirrors the loader's own derivation, one function,
+    # so gate and loader cannot disagree.
+    try:
+        from ..managers.spill import planned_gpu_need_bytes
+        _planned = planned_gpu_need_bytes(need)
+        if _planned is not None and _planned < need:
+            if _planned <= 0:
+                return {"action": "proceed", "evicted": [], "freed_bytes": 0,
+                        "reason": None,
+                        "note": ("placement intent puts 0 B on the GPU "
+                                 "(CPU/RAM-only) — VRAM admission is a no-op")}
+            need = int(_planned)
+            _det = dict(_det)
+            _det["intent_gpu_remainder"] = need
+    except Exception:  # noqa: BLE001 — never break admission over the intent
+        pass
     # THE admission reserve (2026-07-27): a bounded compute/activation cushion,
     # un-stacked against the external floor already out of `_free_vram_bytes()`
     # — NOT a percentage of the card that re-charges for the KV `need` already
@@ -9571,6 +9678,83 @@ def _task_capabilities() -> dict:
     return caps
 
 
+def _selftest_call(model_key: str, system: str, user: str) -> dict:
+    """The self-test's model call — the SAME in-process path a real /infer takes.
+
+    Deliberately not a new serving route: reusing ``_run_once`` means the
+    self-test can only ever do what an ordinary request does, and a model that
+    is already resident stays resident. It never asks for a load (the caller has
+    already proven residency), never touches spill, and caps its own output so a
+    rambling model cannot turn a health probe into a long generation."""
+    payload = {
+        "model_key": model_key,
+        "system": system,
+        "prompt": user,
+        "max_tokens": 400,
+        "temperature": 0.0,
+    }
+    result = _run_once(payload) or {}
+    return {
+        "text": result.get("text") or "",
+        "finish_reason": result.get("finish_reason"),
+        "think_leak": bool(result.get("reasoning_content")),
+    }
+
+
+def _aggregate_tick(state: WorkerState, *, loading, loaded, calib_samples,
+                    vram_split, pid_log) -> dict:
+    """Fold THIS BEAT's already-computed facts into the rolling aggregate.
+
+    Every argument is a value the heartbeat computed for its own payload — the
+    loading/loaded sets, the calibration samples it drained, the RAM/VRAM split
+    it sampled. Nothing here measures anything: that is the whole constraint the
+    operator's ruling imposes, and it is why this function takes data instead of
+    going to get it.
+
+    Returns the COMPACT summary that rides the beat. Fully guarded: telemetry
+    must never cost a heartbeat, because a missed beat drops the box off the
+    fleet."""
+    try:
+        agg = _aggregate.get_aggregate()
+        # Cold-load events, from two already-free sources: the loading->loaded
+        # transition the beat reports anyway (beat-cadence), and the calibration
+        # samples (precise load_seconds, measured by the 0.1.224 helpers).
+        agg.observe_loading(loading, loaded)
+        agg.ingest_calibration_samples(calib_samples)
+        agg.record_process_health(
+            ram_worker_bytes=_ram_worker_bytes(),
+            ram_external_bytes=_ram_external_bytes(),
+            vram_attributed_bytes=(vram_split or {}).get("vram_attributed_bytes"),
+            vram_unattributed_bytes=(vram_split or {}).get("vram_unattributed_bytes"),
+            resident_models=len(loaded or []),
+            unattributed_pids=len(((pid_log or {}).get("unattributed") or [])),
+        )
+        # Aptitude self-test: OFF unless the operator set the lever. When off
+        # this is one env lookup and returns immediately — no import of the
+        # scoring package, no call, no model touched.
+        if _aggregate._selftest_enabled():
+            try:
+                from .aptitude import selftest as _selftest
+                last_served = {
+                    k: (r.get("last_served_at") or 0.0)
+                    for k, r in agg.document().get("models", {}).items()
+                }
+                out = _selftest.get_runner().maybe_run(
+                    loaded, _selftest_call,
+                    last_served=last_served, loading=loading)
+                if out.get("ran") and out.get("score"):
+                    agg.record_selftest(out["model_key"], out["score"])
+            except Exception as _se:  # noqa: BLE001 — a dark lever never breaks a beat
+                logger.debug("worker selftest skipped: %s", _se)
+        # One bounded write per beat at most; the debounce already collapsed the
+        # request burst that happened between beats.
+        agg.maybe_flush(force=True)
+        return agg.heartbeat_summary()
+    except Exception as exc:  # noqa: BLE001 — never break the beat
+        logger.debug("aggregate tick failed: %s", exc)
+        return {}
+
+
 def _heartbeat_loop(client: CentralClient, state: WorkerState, args) -> None:
     while True:
         time.sleep(args.heartbeat)
@@ -9625,12 +9809,20 @@ def _heartbeat_loop(client: CentralClient, state: WorkerState, args) -> None:
             except Exception as _ce:  # noqa: BLE001 — telemetry never breaks a beat
                 logger.debug("calibration capture failed: %s", _ce)
                 _calib_samples = []
+            # Computed ONCE and shared with the aggregate tick — the aggregate
+            # must never become a second caller of the same probes.
+            _loaded_keys = loaded_model_keys()
+            _loading_keys = _loading_model_keys()
+            _agg_summary = _aggregate_tick(
+                state, loading=_loading_keys, loaded=_loaded_keys,
+                calib_samples=_calib_samples, vram_split=_vram_split,
+                pid_log=_pid_log)
             worker = client.heartbeat(
                 state.worker_id,
                 {
                     "gpus": detect_gpus(),
-                    "loaded_models": loaded_model_keys(),
-                    "loading": _loading_model_keys(),
+                    "loaded_models": _loaded_keys,
+                    "loading": _loading_keys,
                     "models_local": _models_local(state),
                     "provisioning": sorted(state._provisioning),
                     "provision_progress": state.provision_snapshot(),
@@ -9693,6 +9885,20 @@ def _heartbeat_loop(client: CentralClient, state: WorkerState, args) -> None:
                     # this box can actually run, so central won't route a task
                     # whose optional dep is missing here (workers_for_model gate).
                     "task_capabilities": _task_capabilities(),
+                    # ROLLING AGGREGATE summary (operator ruling 2026-07-29):
+                    # counts + a digest/mtime, NEVER the document. Central reads
+                    # it to know what the worker holds and whether it changed;
+                    # the document itself is pulled ON READ via
+                    # GET /llm/workers/<id>/aggregate. Keeping the file off the
+                    # beat is the point — the beat must stay small enough that
+                    # it is never the thing that starves.
+                    #
+                    # ADDITIVE, worker->central: an OLDER central's
+                    # HeartbeatRequest is pydantic with the default
+                    # extra='ignore', so it silently drops this key. Safe in
+                    # both directions; see the release-ordering note in the
+                    # aggregate relay route on central.
+                    "aggregate": _agg_summary or None,
                 },
             )
             # Adopt any assignment change made in the UI + pre-provision it.

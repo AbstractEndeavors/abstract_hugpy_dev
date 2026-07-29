@@ -100,14 +100,23 @@ def analyze_scene_text(
         from ..imports.src.constants.constants import DEFAULT_CHAT_MODEL
         model_key = DEFAULT_CHAT_MODEL
 
-    prompt = build_analysis_prompt(scene_text, question)
+    # NO-THINK (utils/no_think.py). The contract here is display-as-prose: the
+    # return value is handed straight to the operator/orchestrator as THE
+    # analysis. DEFAULT_CHAT_MODEL is non-reasoning today, so this is latent —
+    # but it fires the moment the chat default moves to a reasoning model, which
+    # is exactly what happened to /video/prompt/assist.
+    from ..utils.no_think import with_no_think, strip_think
+    prompt = with_no_think(build_analysis_prompt(scene_text, question))
     result = execute_prompt(
         model_key=model_key, prompt=prompt, max_new_tokens=max_new_tokens)
     # execute_prompt returns a result object (ChatResult-like) or a dict.
     text = getattr(result, "text", None)
     if text is None and isinstance(result, dict):
         text = result.get("text")
-    return text if text is not None else str(result)
+    if text is None:
+        return str(result)
+    analysis, _reasoning = strip_think(text)
+    return analysis
 
 
 def analyze_detections(

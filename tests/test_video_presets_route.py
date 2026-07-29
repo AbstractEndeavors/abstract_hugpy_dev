@@ -216,8 +216,14 @@ _RENDER_KEYS = {
     "framework", "task", "precision", "geometry", "width", "height", "fps",
     "default_frames", "max_frames", "inputs", "proven", "evidence",
     "composes", "joints",
+    # PLACEMENT (added 2026-07-29 for the compatibility-aware studio console). Derived,
+    # never restated — see test_render_presets_publish_derived_placement below.
+    "vram_envelope_gb", "vram_need_gib", "fits_render_box",
 }
-_RENDER_ENVELOPE_KEYS = {"presets", "unavailable", "menu", "frame_cadence", "render_box"}
+_RENDER_ENVELOPE_KEYS = {
+    "presets", "unavailable", "menu", "frame_cadence", "render_box",
+    "render_box_vram_gib",
+}
 
 
 def test_render_presets_returns_all_eight():
@@ -261,6 +267,65 @@ def test_render_presets_payload_matches_the_registry():
         assert row["evidence"] == p.evidence
         assert row["composes"] == list(p.composes)
         assert row["joints"] == list(p.joints)
+
+
+def test_render_presets_publish_derived_placement():
+    """The three placement fields must be DERIVED from the registry + the runner's own
+    arithmetic, not typed into the route.
+
+    They exist because the studio console was mirroring these numbers by hand and had
+    drifted: `STUDIO_REAL_FLOOR_GB = 6` in the SPA against a cheapest real envelope of
+    8.2, so a budget of 7 bound the synthetic prover while the honesty banner stayed
+    silent. Same lesson as WAN_DEFAULT_FRAMES — one literal, two importers, no second
+    place to disagree — so this test recomputes both numbers from source and demands the
+    wire follow, rather than pinning the values.
+
+    NULLS ARE PART OF THE CONTRACT: the two ffmpeg enhance rows have no geometry of their
+    own, so there is nothing to price and `vram_need_gib` / `fits_render_box` are null. A
+    0 there would be a lie with a shape.
+    """
+    from abstract_hugpy_dev.video_intel.studio.registry import MODEL_REGISTRY
+    from abstract_hugpy_dev.video_intel.studio.runners.wan_i2v import _placement_need_gib
+
+    body = client.get("/video/render/presets").get_json()
+    assert body["render_box_vram_gib"] == _render_presets.RENDER_BOX_VRAM_GIB
+    rows = {p["id"]: p for p in body["presets"]}
+    priced = 0
+    for p in _render_presets.all_presets():
+        row = rows[p.preset_id]
+        cfg = MODEL_REGISTRY.get(p.model_id)
+        assert cfg is not None, p.preset_id  # a preset naming an absent model is a defect
+        assert row["vram_envelope_gb"] == cfg.vram.as_map().get(p.precision), p.preset_id
+        # The envelope is what a caller's vram_budget_gb is compared against, so it must
+        # be a usable positive number on every row — a null here would leave a console
+        # with no floor to advise and it would go back to mirroring a constant.
+        assert isinstance(row["vram_envelope_gb"], (int, float)), p.preset_id
+        assert row["vram_envelope_gb"] > 0, p.preset_id
+
+        if p.width and p.height and p.default_frames:
+            need = _placement_need_gib(
+                p.model_id, p.precision, p.width, p.height, p.default_frames,
+            )
+            assert row["vram_need_gib"] == need, p.preset_id
+            if need is None:
+                assert row["fits_render_box"] is None, p.preset_id
+            else:
+                priced += 1
+                assert row["fits_render_box"] is (
+                    need <= _render_presets.RENDER_BOX_VRAM_GIB
+                ), p.preset_id
+        else:
+            # enhance-upres / enhance-interp: geometry comes from the source clip.
+            assert row["geometry"] == "source", p.preset_id
+            assert row["vram_need_gib"] is None, p.preset_id
+            assert row["fits_render_box"] is None, p.preset_id
+    # The six Wan rows must all price; a silent None everywhere would make this test
+    # vacuous and hand the console back its guesses.
+    assert priced == 6, priced
+    # And the table's own honesty must survive the round trip: the 14B i2v row is the
+    # one that does NOT fit ae, which is exactly why it is proven=False.
+    assert rows["clip-i2v-480p"]["fits_render_box"] is False
+    assert rows["clip-t2v-480p"]["fits_render_box"] is True
 
 
 def test_render_presets_frame_budgets_are_wan_cadence():

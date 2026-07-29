@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import urllib.error
 import urllib.request
 
@@ -89,27 +88,15 @@ def available_agent() -> tuple[str, str] | None:
 
 def _extract_json(text: str) -> dict | None:
     """Pull the JSON object out of a completion. Small local models routinely
-    wrap it in prose or a ```json fence however firmly you ask them not to."""
-    if not text:
-        return None
-    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.S)
-    if fence:
-        text = fence.group(1)
-    start = text.find("{")
-    while start != -1:
-        depth = 0
-        for i in range(start, len(text)):
-            if text[i] == "{":
-                depth += 1
-            elif text[i] == "}":
-                depth -= 1
-                if depth == 0:
-                    try:
-                        return json.loads(text[start:i + 1])
-                    except ValueError:
-                        break
-        start = text.find("{", start + 1)
-    return None
+    wrap it in prose or a ```json fence however firmly you ask them not to.
+
+    The fence + brace-walk implementation that used to live here is now the
+    package seam ``utils/json_scavenge.extract_json_object`` — a second copy had
+    grown in ``comms/todo_keeper`` and a third was about to in the studio spread
+    path. Behaviour is unchanged; this stays as the module-local name the rest of
+    the file (and its tests) call."""
+    from abstract_hugpy_dev.utils.json_scavenge import extract_json_object
+    return extract_json_object(text)
 
 
 def judge(screen_result, smoke_result, crit) -> dict | None:
@@ -143,16 +130,21 @@ def judge(screen_result, smoke_result, crit) -> dict | None:
                           for p in (k.get("probes") or [])],
     }
 
+    # NO-THINK (utils/no_think.py). Strict JSON verdict contract at temperature 0
+    # with a 700-token ceiling; _extract_json's fence/brace scavenger exists
+    # because models wrap output in prose, and a <think> block is that failure at
+    # its worst — it can consume the entire budget before the JSON starts.
+    from abstract_hugpy_dev.utils.no_think import apply_no_think, strip_think
     payload = {
         "model": model,
         "temperature": 0.0,
         "max_tokens": 700,
-        "messages": [
+        "messages": apply_no_think([
             {"role": "system", "content": SYSTEM},
             {"role": "user", "content":
                 "Measured facts:\n" + json.dumps(facts, indent=2)
                 + "\n\n" + INSTRUCTION},
-        ],
+        ]),
     }
     resp = _post(payload, url=chat_url)
     if not resp:
@@ -161,6 +153,9 @@ def judge(screen_result, smoke_result, crit) -> dict | None:
         text = resp["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError):
         return None
+    # Strip defensively before the scavenger sees it; `raw` below keeps the full
+    # reply so a parse failure is still diagnosable.
+    text, _reasoning = strip_think(text or "")
     parsed = _extract_json(text)
     if parsed is None:
         # keep the raw read rather than dropping the agent's work entirely

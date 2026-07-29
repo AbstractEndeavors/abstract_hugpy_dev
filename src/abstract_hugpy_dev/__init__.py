@@ -5,10 +5,14 @@
 from ._compat_pydantic import ensure_pydantic as _ensure_pydantic
 _ensure_pydantic()
 
-# Running-source version (authoritative even when the installed metadata is
-# stale, e.g. a run-from-source dev box). Keep in sync with pyproject `version`
-# — keeper/stock_pip_index.sh stamps both. Exposed over HTTP at GET /version.
-__version__ = "0.1.223"
+# THE version number for the package. Single-sourced: pyproject.toml reads this
+# attribute (`[tool.setuptools.dynamic] version = {attr = ...}`), so the wheel's
+# metadata and the running module can never disagree. That desync is exactly what
+# shipped in 0.1.224 — dist metadata 0.1.224, this literal 0.1.223 — which made
+# every worker on the required version report version_ok:false forever.
+# Running-source remains authoritative (2026-07-20 skew-honesty design).
+# Exposed over HTTP at GET /version.
+__version__ = "0.1.225"
 
 from .imports import *
 from .managers import *

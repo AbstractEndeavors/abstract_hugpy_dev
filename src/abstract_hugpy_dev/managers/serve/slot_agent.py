@@ -1045,9 +1045,25 @@ class Slot:
                 backoff = min(_LOAD_BACKOFF_BASE_S * (2 ** (n - 1)),
                               _LOAD_BACKOFF_MAX_S)
                 self._load_backoff_until[model_key] = time.time() + backoff
-                self.last_load_error = (
-                    f"did not become healthy (stall/hard-cap); attempt {n}, "
-                    f"backing off {backoff:.0f}s")
+                kind = getattr(self, "_load_fail_kind", None)
+                if kind == "exit":
+                    # The child DIED rather than hung: the loader rejected the
+                    # model file. Permanent by construction — the same bytes fail
+                    # the same way forever — so the wording carries "hard load
+                    # failure", which central's _PERMANENT_LOAD_MARKERS matches to
+                    # fail the call fast instead of holding and re-requesting it.
+                    self.last_load_error = (
+                        f"hard load failure: the llama-server child exited "
+                        f"(code {getattr(self, '_load_exit_code', None)}) after "
+                        f"{getattr(self, '_load_fail_after_s', 0.0):.1f}s without "
+                        f"ever serving — the model file was rejected by the "
+                        f"loader, not stalled; retrying cannot fix it. See the "
+                        f"worker journal for the loader's own error. "
+                        f"Attempt {n}, backing off {backoff:.0f}s")
+                else:
+                    self.last_load_error = (
+                        f"did not become healthy ({kind or 'stall/hard-cap'}); "
+                        f"attempt {n}, backing off {backoff:.0f}s")
                 raise RuntimeError(
                     f"slot {SLOT_ID}: {model_key} {self.last_load_error}")
             # SUCCESS — clear the failure counters + backoff for this model.
@@ -1106,13 +1122,30 @@ class Slot:
         hard_cap = self._hard_cap_s()
         last_progress = self._load_progress_bytes()
         last_progress_ts = start
+        # Why the wait ended, for an HONEST caller message (2026-07-29). All three
+        # exits below used to collapse into a bare False, so load() reported
+        # "stall/hard-cap" even when the child had died in under a second because
+        # the FILE was rejected. That misclassification is what made a corrupt
+        # GGUF cost 900s instead of 0.75s: a stall reads as transient, so central
+        # held and retried it.
+        self._load_fail_kind = None
+        self._load_exit_code = None
         while True:
             if not self._child_alive():
-                return False                     # child exited -> real failure
+                # child exited -> real failure, and a FAST exit means the loader
+                # rejected the model itself (bad tensors / unknown arch / corrupt
+                # file). No retry can fix that; say so instead of crying stall.
+                self._load_fail_kind = "exit"
+                _p = getattr(self, "proc", None)   # never assume the child handle
+                self._load_exit_code = getattr(_p, "returncode", None)
+                self._load_fail_after_s = time.time() - start
+                return False
             if self.healthy():
                 return True                      # up and answering
             now = time.time()
             if now - start >= hard_cap:
+                self._load_fail_kind = "hardcap"
+                self._load_fail_after_s = now - start
                 logger.warning("slot %s: load of %s blew the %.0fs hard cap "
                                "(size-scaled) — treating as wedged",
                                SLOT_ID, self.model_key, hard_cap)
@@ -1122,6 +1155,8 @@ class Slot:
                 last_progress = cur              # real movement — reset the stall clock
                 last_progress_ts = now
             elif now - last_progress_ts >= STALL_TIMEOUT:
+                self._load_fail_kind = "stall"
+                self._load_fail_after_s = now - start
                 logger.warning("slot %s: load of %s STALLED — no forward progress "
                                "(RSS+VRAM) for %.0fs (last=%s); killing the wedged "
                                "child", SLOT_ID, self.model_key, STALL_TIMEOUT,

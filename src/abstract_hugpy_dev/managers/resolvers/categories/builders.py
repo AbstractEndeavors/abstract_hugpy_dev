@@ -52,8 +52,10 @@ def _build_chat_request(kwargs: Dict[str, Any], model_key: str) -> ChatRequest:
     # max_chunks: the caller's continuation budget (ChatRequest already defines
     # it). It was silently dropped here, so a /v1 client could never bound the
     # unbounded continue-loop — part of the 2026-07-14 /v1 stall fix.
+    # alloc: per-request placement triggers (2026-07-29) — same silent-drop trap
+    # as max_chunks above; without forwarding it here the relay never sees it.
     for k in ("max_new_tokens", "temperature", "top_p", "do_sample", "request_id",
-              "unbounded", "max_chunks", "pool", "images"):
+              "unbounded", "max_chunks", "pool", "images", "alloc"):
         if k in kwargs:
             out[k] = kwargs[k]
     out.setdefault("request_id", make_request_id())

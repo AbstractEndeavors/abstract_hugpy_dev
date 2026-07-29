@@ -602,6 +602,27 @@ class HeartbeatRequest(BaseModel):
     # needs_kv_bytes, ctx_pct, need_total_bytes, verdict, n_gpu_layers,
     # total_layers, vram_bytes, rss_bytes, load_seconds, device, ok, ts}.
     calibration_samples: list | None = None
+    # ROLLING AGGREGATE summary (operator ruling 2026-07-29). COMPACT ONLY —
+    # counts plus {digest, mtime, bytes}; the document itself is pulled on read
+    # via GET /llm/workers/<id>/aggregate. Shape: {schema_version, digest,
+    # mtime, bytes, models, requests, ok, fail, loads, load_failures,
+    # last_served_at, selftest_runs, path}.
+    #
+    # RELEASE ORDERING — both directions are safe, and this is why:
+    #   * NEW worker -> OLD central: HeartbeatRequest sets no model_config, so
+    #     pydantic's default extra='ignore' applies and the unknown key is
+    #     silently dropped. The beat still succeeds; central just doesn't show
+    #     the summary. (The pure-python fallback in _compat_pydantic keeps extra
+    #     kwargs as attributes and likewise never raises.) So a worker may ship
+    #     FIRST without waiting for central.
+    #   * NEW central -> OLD worker: every field here is `| None = None`, so an
+    #     older worker that sends no `aggregate` simply leaves it absent and the
+    #     relay route reports the worker as not-yet-aggregating.
+    # The one real ordering constraint is the RELAY, not the beat: GET
+    # /llm/workers/<id>/aggregate needs the worker's GET /ops/aggregate to
+    # exist, so central's route returns an honest 501-shaped payload against a
+    # pre-aggregate worker rather than a bare 502 (see workers_aggregate).
+    aggregate: dict | None = None
 
 
 class AssignRequest(BaseModel):
@@ -1171,6 +1192,7 @@ def workers_heartbeat(worker_id):
         slot_incapable_reason=body.slot_incapable_reason,
         task_capabilities=body.task_capabilities,
         vram_evictions=body.vram_evictions,
+        aggregate=body.aggregate,
     )
     if worker is None:
         # The agent thinks it's registered but central forgot it (restart,
@@ -1850,6 +1872,107 @@ def _relay_worker_op(worker_id: str, op_path: str, body: dict,
             return _fail(exc2)
     except Exception as exc:  # noqa: BLE001
         return _fail(exc)
+
+
+# ── rolling aggregate: pull ON READ, behind a short cache ───────────────────
+# Operator ruling 2026-07-29: "have the workers agg their own datas ... a rolling
+# json for central to pick up upon read."
+#
+# The cache is not an optimization, it is the SAFETY PROPERTY. A console tab open
+# on three workers, refreshing every few seconds, is exactly the fan-out shape
+# that starved ae's heartbeat; without a TTL this route would recreate the load
+# it was built to remove. So N readers within the window cost the pool ONE call.
+_AGG_CACHE: dict = {}
+_AGG_CACHE_LOCK = _threading.Lock()
+_AGG_TTL_DEFAULT_S = 15.0
+
+
+def _aggregate_ttl_s() -> float:
+    try:
+        return max(0.0, float(os.environ.get("HUGPY_WORKER_AGGREGATE_TTL_S")
+                              or _AGG_TTL_DEFAULT_S))
+    except (TypeError, ValueError):
+        return _AGG_TTL_DEFAULT_S
+
+
+def reset_aggregate_cache() -> None:
+    """Test seam — drop every cached aggregate."""
+    with _AGG_CACHE_LOCK:
+        _AGG_CACHE.clear()
+
+
+def _fetch_worker_aggregate(worker: dict, timeout: float = 10.0) -> tuple:
+    """One GET against the worker's /ops/aggregate. Errors are DATA, never a
+    traceback — the same contract _relay_worker_op keeps for the POST ops."""
+    import httpx
+
+    url = (worker.get("url") or "").rstrip("/") + "/ops/aggregate"
+    try:
+        r = httpx.get(url, timeout=timeout)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": {"code": type(exc).__name__,
+                                       "message": str(exc)}}, 502
+    if r.status_code == 404:
+        # An OLDER worker has no /ops/aggregate. This is the ONE real release-
+        # ordering constraint (the heartbeat field is safe both ways), so it gets
+        # an honest, self-explaining answer instead of a bare 502.
+        return {"ok": False, "error": {
+            "code": "AggregateUnsupported",
+            "message": ("worker agent predates the rolling aggregate; it will "
+                        "appear after the worker converges to a version that "
+                        "serves GET /ops/aggregate")}}, 501
+    try:
+        return r.json(), r.status_code
+    except ValueError as exc:
+        return {"ok": False, "error": {"code": "BadAggregateBody",
+                                       "message": str(exc)}}, 502
+
+
+@worker_bp.route("/llm/workers/<worker_id>/aggregate", methods=["GET"])
+def workers_aggregate(worker_id):
+    """Relay the worker's ROLLING AGGREGATE — one call, on demand, cached.
+
+    This replaces the shape the operator halted: instead of central (or a bench)
+    fanning per-model detail polls at a box on a timer, the worker has already
+    aggregated its own serve stats, load events and process health, and central
+    fetches that one small document only when someone actually reads it.
+
+    ``?fresh=1`` bypasses the cache for a single call — an operator escape
+    hatch, deliberately not the default.
+    """
+    worker = get_worker(worker_id)
+    if worker is None:
+        abort(404, description="Unknown worker id.")
+
+    fresh = (request.args.get("fresh") or "").strip().lower() in ("1", "true", "yes")
+    ttl = _aggregate_ttl_s()
+    now = _time.time()
+    if not fresh and ttl > 0:
+        with _AGG_CACHE_LOCK:
+            hit = _AGG_CACHE.get(worker_id)
+        if hit and (now - hit["at"]) < ttl:
+            body = dict(hit["body"])
+            body["cached"] = True
+            body["cache_age_s"] = round(now - hit["at"], 3)
+            return jsonify(body), hit["status"]
+
+    body, status = _fetch_worker_aggregate(worker)
+    if isinstance(body, dict):
+        body = dict(body)
+        body["worker"] = {"id": worker_id, "name": worker.get("name")}
+        # The heartbeat-carried summary rides along so a caller can see, without
+        # a second call, whether the pulled document is the one the beat last
+        # advertised (digest match) or the worker has moved on since.
+        body["heartbeat_summary"] = worker.get("aggregate")
+        body["cached"] = False
+        body["cache_age_s"] = 0.0
+    # Cache successes only: a 502 from a worker that is momentarily deaf must
+    # not be pinned for the whole TTL — that would turn one blip into 15s of
+    # false "worker is broken".
+    if status == 200 and ttl > 0:
+        with _AGG_CACHE_LOCK:
+            _AGG_CACHE[worker_id] = {"at": now, "body": body, "status": status}
+    return jsonify(body), status
 
 
 @worker_bp.route("/llm/workers/<worker_id>/restart", methods=["POST"])
@@ -3104,9 +3227,33 @@ def workers_update(worker_id):
     path as the heartbeat's required_pkg_version handshake, minus the wait).
     Body: {"version": "..."} to pin; default = central's required version.
     Confirm afterward via the worker registry's pkg_version."""
-    return _relay_worker_op(worker_id, "/ops/update",
-                            request.get_json(silent=True) or {},
-                            timeout=30.0, action="update")
+    body = request.get_json(silent=True) or {}
+    # The worker's /ops/update REQUIRES a version (it 400s NoVersion on an
+    # empty body — its error text even says "central sends its
+    # required_pkg_version"). The default-to-pin promise above lived only in
+    # this docstring until 2026-07-29, when the console's ⬆ Update ({} body)
+    # surfaced the 400. Inject the pin here, where the promise was made.
+    if not str(body.get("version") or "").strip():
+        required = required_pkg_version()
+        if not required:
+            abort(409, description="Central pins no required version — "
+                  'supply {"version": "x.y.z"} explicitly.')
+        body = {**body, "version": required}
+    # Already there → honest no-op WITHOUT relaying: the worker's update path
+    # restarts the agent even when pip is a no-op ("Requirement already
+    # satisfied" → rc 0 → re-exec), and the console advertises the converged
+    # case as safe to click. Make that true.
+    worker = get_worker(worker_id)
+    if worker is not None and worker.get("pkg_version") == body["version"]:
+        return jsonify({"ok": True, "already": True,
+                        "version": body["version"],
+                        "message": "worker already runs this version — "
+                                   "no update, no restart"})
+    # Long relay timeout on purpose: the worker's pip step alone is allowed
+    # 560s — a 30s relay turned every real update into a spurious console
+    # "Update failed" while the install kept going.
+    return _relay_worker_op(worker_id, "/ops/update", body,
+                            timeout=600.0, action="update")
 
 
 @worker_bp.route("/llm/workers/<worker_id>/pip", methods=["POST"])

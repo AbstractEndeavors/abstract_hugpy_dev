@@ -91,7 +91,12 @@ async def analyze_video(
         ctx["frame_index"] = i
         ctx["total_frames"] = total_frames
         ctx["total_video_length"] = total_video_length
-        rendered_prompt = _build_prompt(config.prompt, ctx)
+        # NO-THINK (utils/no_think.py). Every frame's `analysis` is VALIDATED and
+        # PERSISTED to analysis.json — a monologue here poisons the whole dataset,
+        # and nothing downstream re-reads the frame to notice. The reasoning is
+        # kept alongside (FrameAnalysis is extra="allow") rather than discarded.
+        from abstract_hugpy_dev.utils.no_think import with_no_think, strip_think
+        rendered_prompt = with_no_think(_build_prompt(config.prompt, ctx))
         image_b64 = get_base_64_image(frame_path)
         req = VisionRequest(
             request_id=f"frame-{i}-{uuid.uuid4().hex[:8]}",
@@ -112,9 +117,19 @@ async def analyze_video(
             text, err = None, f"{type(e).__name__}: {e}"
         duration = time.time() - t0
 
+        reasoning = ""
+        if text:
+            text, reasoning = strip_think(text)
+            if not text:
+                # Nothing but thinking — record it as an error rather than
+                # persisting an empty analysis that reads like a clean run.
+                err = err or ("model returned only reasoning and no analysis "
+                              "(ignored the no-think directive)")
+
         ctx.update({
             "analysis_prompt": rendered_prompt,
             "analysis": text,
+            "analysis_reasoning": reasoning,
             "model_key": model_key,
             "analysis_duration": duration,
             "error": err,

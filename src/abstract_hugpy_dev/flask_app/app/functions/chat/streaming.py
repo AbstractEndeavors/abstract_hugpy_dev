@@ -156,6 +156,12 @@ async def stream_events(body: ChatBody):
     if getattr(body, "pool", None):
         prompt_kwargs["pool"] = body.pool
 
+    # Per-request allocation triggers (4-bit / MoE / alloc mode / budgets) —
+    # ride prompt_kwargs to the relay, which whitelists + merges them over the
+    # designation spill and strips the key from the worker wire.
+    if getattr(body, "alloc", None):
+        prompt_kwargs["alloc"] = body.alloc
+
     if body.temperature is not None:
         prompt_kwargs["temperature"] = body.temperature
 

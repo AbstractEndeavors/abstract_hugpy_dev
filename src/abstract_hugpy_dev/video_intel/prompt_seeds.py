@@ -157,6 +157,94 @@ def steering_clause(kind: Optional[str] = None,
     return lead + "\n" + "\n".join(lines)
 
 
+# ── SPREAD steering (STUDIO-SPREAD-SPEC §1a) ────────────────────────────────
+# THE INVERSE OF THE ABOVE. Everything above this line randomizes PER CALL, which
+# is exactly right for one Generate click and exactly WRONG for a movie: six rows
+# generated one-at-a-time drew six independent steering sets and produced six
+# unrelated worlds (the spec's "per-row Generate is actively incoherent").
+#
+# So a spread draws ONE steering set for the WHOLE movie — shared world, subject,
+# light, mood, palette — and varies only the BEAT per segment. Coherence is not
+# asked of the model as a politeness; it is a property of the brief it receives.
+#
+# The set is seeded (``steering_seed``) so a spread is REPLAYABLE: the same seed
+# rebuilds the same world, which is what makes "regenerate just rows 2 and 5"
+# land in the movie that already exists rather than a new one. No seed -> a fresh
+# random world, and the seed actually used is returned so the caller can pin it.
+_BEATS: Sequence[str] = (
+    "establish the place and who is in it",
+    "introduce the first change or arrival",
+    "press the situation — raise the stakes",
+    "the turn: something gives way",
+    "consequence — the aftermath lands",
+    "a quiet held moment",
+    "close in on the smallest telling detail",
+    "pull back and let the world answer",
+)
+
+# Beat density (spec §3): one segment carries ONE beat. A dense scene is spread
+# across segments rather than crammed into one — too much action in a single
+# clip is what makes motion unreliable.
+_BEAT_DENSITY_RULE = (
+    "Each segment carries ONE beat only. Do not cram several actions into one "
+    "segment — a shot with too much action renders unreliable motion."
+)
+
+
+def beat_for_index(index: int, total: int) -> str:
+    """The dramatic beat for segment ``index`` of ``total``.
+
+    Walks the bank across the movie's length so a 3-segment spread gets a
+    beginning/middle/end and an 8-segment spread gets eight distinct beats
+    instead of the same three repeated. Pure function of (index, total) — no
+    randomness, because the beat is the ONLY axis allowed to vary within a
+    spread and it must vary in a legible, ordered way.
+    """
+    if total <= 1:
+        return _BEATS[0]
+    n = len(_BEATS)
+    if total >= n:
+        return _BEATS[min(index, n - 1)]
+    # Spread the chosen beats evenly across the bank, always ending on a closer.
+    step = (n - 1) / float(total - 1)
+    return _BEATS[min(int(round(index * step)), n - 1)]
+
+
+def spread_axes(kind: Optional[str] = "movie",
+                seed: Optional[int] = None) -> Dict[str, str]:
+    """ONE steering set for a whole spread. Deterministic for a given ``seed``.
+
+    Unlike :func:`steering_axes` this NEVER drops the subject axis: a movie's
+    subject is the thing that has to survive across segments, so it is part of
+    the shared world even when individual rows carry their own prompts. The
+    per-call anti-repeat is deliberately not used — it would break replay.
+    """
+    r = random.Random(seed) if seed is not None else random.Random()
+    axes: Dict[str, str] = {
+        "subject": r.choice(_SUBJECTS),
+        "setting": r.choice(_SETTINGS),
+        "light": r.choice(_LIGHTS),
+        "mood": r.choice(_MOODS),
+        "palette": r.choice(_PALETTES),
+    }
+    if kind in _VIDEO_KINDS or kind is None:
+        axes["motion"] = r.choice(_MOTIONS)
+    return axes
+
+
+def spread_steering_clause(axes: Dict[str, str]) -> str:
+    """Render a spread's shared steering set for the model preface.
+
+    Takes the axes rather than drawing them so the caller can echo the EXACT set
+    back to the UI (a spread has to be reproducible, and a clause that redrew
+    internally could not be).
+    """
+    lines = [f"- {label}: {value}" for label, value in axes.items()]
+    lead = ("SHARED WORLD — every segment below belongs to the SAME film and "
+            "must honour all of these. They do not change between segments:")
+    return lead + "\n" + "\n".join(lines) + "\n" + _BEAT_DENSITY_RULE
+
+
 def combinations(kind: Optional[str] = None, has_draft: bool = False) -> int:
     """How many distinct briefs the banks can produce — used by the test that
     guards against the banks being thinned to the point of repetition."""

@@ -35,7 +35,6 @@ from __future__ import annotations
 import dataclasses
 import mimetypes
 import os
-import re
 import secrets
 
 from flask import request, jsonify, send_file
@@ -81,6 +80,11 @@ from abstract_hugpy_dev.video_intel.chains import (
     resolve_video_parts,
     resolve_video_parts_scene,
     resolve_video_parts_movie,
+)
+from abstract_hugpy_dev.utils.no_think import (
+    apply_no_think as _apply_no_think,
+    strip_think as no_think,
+    with_no_think as _with_no_think,
 )
 
 video_bp, logger = get_bp("video_bp", __name__)
@@ -1158,8 +1162,8 @@ def video_presets():
 # fleet, not a routing rule anyone has to enforce.
 #
 # ⚠ IT IS A REASONING MODEL, so this default is only safe together with the no-think
-# handling above. Without it the whole 200-token budget goes to <think> and the caller
-# gets a monologue instead of a prompt (measured — see the no_think block).
+# seam (utils/no_think.py). Without it the whole 200-token budget goes to <think> and
+# the caller gets a monologue instead of a prompt (measured — see that module).
 #
 # ⚠ DO NOT "fix" this to Flux-Uncensored-V2. That row is ALSO tagged text-generation in
 # the catalog but is a Flux IMAGE LoRA — the same mis-classification class as 41f908d.
@@ -1177,6 +1181,26 @@ _PROMPT_ASSIST_SYSTEM = (
 # the original still-image behavior, so old callers are unaffected.
 _PROMPT_ASSIST_KINDS = ("image", "scene", "movie", "clip")
 _PROMPT_ASSIST_VIDEO_KINDS = frozenset({"movie", "clip"})
+
+# STUDIO-SPREAD-SPEC §1a/§1b added two modes. detail/generate are UNCHANGED —
+# both new modes branch out of the handler before any of their validation runs.
+_ASSIST_MODES = ("detail", "generate", "spread", "negative")
+
+# SPREAD GENERATOR (spec §3, "start official, benchmark the rest"). A spread is
+# ONE call that must hold a whole timeline plus a style bible plus locked
+# identity data in context and emit structured JSON — a materially harder job
+# than enriching a single draft, which is why it does not inherit the
+# detail/generate default. Overridable per call via body["model"]; the spec's
+# benchmark protocol decides any promotion from here.
+_DEFAULT_SPREAD_MODEL = "Qwen2.5-7B-Instruct-GGUF"
+
+# A spread writes N paragraphs in one reply, so the 200-token ceiling the
+# single-prompt modes use would truncate it mid-segment — and a truncated JSON
+# object is an unparseable one. Scaled per target row with a floor.
+_SPREAD_TOKENS_PER_SEGMENT = 320
+_SPREAD_TOKENS_MIN = 700
+_SPREAD_TOKENS_MAX = 4000
+_NEGATIVE_MAX_TOKENS = 200
 
 
 def _assist_framing(kind):
@@ -1226,73 +1250,30 @@ def _prompt_assist_result_text(result) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# NO-THINK (operator 2026-07-27: "a specific no_think function would be fine
-# granted it propagates the query and strips <think>...</think> ... or even sends
-# it out as a dict var of its own")
+# NO-THINK — the package-wide seam now lives in utils/no_think.py (operator
+# 2026-07-29: "the expectation of a model to adhere to no_think should be
+# circumvented for any execution that requires this stipulation, package wide").
+# The two-halves rationale, the live measurement that proved a strip-only fix
+# useless, and the unclosed-<think> handling are documented there. This route
+# uses the primitives directly (rather than execute_prompt_no_think) because it
+# owns its own JSON envelope and error copy.
 # --------------------------------------------------------------------------- #
-# WHY THIS IS NOT OPTIONAL. The prompt-assist default is now a REASONING model,
-# and reasoning does not stay in its own lane here: llama.cpp extracts
-# <think>...</think> into message.reasoning_content, and
-# managers/llama/runners/src/ccp_runner.py:43 then DELIBERATELY RE-INLINES it:
-#
-#     if reasoning and "<think>" not in content:
-#         return f"<think>{reasoning}</think>{content}"
-#
-# so it arrives fused into the text. Measured on the live fleet 2026-07-27,
-# flux2-klein-9b-uncensored-text-encoder via computron, draft "a red car on a wet
-# street": the ENTIRE 200-token budget went to reasoning and the reply was
-# "<think>Okay, the user wants me to expand...</think>" with NO prompt at all.
-# Stripping alone would therefore have yielded an EMPTY prompt — which is why the
-# suppression half below matters and a strip-only fix would have looked correct in
-# a unit test and produced nothing in the product.
-#
-# TWO HALVES, BOTH REQUIRED:
-#   1. SUPPRESS at generation. This model's chat_template.jinja carries the Qwen3
-#      idiom -- `{%- if enable_thinking is defined and enable_thinking is false %}`
-#      emits a PRE-CLOSED `<think>\n\n</think>` so the model starts after thinking
-#      is already shut. We cannot reach that kwarg: `chat_template_kwargs` has ZERO
-#      hits across this package, so plumbing one would be a knob nothing reads.
-#      The `/no_think` directive rides the EXISTING message path and does the same
-#      job. VERIFIED on the same model + draft: a clean 4-sentence prompt, no
-#      <think> at all.
-#   2. STRIP defensively, because the model is user-selectable and the next one
-#      picked may ignore the directive. The reasoning is RETURNED, not discarded —
-#      it rides its own `reasoning` key so a caller can show or ignore it, and it
-#      can never be mistaken for the prompt.
-_NO_THINK_DIRECTIVE = "/no_think"
-_THINK_BLOCK_RE = re.compile(r"<think>(.*?)(?:</think>|\Z)", re.DOTALL | re.IGNORECASE)
-
-
-def no_think(text: str) -> tuple[str, str]:
-    """Split a model reply into (prompt_text, reasoning).
-
-    Removes every ``<think>...</think>`` block and returns the surviving prose plus
-    the concatenated reasoning. An UNCLOSED ``<think>`` (the token budget ran out
-    mid-thought — exactly what the live measurement above produced) is treated as
-    reasoning to the end of the string, so a truncated ramble can never be served as
-    a prompt. Returns ("", reasoning) when the reply was nothing but thinking; the
-    caller turns that into an honest error rather than an empty prompt box."""
-    if not text:
-        return "", ""
-    reasoning = "\n".join(m.group(1).strip() for m in _THINK_BLOCK_RE.finditer(text))
-    return _THINK_BLOCK_RE.sub("", text).strip(), reasoning.strip()
-
-
-def _with_no_think(user_text: str) -> str:
-    """PROPAGATE THE QUERY, then ask for it without the monologue. Appending the
-    directive (rather than replacing anything) is what keeps the user's own draft
-    intact — the operator's "granted it propagates the query"."""
-    if _NO_THINK_DIRECTIVE in user_text:
-        return user_text
-    return f"{user_text}\n\n{_NO_THINK_DIRECTIVE}"
-
-
 @video_bp.route("/video/prompt/assist", methods=["POST"])
 def video_prompt_assist():
     body = request.get_json(silent=True) or {}
     mode = body.get("mode")
-    if mode not in ("detail", "generate"):
-        return jsonify({"error": 'mode must be "detail" or "generate"'}), 400
+    if mode not in _ASSIST_MODES:
+        return jsonify({"error": "mode must be one of "
+                        + "|".join(_ASSIST_MODES)}), 400
+
+    # SPREAD and NEGATIVE are whole-request shapes of their own (STUDIO-SPREAD-SPEC
+    # §1a/§1b) — a spread has no "draft" at all, and a negative is an exclusion list
+    # rather than prose. They branch BEFORE the draft/kind validation below so the
+    # detail/generate path stays byte-identical to what it was.
+    if mode == "spread":
+        return _assist_spread(body)
+    if mode == "negative":
+        return _assist_negative(body)
 
     draft = body.get("draft")
     if draft is not None and not isinstance(draft, str):
@@ -1351,6 +1332,22 @@ def video_prompt_assist():
     if hint:
         user += f"\n\nAdditional context to honor: {hint}"
 
+    # TYPED CONTEXT (SPEC §1c). ``hint`` stays free-form (above, unchanged); the
+    # STRUCTURED row state — this segment, its neighbours, the locked identity —
+    # rides typed fields the backend renders into the preface, so joint modes
+    # arrive as sentences and an identity arrives with its do-not-invent list
+    # instead of a bare name the model will happily make a wardrobe up for.
+    # Absent typed fields render to "" and this is a no-op: a caller that sends
+    # only {kind, hint} gets the byte-identical message it got before.
+    from abstract_hugpy_dev.video_intel import prompt_spread
+    try:
+        typed_ctx = prompt_spread.validate_context(context)
+    except prompt_spread.SpreadError as exc:
+        return jsonify({"error": str(exc)}), 400
+    preface = prompt_spread.render_context_preface(typed_ctx)
+    if preface:
+        user += "\n\n" + preface
+
     # NO-THINK, half 1 of 2: suppress the monologue at GENERATION. The user's own draft
     # rides through untouched — the directive is appended, never substituted.
     messages = [
@@ -1404,8 +1401,243 @@ def video_prompt_assist():
             "reasoning": reasoning,
         }), 502
 
+    # PROVENANCE (SPEC §1f, the honest half): say which model was ASKED FOR and
+    # which one actually answered. The 35B incident showed generated text
+    # displayed as though it came from a model that had failed to load; a caller
+    # that can compare these two can never be fooled that way again. ``model`` is
+    # unchanged (the requested key) so no existing consumer moves.
     return jsonify({"prompt": text, "model": model_key, "kind": kind,
-                    "reasoning": reasoning, "thinking_suppressed": True}), 200
+                    "reasoning": reasoning, "thinking_suppressed": True,
+                    "model_requested": model_key,
+                    "model_resolved": _assist_resolved_model(result)}), 200
+
+
+# --------------------------------------------------------------------------- #
+# STUDIO SPREAD (STUDIO-SPREAD-SPEC §1a) + NEGATIVE (§1b) + INTENT (§1d).
+#
+# The build the spec calls for, in three pieces:
+#   * mode="spread"   ONE generator call for a whole movie, holding unselected
+#                     rows as locked context. Never N sequential prompt calls —
+#                     N calls is not a slower spread, it is a DIFFERENT and worse
+#                     product (six rows, six unrelated worlds), which is exactly
+#                     the defect this replaces.
+#   * mode="negative" a negative prompt is an exclusion list, not prose; reusing
+#                     the scene system prompt returns a poem.
+#   * /video/prompt/intent  the 3B router that decides whether what the user
+#                     typed is a scene or a direction.
+#
+# The heavy lifting (validation, preface rendering, JSON parsing) lives in
+# video_intel/prompt_spread.py and video_intel/prompt_intent.py so it is
+# testable without a Flask app and so this module stays a routing layer.
+# --------------------------------------------------------------------------- #
+def _assist_resolved_model(result):
+    """Which model ACTUALLY answered (§1f). ``TaskResult.model_key`` is set by the
+    runner that produced the result, so it differs from the requested key exactly
+    when something resolved elsewhere. None when the result doesn't say."""
+    if isinstance(result, dict):
+        return result.get("model_key") or result.get("model") or None
+    return getattr(result, "model_key", None) or None
+
+
+def _assist_execute(model_key, messages, max_new_tokens, **extra):
+    """Run one assist generation through the shared chat plane.
+
+    Returns ``(payload, None)`` on success or ``(None, (body, status))`` on
+    failure, using the SAME error mapping the detail/generate path uses (400 for
+    a caller-fixable resolve error, 502 for a fleet/worker failure — never a 500,
+    never a silent local load). Both halves of the no-think seam are applied
+    here, so every new mode gets them without repeating the reasoning.
+    """
+    from ..functions.imports import execute_prompt
+    from ..functions.chat.streaming import _friendly_stream_error
+    try:
+        result = _await_sync(execute_prompt(
+            model_key=model_key,
+            messages=_apply_no_think(messages),   # NO-THINK half 1
+            task="text-generation",
+            max_new_tokens=max_new_tokens,
+            **extra,
+        ))
+    except (KeyError, ValueError, TypeError, FileNotFoundError) as exc:
+        return None, ({"error": str(exc).strip("'\""),
+                       "model_requested": model_key}, 400)
+    except Exception as exc:
+        logger.exception("prompt/assist failed")
+        return None, ({"error": _friendly_stream_error(exc),
+                       "model_requested": model_key}, 502)
+
+    ok = result.get("ok", True) if isinstance(result, dict) else getattr(result, "ok", True)
+    raw = _prompt_assist_result_text(result).strip()
+    resolved = _assist_resolved_model(result)
+    if not ok or not raw:
+        err = result.get("error") if isinstance(result, dict) else getattr(result, "error", None)
+        return None, ({"error": err or "assist produced no text",
+                       "model_requested": model_key,
+                       "model_resolved": resolved}, 502)
+
+    text, reasoning = no_think(raw)                # NO-THINK half 2
+    if not text:
+        return None, ({
+            "error": ("the assistant returned only reasoning and no output — "
+                      f"{model_key!r} appears to have ignored the no-think directive; "
+                      "retry, or choose a different text generator"),
+            "model": model_key,
+            "model_requested": model_key,
+            "model_resolved": resolved,
+            "reasoning": reasoning,
+        }, 502)
+    return {"text": text, "reasoning": reasoning, "raw": raw,
+            "model_resolved": resolved}, None
+
+
+def _assist_spread(body):
+    """``mode="spread"`` — one call, N segment replacements, locked rows untouched."""
+    from abstract_hugpy_dev.video_intel import prompt_spread
+
+    model_key = body.get("model") or _DEFAULT_SPREAD_MODEL
+    if not isinstance(model_key, str) or not model_key.strip():
+        return jsonify({"error": "model must be a non-empty string"}), 400
+    model_key = model_key.strip()
+
+    try:
+        req = prompt_spread.build_spread_request(body)
+    except prompt_spread.SpreadError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    n = len(req.target_segments)
+    budget = max(_SPREAD_TOKENS_MIN,
+                 min(_SPREAD_TOKENS_MAX, n * _SPREAD_TOKENS_PER_SEGMENT))
+
+    payload, err = _assist_execute(
+        model_key, prompt_spread.build_spread_messages(req), budget)
+    if err is not None:
+        body_out, status = err
+        return jsonify(body_out), status
+
+    try:
+        parsed = prompt_spread.parse_spread_reply(payload["text"], req.target_ids)
+    except prompt_spread.SpreadParseError as exc:
+        # HONEST 502 (spec §1e/§1f). The raw, think-stripped reply rides along so
+        # the failure is diagnosable — an invented segment here would be worse
+        # than no segment, because it would silently become the user's movie.
+        return jsonify({
+            "error": str(exc),
+            "model": model_key,
+            "model_requested": model_key,
+            "model_resolved": payload["model_resolved"],
+            "raw": exc.raw[:4000],
+            "reasoning": payload["reasoning"],
+        }), 502
+
+    return jsonify({
+        "mode": "spread",
+        "segments": parsed["segments"],
+        "missing_segments": parsed["missing_segments"],
+        "warnings": parsed["warnings"],
+        "invented_identity_attributes": parsed["invented_identity_attributes"],
+        # Echo the steering set + the seed that produced it so the caller can PIN
+        # a spread it liked and re-spread a subset into the same world later.
+        "steering": req.steering,
+        "steering_seed": req.steering_seed,
+        "model": model_key,
+        "model_requested": model_key,
+        "model_resolved": payload["model_resolved"],
+        "reasoning": payload["reasoning"],
+        "thinking_suppressed": True,
+    }), 200
+
+
+def _assist_negative(body):
+    """``mode="negative"`` — an artifact/quality exclusion list (§1b)."""
+    from abstract_hugpy_dev.video_intel import prompt_spread
+
+    model_key = body.get("model") or _DEFAULT_PROMPT_ASSIST_MODEL
+    if not isinstance(model_key, str) or not model_key.strip():
+        return jsonify({"error": "model must be a non-empty string"}), 400
+    model_key = model_key.strip()
+
+    draft = body.get("draft")
+    if draft is not None and not isinstance(draft, str):
+        return jsonify({"error": "draft must be a string"}), 400
+    subject = body.get("subject") or body.get("prompt")
+    if subject is not None and not isinstance(subject, str):
+        return jsonify({"error": "subject must be a string"}), 400
+
+    context = body.get("context") or {}
+    if not isinstance(context, dict):
+        return jsonify({"error": "context must be an object"}), 400
+    hint = context.get("hint")
+    if hint is not None and not isinstance(hint, str):
+        return jsonify({"error": "context.hint must be a string"}), 400
+    try:
+        typed_ctx = prompt_spread.validate_context(context)
+    except prompt_spread.SpreadError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    # The shot being negated is whatever the caller can tell us about it: an
+    # explicit subject, else the current segment's own prompt.
+    if not subject:
+        subject = (typed_ctx.get("segment") or {}).get("prompt") or ""
+
+    messages = prompt_spread.build_negative_messages(
+        (draft or "").strip(), typed_ctx, hint=(hint or "").strip(),
+        subject=subject.strip())
+    payload, err = _assist_execute(model_key, messages, _NEGATIVE_MAX_TOKENS)
+    if err is not None:
+        body_out, status = err
+        return jsonify(body_out), status
+
+    # ``prompt`` carries the text for every assist mode (no existing key moves);
+    # ``negative`` is the same string under the name this mode's caller wants.
+    return jsonify({
+        "mode": "negative",
+        "prompt": payload["text"],
+        "negative": payload["text"],
+        "model": model_key,
+        "model_requested": model_key,
+        "model_resolved": payload["model_resolved"],
+        "reasoning": payload["reasoning"],
+        "thinking_suppressed": True,
+    }), 200
+
+
+# --------------------------------------------------------------------------- #
+# POST /video/prompt/intent — the 3B intent router (spec §1d).
+#
+# WHY ITS OWN ROUTE RATHER THAN A MODE ON /assist (keeper's call, per the spec's
+# "or a mode on the assist route — your call"):
+#   * It does not generate. Every /assist mode returns a prompt and 502s when it
+#     cannot; this returns a CLASSIFICATION and must never fail the caller — its
+#     whole failure contract is inverted (degrade to "ambiguous", always 200).
+#   * Different model role, different budget (100 tokens, temp 0) and a cache;
+#     folding it into /assist would put a "sometimes cached, never errors" branch
+#     inside a handler whose contract is "always generates, errors honestly".
+#   * It is called on BLUR — far more often than a generation, and from fields
+#     that may never be generated at all.
+# --------------------------------------------------------------------------- #
+@video_bp.route("/video/prompt/intent", methods=["POST"])
+def video_prompt_intent():
+    from abstract_hugpy_dev.video_intel import prompt_intent
+
+    body = request.get_json(silent=True) or {}
+    text = body.get("text")
+    if text is None:
+        text = body.get("draft")
+    if text is not None and not isinstance(text, str):
+        return jsonify({"error": "text must be a string"}), 400
+
+    scope = body.get("scope") or "segment"
+    if scope not in ("segment", "movie"):
+        return jsonify({"error": 'scope must be "segment" or "movie"'}), 400
+
+    model = body.get("model")
+    if model is not None and (not isinstance(model, str) or not model.strip()):
+        return jsonify({"error": "model must be a non-empty string"}), 400
+
+    # classify_intent NEVER raises and never blocks: blank short-circuits without
+    # a model call, and any router failure degrades to "ambiguous" so the UI
+    # offers both actions. A classifier outage must not make a text box unusable.
+    return jsonify(prompt_intent.classify_intent(text, scope=scope, model=model)), 200
 
 
 # --------------------------------------------------------------------------- #
@@ -1632,6 +1864,64 @@ def studio_preset_apply(preset_id):
 #     /video gate (video_auth.install_video_gate): a console session OR a video-share
 #     credential, exactly like every sibling preset GET — nothing new, nothing looser.
 # --------------------------------------------------------------------------- #
+def _render_preset_placement(p):
+    """The two VRAM numbers a caller needs BEFORE it fills in a budget field, derived
+    (never restated) from the SAME code the router and the runner read.
+
+    Returns ``(envelope_gb, need_gib, fits_render_box)``.
+
+    THE TWO NUMBERS ARE DIFFERENT QUESTIONS AND THE CONSOLE NEEDS BOTH:
+
+      * ``envelope_gb`` — the registry's declared VRAM cost for THIS preset's model at
+        THIS preset's precision (``ModelConfig.vram.as_map()[precision]``). This is the
+        one and only number ``vram_budget_gb`` is ever compared against: router.py:368
+        does ``cfg.vram.fits(req.vram_budget_gb)``, which is ``gb <= budget``. So a
+        caller that wants THIS preset's binding must send a budget >= this, and a
+        console that wants to stop offering budgets that cannot bind anything real must
+        read it from here rather than mirror a constant by hand. (The studio console did
+        mirror one — ``STUDIO_REAL_FLOOR_GB = 6`` — and it had drifted below every real
+        row in this table.)
+      * ``need_gib`` — the TOTAL whole-on-GPU footprint the render actually costs at
+        this preset's geometry and default frame budget (DiT + text encoder + VAE +
+        denoise workspace), from ``runners.wan_i2v._placement_need_gib`` — the same
+        function ``_should_place_whole_on_gpu`` calls. It is NOT a budget input; it is
+        provenance, and it is what makes ``fits_render_box`` meaningful: clip-i2v-480p's
+        18.0 GB envelope looks affordable while its real need (29.20 GiB) exceeds the
+        only render box this fleet has, which is exactly why that row is proven=False.
+
+    NEVER RAISES. This is a read-only discovery route; a registry row that has moved on,
+    a model with no measured footprint, or an ffmpeg preset with no geometry at all all
+    answer ``None`` rather than 500 a menu. ``_placement_need_gib`` is pure arithmetic
+    (no torch/diffusers — wan_i2v keeps the heavy stack lazy inside the runner), so this
+    import costs nothing but the module load.
+    """
+    envelope_gb = None
+    need_gib = None
+    fits = None
+    try:
+        from abstract_hugpy_dev.video_intel.studio.registry import MODEL_REGISTRY
+        cfg = MODEL_REGISTRY.get(p.model_id)
+        if cfg is not None:
+            envelope_gb = cfg.vram.as_map().get(p.precision)
+    except Exception:  # pragma: no cover - a discovery route never fails on provenance
+        envelope_gb = None
+    try:
+        if p.width and p.height and p.default_frames:
+            from abstract_hugpy_dev.video_intel.studio.runners.wan_i2v import (
+                _placement_need_gib,
+            )
+            from abstract_hugpy_dev.video_intel.studio import presets as _rp
+            need_gib = _placement_need_gib(
+                p.model_id, p.precision, p.width, p.height, p.default_frames,
+            )
+            if need_gib is not None:
+                fits = need_gib <= _rp.RENDER_BOX_VRAM_GIB
+    except Exception:  # pragma: no cover
+        need_gib = None
+        fits = None
+    return envelope_gb, need_gib, fits
+
+
 def _render_preset_row(p):
     """Wire shape for one ``RenderPreset``. A projection of the frozen dataclass —
     every value is read off ``p``, none is restated here.
@@ -1645,6 +1935,7 @@ def _render_preset_row(p):
     should keep visible. ``geometry`` is the registry's own human string — "source"
     on the two ffmpeg enhance presets, which have no geometry of their own (a 0 there
     would be a lie with a shape)."""
+    envelope_gb, need_gib, fits_box = _render_preset_placement(p)
     return {
         "id": p.preset_id,
         "title": p.title,
@@ -1676,6 +1967,22 @@ def _render_preset_row(p):
         # the row is uniform and a client never branches on key presence.
         "composes": list(p.composes),
         "joints": list(p.joints),
+        # ── PLACEMENT (added 2026-07-29 so a console stops mirroring these by hand) ──
+        # See _render_preset_placement for what each one answers and which line of the
+        # router/runner it is derived from. All three may be null: the ffmpeg enhance
+        # rows have no geometry to price, and a model with no measured footprint has no
+        # derivable need. Null means "not derivable here", never 0.
+        #
+        # vram_envelope_gb is THE number a caller's `vram_budget_gb` is compared against
+        # (router.py: cfg.vram.fits(budget) is `gb <= budget`), so it is the MINIMUM
+        # budget that can bind this preset's model at this precision.
+        "vram_envelope_gb": envelope_gb,
+        # vram_need_gib is the whole-on-GPU footprint at this row's geometry + default
+        # frames — provenance for fits_render_box, NOT a budget input. Feeding it into a
+        # budget field would inflate the budget past cheaper real models and let a bigger
+        # one win the router's fit test, which is the opposite of what a caller wants.
+        "vram_need_gib": need_gib,
+        "fits_render_box": fits_box,
     }
 
 
@@ -1710,6 +2017,9 @@ def video_render_presets():
         # WHERE these numbers were sized. Not a routing input — provenance, so a
         # reader can tell which box the VRAM figures in `evidence` refer to.
         "render_box": render_presets.RENDER_BOX,
+        # The capacity every row's `fits_render_box` was tested against, published
+        # beside it so a caller can re-derive the verdict instead of trusting a bool.
+        "render_box_vram_gib": render_presets.RENDER_BOX_VRAM_GIB,
     }), 200
 
 
@@ -1786,7 +2096,7 @@ def video_prompt_assist_models():
         # why. Silent omission is how a mis-tag survives for months.
         "excluded": excluded,
         # Every generator served through this route runs with thinking suppressed
-        # (see the no_think block) — the picker can say so instead of implying that
+        # (see utils/no_think.py) — the picker can say so instead of implying that
         # choosing a reasoning model will fill the prompt box with a monologue.
         "thinking_suppressed": True,
     }), 200

@@ -1608,6 +1608,36 @@ def transformers_quantization_config():
         return None
 
 
+def planned_gpu_need_bytes(need_bytes: Optional[int]) -> Optional[int]:
+    """What the CURRENT placement intent will actually put on the GPU, given a
+    total need of ``need_bytes``. THE admission companion to
+    ``transformers_max_memory`` / the GGUF ngl mapping — one derivation, so the
+    gate and the loader cannot disagree (incident 2026-07-29: a model designated
+    RAM-only was refused "won't fit on GPU: needs 70.2 GB" and an idle resident
+    was evicted on the way — for a load that was about to place 0 B on the card).
+
+      * intent "cpu" (n_gpu_layers off/0)  -> 0 (nothing lands on the GPU)
+      * alloc_mode "max-ram"               -> the REMAINDER after the CPU budget
+        (same math as transformers_max_memory: cpu = explicit or free_ram*0.8;
+        gpu = max(0, need - cpu); unknown need -> 0, matching the loader's
+        never-silently-fill-the-GPU rule)
+      * everything else                    -> ``need_bytes`` unchanged
+
+    Returns None only when ``need_bytes`` is None and the intent would not force
+    it to 0 — i.e. "unknown", which admission already fails open on."""
+    if n_gpu_layers_intent() == "cpu":
+        return 0
+    if alloc_mode_env() == "max-ram":
+        if not need_bytes:
+            return 0                       # loader: unknown need -> GPU budget 0
+        cpu_gib = _env_float("HUGPY_CPU_MEM_GIB")
+        if cpu_gib is None:
+            fr = free_ram_bytes()
+            cpu_gib = (fr * 0.8) / 2**30 if fr else 16.0
+        return max(0, int(need_bytes) - int(cpu_gib * 2**30))
+    return need_bytes
+
+
 def transformers_max_memory(model_need_bytes: Optional[int] = None) -> Optional[dict]:
     """Build a ``max_memory`` map for device_map='auto', or None to skip.
 

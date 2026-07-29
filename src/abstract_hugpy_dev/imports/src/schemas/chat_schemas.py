@@ -145,6 +145,18 @@ class ChatRequest(BaseModel):
     # Dedicated worker pool to route this request to ("" / None = general pool).
     # Resolved at the route from the API key's bound pool + an optional override.
     pool: Optional[str] = None
+    # Per-REQUEST allocation triggers (operator ask 2026-07-29): a dict of spill
+    # keys (alloc_mode, bnb_4bit, n_cpu_moe, n_gpu_layers, gpu_mem_gib,
+    # cpu_mem_gib, threads) overlaid on the worker's per-assignment spill for
+    # THIS call, so a client can exercise one model under a chosen config
+    # (4-bit on/off, MoE split, RAM-only, ...) without editing designations.
+    # ⚠ WIRE LANDMINE: the relay MUST pop this key before the payload ships —
+    # released workers run extra="forbid" and an unknown key rejects ALL chat
+    # (the 2026-07-17 None-key incident). _relay_payload owns that pop + the
+    # whitelist; this field never crosses the wire itself.
+    # Takes effect at LOAD time: an already-resident model keeps its current
+    # placement until evicted/reseated (same rule as designation edits).
+    alloc: Optional[dict] = None
     @field_validator("messages", mode="before")
     @classmethod
     def normalize_messages(cls, value: Any) -> Any:

@@ -252,7 +252,8 @@ def feasible_modes(engine: Any,
                    model_bytes: "Optional[int]",
                    gpu_total_bytes: "Optional[int]",
                    ram_total_bytes: "Optional[int]",
-                   moe_split_gpu_bytes: "Optional[int]" = None) -> tuple:
+                   moe_split_gpu_bytes: "Optional[int]" = None,
+                   bnb: bool = False) -> tuple:
     """The allocation modes that are FEASIBLE for one (model x worker), in
     ALLOC_MODES display order (operator ruling 2026-07-24 scope-extension: "the
     user shouldn't be able to select an option that implies something it cannot
@@ -305,6 +306,23 @@ def feasible_modes(engine: Any,
     gpu_total = _as_int(gpu_total_bytes)
     ram_total = _as_int(ram_total_bytes)
     gguf = is_gguf_engine(engine)
+    # BITSANDBYTES RE-PRICING (operator ruling 2026-07-29: "its auto should
+    # change upon 4-bit delegation"). default_allocation has priced the 4-bit
+    # footprint since 2026-07-26 while THIS function — the set the console
+    # offers and /assign enforces — still priced the full fp16 size. The two
+    # disagreed: the allocator planned ~15 GiB for a 51.7 GiB model and would
+    # have placed it on the card, but the gate refused the mode outright. Same
+    # re-pricing, same place in the order (before any rule reads `size`), so
+    # 4-bit and MoE still compose.
+    #
+    # ⚠ ESTIMATE, NOT A MEASUREMENT: BNB_4BIT_SIZE_RATIO is a flat 0.30 of the
+    # whole directory, deliberately pessimistic vs the theoretical 0.25. It is
+    # NOT per-component, so for a diffusers PIPELINE (VAE/tokenizer/scheduler
+    # never quantize) it can still flatter. Feasibility is a gate, not a
+    # promise the load will fit — the worker's own admission preflight remains
+    # the measured authority.
+    if bool(bnb) and not gguf and size:
+        size = bnb_effective_bytes(size) or size
     unknown_size = size is None
     # The GPU-side footprint used for GPU-fit tests: the MoE split's non-expert
     # share when known (never larger than the full size), else the full size.
@@ -324,8 +342,28 @@ def feasible_modes(engine: Any,
             if gguf:
                 feasible = True                  # partial offload: universal
             else:
-                feasible = (unknown_size or gpu_total is None
-                            or size <= _GPU_FIT_HEADROOM * gpu_total)
+                # SAME numbers rule as max-ram (operator ruling 2026-07-29:
+                # "feasible modes should be auto-derived from auto setting; if
+                # they derive non-feasible modes that's a blanket function
+                # problem"). max-gpu means "as much GPU as fits, SPILL THE REST
+                # TO RAM" — so the test is fits-GPU+RAM-combined, never
+                # fits-the-card-whole. That is the same spill the non-GGUF
+                # loaders already honor for max-ram (transformers RAM-priority
+                # max_memory, diffusers enable_model_cpu_offload — wired by
+                # Slice C), so gating the two differently was an inconsistency,
+                # not a capability fact.
+                #
+                # WHAT IT COST: every non-GGUF model larger than VRAM lost THE
+                # DEFAULT mode, so a stored/derived max-gpu became unassignable
+                # — /assign 409'd with "not feasible" on 8 of ae's designations
+                # after the 2026-07-29 in-VM migration (24 GiB card), making
+                # models that CAN spill simply uncallable. defaults-are-promises
+                # says the default must be a success path, not a refusal.
+                combined = None
+                if gpu_total is not None or ram_total is not None:
+                    combined = (gpu_total or 0) + (ram_total or 0)
+                feasible = (unknown_size or combined is None
+                            or size <= combined)
         elif mode == "max-ram":
             # Engine-agnostic (2026-07-24): both GGUF and non-GGUF honor max-ram
             # now, so no engine gate — only the numbers rule (fits GPU+RAM

@@ -13,6 +13,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from ...utils.no_think import strip_think, with_no_think
 from ..hugpy_client import HugpyError
 from ..streamer import MessageStreamer
 from .helpers import forward_attachment, model_autocomplete, send_long
@@ -298,10 +299,14 @@ class ToolsCog(commands.Cog):
         if file_path is None:
             return
         try:
+            # NO-THINK (utils/no_think.py). The reply is posted to Discord as the
+            # description — display-as-prose, nobody watching tokens arrive. The
+            # prompt is only rewritten when the caller gave one; leaving it None
+            # keeps central's own default, and the strip below covers that case.
             result = await self.bot.hugpy.execute_prompt(
                 task="image-text-to-text",
                 file=file_path,
-                prompt=prompt,
+                prompt=with_no_think(prompt) if prompt else prompt,
                 max_new_tokens=max_tokens,
                 model_key=model,
             )
@@ -313,7 +318,8 @@ class ToolsCog(commands.Cog):
                 return
             await interaction.followup.send(f"⚠️ {exc}")
             return
-        await send_long(interaction.followup.send, result.get("text") or "",
+        description, _reasoning = strip_think(result.get("text") or "")
+        await send_long(interaction.followup.send, description,
                         filename="description.txt")
 
 

@@ -323,10 +323,24 @@ def _generate_candidate(bridge: dict, current_inbound: str = "") -> str:
         msgs.append({"role": "user", "content": current_inbound})
     if len(msgs) > 13:                       # cap history (system + last 12 turns)
         msgs = [msgs[0]] + msgs[-12:]
+    # NO-THINK (utils/no_think.py). This reply is PARSED and then TRANSMITTED:
+    # _route_bridge_reply gates on candidate.upper().startswith("DEFER"), so a
+    # <think> prelude silently defeats the defer gate — a model that CHOSE to
+    # escalate would be auto-sent instead. And whatever survives goes verbatim to
+    # a live Discord channel. Nobody is watching tokens arrive here, so reasoning
+    # is never legitimately shown; it is stripped and logged, not sent.
+    from abstract_hugpy_dev.utils.no_think import apply_no_think, strip_think
     from ..functions.imports import execute_prompt
-    result = _await_sync(execute_prompt(model_key=model_key, messages=msgs,
+    result = _await_sync(execute_prompt(model_key=model_key,
+                                        messages=apply_no_think(msgs),
                                         task="text-generation"))
-    return (_result_text(result) or "").strip()
+    candidate, reasoning = strip_think((_result_text(result) or "").strip())
+    if reasoning and not candidate:
+        # Nothing but thinking — return '' so the caller falls back to manual
+        # operation rather than sending a monologue to the channel.
+        logger.warning("bridge %s: model returned only reasoning, no candidate",
+                       bridge.get("id"))
+    return candidate
 
 
 @discord_bp.route("/discord/inbox", methods=["POST"])

@@ -25,6 +25,11 @@ class ChatBody(BaseModel):
     # the API key's bound pool (default) + this field (override, if the key
     # allows it). "" / None = the general pool.
     pool: Optional[str] = None
+    # Per-request allocation triggers (alloc_mode / bnb_4bit / n_cpu_moe /
+    # n_gpu_layers / gpu_mem_gib / cpu_mem_gib / threads) — overlaid on the
+    # designation spill for this call only. Whitelisted + wire-scrubbed in
+    # managers.resolvers.remote._relay_payload; see ChatRequest.alloc.
+    alloc: Optional[dict] = None
     # Attribution for the F5 job record (unified jobs view): which transport
     # originated this (web | discord | cli | v1) and its conversational
     # context id (discord channel, web session). Never used for routing.

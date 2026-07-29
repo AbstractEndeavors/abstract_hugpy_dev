@@ -2571,6 +2571,7 @@ class WorkerStore:
         slot_incapable_reason: Optional[str] = None,
         task_capabilities: Optional[Dict[str, bool]] = None,
         vram_evictions: Optional[Dict[str, Any]] = None,
+        aggregate: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Mark a worker alive and refresh its live GPU / loaded-model stats."""
         with self._transaction() as workers:
@@ -2687,6 +2688,14 @@ class WorkerStore:
                 # vram + unattributed foreign squatters. Stored verbatim;
                 # _public_view spreads it so the console renders it per worker.
                 worker["pid_registry"] = pid_registry
+            if aggregate is not None:
+                # ROLLING AGGREGATE summary (operator ruling 2026-07-29): the
+                # COMPACT counts+digest the worker rides on the beat. Stored
+                # verbatim; the document itself is never on the beat and is
+                # pulled on read via GET /llm/workers/<id>/aggregate. Absent on
+                # a pre-aggregate worker -> the key simply stays unset, which
+                # is how the relay route reports "not yet aggregating".
+                worker["aggregate"] = aggregate
             if vram_evictions is not None:
                 # VRAM eviction churn (slice 10): stored verbatim so the console
                 # can surface GPU evict-to-fit churn beside the disk reaps.
@@ -3766,8 +3775,12 @@ def feasible_modes_for(worker_id: str, model_key: str) -> Optional[tuple]:
         gpu_total = _worker_gpu_total_bytes(worker)
         ram_total = _worker_ram_total_bytes(worker)
         _warn_feasibility_failopen(worker, model_key, size, gpu_total, ram_total)
+        # bnb (2026-07-29): the 4-bit lever re-prices the model, so the FEASIBLE
+        # SET must move with it — otherwise the gate refuses a mode the
+        # allocator has already planned at the smaller size.
         return feasible_modes(_model_engine(model_key), size, gpu_total, ram_total,
-                              moe_split_gpu_bytes=_model_moe_gpu_bytes(model_key))
+                              moe_split_gpu_bytes=_model_moe_gpu_bytes(model_key),
+                              bnb=bnb_enabled(worker, model_key))
     except Exception:  # noqa: BLE001 — a derivation must never break a read/relay
         from ......managers.alloc_modes import ALLOC_MODES
         return ALLOC_MODES
@@ -3788,6 +3801,10 @@ def feasibility_context(worker_id: str, model_key: str) -> Dict[str, Any]:
         # MoE (2026-07-24): the expert-split GPU need (non-expert + mmproj) a
         # feasibility decision priced GPU-fit with; None for dense models.
         "moe_split_gpu_bytes": _model_moe_gpu_bytes(model_key),
+        # bnb (2026-07-29): whether the 4-bit lever was ON for this decision.
+        # An honest 409 must say WHICH size it priced — a refusal quoting the
+        # fp16 bytes while 4-bit is enabled reads as a bug in the numbers.
+        "bnb": bnb_enabled(worker, model_key),
     }
 
 

@@ -128,10 +128,16 @@ def _score_keyframe(goal: str, keyframe_uri: str, judge_model_id) -> dict:
         "Does the image achieve this goal? Reply exactly: "
         "VERDICT=YES|NO; SCORE=0-100; WHY=<one sentence>."
     )
+    # NO-THINK (utils/no_think.py). max_new_tokens=80 is SMALLER than a typical
+    # <think> prelude, so a reasoning judge burns the whole budget and returns no
+    # verdict at all. Worse, parse_vision_verdict's bare-word \bYES\b/\bNO\b
+    # fallback would happily match a YES/NO *inside the monologue* and fabricate
+    # an inverted verdict instead of degrading to UNSCORED.
+    from abstract_hugpy_dev.utils.no_think import with_no_think, strip_think
     kwargs = dict(
         task="image-text-to-text",
         file=keyframe_uri,
-        prompt=prompt,
+        prompt=with_no_think(prompt),
         max_new_tokens=80,
     )
     if judge_model_id:
@@ -143,14 +149,20 @@ def _score_keyframe(goal: str, keyframe_uri: str, judge_model_id) -> dict:
     except Exception as exc:  # plane raised -> unscored (keep the take)
         logger.info("movie vision judge raised (%s: %s); leaving segment unscored",
                     type(exc).__name__, exc)
-        return {"verdict": None, "score": None, "why": f"judge unavailable: {exc}", "raw": ""}
+        return {"verdict": None, "score": None, "why": f"judge unavailable: {exc}",
+                "raw": "", "reasoning": ""}
     if not getattr(res, "ok", True):
         err = getattr(res, "error", None)
         return {"verdict": None, "score": None,
-                "why": f"judge not-ok: {err}", "raw": ""}
+                "why": f"judge not-ok: {err}", "raw": "", "reasoning": ""}
     raw = _vision_text(res)
-    verdict = parse_vision_verdict(raw)
+    # Parse the PROSE, never the monologue. ``raw`` keeps the full reply (it is
+    # persisted evidence); ``reasoning`` carries what was removed. An only-thinking
+    # reply parses to UNSCORED, which keeps the take — the honest degradation.
+    scored, reasoning = strip_think(raw)
+    verdict = parse_vision_verdict(scored)
     verdict["raw"] = raw
+    verdict["reasoning"] = reasoning
     return verdict
 
 
