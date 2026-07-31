@@ -164,9 +164,14 @@ class LlamaCppRunner(LlamaCppBaseRunner):
                 return
             except (httpx.HTTPStatusError, httpx.ConnectError) as exc:
                 status = getattr(getattr(exc, "response", None), "status_code", None)
-                if attempt == 1 and (status in (502, 503) or isinstance(exc, httpx.ConnectError)):
+                if attempt == 1 and (status in (500, 502, 503) or isinstance(exc, httpx.ConnectError)):
                     # Stale cached endpoint (slot unloaded/agent restarted):
                     # re-resolve — serve_endpoint reloads the model — and retry once.
+                    # 500 belongs here too (2026-07-29): a single-slot box that
+                    # SWAPPED to a different model keeps answering 500 (e.g.
+                    # "image input is not supported … mmproj" when a text model
+                    # replaced a vision one) — the child is up, so only a
+                    # re-resolve (which reloads OUR model into a slot) recovers.
                     if self._refresh_endpoint():
                         continue
                 raise
@@ -184,8 +189,8 @@ class LlamaCppRunner(LlamaCppBaseRunner):
                 break
             except (httpx.HTTPStatusError, httpx.ConnectError) as exc:
                 status = getattr(getattr(exc, "response", None), "status_code", None)
-                if attempt == 1 and (status in (502, 503) or isinstance(exc, httpx.ConnectError)):
-                    if self._refresh_endpoint():   # stale cached endpoint — see _iter_stream
+                if attempt == 1 and (status in (500, 502, 503) or isinstance(exc, httpx.ConnectError)):
+                    if self._refresh_endpoint():   # stale/swapped cached endpoint — see _iter_stream
                         continue
                 raise
         # Non-streaming twin of the capture in _iter_stream: llama-server puts

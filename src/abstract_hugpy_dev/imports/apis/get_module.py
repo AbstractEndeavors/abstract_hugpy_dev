@@ -6,6 +6,7 @@ from .huggingface_api import *
 from .call_api import *
 from .imports import *
 from huggingface_hub.errors import HFValidationError
+from ..src.model_classifier import classify_model_dir
 
 
 # ---------------------------------------------------------------------------
@@ -28,17 +29,12 @@ def is_valid_repo_id(hub_id: str) -> bool:
     hub_id = (hub_id or "").strip("/")
     return bool(hub_id) and "/" in hub_id
 
-def base_present(base_model: str) -> bool:
-    if not base_model:
-        return True   # not an adapter; nothing to require
-    base_dir = route_destination(
-        {"hub_id": base_model, "framework": "transformers",
-         "primary_task": "text-generation"}
-    )
-    return os.path.isdir(base_dir) and any(
-        f.endswith(".safetensors") or f.endswith(".bin")
-        for f in os.listdir(base_dir)
-    )
+# Delegates to imports/src/peft_adapters.py so discovery, the registry gate and
+# the LOAD path all decide "is the base here?" by one rule. The old local copy
+# accepted .safetensors/.bin only and swallowed nothing, which meant a shard set
+# under any other extension read as absent and an EMFILE storm read as absent
+# too (see store-presence-scan-emfile-false-negative).
+base_present = base_model_present
 # ---------------------------------------------------------------------------
 # Registry lookup — exact / canonical match only
 # ---------------------------------------------------------------------------
@@ -107,10 +103,21 @@ def get_all_configs(verbose: bool = False, get_code: bool = False,
 
         merged, provenance = merge_disk_over_registry(discovered, registry_cfg)
 
+        # NULL IS NOT text-generation (k61, 2026-07-31). This default is what
+        # offered an image LoRA as an LLM. Ask the DIRECTORY what it is first —
+        # a diffusers model_index.json / an adapter-only dir both answer offline
+        # — and when it says nothing, leave the row unclassified and flagged.
         if merged.get("tasks") is None:
-            merged["tasks"] = ["text-generation"]
-            merged["primary_task"] = "text-generation"
-            provenance["primary_task"] = "default"
+            verdict = classify_model_dir(directory)
+            if verdict:
+                merged["tasks"] = verdict["tasks"]
+                merged["primary_task"] = verdict["primary_task"]
+                provenance["primary_task"] = verdict["source"]
+                if verdict.get("adapter"):
+                    merged["adapter"] = True
+            else:
+                merged["needs_classification"] = True
+                provenance["primary_task"] = "unclassified"
 
         if verbose:
             print(f"[discover] {merged['name']}: {provenance}")
@@ -140,7 +147,14 @@ def get_all_configs(verbose: bool = False, get_code: bool = False,
 def resolve_local_config(directory: str, hub_id: str) -> dict:
     path = os.path.join(directory, "config.json")
     if not os.path.isfile(path):
-        return {}
+        # NO config.json is not "nothing to say". A bare PEFT adapter dir has
+        # only adapter_config.json, and returning {} here is what left
+        # base_model/peft_type None for every adapter on the fleet — which
+        # disarmed the registry's adapter gate (it keys on base_model) and let
+        # three LoRA dirs be minted as ordinary transformers models that then
+        # answered every serve attempt with "Unrecognized model in <dir>.
+        # Should have a `model_type` key in its config.json".
+        return adapter_metadata_fields(directory)
     try:
         with open(path, "r") as f:
             cfg = json.load(f)
@@ -154,7 +168,9 @@ def resolve_local_config(directory: str, hub_id: str) -> dict:
         "rope_scaling":            cfg.get("rope_scaling"),
         "torch_dtype":             cfg.get("torch_dtype"),
         "vocab_size":              cfg.get("vocab_size"),
-        # peft markers — present iff this is an adapter
+        # peft markers — a merged checkpoint can ship BOTH files, and then
+        # config.json is authoritative (it loads standalone). Only an adapter
+        # that cannot stand alone contributes the markers, via the branch above.
         "peft_type":               cfg.get("peft_type"),
         "base_model":              cfg.get("base_model_name_or_path"),
     }
@@ -173,6 +189,29 @@ def resolve_local_tokenizer(directory: str, hub_id: str) -> dict:
     if isinstance(raw, (int, float)) and 0 < raw < TOKENIZER_SENTINEL_THRESHOLD:
         return {"tokenizer_model_max_length": int(raw)}
     return {}
+
+
+def resolve_dir_declaration(directory: str, hub_id: str) -> dict:
+    """What the model dir DECLARES about itself — diffusers pipeline or adapter.
+
+    Runs FIRST in the chain, ahead of hugpy.json, and it is the only resolver
+    allowed to outrank the marker. That is deliberate: the 2026-07-31 incident was
+    a WRONG STAMP (a complete Flux2KleinPipeline marked image-to-image only) that
+    every store faithfully preserved. A pipeline's own model_index.json cannot be
+    stale about what class it runs, so when it speaks it wins; when it is silent
+    this resolver returns {} and the marker keeps its authority.
+
+    Offline by construction — dir contents only, never the hub (hub metadata is a
+    bonus, never a dependency; see the fetch-once cache note in
+    resolve_hub_model_info)."""
+    from ..src.model_classifier import classify_model_dir
+    verdict = classify_model_dir(directory)
+    if not verdict:
+        return {}
+    out = {"tasks": verdict["tasks"], "primary_task": verdict["primary_task"]}
+    if verdict.get("adapter"):
+        out["adapter"] = True
+    return out
 
 
 def resolve_hugpy_marker(directory: str, hub_id: str) -> dict:
@@ -273,10 +312,13 @@ ResolverFn = Callable[[str, str], dict]
 
 def build_resolver_chain(*, api: Optional[HfApi] = None,
                          use_hub: bool = True) -> List[Tuple[str, ResolverFn]]:
-    # Order = priority (first non-None wins): declared identity (hugpy.json)
-    # beats disk contents beats the Hub; the routed-path layout is the floor —
-    # anything is better than minting default framework/task attribution.
+    # Order = priority (first non-None wins): the model's OWN pipeline/adapter
+    # declaration (k61 — a stamp can be wrong, model_index.json cannot) beats the
+    # declared identity (hugpy.json), which beats disk contents, which beats the
+    # Hub; the routed-path layout is the floor — anything is better than minting
+    # default framework/task attribution.
     chain: List[Tuple[str, ResolverFn]] = [
+        ("dir_declaration", resolve_dir_declaration),
         ("hugpy_marker",    resolve_hugpy_marker),
         ("local_config",    resolve_local_config),
         ("local_tokenizer", resolve_local_tokenizer),
@@ -414,8 +456,13 @@ def discover_models(save_json: bool = True, verbose: bool = True, use_hub: bool 
         # so the console can prompt for a real task. A task sourced ONLY from the
         # legacy layout path (a not-yet-migrated task dir) is likewise flagged —
         # its path-derived task is provisional until the marker confirms it.
+        # k61: a dir_declaration verdict IS a classification (the pipeline's own
+        # model_index.json, or an adapter-only dir) — it must not be flagged as
+        # needing one, or the console would keep asking about the one source that
+        # cannot be stale.
         task_src = meta_sources.get("primary_task") or meta_sources.get("tasks")
-        if row.get("primary_task") is None or task_src in (None, "layout_path"):
+        if task_src != "dir_declaration" and (
+                row.get("primary_task") is None or task_src in (None, "layout_path")):
             row["needs_classification"] = True
 
         rows.append((name, owner, row))

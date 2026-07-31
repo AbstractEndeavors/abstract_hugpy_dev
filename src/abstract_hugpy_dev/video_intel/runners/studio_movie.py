@@ -134,6 +134,12 @@ from abstract_hugpy_dev.imports.src.utils import slugify
 from ..media_store import ingest
 from ..result_schema import JobError, JobResult
 from ..studio.job import make_studio_i2v
+# PER-SEGMENT capability resolution (k58): the ONE definition of "what does segment N
+# render" plus the movie-pin-binds-only-what-it-serves rule. Read from there rather
+# than restated here, so the submit-time preflight (video_routes) and this render can
+# never disagree about what will be asked for. studio.movie_plan is registry-only
+# (no torch/numpy), so this import stays boot-safe.
+from ..studio.movie_plan import resolve_segment_model, segment_capability
 from ..studio_movie_schema import StudioMovieSpec
 # The studio-spine boundary. studio_i2v's module top is dependency-light (its
 # studio/numpy imports are lazy INSIDE its functions), so importing these here — and
@@ -197,6 +203,26 @@ def _seg_budget(movie_budget, floor: float):
       than pretending the floor is available (the exact guaranteed-fail the operator hates).
     """
     return None if movie_budget is None else max(movie_budget, floor)
+
+
+def _bound_model_id(clip_path: "str | None") -> "str | None":
+    """The model a finished segment ACTUALLY bound, read from the ``manifest.json``
+    sidecar every studio runner writes beside its content-addressed clip.
+
+    The point is attribution (k58): when a movie-level pin does not serve a segment's
+    capability the router picks the model, and "the router picked something" is not an
+    answer — movie.json should name WHICH. Best-effort by construction: a missing or
+    unreadable sidecar simply leaves the requested pin in place rather than failing a
+    rendered segment over a metadata read."""
+    if not clip_path:
+        return None
+    try:
+        with open(os.path.join(os.path.dirname(clip_path), "manifest.json"),
+                  "r", encoding="utf-8") as fh:
+            mid = json.load(fh).get("model_id")
+    except (OSError, ValueError):
+        return None
+    return mid if isinstance(mid, str) and mid else None
 
 
 # --------------------------------------------------------------------------- #
@@ -624,8 +650,15 @@ def run_generate_studio_movie(spec: StudioMovieSpec, job_id: str) -> JobResult:
         # new scene can hold the SAME person while re-framing the camera per shot. A goal
         # with no per-goal refs (reference_images None) inherits the movie-level set —
         # byte-identical to today's every-segment behavior.
+        #
+        # THE CAPABILITY ITSELF is decided by ``studio.movie_plan.segment_capability``
+        # (k58) — the SAME call the submit-time preflight walks the take-tree with, so a
+        # movie that passed POST asks for exactly the capabilities that were checked. The
+        # branch below still owns the CONDITIONING (branch still / context frames / budget
+        # floor); it no longer re-derives the capability alongside it.
         id_refs = tuple(goal.reference_images or spec.reference_images or ())
         is_id_movie = bool(id_refs)
+        capability = segment_capability(spec, goal, seg_i)
         resolved_branch = None
         start_image = None
         vace_context_frames = None
@@ -642,14 +675,12 @@ def run_generate_studio_movie(spec: StudioMovieSpec, job_id: str) -> JobResult:
             # the movie start_image, else t2v. In an id-movie the movie start_image is
             # ACCEPTED but the VACE runner ignores it (references win) — carried for provenance.
             start_image = spec.start_image.uri if spec.start_image is not None else None
-            capability = "id_lock" if is_id_movie else ("i2v" if start_image else "t2v")
         elif goal.joint_mode == "cut":
             # SCENE CUT: no frame carry at all — no branch resolve / extraction. The child is a
             # FRESH render (id_lock in an id-movie so the subject carries, else t2v). The parent
             # plays in FULL: resolved_branch stays None so assembly does NOT trim it.
             seg_joint_mode = "cut"
             _emit("branching", {"segment_id": goal.segment_id, "mode": "cut"})
-            capability = "id_lock" if is_id_movie else "t2v"
         else:
             # still / vace_extend splice onto the parent at a branch frame.
             # branch_frame null -> the parent's LAST frame (prev_frames - 1).
@@ -693,7 +724,6 @@ def run_generate_studio_movie(spec: StudioMovieSpec, job_id: str) -> JobResult:
                 # EXPLICIT budget -> floored to the VACE minimum; BLANK (None) -> autofit
                 # flows through (render_clip sizes it to the worker's free VRAM).
                 seg_budget = _seg_budget(spec.vram_budget_gb, _VACE_MIN_BUDGET_GB)
-                capability = "v2v"
             else:
                 # STILL (default, backward-compatible): condition on ONE branch frame. In an
                 # id-movie the render is id_lock (the references) + this branch still, which the
@@ -710,10 +740,23 @@ def run_generate_studio_movie(spec: StudioMovieSpec, job_id: str) -> JobResult:
                                  f"branch frame {resolved_branch} from the parent clip: {tail}"),
                         retryable=False)))
                 start_image = branch_png
-                capability = "id_lock" if is_id_movie else "i2v"
 
         # ---- deterministic per-segment seed (node override wins) ----
         seg_seed = goal.seed if goal.seed is not None else (spec.seed + seg_i)
+
+        # ---- which MODEL this segment asks for (k58) ----
+        # A movie-level pin binds ONLY the segments whose capability it serves; the rest
+        # resolve their own capable model through the router, and the substitution is
+        # ATTRIBUTED (seg_model.as_record() rides into movie.json + the JobResult, and the
+        # note into the live progress blob -> the stage log). An EXPLICIT per-goal model_id
+        # is authoritative and never substituted — the route's preflight already refused
+        # the movie if it cannot serve this segment, so reaching a render with one means it
+        # can. This is what stops the mid-movie pinned_model_unavailable that burned real
+        # GPU minutes on segment 0 before segment 1's i2v splice was ever considered.
+        seg_model = resolve_segment_model(capability, goal.model_id, spec.model_id)
+        if seg_model.note is not None:
+            logger.info("studio movie %s: segment %d (%s) capability=%s — %s",
+                        job_id, seg_i, goal.segment_id, capability, seg_model.note)
 
         # ---- build the per-segment studio spec + render through the SAME spine ----
         # (validate-at-construction; a bad geometry/override raises LOCALLY here, which
@@ -731,7 +774,10 @@ def run_generate_studio_movie(spec: StudioMovieSpec, job_id: str) -> JobResult:
             project=spec.project,
             steps=(goal.steps if goal.steps is not None else spec.steps),
             cfg=(goal.cfg if goal.cfg is not None else spec.cfg),
-            model_id=(goal.model_id if goal.model_id is not None else spec.model_id),
+            # PER-CAPABILITY pin (k58): the explicit per-goal choice, else the movie-level
+            # pin ONLY where it serves this segment's capability, else None (unpinned —
+            # the router resolves a capable model for THIS capability).
+            model_id=seg_model.model_id,
             # VACE-EXTEND temporal conditioning (None for a still/i2v/t2v segment).
             vace_context_frames=vace_context_frames,
             # IDENTITY LOCK: the movie-level subject references, passed on EVERY segment of an
@@ -741,8 +787,12 @@ def run_generate_studio_movie(spec: StudioMovieSpec, job_id: str) -> JobResult:
         )
 
         segments_meta[seg_i].update(status="generating")
+        # The model attribution rides in the LIVE blob too (and therefore into the bus
+        # stage log's detail line), so a capability fallback is visible WHILE it renders,
+        # not only in movie.json after the fact.
         _emit("generating", {"segment_id": goal.segment_id, "index": seg_i,
-                             "prompt": goal.prompt, "capability": capability})
+                             "prompt": goal.prompt, "capability": capability,
+                             **seg_model.as_record()})
 
         # RENDER via the SHARED render_clip: a REAL-model segment DELEGATES to the studio
         # GPU worker (HUGPY_STUDIO_WORKER) — progress nested into THIS movie's per-segment
@@ -754,12 +804,14 @@ def run_generate_studio_movie(spec: StudioMovieSpec, job_id: str) -> JobResult:
         seg_render_id = f"{job_id}.s{seg_i:02d}.{run_nonce}"
 
         def _seg_progress_sink(worker_blob, _sid=goal.segment_id, _idx=seg_i,
-                               _prompt=goal.prompt, _cap=capability):
+                               _prompt=goal.prompt, _cap=capability,
+                               _model=seg_model.as_record()):
             # Nest the DELEGATED segment's worker progress (queue position / render
             # progress) under the movie's ``current.worker`` so the console shows the
             # in-flight segment without flattening the movie-level nested blob.
             _emit("generating", {"segment_id": _sid, "index": _idx, "prompt": _prompt,
-                                 "capability": _cap, "delegated": True, "worker": worker_blob})
+                                 "capability": _cap, "delegated": True,
+                                 "worker": worker_blob, **_model})
 
         outcome = render_clip(
             seg_spec, render_id=seg_render_id, should_cancel=should_cancel,
@@ -780,6 +832,9 @@ def run_generate_studio_movie(spec: StudioMovieSpec, job_id: str) -> JobResult:
                 "parent_segment_id": goal.parent_segment_id,
                 "prompt": goal.prompt,
                 "capability": capability,
+                # k58 attribution: which model this segment ASKED for and why (the
+                # movie pin, an explicit per-segment choice, or a capability fallback).
+                **seg_model.as_record(),
                 "joint_mode": seg_joint_mode,
                 "context_frames": seg_context_frames,
                 "resolved_branch": resolved_branch,
@@ -810,6 +865,11 @@ def run_generate_studio_movie(spec: StudioMovieSpec, job_id: str) -> JobResult:
             "parent_segment_id": goal.parent_segment_id,
             "prompt": goal.prompt,
             "capability": capability,
+            # k58 attribution: how the model was chosen (``model_source``) and WHICH one
+            # actually rendered — the manifest sidecar's bound model when it is readable,
+            # so a capability fallback names its substitute instead of a bare null.
+            **{**seg_model.as_record(),
+               "model_id": (_bound_model_id(outcome.path) or seg_model.model_id)},
             "seed": seg_seed,
             "branch_frame": goal.branch_frame,          # the AUTHORED value (may be null)
             "resolved_branch": resolved_branch,          # frame index into the PARENT (None for root)

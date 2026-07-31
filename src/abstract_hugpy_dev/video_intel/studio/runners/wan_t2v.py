@@ -41,6 +41,7 @@ def run_wan_t2v(
     out_root: str,
     start_image: str | None = None,
     should_cancel: "Callable[[], bool] | None" = None,
+    on_step: "Callable[[int, int], None] | None" = None,
 ) -> Result[Artifact, StageError]:
     """Produce (or resume) a Wan TEXT-to-video clip for ``manifest`` under
     ``out_root``.
@@ -50,6 +51,11 @@ def run_wan_t2v(
     (t2v is text-only). Returns ``Ok(Artifact)`` on a real render (on the box), or
     a graceful ``Err(StageError)`` (DEPS_MISSING / NO_GPU / WEIGHTS_MISSING) on a
     box that can't run Wan yet. Only a genuine programmer error (a non-
-    RenderManifest) raises — inherited from ``run_wan_i2v``."""
+    RenderManifest) raises — inherited from ``run_wan_i2v``.
+
+    ``on_step`` (the denoise-progress sink, k57) is forwarded like ``should_cancel``
+    — a t2v movie segment is exactly the long single render whose bar would
+    otherwise never move."""
     return run_wan_i2v(
-        manifest, out_root, start_image=None, should_cancel=should_cancel)
+        manifest, out_root, start_image=None, should_cancel=should_cancel,
+        on_step=on_step)

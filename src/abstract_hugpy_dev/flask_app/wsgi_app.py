@@ -9,6 +9,7 @@ from .app.routes.phone_brick_routes import phone_brick_bp
 from .app.routes.discord_routes import discord_bp
 from .app.routes.video_routes import video_bp
 from .app.routes.agent_routes import agent_bp
+from .app.routes.messages_routes import messages_bp
 
 # Video Intelligence worker daemon is started ONCE per process at app init
 # (guarded below). Module-level so re-entrant app creation can't spawn a second.
@@ -157,6 +158,16 @@ def get_hugpy_flask(name=None,allowed_origins=None,debug=False):
     # (auto-discovered via routes/__init__) serves the nginx-proxied path.
     try:
         app.register_blueprint(agent_bp, url_prefix="/api", name="agent_bp_api")
+    except (ValueError, AssertionError):
+        pass
+
+    # Same /api dual-mount for the Anthropic Messages shim, so Claude Code / the
+    # Claude Agent SDK reach /v1/messages whether they hit the nginx-proxied
+    # /api/v1/messages or gunicorn directly. The bare /v1/messages mount
+    # (auto-discovered via routes/__init__) serves the proxied path unchanged.
+    try:
+        app.register_blueprint(messages_bp, url_prefix="/api",
+                               name="messages_bp_api")
     except (ValueError, AssertionError):
         pass
 

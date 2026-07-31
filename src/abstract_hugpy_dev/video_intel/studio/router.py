@@ -198,6 +198,39 @@ def _alternatives(capability: Capability) -> str:
     )
 
 
+def capable_model_ids(capability: Capability,
+                      include_synthetic: bool = False) -> tuple[str, ...]:
+    """Every model that DECLARES ``capability`` and could actually run it on this
+    fleet — the "does a capable model EXIST at all" question, answered WITHOUT a
+    geometry or a VRAM budget (k58).
+
+    Same gates ``resolve`` applies per candidate, minus the request-shaped ones
+    (resolution / frames / license / precision): the model must reach the capability
+    through a task whose runner is SERVABLE (k1) and must carry no viability blocker
+    (stub runner / zero bytes on the store). Deriving it from the same helpers is the
+    point — a preflight that answered from its own list would drift from the router
+    the moment the zoo moved.
+
+    SYNTHETIC IS EXCLUDED BY DEFAULT. The last-resort synthetic tier is opt-in at
+    render time (``render_clip``), so its presence is NOT evidence that a capability
+    is served — a preflight that counted it would pass a movie whose only possible
+    output is a noise blob."""
+    out: list[str] = []
+    for cfg in MODEL_REGISTRY.values():
+        if capability not in cfg.capabilities:
+            continue
+        if cfg.synthetic and not include_synthetic:
+            continue
+        task = _pick_task(cfg, capability)
+        if task is None:
+            continue
+        spec = runner_for(cfg.family, task)
+        if spec is None or _viability_reason(cfg, task, spec) is not None:
+            continue
+        out.append(cfg.model_id)
+    return tuple(sorted(out))
+
+
 def _refusal(code: ErrorCode, capability: Capability, why: str,
              extra: tuple[tuple[str, str], ...] = ()) -> Err[StageError]:
     """A refusal, as data: WHY it cannot complete plus WHAT IS AVAILABLE instead,

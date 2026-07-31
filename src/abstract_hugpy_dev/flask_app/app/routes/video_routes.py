@@ -33,11 +33,13 @@ verification without booting the full wsgi stack.
 from __future__ import annotations
 
 import dataclasses
+import json
 import mimetypes
 import os
 import secrets
+import time
 
-from flask import request, jsonify, send_file
+from flask import request, jsonify, send_file, Response, stream_with_context
 
 from abstract_flask import get_bp
 
@@ -46,7 +48,7 @@ from abstract_hugpy_dev.imports.src.constants.constants import (
     DEFAULT_ROOT,
 )
 from abstract_hugpy_dev.video_intel import media_store, media_bus, identity_profiles, shot_intent
-from abstract_hugpy_dev.video_intel.placement import job_placement
+from abstract_hugpy_dev.video_intel.placement import PlacementSnapshot, job_placement
 from abstract_hugpy_dev.video_intel.media_schema import make_media_ref
 from abstract_hugpy_dev.video_intel.crop_schema import (
     SpatialRegion,
@@ -86,8 +88,20 @@ from abstract_hugpy_dev.utils.no_think import (
     strip_think as no_think,
     with_no_think as _with_no_think,
 )
+from abstract_hugpy_dev.comms import studio_assist_log as _assist_log
 
 video_bp, logger = get_bp("video_bp", __name__)
+
+
+def _log_assist(**fields) -> None:
+    """Record ONE studio-assist attempt to the live log. STRICTLY a side-effect:
+    ``studio_assist_log.append`` is already total, and this wrapper adds a second
+    belt so a logging bug can never move a generate response. See
+    comms/studio_assist_log.py (mirrors the eviction-telemetry store)."""
+    try:
+        _assist_log.append(**fields)
+    except Exception:  # noqa: BLE001 — telemetry never breaks the serve path
+        logger.debug("studio-assist log emit failed", exc_info=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -1043,6 +1057,44 @@ def video_studio_movie():
         )
     except (ValueError, TypeError) as exc:  # bad node / geometry / chain = 400
         return jsonify({"error": str(exc)}), 400
+
+    # ----------------------------------------------------------------------- #
+    # TAKE-TREE CAPABILITY PREFLIGHT (k58) — refuse HERE, over the WHOLE movie,
+    # before a job_id exists.
+    #
+    # THE FAILURE THIS DELETES (operator movie eb9dee56, 2026-07-31): a 2-segment
+    # movie pinned ``wan2.1-t2v-1.3b``; segment 0 (t2v) rendered on the 3090, then
+    # segment 1 (a "still" splice -> capability i2v) died mid-movie with
+    # ``pinned_model_unavailable`` — a refusal whose own text listed what WAS
+    # available. Real GPU minutes bought a failure that was knowable at submit: a
+    # movie's per-segment capabilities are a pure function of this spec.
+    #
+    # So the whole tree is walked now (``studio.movie_plan.preflight_movie``, the same
+    # module the runner derives each segment's capability from — it cannot drift from
+    # what will actually be asked for), and the refusal is PER SEGMENT: which segment,
+    # which capability it needs, what the named model does serve, and what IS available.
+    # A movie that passes here can no longer fail for a capability reason — only for a
+    # runtime one (OOM, weights, a lost worker).
+    #
+    # NOT REFUSED: a movie-level pin that serves only SOME segments. That is a legal,
+    # useful request (ruling 1) — the pin binds the segments it serves and the others
+    # resolve their own capable model, attributed per segment in movie.json and the
+    # stage log. Only an EXPLICIT per-segment ``model_id`` that cannot serve its own
+    # segment is a refusal, because an explicit choice is never substituted.
+    # ----------------------------------------------------------------------- #
+    from abstract_hugpy_dev.video_intel.studio.movie_plan import preflight_movie
+    _seg_problems = preflight_movie(spec)
+    if _seg_problems:
+        _first = _seg_problems[0]
+        return jsonify({
+            "error": (f"this movie cannot be rendered as asked: "
+                      f"{_first.get('detail')}"
+                      + (f" (and {len(_seg_problems) - 1} more segment(s))"
+                         if len(_seg_problems) > 1 else "")),
+            "code": "movie_capability_preflight_failed",
+            "segments": _seg_problems,
+        }), 400
+
     job_id = _video_enqueue("generate_studio_movie", spec)
     return jsonify({"job_id": job_id}), 200
 
@@ -1249,6 +1301,35 @@ def _prompt_assist_result_text(result) -> str:
     return getattr(result, "text", "") or ""
 
 
+def _studio_no_think(raw: str):
+    """Studio-generate's reading of a no-think reply: ``(text, reasoning,
+    from_reasoning)``.
+
+    ``no_think`` (strip_think) is a STRIP FUNCTION, not a request the model must
+    obey (operator 2026-07-31: *"no_think isn't a request. it's a function that
+    strips the <think>…</think> from the actual response and returns the think as
+    a dict var"*). A reasoning model that keeps its whole answer inside
+    ``<think>`` has NOT failed — its content is right there in the reasoning dict
+    var. For studio GENERATE (an image/video prompt, where any description beats
+    a hard block) we therefore SALVAGE that reasoning as the prompt instead of
+    refusing a callable model, and flag ``from_reasoning`` so the caller/UI can
+    say where it came from. Only a reply with neither prose NOR reasoning is a
+    genuine empty.
+
+    Deliberately LOCAL to studio generate. The shared ``finalize_no_think`` stays
+    strict (empty prose → honest error) because its other callers — the discord
+    DEFER gate and the movie-keyframe verdict judge — must NEVER read the
+    monologue as the answer: a verdict regex matching inside the reasoning would
+    invert the decision.
+    """
+    prose, reasoning = no_think(raw)
+    if prose:
+        return prose, reasoning, False
+    if reasoning:
+        return reasoning, reasoning, True
+    return "", "", False
+
+
 # --------------------------------------------------------------------------- #
 # NO-THINK — the package-wide seam now lives in utils/no_think.py (operator
 # 2026-07-29: "the expectation of a model to adhere to no_think should be
@@ -1359,6 +1440,17 @@ def video_prompt_assist():
     # and keeps this module app-boot cheap when chat's plane isn't touched.
     from ..functions.imports import execute_prompt
     from ..functions.chat.streaming import _friendly_stream_error
+    # STUDIO-ASSIST LOG (operator, 2026-07-31): the detail/generate path runs its
+    # own generation (not through _assist_execute), so it mints its own run_id and
+    # records the terminal outcome directly. There is no downstream parse — a
+    # non-empty prompt IS served — so this handler is the only place its record is
+    # emitted.
+    _run_id = _assist_log.new_run_id()
+    _started = time.monotonic()
+
+    def _elapsed_ms():
+        return int((time.monotonic() - _started) * 1000)
+
     try:
         result = _await_sync(execute_prompt(
             model_key=model_key,
@@ -1370,37 +1462,61 @@ def video_prompt_assist():
         # resolve()/builder validation errors (e.g. unknown model_key, or the
         # model doesn't support text-generation) — the caller's to fix, same
         # envelope /prompt uses for the identical exception set.
+        _log_assist(run_id=_run_id, mode=mode, kind=kind,
+                    model_requested=model_key,
+                    outcome=_assist_log.OUTCOME_RESOLVE_ERROR,
+                    error=str(exc).strip("'\""), elapsed_ms=_elapsed_ms())
         return jsonify({"error": str(exc).strip("'\"")}), 400
     except Exception as exc:
         # No live worker for this model / worker unreachable / no local engine
         # — an actionable message via the same mapper /chat/stream uses,
         # never a raw traceback, never a 500.
         logger.exception("prompt/assist failed")
+        _log_assist(run_id=_run_id, mode=mode, kind=kind,
+                    model_requested=model_key,
+                    outcome=_assist_log.OUTCOME_WORKER_ERROR,
+                    error=_friendly_stream_error(exc), elapsed_ms=_elapsed_ms())
         return jsonify({"error": _friendly_stream_error(exc)}), 502
 
     ok = result.get("ok", True) if isinstance(result, dict) else getattr(result, "ok", True)
     raw = _prompt_assist_result_text(result).strip()
+    _resolved = _assist_resolved_model(result)
     if not ok or not raw:
         err = result.get("error") if isinstance(result, dict) else getattr(result, "error", None)
-        return jsonify({"error": err or "assist produced no text"}), 502
+        err = err or "assist produced no text"
+        _log_assist(run_id=_run_id, mode=mode, kind=kind,
+                    model_requested=model_key, model_resolved=_resolved, raw=raw,
+                    outcome=_assist_log.classify_execute_error(502, err),
+                    error=err, elapsed_ms=_elapsed_ms())
+        return jsonify({"error": err}), 502
 
     # NO-THINK, half 2 of 2: strip defensively, because the model is caller-selectable
     # and the next one chosen may ignore the directive. The reasoning is not thrown away
     # — it rides its own key, so it can be shown or ignored but never mistaken for the
     # prompt (operator: "or even sends it out as a dict var of its own").
-    text, reasoning = no_think(raw)
+    text, reasoning, from_reasoning = _studio_no_think(raw)
     if not text:
-        # Nothing but thinking. Say so honestly rather than handing back an empty prompt
-        # box — this is the failure the live measurement produced before the directive
-        # was wired, and the caller can act on it (retry, or pick a non-reasoning model).
+        # Neither prose NOR reasoning — a genuinely empty reply. Say so honestly
+        # rather than handing back an empty prompt box; the caller can retry or
+        # pick another model.
+        err = ("the assistant returned nothing — neither a prompt nor "
+               f"reasoning came back from {model_key!r}; retry, or choose "
+               "a different text generator")
+        _log_assist(run_id=_run_id, mode=mode, kind=kind,
+                    model_requested=model_key, model_resolved=_resolved, raw=raw,
+                    reasoning=reasoning, from_reasoning=from_reasoning,
+                    outcome=_assist_log.OUTCOME_EMPTY, error=err,
+                    elapsed_ms=_elapsed_ms())
         return jsonify({
-            "error": ("the assistant returned only reasoning and no prompt — "
-                      f"{model_key!r} appears to have ignored the no-think directive; "
-                      "retry, or choose a different text generator"),
+            "error": err,
             "model": model_key,
             "reasoning": reasoning,
         }), 502
 
+    _log_assist(run_id=_run_id, mode=mode, kind=kind,
+                model_requested=model_key, model_resolved=_resolved, raw=raw,
+                text=text, reasoning=reasoning, from_reasoning=from_reasoning,
+                outcome=_assist_log.OUTCOME_SERVED, elapsed_ms=_elapsed_ms())
     # PROVENANCE (SPEC §1f, the honest half): say which model was ASKED FOR and
     # which one actually answered. The 35B incident showed generated text
     # displayed as though it came from a model that had failed to load; a caller
@@ -1408,8 +1524,124 @@ def video_prompt_assist():
     # unchanged (the requested key) so no existing consumer moves.
     return jsonify({"prompt": text, "model": model_key, "kind": kind,
                     "reasoning": reasoning, "thinking_suppressed": True,
+                    "from_reasoning": from_reasoning,
                     "model_requested": model_key,
-                    "model_resolved": _assist_resolved_model(result)}), 200
+                    "model_resolved": _resolved}), 200
+
+
+# --------------------------------------------------------------------------- #
+# STUDIO-ASSIST LIVE LOG (operator directive, 2026-07-31).
+#
+# "a live log in the studio ui showing what each generate attempt actually
+# returned — the raw model reply, what was stripped, and the outcome — so they
+# can self-diagnose without asking the keeper each time."
+#
+# These two routes are the console's read side of comms/studio_assist_log.py.
+# They are the exact shape of the eviction-telemetry routes (bounded backfill +
+# replay-then-live SSE, tailed by sqlite rowid so the stream is correct across
+# gunicorn workers). Auth is NOT re-checked here: both routes live on the /video
+# surface, so the blanket video gate (video_auth.install_video_gate) already
+# requires the SAME console session /video/prompt/assist itself requires — the
+# UI's existing creds work unchanged, and there is no new credential to loosen.
+# --------------------------------------------------------------------------- #
+_LOG_REPLAY_LIMIT = 100        # replay depth for a fresh SSE subscriber
+_LOG_POLL_S = 0.5              # cursor poll — sub-second is "real time" for a human
+_LOG_HEARTBEAT_S = 15.0        # keep an idle proxied pipe warm
+_LOG_STREAM_MAX_S = 3600.0     # a forgotten tab must not pin a thread forever
+_LOG_BACKFILL_RAW_CAP = 20000  # bound a huge reply on the PAGE LOAD only (the store
+                               # and the SSE stream keep the full untruncated reply)
+
+
+@video_bp.route("/video/prompt/assist/log", methods=["GET"])
+def video_prompt_assist_log():
+    """Bounded history of studio-assist attempts — the panel's page-load backfill.
+
+    ``limit`` (default 200, max 2000) newest records, oldest-first for direct
+    rendering. ``since`` is an epoch-seconds floor; ``after_id`` is the stream
+    cursor form. ``raw`` is capped for the page load only (see the SSE route for
+    the untruncated stream)."""
+    try:
+        limit = int(request.args.get("limit") or 200)
+    except (TypeError, ValueError):
+        limit = 200
+    limit = max(1, min(limit, 2000))
+    since = request.args.get("since")
+    after = request.args.get("after_id")
+    try:
+        since_ts = float(since) if since not in (None, "") else None
+    except (TypeError, ValueError):
+        since_ts = None
+    try:
+        after_id = int(after) if after not in (None, "") else None
+    except (TypeError, ValueError):
+        after_id = None
+    store = _assist_log.get_store()
+    records = store.recent(limit=limit, since_ts=since_ts, after_id=after_id,
+                           raw_cap=_LOG_BACKFILL_RAW_CAP)
+    return jsonify({"events": records, "count": len(records),
+                    "cursor": (records[-1].get("_id") if records else after_id or 0)})
+
+
+@video_bp.route("/video/prompt/assist/log/stream", methods=["GET"])
+def video_prompt_assist_log_stream():
+    """SSE: the last ~100 attempts, then live.
+
+    Tails the shared sqlite table by rowid, which is what makes this correct
+    across gunicorn workers. Emits a ``: heartbeat`` comment when idle so a proxy
+    does not reap the connection, and returns after ``_LOG_STREAM_MAX_S`` so a
+    forgotten tab cannot pin a thread — EventSource reconnects and replays from
+    the cursor, so the operator sees no gap. The full untruncated ``raw`` rides
+    the stream (only the page-load backfill bounds it)."""
+    try:
+        replay = int(request.args.get("replay") or _LOG_REPLAY_LIMIT)
+    except (TypeError, ValueError):
+        replay = _LOG_REPLAY_LIMIT
+    replay = max(0, min(replay, 1000))
+
+    def sse(payload: dict) -> bytes:
+        return f"data: {json.dumps(payload, default=str)}\n\n".encode("utf-8")
+
+    def generate():
+        store = _assist_log.get_store()
+        cursor = 0
+        try:
+            backlog = store.recent(limit=replay) if replay else []
+        except Exception:  # noqa: BLE001 — an unreadable store still streams live
+            backlog = []
+        for rec in backlog:
+            cursor = max(cursor, int(rec.get("_id") or 0))
+            yield sse(rec)
+        if not cursor:
+            try:
+                cursor = store.max_id()
+            except Exception:  # noqa: BLE001
+                cursor = 0
+        # Tell the client it is attached even when nothing has been generated yet.
+        yield sse({"stage": "stream.ready", "ts": time.time(), "cursor": cursor})
+        last_beat = time.time()
+        deadline = time.time() + _LOG_STREAM_MAX_S
+        while time.time() < deadline:
+            try:
+                fresh = store.recent(limit=200, after_id=cursor)
+            except Exception:  # noqa: BLE001 — a transient store fault is not a
+                fresh = []      # reason to drop the operator's stream
+            for rec in fresh:
+                cursor = max(cursor, int(rec.get("_id") or 0))
+                yield sse(rec)
+            if fresh:
+                last_beat = time.time()
+            elif time.time() - last_beat >= _LOG_HEARTBEAT_S:
+                last_beat = time.time()
+                yield b": heartbeat\n\n"
+            time.sleep(_LOG_POLL_S)
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+                 "Connection": "keep-alive"},
+        direct_passthrough=True,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1439,7 +1671,8 @@ def _assist_resolved_model(result):
     return getattr(result, "model_key", None) or None
 
 
-def _assist_execute(model_key, messages, max_new_tokens, **extra):
+def _assist_execute(model_key, messages, max_new_tokens,
+                    _log_mode=None, _log_kind=None, **extra):
     """Run one assist generation through the shared chat plane.
 
     Returns ``(payload, None)`` on success or ``(None, (body, status))`` on
@@ -1447,9 +1680,24 @@ def _assist_execute(model_key, messages, max_new_tokens, **extra):
     a caller-fixable resolve error, 502 for a fleet/worker failure — never a 500,
     never a silent local load). Both halves of the no-think seam are applied
     here, so every new mode gets them without repeating the reasoning.
+
+    STUDIO-ASSIST LOG (operator, 2026-07-31): this is the generation choke point,
+    so it mints the ``run_id`` and records the attempt. A FAILURE is terminal and
+    logged here with the classified outcome (resolve_error / worker_error /
+    empty), carrying the raw reply when one came back. A SUCCESS is PROVISIONAL —
+    the mode handler that parses the reply decides served-vs-parse_error, and
+    emits the terminal record under the same ``run_id`` (carried in the payload).
+    ``_log_mode`` / ``_log_kind`` label the record and are stripped BEFORE the
+    executor call so they never reach ``execute_prompt``.
     """
     from ..functions.imports import execute_prompt
     from ..functions.chat.streaming import _friendly_stream_error
+    run_id = _assist_log.new_run_id()
+    started = time.monotonic()
+
+    def _elapsed_ms():
+        return int((time.monotonic() - started) * 1000)
+
     try:
         result = _await_sync(execute_prompt(
             model_key=model_key,
@@ -1459,35 +1707,61 @@ def _assist_execute(model_key, messages, max_new_tokens, **extra):
             **extra,
         ))
     except (KeyError, ValueError, TypeError, FileNotFoundError) as exc:
+        _log_assist(run_id=run_id, mode=_log_mode, kind=_log_kind,
+                    model_requested=model_key,
+                    outcome=_assist_log.OUTCOME_RESOLVE_ERROR,
+                    error=str(exc).strip("'\""), elapsed_ms=_elapsed_ms())
         return None, ({"error": str(exc).strip("'\""),
-                       "model_requested": model_key}, 400)
+                       "model_requested": model_key, "run_id": run_id}, 400)
     except Exception as exc:
         logger.exception("prompt/assist failed")
+        _log_assist(run_id=run_id, mode=_log_mode, kind=_log_kind,
+                    model_requested=model_key,
+                    outcome=_assist_log.OUTCOME_WORKER_ERROR,
+                    error=_friendly_stream_error(exc), elapsed_ms=_elapsed_ms())
         return None, ({"error": _friendly_stream_error(exc),
-                       "model_requested": model_key}, 502)
+                       "model_requested": model_key, "run_id": run_id}, 502)
 
     ok = result.get("ok", True) if isinstance(result, dict) else getattr(result, "ok", True)
     raw = _prompt_assist_result_text(result).strip()
     resolved = _assist_resolved_model(result)
     if not ok or not raw:
         err = result.get("error") if isinstance(result, dict) else getattr(result, "error", None)
-        return None, ({"error": err or "assist produced no text",
+        err = err or "assist produced no text"
+        _log_assist(run_id=run_id, mode=_log_mode, kind=_log_kind,
+                    model_requested=model_key, model_resolved=resolved, raw=raw,
+                    outcome=_assist_log.classify_execute_error(502, err),
+                    error=err, elapsed_ms=_elapsed_ms())
+        return None, ({"error": err,
                        "model_requested": model_key,
-                       "model_resolved": resolved}, 502)
+                       "model_resolved": resolved, "run_id": run_id}, 502)
 
-    text, reasoning = no_think(raw)                # NO-THINK half 2
+    text, reasoning, from_reasoning = _studio_no_think(raw)   # NO-THINK half 2
     if not text:
+        err = ("the assistant returned nothing — neither output nor "
+               f"reasoning came back from {model_key!r}; retry, or choose "
+               "a different text generator")
+        _log_assist(run_id=run_id, mode=_log_mode, kind=_log_kind,
+                    model_requested=model_key, model_resolved=resolved, raw=raw,
+                    reasoning=reasoning, from_reasoning=from_reasoning,
+                    outcome=_assist_log.OUTCOME_EMPTY, error=err,
+                    elapsed_ms=_elapsed_ms())
         return None, ({
-            "error": ("the assistant returned only reasoning and no output — "
-                      f"{model_key!r} appears to have ignored the no-think directive; "
-                      "retry, or choose a different text generator"),
+            "error": err,
             "model": model_key,
             "model_requested": model_key,
             "model_resolved": resolved,
             "reasoning": reasoning,
+            "run_id": run_id,
         }, 502)
+    # SUCCESS — provisional. The mode handler emits the terminal record (served
+    # or parse_error) under this run_id, with the raw reply already captured.
     return {"text": text, "reasoning": reasoning, "raw": raw,
-            "model_resolved": resolved}, None
+            "from_reasoning": from_reasoning,
+            "model_resolved": resolved,
+            "run_id": run_id, "elapsed_ms": _elapsed_ms(),
+            "model_requested": model_key,
+            "log_mode": _log_mode, "log_kind": _log_kind}, None
 
 
 def _assist_spread(body):
@@ -1509,17 +1783,32 @@ def _assist_spread(body):
                  min(_SPREAD_TOKENS_MAX, n * _SPREAD_TOKENS_PER_SEGMENT))
 
     payload, err = _assist_execute(
-        model_key, prompt_spread.build_spread_messages(req), budget)
+        model_key, prompt_spread.build_spread_messages(req), budget,
+        _log_mode="spread")
     if err is not None:
         body_out, status = err
         return jsonify(body_out), status
 
     try:
-        parsed = prompt_spread.parse_spread_reply(payload["text"], req.target_ids)
+        # Pass the whole req (not just target_ids): the parser assembles each
+        # result row's operation/negative/directions from the structure the
+        # backend already holds, so the model only has to supply the prose.
+        parsed = prompt_spread.parse_spread_reply(payload["text"], req)
     except prompt_spread.SpreadParseError as exc:
         # HONEST 502 (spec §1e/§1f). The raw, think-stripped reply rides along so
         # the failure is diagnosable — an invented segment here would be worse
         # than no segment, because it would silently become the user's movie.
+        # TERMINAL LOG RECORD: this is the "did not return the JSON object the
+        # spread contract requires" case — capture the FULL raw reply so the
+        # operator can read exactly what the model sent.
+        _log_assist(run_id=payload["run_id"], mode="spread",
+                    model_requested=model_key,
+                    model_resolved=payload["model_resolved"],
+                    raw=payload["raw"], text=payload["text"],
+                    reasoning=payload["reasoning"],
+                    from_reasoning=payload["from_reasoning"],
+                    outcome=_assist_log.OUTCOME_PARSE_ERROR, error=str(exc),
+                    elapsed_ms=payload.get("elapsed_ms"))
         return jsonify({
             "error": str(exc),
             "model": model_key,
@@ -1529,6 +1818,13 @@ def _assist_spread(body):
             "reasoning": payload["reasoning"],
         }), 502
 
+    _log_assist(run_id=payload["run_id"], mode="spread",
+                model_requested=model_key,
+                model_resolved=payload["model_resolved"], raw=payload["raw"],
+                text=payload["text"], reasoning=payload["reasoning"],
+                from_reasoning=payload["from_reasoning"],
+                outcome=_assist_log.OUTCOME_SERVED,
+                elapsed_ms=payload.get("elapsed_ms"))
     return jsonify({
         "mode": "spread",
         "segments": parsed["segments"],
@@ -1582,11 +1878,21 @@ def _assist_negative(body):
     messages = prompt_spread.build_negative_messages(
         (draft or "").strip(), typed_ctx, hint=(hint or "").strip(),
         subject=subject.strip())
-    payload, err = _assist_execute(model_key, messages, _NEGATIVE_MAX_TOKENS)
+    payload, err = _assist_execute(model_key, messages, _NEGATIVE_MAX_TOKENS,
+                                   _log_mode="negative")
     if err is not None:
         body_out, status = err
         return jsonify(body_out), status
 
+    # A negative exclusion list needs no further parse — a non-empty reply IS the
+    # result, so the attempt is served the moment _assist_execute returned it.
+    _log_assist(run_id=payload["run_id"], mode="negative",
+                model_requested=model_key,
+                model_resolved=payload["model_resolved"], raw=payload["raw"],
+                text=payload["text"], reasoning=payload["reasoning"],
+                from_reasoning=payload["from_reasoning"],
+                outcome=_assist_log.OUTCOME_SERVED,
+                elapsed_ms=payload.get("elapsed_ms"))
     # ``prompt`` carries the text for every assist mode (no existing key moves);
     # ``negative`` is the same string under the name this mode's caller wants.
     return jsonify({
@@ -2112,6 +2418,14 @@ def video_prompt_assist_models():
 #     run physically executes (e.g. "ae · cuda:0 · P-studio"). Read-only; never
 #     5xxes (a bus/placement hiccup degrades to fewer rows / no placement).
 #
+#     Each row also carries what the Active panel needs to be INFORMATIVE (k57):
+#     `progress_ratio` (0..1, null when unmeasurable) + `progress_detail`
+#     (segment i/N, step i/N, fraction), a `stage_log` TAIL (+ `stage_log_total`;
+#     terminal rows keep the full timeline), the verbatim `failure` envelope
+#     (code/message/stage/retryable), and `progressed_at`. Rows abandoned by a dead
+#     process (no movement for HUGPY_MEDIA_BUS_STALE_SECONDS, default 6h) are
+#     hidden; ?stale=1 shows them, flagged `stale` + `stale_for_s`.
+#
 #     NOTE: this bare-path route MUST be registered on the blueprint so it wins
 #     over the SPA catch-all (`@app.route("/<path:asset>")`): Werkzeug ranks a
 #     static rule above a <path:> converter regardless of registration order, so
@@ -2120,25 +2434,39 @@ def video_prompt_assist_models():
 # --------------------------------------------------------------------------- #
 @video_bp.route("/video/jobs", methods=["GET"])
 def video_jobs_list():
-    include_terminal = (request.args.get("all") or "").strip().lower() in (
-        "1", "true", "yes", "on")
+    def _flag(name):
+        return (request.args.get(name) or "").strip().lower() in (
+            "1", "true", "yes", "on")
+
+    include_terminal = _flag("all")
+    include_stale = _flag("stale")
     try:
         limit = int(request.args.get("limit", 50))
     except (TypeError, ValueError):
         limit = 50
     jobs = []
     try:
-        rows = media_bus.list_jobs(include_terminal=include_terminal, limit=limit)
+        rows = media_bus.list_jobs(include_terminal=include_terminal, limit=limit,
+                                   include_stale=include_stale)
     except Exception:  # noqa: BLE001 — the listing never 5xxes
         logger.debug("video jobs listing failed", exc_info=True)
         rows = []
+    # ONE placement snapshot for the whole page (k57). The per-row job_placement
+    # this replaces consulted the reservation store per row — and that read took a
+    # WRITE lock (its lapsed-lease sweep) on a store live renderers heartbeat into,
+    # plus a fresh measured.json read per row. With renders in flight the listing
+    # serialized behind those locks and hung past 60s, starving the Active panel of
+    # the feed that carries its logs, progress and errors.
+    try:
+        snapshot = PlacementSnapshot()
+    except Exception:  # noqa: BLE001 — placement is observability, never a 5xx
+        logger.debug("placement snapshot failed", exc_info=True)
+        snapshot = None
     for row in rows:
-        try:
-            pl = job_placement(row.get("job_id"), row.get("name"))
+        if snapshot is not None:
+            pl = snapshot.placement_for(row.get("job_id"), row.get("name"))
             if pl:
                 row["placement"] = pl
-        except Exception:  # noqa: BLE001 — placement is best-effort per row
-            pass
         jobs.append(row)
     return jsonify({"jobs": jobs}), 200
 
@@ -2234,6 +2562,15 @@ def video_studio_clips():
         limit = 50
     limit = max(1, min(limit, 200))
 
+    # Guarantee the schema (progress_json / archived_at / stage_log_json columns)
+    # exists before the read-only SELECT below — a RO connection cannot ALTER, so on
+    # a fresh process that has not yet run a write path the column would be missing
+    # and the whole SELECT would raise (empty list). _ensure_db is idempotent + cheap.
+    try:
+        media_bus._ensure_db()
+    except Exception:  # noqa: BLE001 — never let migration break the listing
+        pass
+
     clips = []
     try:
         conn = sqlite3.connect(
@@ -2241,7 +2578,8 @@ def video_studio_clips():
         conn.execute("PRAGMA busy_timeout=5000")
         try:
             rows = conn.execute(
-                "SELECT job_id, status, result_json, created, updated, progress_json "
+                "SELECT job_id, status, result_json, created, updated, progress_json, "
+                "stage_log_json "
                 "FROM media_jobs WHERE name='studio_i2v' AND archived_at IS NULL "
                 "ORDER BY updated DESC LIMIT ?",
                 (limit,),
@@ -2254,8 +2592,18 @@ def video_studio_clips():
         # honest answer, same posture as before this feature.
         rows = []
 
-    for job_id, status, result_json, created, updated, progress_json in rows:
+    # One snapshot for the page, not one reservation-store round trip per clip —
+    # same k57 fix as GET /video/jobs (a per-row placement read took a write lock
+    # renderers contend for; a 200-clip page paid for it 200 times).
+    try:
+        snapshot = PlacementSnapshot()
+    except Exception:  # noqa: BLE001 — placement never breaks the clips listing
+        logger.debug("placement snapshot failed", exc_info=True)
+        snapshot = None
+
+    for job_id, status, result_json, created, updated, progress_json, stage_log_json in rows:
         out = None
+        res = None
         if result_json:
             try:
                 res = _json.loads(result_json)
@@ -2287,6 +2635,11 @@ def video_studio_clips():
                 progress = _json.loads(progress_json)
             except (ValueError, TypeError):
                 progress = None
+        # STAGE TIMELINE + terminal FAILURE summary + stall basis (the exhaustive
+        # per-process telemetry). RETAINED through terminal, so a failed/cancelled
+        # row still carries its full timeline + the exact failing stage/code/message.
+        # Additive — every existing key above is untouched.
+        stage_log = media_bus._load_stage_log(stage_log_json)
         clip = {
             "job_id": job_id,
             "status": status,
@@ -2295,13 +2648,15 @@ def video_studio_clips():
             "updated": updated,
             "output": out,
             "progress": progress,
+            "stage_log": stage_log,
+            "failure": media_bus.build_failure_summary(res, stage_log),
+            "last_movement_ts": media_bus._last_movement_ts(stage_log, updated),
+            "current_stage": media_bus._current_stage(stage_log),
         }
-        try:
-            pl = job_placement(job_id, "studio_i2v")
+        if snapshot is not None:
+            pl = snapshot.placement_for(job_id, "studio_i2v")
             if pl:
                 clip["placement"] = pl
-        except Exception:  # noqa: BLE001 — placement is best-effort per clip
-            pass
         clips.append(clip)
 
     return jsonify({"clips": clips}), 200
@@ -2381,6 +2736,12 @@ def video_studio_clip_detail(job_id):
 
     # Read the bus row read-only (mirrors /video/studio/clips) — spec_json carries the
     # REQUESTED params, result_json the outcome. Unknown id -> 404 (nothing to detail).
+    # Ensure the schema (stage_log_json) before the RO read (see /video/studio/clips).
+    try:
+        media_bus._ensure_db()
+    except Exception:  # noqa: BLE001
+        pass
+
     row = None
     try:
         conn = sqlite3.connect(
@@ -2388,8 +2749,8 @@ def video_studio_clip_detail(job_id):
         conn.execute("PRAGMA busy_timeout=5000")
         try:
             row = conn.execute(
-                "SELECT status, spec_json, result_json, created, updated FROM media_jobs "
-                "WHERE job_id=? AND name='studio_i2v'",
+                "SELECT status, spec_json, result_json, created, updated, stage_log_json "
+                "FROM media_jobs WHERE job_id=? AND name='studio_i2v'",
                 (job_id,),
             ).fetchone()
         finally:
@@ -2398,7 +2759,8 @@ def video_studio_clip_detail(job_id):
         row = None
     if row is None:
         return jsonify({"error": "no studio job for that id"}), 404
-    status, spec_json, result_json, created, updated = row
+    status, spec_json, result_json, created, updated, stage_log_json = row
+    stage_log = media_bus._load_stage_log(stage_log_json)
 
     # Curated view of the REQUESTED spec (drop out_root — an internal path). Everything
     # else is a creation parameter worth showing.
@@ -2444,10 +2806,14 @@ def video_studio_clip_detail(job_id):
         else:
             err = result.get("error") or {}
             if isinstance(err, dict):
+                # `stage` = the recorded failing stage (where it broke), from the
+                # retained timeline — the whole point of the exhaustive view.
+                _fail = media_bus.build_failure_summary(result, stage_log)
                 error_view = {
                     "code": err.get("code"),
                     "message": err.get("message"),
                     "retryable": bool(err.get("retryable", False)),
+                    "stage": _fail.get("stage") if _fail else None,
                 }
 
     # SOURCE discriminator (coordinator addendum): which record the render params come
@@ -2469,6 +2835,12 @@ def video_studio_clip_detail(job_id):
         "spec": spec_view,
         "manifest": manifest_view,
         "error": error_view,
+        # STAGE TIMELINE (retained through terminal) — the full sequence this render
+        # moved through, so a failed/cancelled row in the Library is inspectable with
+        # exactly what it did + where it stopped. Additive.
+        "stage_log": stage_log,
+        "current_stage": media_bus._current_stage(stage_log),
+        "last_movement_ts": media_bus._last_movement_ts(stage_log, updated),
         # Bus row timestamps (epoch seconds) — when the job was enqueued / last updated.
         # Present in every case (the row always carries them); the UI shows them on a
         # failed/cancelled row alongside the requested params + error.

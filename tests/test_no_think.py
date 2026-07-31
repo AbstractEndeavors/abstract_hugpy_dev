@@ -23,11 +23,57 @@ import sys
 
 from abstract_hugpy_dev.utils.no_think import (
     NO_THINK_DIRECTIVE,
+    StreamingThinkSplitter,
     apply_no_think,
     finalize_no_think,
     strip_think,
     with_no_think,
 )
+
+
+def _drive_splitter(tokens):
+    """Feed tokens one at a time; return the accumulated (answer, reasoning)."""
+    sp = StreamingThinkSplitter()
+    a = r = ""
+    for t in tokens:
+        da, dr = sp.feed(t)
+        a += da
+        r += dr
+    fa, fr = sp.flush()
+    return a + fa, r + fr
+
+
+def test_splitter_separates_think_from_answer():
+    assert _drive_splitter(["<think>reasoning</think>The answer."]) == (
+        "The answer.", "reasoning")
+
+
+def test_splitter_handles_a_tag_split_across_tokens():
+    # the whole point of the streaming splitter: '<thi'+'nk>' must never leak
+    assert _drive_splitter(["<thi", "nk>rea", "soning</thi", "nk>ans", "wer"]) == (
+        "answer", "reasoning")
+
+
+def test_splitter_char_by_char_stream():
+    assert _drive_splitter(list("<think>ab</think>cd")) == ("cd", "ab")
+
+
+def test_splitter_unclosed_think_drains_as_reasoning_never_answer():
+    assert _drive_splitter(["<think>ran out of budget mid-thou"]) == (
+        "", "ran out of budget mid-thou")
+
+
+def test_splitter_plain_answer_has_no_reasoning():
+    assert _drive_splitter(["just a plain answer"]) == ("just a plain answer", "")
+
+
+def test_splitter_a_literal_lt_is_not_a_tag():
+    assert _drive_splitter(["2 < 3 is true"]) == ("2 < 3 is true", "")
+
+
+def test_splitter_thinking_variant_and_surrounding_answer():
+    assert _drive_splitter(["pre <thinking>mid</thinking> post"]) == (
+        "pre  post", "mid")
 
 
 # --------------------------------------------------------------------------- #
@@ -76,6 +122,16 @@ def test_strip_empty_and_case_insensitive():
     assert strip_think("") == ("", "")
     assert strip_think(None) == ("", "")
     assert strip_think("<THINK>x</THINK>y") == ("y", "x")
+
+
+def test_strip_an_empty_pre_opened_think_block_still_removes_the_tags():
+    # A Qwen3-style template pre-opens an empty <think></think> when thinking is
+    # disabled: no reasoning to surface, but the tags must NOT be left in the
+    # answer (this leaked into /v1 content until the condition was fixed to
+    # rewrite whenever the answer changed, not only when reasoning was present).
+    answer, reasoning = strip_think("<think>\n</think>\n\n blue")
+    assert answer == "blue"
+    assert reasoning == ""
 
 
 # --------------------------------------------------------------------------- #
@@ -219,6 +275,63 @@ def test_video_routes_uses_the_shared_seam():
         "abstract_hugpy_dev.flask_app.app.routes.video_routes")
     assert vr.no_think is strip_think
     assert vr._with_no_think is with_no_think
+
+
+# --------------------------------------------------------------------------- #
+# STUDIO GENERATE reads a reasoning-only reply as content, not a failure
+# (operator 2026-07-31: "no_think isn't a request. it's a function that strips
+# the <think>…</think> and returns the think as a dict var"). A reasoning model
+# that keeps its whole answer inside <think> — the wazimondo~Qwen3.6-35B case —
+# was hard-erroring "returned only reasoning and no output"; studio generate now
+# salvages that reasoning as the prompt. Kept LOCAL: the shared finalize_no_think
+# stays strict for the judge/gate callers.
+# --------------------------------------------------------------------------- #
+def _snt():
+    import importlib
+    return importlib.import_module(
+        "abstract_hugpy_dev.flask_app.app.routes.video_routes")._studio_no_think
+
+
+def test_studio_salvages_reasoning_only_reply_as_the_prompt():
+    text, reasoning, from_reasoning = _snt()(
+        "<think>a sleek red sports car, rain-slicked street, neon reflections</think>")
+    assert text == "a sleek red sports car, rain-slicked street, neon reflections"
+    assert reasoning == text
+    assert from_reasoning is True
+
+
+def test_studio_salvages_an_unclosed_reasoning_ramble():
+    # budget ran out mid-thought — no closing tag; still salvageable, not a block
+    text, _r, from_reasoning = _snt()("<think>a red car at night, wet asphalt")
+    assert text == "a red car at night, wet asphalt"
+    assert from_reasoning is True
+
+
+def test_studio_prefers_prose_over_reasoning_when_both_present():
+    text, reasoning, from_reasoning = _snt()(
+        "<think>deliberating</think>a red car on a wet street")
+    assert text == "a red car on a wet street"
+    assert reasoning == "deliberating"
+    assert from_reasoning is False
+
+
+def test_studio_plain_prose_is_unchanged():
+    assert _snt()("a red car") == ("a red car", "", False)
+
+
+def test_studio_genuinely_empty_stays_empty():
+    # neither prose nor reasoning -> the caller still raises an honest error
+    assert _snt()("") == ("", "", False)
+
+
+def test_shared_finalize_stays_strict_for_judge_gate_callers():
+    # The salvage is studio-LOCAL. finalize_no_think (discord DEFER gate, movie
+    # keyframe verdict) must still treat reasoning-only as a failure, or a
+    # verdict regex could match inside the monologue and invert the decision.
+    out = finalize_no_think({"ok": True, "text": "<think>the answer is yes</think>"})
+    assert out["ok"] is False
+    assert out["text"] == ""
+    assert out["reasoning"] == "the answer is yes"
 
 
 if __name__ == "__main__":

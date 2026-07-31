@@ -87,6 +87,28 @@ except Exception as exc:  # never let placement config break resolution
 
 
 # ---------------------------------------------------------------------------
+# Unclassified / adapter rows — refuse by NAME, never by assumption (k61).
+#
+# A null task used to default to text-generation, so an image LoRA was routed as
+# a chat model and refused with "supported: ['text-generation']" — a message that
+# named neither the cause nor a fix, and sent the operator hunting for seven
+# attempts. Null now means UNCLASSIFIED, and unclassified refuses here, at the one
+# resolution authority every request passes through, quoting the remedy.
+# ---------------------------------------------------------------------------
+def _refuse_if_unclassified(model_key, cfg) -> None:
+    from ...imports.src.model_classifier import (
+        ADAPTER_TASK, NEEDS_CLASSIFICATION_TASK, adapter_refusal,
+        needs_classification_refusal,
+    )
+    tasks = list(getattr(cfg, "tasks", None) or [])
+    if not tasks or tasks == [NEEDS_CLASSIFICATION_TASK]:
+        raise ValueError(needs_classification_refusal(model_key))
+    if tasks == [ADAPTER_TASK]:
+        raise ValueError(adapter_refusal(
+            model_key, base_model=getattr(cfg, "base_model", None)))
+
+
+# ---------------------------------------------------------------------------
 # resolve_model_key — picks the model. Default-resolution chain only.
 # Does NOT pick task; that's resolve()'s job.
 # ---------------------------------------------------------------------------
@@ -118,6 +140,7 @@ def resolve_model_key(
                 f"Unknown model_key={requested!r}; "
                 f"known: {sorted(MODEL_REGISTRY.keys())}"
             )
+        _refuse_if_unclassified(model_key, MODEL_REGISTRY[model_key])
         if task is not None and task not in MODEL_REGISTRY[model_key].tasks:
             raise ValueError(
                 f"Model {model_key!r} does not support task={task!r}; "
@@ -252,6 +275,10 @@ def resolve(prompt_kwargs: Dict[str, Any]) -> Resolution:
     # sees the current model set before the runner is built/loaded.
     from ...imports.config.models.models_default import refresh_task_registries
     refresh_task_registries()
+
+    # An unclassified/adapter row never becomes a task by falling through to
+    # cfg.primary_task — it refuses here with the remedy named (k61).
+    _refuse_if_unclassified(model_key, cfg)
 
     task = requested_task or cfg.primary_task
     if isinstance(task, (list, tuple)):       # primary_task must be scalar

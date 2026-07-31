@@ -79,6 +79,90 @@ _LOAD_BACKOFF_BASE_S = float(os.environ.get("SLOT_LOAD_BACKOFF_BASE_S", "30"))
 _LOAD_BACKOFF_MAX_S = float(os.environ.get("SLOT_LOAD_BACKOFF_MAX_S", "600"))
 
 
+# ── Child IDENTITY verification (k53, 2026-07-31) ──────────────────────────
+# The slot proxy forwards to whatever answers on SLOT_CHILD_PORT and labels the
+# answer with the model the CALLER asked for. That is only true while the
+# process on that port is the child we spawned. Observed: a Qwen2.5-3B process
+# took over the port and coder-next requests were answered by it — a silent
+# MODEL SUBSTITUTION, correct-looking at every layer above, invisible in every
+# log. So before proxying we ask the process what it is serving and compare it
+# to what we launched; a mismatch drops the stale mapping so the next request
+# cold-loads properly instead of being quietly answered by a stranger.
+#
+# Cheap by construction: one local HTTP GET, cached per (pid, path) for
+# _IDENTITY_RECHECK_S, skipped entirely while the child is mid-generation (a
+# busy python child can't answer a probe, and a request in flight is already
+# proof the port answers).
+_IDENTITY_RECHECK_S = float(os.environ.get("SLOT_IDENTITY_RECHECK_S", "30"))
+
+
+def _model_path_of(argv):
+    """The model file an argv launches with (``-m`` / ``--model``), or None.
+    Both child kinds are covered: the native llama-server takes ``-m``, the
+    llama_cpp.server fallback ``--model``. ``--model`` is read FIRST because the
+    python child's argv also carries a ``-m`` — python's own module flag
+    (``python -m llama_cpp.server``), which is not a model file at all."""
+    argv = argv or []
+    for i, arg in enumerate(argv):
+        if arg == "--model" and i + 1 < len(argv):
+            return argv[i + 1]
+    for i, arg in enumerate(argv):
+        if arg == "-m" and i + 1 < len(argv):
+            val = argv[i + 1]
+            if os.sep in val or val.lower().endswith(".gguf"):
+                return val
+    return None
+
+
+def _reported_model_id(doc):
+    """The model identifier out of a llama-server ``/props`` or an OpenAI
+    ``/v1/models`` document — the child's own statement of what it loaded.
+    None when the document says nothing identifiable (never guess)."""
+    if not isinstance(doc, dict):
+        return None
+    for key in ("model_path", "model"):
+        val = doc.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    gen = doc.get("default_generation_settings")
+    if isinstance(gen, dict):
+        for key in ("model_path", "model"):
+            val = gen.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+    data = doc.get("data")
+    if isinstance(data, list) and data and isinstance(data[0], dict):
+        for key in ("id", "root"):
+            val = data[0].get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+    return None
+
+
+def _identity_matches(expected_path, model_key, reported) -> bool:
+    """Whether ``reported`` (what the process on the port says it serves) is the
+    model we launched. Deliberately LENIENT — the identifier may be an absolute
+    path (native llama-server), a bare filename, or an alias (llama_cpp.server),
+    and an unreadable/absent identifier is "can't tell", which must never be
+    read as a mismatch. Only a POSITIVE, clearly-different name is a mismatch:
+    that is the one case worth tearing a live seat down for."""
+    rep = str(reported or "").strip().lower()
+    if not rep:
+        return True                              # said nothing -> can't tell
+    rep_base = os.path.basename(rep)
+    for candidate in (expected_path, model_key):
+        cand = str(candidate or "").strip().lower()
+        if not cand:
+            continue
+        cand_base = os.path.basename(cand)
+        if not cand_base:
+            continue
+        if (cand_base == rep_base or cand_base in rep or rep_base in cand
+                or os.path.splitext(cand_base)[0] in rep):
+            return True
+    return False
+
+
 def _allowed_cpus():
     """Cores this slot's cgroup is confined to via systemd AllowedCPUs (kernel-
     enforced, un-escapable), or None when unconfined. Read-only; no root needed."""
@@ -338,6 +422,139 @@ def _effective_ngl(requested, auto):
     return auto if _ngl_is_unset(requested) else int(requested)
 
 
+class GpuOnlyInfeasible(RuntimeError):
+    """gpu-only was selected for a MoE whose FULL footprint does not fit the
+    card. The mode's contract is all-or-bust, so this is a refusal, never a
+    quiet expert split — see :func:`_strict_gpu_only`."""
+
+
+def _strict_gpu_only(n_gpu_layers) -> bool:
+    """Is THIS load the k37 ``gpu-only`` mode — ALL tensors on the card,
+    experts included, bust if they don't fit (operator ruling 2026-07-31:
+    "gpu-only must be honest to its name")?
+
+    Two spellings reach the slot and both are the SAME operator statement:
+      * ``HUGPY_ALLOC_MODE=gpu-only`` — the mode named outright;
+      * an EXPLICIT ``n_gpu_layers=-1`` — gpu-only's frozen wire encoding
+        (``alloc_modes.mode_to_spill``: gpu-only -> ``{"n_gpu_layers": -1}``),
+        which is exactly what ``derive_alloc_mode`` reads back as gpu-only.
+
+    A DEFAULTED -1 (:class:`_NglDefaulted` — the ServeSpec fill-in nobody
+    asked for) is NOT a statement: it stays the blank max-gpu default and keeps
+    the dense-first split. That distinction is the whole reason the provenance
+    marker exists.
+
+    ⚠ THIS NARROWS k53 (da2b5d9), deliberately and by ruling. That slice read a
+    stored ``{"n_gpu_layers": -1}`` as a max-GPU PREFERENCE so it could not
+    disable the split — because the alternative it produced was the 17/48 LAYER
+    hybrid (31 layers of dense attention on the CPU), which is never right. The
+    ruling does not restore that hybrid: a gpu-only MoE that fits launches
+    WHOLE, and one that doesn't is REFUSED with max-gpu named as the remedy. So
+    dense-on-CPU is still impossible; what changes is that "only" stops
+    silently meaning "mostly"."""
+    from ..spill import alloc_mode_env
+    if alloc_mode_env() == "gpu-only":
+        return True
+    if _ngl_is_unset(n_gpu_layers):
+        return False
+    try:
+        return int(n_gpu_layers) == -1
+    except (TypeError, ValueError):
+        return False
+
+
+def _gpu_only_moe_plan(model_key, moe, budget, why):
+    """The gpu-only placement for a detected MoE: the WHOLE model on the card,
+    or an honest refusal. Never a silent expert split (operator ruling
+    2026-07-31 — the split is max-gpu's contract, not this one's).
+
+    ``budget`` is :func:`_moe_gpu_budget`'s verdict — ``None`` (unmeasurable
+    card), ``0`` (no GPU to spend), or budgetable VRAM. Returns a plan shaped
+    like :func:`spill.moe_dense_first_plan`'s (``n_cpu_moe`` 0, stated
+    explicitly so an inherited ``LLAMA_ARG_N_CPU_MOE`` cannot flip it), or
+    raises :class:`GpuOnlyInfeasible`."""
+    from ..spill import moe_dense_first_plan
+    if budget is None:
+        # UNMEASURABLE CARD. We cannot prove it doesn't fit, and a refusal
+        # invented from missing data is what degrade-not-guess forbids
+        # everywhere else. So obey the mode literally — everything on the card,
+        # stated — and let llama.cpp bust honestly if the card turns out too
+        # small. That bust IS gpu-only's contract, which is why the blank
+        # default's all-experts-to-CPU degrade would be the wrong answer here:
+        # it would serve a split nobody asked for under the name "only".
+        return {"n_cpu_moe": 0, "cpu_bytes": 0, "dense_fits": True}
+    plan = moe_dense_first_plan(moe, budget) if budget else None
+    if plan is not None and int(plan.get("n_cpu_moe") or 0) == 0:
+        return plan                          # everything fits: n_cpu_moe 0
+    weights = (int(moe.get("non_expert_bytes") or 0)
+               + int(moe.get("expert_bytes") or 0))
+    raise GpuOnlyInfeasible(
+        f"{model_key}: gpu-only needs the WHOLE model on the card "
+        f"(~{weights / 1e9:.1f} GB of weights, experts included) but this "
+        f"load's VRAM budget after the context/projector reserve is "
+        f"~{int(budget) / 1e9:.1f} GB ({why}) — gpu-only is all-or-bust by "
+        "contract, so it will NOT be quietly served as a partial expert split. "
+        "Select max-gpu for this model (as much GPU as fits, the rest spilled "
+        "to RAM), free the card, or pick a smaller quant.")
+
+
+def _moe_gpu_budget(path, n_gpu_layers, free_cap, extra_reserve_bytes):
+    """The VRAM budget THIS load may spend, as the active allocation mode
+    defines it — the input to the dense-backbone-first plan (k53).
+
+    Returns ``(bytes, why)``:
+      * ``0``    — there is nothing for a split to plan: the mode grants NO GPU
+        (ram-only / an explicit ``n_gpu_layers=0`` / a max-ram fill that holds
+        the whole model in RAM), or a caller stated an explicit POSITIVE layer
+        count, which is the k14/k7 override lever (seat at full offload, then
+        relaunch DOWN through layer counts) and stays obeyed verbatim. Either
+        way the placement is byte-identical to before.
+      * ``None`` — the budget is UNMEASURABLE (no VRAM reading on this box).
+        Never invent a placement on missing data; the caller degrades.
+      * a positive int — budgetable free VRAM, capped by the model's own
+        ``gpu_mem_gib`` contract when it has one, minus what already has to land
+        on the card beside the weights (mmproj projector + KV/context reserve).
+
+    Every mode that reaches a positive number (or an unmeasurable card) gets the
+    SAME treatment — dense backbone first, experts with the remainder (operator
+    ruling 2026-07-31). The mode decides HOW MUCH card the model may claim; it
+    never decides that the dense backbone goes second. An explicit ``-1`` is
+    deliberately NOT a per-layer instruction that disables the split; it is the
+    gpu-only wire, and gpu-only SPENDS this same budget — on the whole model or
+    not at all (:func:`_gpu_only_moe_plan`), never on a partial expert split."""
+    from ..spill import (alloc_mode_env, free_vram_bytes, maxram_gpu_layers)
+    mode = alloc_mode_env()
+    if n_gpu_layers not in (None, "") and not _ngl_is_unset(n_gpu_layers):
+        try:
+            demanded = int(n_gpu_layers)
+        except (TypeError, ValueError):
+            demanded = None
+        if demanded == 0:
+            return 0, "explicit n_gpu_layers=0 (ram-only / CPU-only)"
+        if demanded is not None and demanded > 0:
+            return 0, (f"explicit n_gpu_layers={demanded} — a stated layer "
+                       "count is obeyed verbatim (the k14/k7 offload lever)")
+    if mode == "max-ram":
+        # max-ram fills RAM first and only the OVERFLOW reaches the GPU. No
+        # overflow == no GPU budget; an overflow means the card IS in play, and
+        # what it should hold first is the dense backbone.
+        try:
+            if int(maxram_gpu_layers(path)) <= 0:
+                return 0, "max-ram holds the whole model in RAM"
+        except Exception:  # noqa: BLE001 — unpriceable fill: fall through
+            pass
+    budget = free_vram_bytes()
+    if free_cap is not None:
+        budget = min(budget, free_cap) if budget else free_cap
+    if not budget:
+        return None, "VRAM budget unmeasurable on this box"
+    budget -= int(extra_reserve_bytes or 0)
+    if budget <= 0:
+        return 0, "the context/projector reserve consumes the whole VRAM budget"
+    return int(budget), (f"{mode or 'max-gpu'} budget "
+                         f"{budget / 2 ** 30:.2f} GiB")
+
+
 def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None,
                path=None, gpu_mem_gib=None, cpu_mem_gib=None, profile_bin=None,
                n_cpu_moe=None):
@@ -347,14 +564,29 @@ def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None,
     number of MoE layers whose EXPERT tensors stay on CPU (999/
     spill.MOE_ALL_LAYERS = all), emitted as llama-server ``--n-cpu-moe``.
     Explicit (per-load opts / persisted override) always wins. Absent -> the
-    AUTO policy, which is now THE DEFAULT for every applicable GGUF: a detected
-    MoE whose expert tensors fit budgetable host RAM is served with
-    n_gpu_layers=-1 + --n-cpu-moe 999, whether or not the whole model would have
-    fit the card (measured strictly better on ae: +59% tok/s at 5x less VRAM —
-    so a fits-whole MoE pinned fully on the GPU was slower AND monopolised the
-    card). Experts that can't fit RAM -> degrade to the autofit layer placement.
-    Explicit n_gpu_layers (incl. an explicit -1 "Max GPU"), a k37 alloc_mode
-    (max-ram/explicit), and dense models -> byte-identical to today (no flag).
+    AUTO policy, DENSE BACKBONE FIRST (operator ruling 2026-07-31): a detected
+    MoE is served with n_gpu_layers=-1 and a --n-cpu-moe threshold computed so
+    the always-hot non-expert tensors take the GPU budget FIRST and the expert
+    FFN tensors get only the remainder — under every allocation mode that grants
+    any GPU budget. A budget that only covers the backbone lands on --n-cpu-moe
+    999 (the measured ae default: +59% tok/s at 5x less VRAM); a budget that
+    covers everything lands on 0. Modes
+    that grant no GPU at all (ram-only / explicit ngl=0 / a max-ram fill that
+    holds the whole model in RAM) plan no split, and dense models never see the
+    flag — both byte-identical to today. An expert share that can't fit RAM ->
+    degrade to the autofit layer placement.
+
+    ``gpu-only`` IS THE ONE EXCEPTION (operator ruling 2026-07-31, k55), and it
+    is an exception to the REMAINDER, not to the ordering: "only" means ALL
+    tensors on the card, experts included. The same budget is priced, but the
+    answer is binary — the whole model fits (``--n-cpu-moe 0``, stated
+    explicitly so an inherited ``LLAMA_ARG_N_CPU_MOE`` cannot flip it) or the
+    load is REFUSED with max-gpu named as the remedy (:class:`GpuOnlyInfeasible`
+    via :func:`_gpu_only_moe_plan`). It is never quietly served as a partial
+    split, which would be the mode redefining its own name. The gpu-only wire is
+    an EXPLICIT ``n_gpu_layers: -1`` (a DEFAULTED -1 is still the blank
+    max-gpu default and still splits).
+
     This function is THE choke point for every slot child spawn — /load, k14
     /relaunch, and direct slot loads all funnel through here — so the policy
     holds for all of them.
@@ -455,6 +687,14 @@ def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None,
     # spill.vram_ctx_reserve_bytes. Pure move of the line that was below; nothing
     # between here and the old position reads ctx.
     ctx = int(ctx) if ctx else (_ctx_for(cfg, model_key) if cfg is not None else 4096)
+    # The same context reserve autofit charges internally, made explicit here:
+    # the MoE dense-first plan (below) must price the KV cache against the card
+    # before it hands a single byte to the expert tensors.
+    try:
+        from ..spill import vram_ctx_reserve_bytes
+        _ctx_reserve = int(vram_ctx_reserve_bytes(path, ctx)[0])
+    except Exception:  # noqa: BLE001 — never block a load on a reserve probe
+        _ctx_reserve = 0
     if free_cap is not None:
         from ..spill import free_vram_bytes as _fvb
         fv = _fvb()
@@ -475,40 +715,60 @@ def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None,
     except Exception:  # noqa: BLE001 — never block a load on header metadata
         total_layers = None
 
-    # ── MoE expert split — THE DEFAULT for applicable GGUFs (2026-07-25) ────
+    # ── MoE expert split — DENSE BACKBONE FIRST (operator ruling 2026-07-31) ─
     # Decide the effective --n-cpu-moe BEFORE the engine branch so both child
     # kinds can degrade honestly. moe_mode: "explicit" (per-load opts/override —
-    # always wins), "auto" (detected-MoE, split applied: ngl=-1 + all experts on
-    # CPU), or None (dense / explicit layer designation / k37 mode engine active
-    # / experts don't fit RAM — byte-identical to the pre-MoE behaviour).
+    # always wins), "auto" (detected-MoE, the dense-first plan applied: ngl=-1 +
+    # a computed threshold), or None (dense model / no GPU budget / a stated
+    # layer count / experts don't fit RAM — byte-identical to before).
     #
-    # POLICY CHANGE (operator, 2026-07-25): "the default needs to be the MoE
-    # split for all GGUFs that it applies to". APPLIES-TO = detected MoE AND the
-    # expert tensors physically fit budgetable host RAM. The old policy only
-    # split in the HYBRID case (autofit wanted a partial layer split) and PINNED
-    # the experts onto the card whenever the whole model fit (moe_mode
-    # "pin-gpu"). The ae measurement retires that exception: the split is BOTH
-    # faster (+59% tok/s: 24.1 vs 15.2) AND ~5x cheaper in VRAM (3.2 vs 16.6
-    # GiB) on coder-next. Pinning a fits-whole MoE was therefore strictly worse
-    # on both axes AND monopolised a card that could have seated other models —
-    # the whole point of the fleet. defaults-are-promises: the default is now
-    # the measured success path, not the historical one.
+    # The 2026-07-25 policy made the split the DEFAULT (measured on ae's
+    # coder-next: +59% tok/s at 5x less VRAM vs the 17/48 layer hybrid), but the
+    # mode/ngl gates still decided WHETHER it happened at all. That is what
+    # stranded ae again: a stored {"n_gpu_layers": -1} — the ROUTINE stamp, 40 of
+    # 43 persisted allocations there carry exactly it, from the console's Max GPU
+    # button / bulk-allocate / reconcile — read as an explicit demand, DISABLED
+    # the split, and llama.cpp answered with the layer hybrid: 31 layers of dense
+    # attention on the CPU while expert weights sat on the card. Dense bytes are
+    # touched by EVERY token, expert bytes by ~10/512 of one, so that ordering is
+    # never right.
     #
-    # NOT changed (deliberate, each an operator DEMAND about placement):
-    #   * explicit n_cpu_moe (incl. an explicit 0 = "experts on GPU") — wins;
-    #   * explicit n_gpu_layers, INCLUDING an explicit -1 ("Max GPU" /
-    #     alloc_modes gpu-only / runners.get / chaos sweep). A DEFAULTED -1
-    #     (_NglDefaulted — a fill-in nobody asked for) is still unset and does
-    #     get the split;
-    #   * a k37 alloc_mode on the env wire. Only max-ram and explicit ever reach
-    #     the worker as HUGPY_ALLOC_MODE (mode_to_spill encodes gpu-only as
-    #     n_gpu_layers=-1, ram-only as "off", max-gpu as {}), so this gate reads
-    #     exactly as: max-ram/explicit -> no auto split (the operator is driving
-    #     the placement numbers themselves); max-gpu -> SPLIT (it wants
-    #     throughput and it is the blank default); gpu-only -> no split (it
-    #     demands GPU residency, and arrives as an explicit -1 anyway).
+    # The inversion is now impossible: for ANY MoE, EVERY mode that grants a GPU
+    # budget spends it on the dense backbone FIRST and gives the experts only the
+    # remainder (spill.moe_dense_first_plan computes the --n-cpu-moe threshold;
+    # _moe_gpu_budget says how much card the mode grants). A mode still decides
+    # HOW MUCH card the model may claim — it can no longer decide that the
+    # always-hot bytes go second.
+    #
+    #   budget == 0     ram-only / explicit ngl=0 / a max-ram fill that holds
+    #                   the whole model in RAM -> nothing to prioritize, no
+    #                   split (byte-identical to before).
+    #   budget unknown  no VRAM reading on this box -> the historical degrade:
+    #                   the blank default still splits all experts to CPU (the
+    #                   measured coder-next win); an EXPLICIT ngl/mode is obeyed
+    #                   verbatim, because inventing a placement from missing
+    #                   data is exactly what we refuse to do everywhere else.
+    #   budget > 0      dense first, experts fill the remainder. A full card
+    #                   yields n_cpu_moe=0 (everything on the GPU, stated
+    #                   explicitly so an inherited LLAMA_ARG_N_CPU_MOE cannot
+    #                   flip it); a small one yields a partial threshold; a card
+    #                   that only holds the backbone yields MOE_ALL_LAYERS.
+    #
+    # NOT changed (each an operator DEMAND about placement): an explicit
+    # n_cpu_moe (incl. an explicit 0 = "experts on GPU") wins absolutely, and
+    # dense models never see the flag at all.
+    #
+    # gpu-only IS THE EXCEPTION TO THE REMAINDER (operator ruling 2026-07-31,
+    # k55): "only" means every tensor on the card. Same budget, binary answer —
+    # fits whole -> --n-cpu-moe 0; doesn't -> GpuOnlyInfeasible naming max-gpu
+    # as the remedy. This narrows the paragraph above for exactly one mode: the
+    # stored -1 no longer produces the LAYER hybrid (that inversion stays
+    # impossible) but it no longer produces a silent expert split either — the
+    # mode that promises the whole card either delivers it or says so.
     eff_n_cpu_moe = None
     moe_mode = None
+    moe_cpu_bytes = None                     # expert bytes the plan sends to RAM
+    moe_budget_priced = False                # the plan spent a MEASURED budget
     moe_fallback_ngl = ngl                   # what we revert to if we must degrade
     if n_cpu_moe not in (None, ""):
         try:
@@ -518,75 +778,77 @@ def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None,
             eff_n_cpu_moe = None
     else:
         try:
-            from ..spill import gguf_moe_detail, alloc_mode_env, MOE_ALL_LAYERS
+            from ..spill import (gguf_moe_detail, MOE_ALL_LAYERS,
+                                 moe_dense_first_plan)
             moe = gguf_moe_detail(path)
-            # AUTO policy only when nothing explicit governs placement: no
-            # explicit n_gpu_layers request and no k37 mode engine in play.
-            # An explicit -1 ("Max GPU") normally WINS and suppresses the split.
-            # ONE exception (2026-07-25): when the model physically cannot fit
-            # the card, -1 is not a placement — it is a stall. Obeying it means
-            # launching --n-gpu-layers -1 with no --n-cpu-moe onto a card that
-            # is multiples too small, which is precisely what stranded ae for
-            # 5.5h (48.4 GB MoE, 24 GB 3090, 9 failed attempts, silent fallback).
-            #
-            # This matters because a bare {"n_gpu_layers": -1} is the ROUTINE
-            # stamp here: 40 of 43 persisted allocations on ae carry exactly
-            # that, applied by the console's Max GPU button / bulk-allocate /
-            # reconcile across comfy checkpoints, video models and LLMs alike.
-            # None are MoE today, so it is currently harmless — but one such
-            # stamp on a MoE model reproduces the incident.
-            #
-            # Deliberately NARROW. -1 still wins whenever it is ACHIEVABLE, so
-            # the dense fit-entirely case (measured 135 tok/s, vs 36 the moment
-            # one layer spills) is untouched. An operator who truly wants
-            # experts pinned to the card says n_cpu_moe=0 — unambiguous, unlike
-            # a bare -1 — and that still wins absolutely, above.
-            _forced_all_gpu = (n_gpu_layers == -1
-                               and not _ngl_is_unset(n_gpu_layers))
-            _impossible = False
-            if _forced_all_gpu and moe.get("is_moe"):
-                try:
-                    from ..spill import free_vram_bytes as _fvb
-                    _need = _total_gguf_bytes(path)
-                    _have = _fvb()
-                    _impossible = bool(_need and _have and _need > _have * 1.15)
-                except Exception:  # noqa: BLE001 — unmeasurable -> obey the -1
-                    _impossible = False
-                if _impossible:
-                    _log_moe_degrade_once(
-                        ("forced", model_key),
-                        f"slot {SLOT_ID}: {model_key} was requested "
-                        "n_gpu_layers=-1 but its weights cannot fit this card — "
-                        "applying the MoE expert split instead of stalling "
-                        "(pass n_cpu_moe=0 to pin experts on the GPU anyway)")
-
-            if (moe.get("is_moe") and alloc_mode_env() is None
-                    and (_ngl_is_unset(n_gpu_layers) or _impossible)):
-                # Viability, the ONE remaining condition: the expert tensors
-                # must fit budgetable host RAM. When they clearly don't, degrade
-                # to whatever autofit decided (layer-split hybrid, or full GPU
-                # when the model fits whole) — never refuse, and never move
-                # bytes into RAM that isn't there. Unmeasurable RAM -> proceed
-                # (degrade honestly: never block on missing data).
-                exp = int(moe.get("expert_bytes") or 0)
-                avail = _mem_available_bytes()
-                if avail:
-                    from ..spill import ram_reserve_bytes
-                    avail = max(0, avail - ram_reserve_bytes())
-                if exp and avail and exp > avail * 0.95:
-                    _log_moe_degrade_once(
-                        ("ram", model_key),
-                        f"slot {SLOT_ID}: {model_key} is MoE but its expert "
-                        f"tensors (~{exp / 1e9:.1f} GB) exceed budgetable RAM "
-                        f"(~{avail / 1e9:.1f} GB) — keeping the autofit layer "
-                        "placement instead of the MoE split")
+            if moe.get("is_moe"):
+                budget, why = _moe_gpu_budget(path, n_gpu_layers, free_cap,
+                                              _mmproj_reserve + _ctx_reserve)
+                plan = None
+                if _strict_gpu_only(n_gpu_layers):
+                    # gpu-only: the card takes EVERYTHING or the load is
+                    # refused (2026-07-31). No expert ever lands in RAM under
+                    # this mode, so there is no dense-first REMAINDER to
+                    # compute — only a yes/no against the same budget.
+                    plan = _gpu_only_moe_plan(model_key, moe, budget, why)
+                    moe_budget_priced = bool(budget)
+                elif budget:
+                    plan = moe_dense_first_plan(moe, budget)
+                    moe_budget_priced = True
+                elif budget is None:
+                    # Unmeasurable card: keep the measured default (backbone on
+                    # the GPU, ALL experts to CPU — +59% tok/s at 5x less VRAM
+                    # on ae's coder-next). It is the one placement that cannot
+                    # invert the ordering no matter what the card turns out to
+                    # hold, so it is also the honest degrade.
+                    plan = {"n_cpu_moe": MOE_ALL_LAYERS,
+                            "cpu_bytes": int(moe.get("expert_bytes") or 0)}
+                if plan is None:
+                    logger.info("slot %s: %s is MoE but no expert split is "
+                                "planned — %s", SLOT_ID, model_key, why)
                 else:
-                    ngl = -1
-                    eff_n_cpu_moe = MOE_ALL_LAYERS
-                    moe_mode = "auto"
+                    # Viability, the ONE remaining condition: the expert share
+                    # the plan sends to host RAM must actually fit budgetable
+                    # RAM. When it clearly doesn't, degrade to whatever autofit
+                    # decided — never refuse, and never move bytes into RAM that
+                    # isn't there. Unmeasurable RAM -> proceed (degrade
+                    # honestly: never block on missing data).
+                    need_ram = int(plan.get("cpu_bytes") or 0)
+                    avail = _mem_available_bytes()
+                    if avail:
+                        from ..spill import ram_reserve_bytes
+                        avail = max(0, avail - ram_reserve_bytes())
+                    if need_ram and avail and need_ram > avail * 0.95:
+                        _log_moe_degrade_once(
+                            ("ram", model_key),
+                            f"slot {SLOT_ID}: {model_key} is MoE but the expert "
+                            f"tensors this plan spills (~{need_ram / 1e9:.1f} GB) "
+                            f"exceed budgetable RAM (~{avail / 1e9:.1f} GB) — "
+                            "keeping the autofit layer placement instead")
+                    else:
+                        ngl = -1
+                        eff_n_cpu_moe = int(plan["n_cpu_moe"])
+                        moe_cpu_bytes = need_ram
+                        moe_mode = "auto"
+                        if not plan.get("dense_fits", True):
+                            _log_moe_degrade_once(
+                                ("dense", model_key),
+                                f"slot {SLOT_ID}: {model_key}'s dense backbone "
+                                f"(~{int(moe.get('non_expert_bytes') or 0) / 1e9:.1f} GB) "
+                                f"is larger than this load's VRAM budget — the "
+                                "backbone still goes first (llama.cpp spills "
+                                "what cannot fit), experts stay in RAM")
+        except GpuOnlyInfeasible:
+            # The ONE refusal this block may raise, and it must survive the
+            # catch-all below: "MoE policy never blocks a load" is about probes
+            # and pricing gaps, not about an operator mode whose whole contract
+            # is to bust rather than place bytes it was told not to place.
+            raise
         except Exception:  # noqa: BLE001 — MoE policy must never block a load
             eff_n_cpu_moe = None
             moe_mode = None
+            moe_cpu_bytes = None
+            moe_budget_priced = False
 
     # Preflight: when nothing can offload to GPU (auto<=0 — e.g. no GPU on this
     # node) the weights are CPU-RAM-resident, so a model bigger than free RAM will
@@ -600,13 +862,19 @@ def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None,
             ram_budget = float(cpu_mem_gib) * 1e9
             ngl_eff = ngl                      # the already-resolved effective ngl
             if eff_n_cpu_moe and moe_mode in ("auto", "explicit"):
-                # MoE split: the CPU-resident share is the expert tensors, not a
-                # layer fraction (ngl=-1 would otherwise read as 0 CPU bytes).
-                try:
-                    from ..spill import gguf_moe_detail
-                    need_cpu = int(gguf_moe_detail(path).get("expert_bytes") or 0)
-                except Exception:  # noqa: BLE001
-                    need_cpu = 0
+                # MoE split: the CPU-resident share is the expert tensors the
+                # split actually spills, not a layer fraction (ngl=-1 would
+                # otherwise read as 0 CPU bytes). The auto path already priced
+                # its own plan (dense-first, experts of the first N blocks);
+                # an explicit n_cpu_moe has no plan, so price the whole set.
+                if moe_cpu_bytes is not None:
+                    need_cpu = moe_cpu_bytes
+                else:
+                    try:
+                        from ..spill import gguf_moe_detail
+                        need_cpu = int(gguf_moe_detail(path).get("expert_bytes") or 0)
+                    except Exception:  # noqa: BLE001
+                        need_cpu = 0
             else:
                 need_cpu = cpu_resident_bytes(path, int(ngl_eff)) or 0
             if need_cpu > ram_budget:
@@ -682,7 +950,16 @@ def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None,
     # measurable — an unmeasurable card (no GPU visibility, no nvidia-smi,
     # etc.) must never block a load on missing data (degrade honestly, same
     # doctrine as every other best-effort probe in this module).
-    if ngl == -1 and not eff_n_cpu_moe:
+    # (d) the AUTO dense-first plan is exempt WHEN IT PRICED A REAL BUDGET: an
+    # ``n_cpu_moe`` of 0 from that plan is not "no split" — it is the plan
+    # STATING that the whole model fits the budget it just measured, so
+    # re-litigating it here would refuse a load the placement engine already
+    # sized. A gpu-only plan made against an UNMEASURABLE budget priced
+    # nothing, so it stays subject to this check: free VRAM being unreadable
+    # does not mean the card's TOTAL is, and "48 GB model onto a 24 GB card"
+    # is exactly the stall this preflight exists to catch.
+    if ngl == -1 and not eff_n_cpu_moe and not (moe_mode == "auto"
+                                                and moe_budget_priced):
         need_vram = _total_gguf_bytes(path)
         try:
             from ..spill import total_vram_bytes as _tvb, free_vram_bytes as _fvb
@@ -824,6 +1101,14 @@ class Slot:
     def __init__(self):
         self.model_key = None
         self.proc = None
+        # The model FILE this slot's child was launched with — the ground truth
+        # the child's own /props answer is verified against (see
+        # _identity_matches). None until a load resolves one.
+        self.model_path = None
+        # Identity-check cache: (pid, verdict, note, when). Bounded by
+        # _IDENTITY_RECHECK_S so a hot proxy path costs one local GET a minute,
+        # not one per request.
+        self._identity = {"pid": None, "ok": True, "note": None, "at": 0.0}
         self.ngl = None
         self.ctx = None
         self.threads = None
@@ -890,6 +1175,91 @@ class Slot:
         except Exception:
             return False
 
+    def _child_model_id(self):
+        """What the process on the child port SAYS it is serving, or None when
+        it says nothing identifiable. /props is the native llama-server's
+        answer; /v1/models is the llama_cpp.server child's."""
+        import httpx
+        for path in ("/props", "/v1/models"):
+            try:
+                resp = httpx.get(self.child_base + path, timeout=2.0)
+                if resp.status_code != 200:
+                    continue
+                got = _reported_model_id(resp.json())
+                if got:
+                    return got
+            except Exception:  # noqa: BLE001 — an unanswered probe is "can't tell"
+                continue
+        return None
+
+    def verify_identity(self, force: bool = False):
+        """Confirm the process on the child port is serving THIS slot's model.
+
+        Returns ``(ok, note)``. ``ok`` is True when the child's own statement
+        matches what we launched, when it says nothing identifiable (can't tell
+        — never tear down a seat on missing data), or when nothing is claimed at
+        all. On a genuine MISMATCH the stale mapping is DROPPED: the child (if
+        it is still ours) is killed and the claim cleared, so the next request
+        cold-loads the right model instead of being silently answered by a
+        stranger that took the port."""
+        if self.model_key is None:
+            return True, None
+        if not self._child_alive():
+            # Our process is gone; anything answering that port is not ours.
+            self._self_heal()
+            return (self.model_key is None), "child process is gone"
+        if self.inflight > 0:
+            # Mid-generation: the request in flight is itself proof the port
+            # answers, and a python child cannot answer a probe while it runs.
+            return self._identity["ok"], self._identity["note"]
+        pid = self.proc.pid
+        cached = self._identity
+        if (not force and cached["pid"] == pid
+                and (time.time() - cached["at"]) < _IDENTITY_RECHECK_S):
+            return cached["ok"], cached["note"]
+        reported = self._child_model_id()
+        ok = _identity_matches(self.model_path, self.model_key, reported)
+        note = None if ok else (
+            f"the process on port {SLOT_CHILD_PORT} reports {reported!r}, but "
+            f"this slot launched {self.model_key} from "
+            f"{self.model_path!r}")
+        self._identity = {"pid": pid, "ok": ok, "note": note, "at": time.time()}
+        if not ok:
+            logger.error(
+                "slot %s: MODEL SUBSTITUTION detected — %s. Dropping the stale "
+                "mapping; the next request will cold-load %s properly.",
+                SLOT_ID, note, self.model_key)
+            claimed = self.model_key
+            if self.lock.acquire(blocking=False):
+                try:
+                    self._kill()
+                    self._clear_claim()
+                    # _clear_claim resets the verdict (a cleared slot has
+                    # nothing to verify); keep THIS one, so /status can still
+                    # say WHY the seat vanished instead of just losing it.
+                    self._identity = {"pid": None, "ok": False, "note": note,
+                                      "at": time.time()}
+                finally:
+                    self.lock.release()
+            else:
+                # A load is in flight and owns the lock — its own failure path
+                # cleans up. Never race it; the note still travels back.
+                logger.warning("slot %s: identity mismatch on %s while a load "
+                               "holds the lock — leaving cleanup to it",
+                               SLOT_ID, claimed)
+        return ok, note
+
+    def _clear_claim(self):
+        """Forget the seated model (shared by unload, self-heal and the identity
+        drop) — every field that describes the occupant, in one place."""
+        self.model_key = self.ngl = self.ctx = None
+        self.threads = self.cpus = self.gpu = self.expected_bytes = None
+        self.total_layers = None
+        self.n_cpu_moe = None
+        self.profile_bin = None
+        self.model_path = None
+        self._identity = {"pid": None, "ok": True, "note": None, "at": 0.0}
+
     def _self_heal(self):
         """Clear a WEDGED claim: child dead but model_key still set.
 
@@ -908,11 +1278,7 @@ class Slot:
             if self.model_key is not None and not self._child_alive():
                 logger.warning("slot %s: child died while claiming %s — "
                                "clearing the stale claim", SLOT_ID, self.model_key)
-                self.model_key = self.ngl = self.ctx = None
-                self.threads = self.cpus = self.gpu = self.expected_bytes = None
-                self.total_layers = None
-                self.n_cpu_moe = None
-                self.profile_bin = None
+                self._clear_claim()
                 self.proc = None
         finally:
             self.lock.release()
@@ -920,6 +1286,10 @@ class Slot:
     def status(self) -> dict:
         from ..spill import free_vram_bytes
         self._self_heal()
+        # The scheduler routes on this dict, so it must not advertise a model a
+        # stranger on the port would answer for. Cached/skipped as described in
+        # verify_identity — a status poll costs at most one local GET a minute.
+        self.verify_identity()
         out = {
             "slot_id": SLOT_ID,
             "control_port": SLOT_PORT,
@@ -952,6 +1322,12 @@ class Slot:
             # this against nvidia-smi's per-process accounting to report the
             # slot occupant's REAL VRAM (its type/ngl guess is not ground truth).
             "child_pid": self.proc.pid if self._child_alive() else None,
+            # The file the child launched with + the last identity verdict: what
+            # the "is this really our model on that port" check compares, made
+            # visible instead of implied (getattr for a pre-field instance).
+            "model_path": getattr(self, "model_path", None),
+            "identity_ok": getattr(self, "_identity", {}).get("ok", True),
+            "identity_note": getattr(self, "_identity", {}).get("note"),
             "expected_bytes": self.expected_bytes,
             # The last honest load-failure reason + backoff (slice 12), so the
             # console can show WHY a model's row is degraded/retrying instead of a
@@ -1032,6 +1408,11 @@ class Slot:
                 pass
             self.proc = subprocess.Popen(argv, env=env)
             self.model_key = model_key
+            # The file this child was launched with — argv's -m/--model — kept
+            # so the identity check has something to verify /props against.
+            self.model_path = _model_path_of(argv)
+            self._identity = {"pid": self.proc.pid, "ok": True, "note": None,
+                              "at": 0.0}
             self.loaded_at = self.last_used = time.time()
 
             if not self._wait_healthy():
@@ -1171,11 +1552,7 @@ class Slot:
         self._kill()
         with self.lock:
             self._kill()
-            self.model_key = self.ngl = self.ctx = None
-            self.threads = self.cpus = self.gpu = self.expected_bytes = None
-            self.total_layers = None
-            self.n_cpu_moe = None
-            self.profile_bin = None
+            self._clear_claim()
             return self.status()
 
     def relaunch(self, n_gpu_layers=None, ctx=None, n_cpu_moe=None) -> dict:
@@ -1319,6 +1696,17 @@ def build_app():
         import httpx
         if not slot.healthy():
             return jsonify({"error": f"slot {SLOT_ID} has no model loaded"}), 503
+        # IDENTITY (k53): forward only to a child that is serving the model this
+        # slot claims. A stranger on the port would otherwise answer in the
+        # claimed model's name — a silent substitution. On mismatch the claim has
+        # just been dropped, so 503 (not 500): the caller re-resolves and the
+        # model cold-loads properly.
+        ok, note = slot.verify_identity()
+        if not ok:
+            return jsonify({"error": (
+                f"slot {SLOT_ID} refused to proxy: the child on port "
+                f"{SLOT_CHILD_PORT} is not serving the claimed model — {note}. "
+                "The stale mapping was dropped; retry to cold-load it.")}), 503
         slot.last_used = time.time()
 
         url = f"{slot.child_base}/v1/{sub}"

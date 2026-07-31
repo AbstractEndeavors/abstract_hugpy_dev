@@ -382,7 +382,6 @@ def _evict(worker: Dict[str, Any], model_key: str, force: bool = False) -> Dict[
     worker picks the mechanism by host_mode (comfy /free, slot SIGTERM, in-process
     ref-drop) and enforces the protection gate when force=false. Best-effort:
     a transport error reads as 'not evicted' and the loop moves on."""
-    url = (worker.get("url") or "").rstrip("/") + "/ops/evict"
     # Telemetry (2026-07-28): the reservation flush is a real eviction of a real
     # card and belongs on the operator's live stream like any other, tagged
     # tier="reservation". Emitted from CENTRAL (which drives this relay), so
@@ -392,9 +391,11 @@ def _evict(worker: Dict[str, Any], model_key: str, force: bool = False) -> Dict[
               target_worker=worker.get("id") or worker.get("name"), force=force)
     _t0 = time.time()
     try:
-        import httpx
-        r = httpx.post(url, json={"model_key": model_key, "force": bool(force)},
-                       timeout=45.0)
+        from abstract_hugpy_dev.flask_app.app.functions.imports.utils import (
+            worker_http)
+        r = worker_http.post(worker, "/ops/evict",
+                             json={"model_key": model_key, "force": bool(force)},
+                             read_timeout=45.0)
         if r.status_code == 200:
             out = r.json()
         else:

@@ -95,15 +95,19 @@ def rig(monkeypatch):
 
     class _FakeHttpx:
         @staticmethod
-        def post(url, json=None, timeout=None):
+        def request(method, url, json=None, **kwargs):
             state["probe_calls"].append({"url": url, "json": json})
             payload, status = state["probe_response"]
             return _FakeResp(payload, status)
 
-    # workers_load does `import httpx` INSIDE the function body, so patching
-    # the real module (sys.modules) is what actually takes effect.
+    # k59: the warm goes through worker_http, which calls httpx.request with a
+    # split timeout — patching the real module (sys.modules) is what actually
+    # takes effect, since the import happens inside the function body.
     import httpx as _real_httpx
-    monkeypatch.setattr(_real_httpx, "post", _FakeHttpx.post)
+    monkeypatch.setattr(_real_httpx, "request", _FakeHttpx.request)
+    wh = importlib.import_module(
+        "abstract_hugpy_dev.flask_app.app.functions.imports.utils.worker_http")
+    wh.reset_breakers()             # no failure streak carried in from elsewhere
 
     # set_load_report is imported lazily inside the background thread; stub
     # it so the thread doesn't touch a real registry file.

@@ -3,6 +3,14 @@ ONE retry after a 3s pause when the worker agent's socket is dead (it re-execs
 ~0.5s after ACKing a config change), and an honest 503 "agent is restarting"
 when the retry also can't connect. Non-config ops keep the single-shot 502.
 
+k59: the relay now goes through worker_http (short connect + per-worker
+breaker), so the seam patched here is httpx.request rather than httpx.post,
+and each case starts from a clean breaker — a run of failures across UNRELATED
+cases would otherwise open it and fail the next case fast, which is correct
+behaviour but not what this file is about (see test_worker_http_discipline.py).
+The wire contract is unchanged: the error `code` is still the underlying
+transport error's class name.
+
 Runs like the other tests here: venv/bin/python tests/test_relay_retry.py
 """
 import importlib
@@ -19,6 +27,8 @@ wr = importlib.import_module(
     "abstract_hugpy_dev.flask_app.app.routes.worker_routes")
 cr = importlib.import_module(
     "abstract_hugpy_dev.flask_app.app.routes.comms_routes")
+wh = importlib.import_module(
+    "abstract_hugpy_dev.flask_app.app.functions.imports.utils.worker_http")
 
 ok = 0
 def check(name, cond):
@@ -36,11 +46,11 @@ class _FakeResp:
 
 app = Flask("relay-retry-test")
 
-_orig = (wr.get_worker, cr.audit, httpx.post, time.sleep)
+_orig = (wr.get_worker, cr.audit, httpx.request, time.sleep)
 _posts, _sleeps = [], []
 _outcomes = []          # per-call: "ok" | exception instance to raise
 
-def _fake_post(url, json=None, timeout=None):
+def _fake_request(method, url, **kwargs):
     _posts.append(url)
     out = _outcomes.pop(0)
     if out == "ok":
@@ -48,6 +58,7 @@ def _fake_post(url, json=None, timeout=None):
     raise out
 
 def _run(retry):
+    wh.reset_breakers()     # each case is its own worker's first contact
     with app.app_context():
         resp, status = wr._relay_worker_op(
             "w1", "/ops/config", {"pinned": {"m": True}},
@@ -57,7 +68,7 @@ def _run(retry):
 try:
     wr.get_worker = lambda wid: {"name": "t", "url": "http://worker:9999"}
     cr.audit = lambda *a, **k: None
-    httpx.post = _fake_post
+    httpx.request = _fake_request
     time.sleep = lambda s: _sleeps.append(s)   # _relay imports time as _time
 
     # 1. blip then recovery: connect error -> 3s pause -> retry succeeds
@@ -91,6 +102,6 @@ try:
     check("non-connect error -> immediate 502", status == 502)
     check("non-connect error not retried", _sleeps == [] and len(_posts) == 1)
 finally:
-    wr.get_worker, cr.audit, httpx.post, time.sleep = _orig
+    wr.get_worker, cr.audit, httpx.request, time.sleep = _orig
 
 print(f"\nall {ok} checks passed")

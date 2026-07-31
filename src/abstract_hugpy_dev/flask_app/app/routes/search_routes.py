@@ -469,3 +469,125 @@ def hf_auth_delete():
     out = hf_auth_status(validate=True)
     out["removed"] = removed
     return jsonify(out)
+
+
+# ── the FINDER (operator ask 2026-07-29): the console's 🔍 for the API ──────
+# abstract-search (the operator's own package) worked into hugpy: grep/files
+# search over the VM's trees, returning ONLY file paths + the specific lines
+# that matched — the keeper/agent shape ("find my target data fast, cheap").
+# Read-gated like the eviction telemetry: operator session OR a valid API key.
+# Roots are a WHITELIST — a search surface over an HTTP port must not be a
+# filesystem browser; anything outside these answers 400 naming the allowed.
+_FINDER_ROOTS = {
+    "dev":     "/srv/share/projects/hugpy/dev",
+    "station": "/srv/share/projects/hugpy",
+    "comms":   "/mnt/llm_storage/comms",
+    "spool":   os.path.expanduser("~/.hugpy-lean/spool"),
+}
+
+
+def _finder_authorized() -> bool:
+    try:
+        from ..operator_auth import operator_authenticated
+        if operator_authenticated():
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from .worker_routes import _bearer_token
+        from ..functions.imports.utils.api_keys import key_id_for_token
+        tok = _bearer_token()
+        return bool(tok and key_id_for_token(tok))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+@search_bp.route("/finder/search", methods=["GET", "POST"])
+def finder_search():
+    """GET/POST /finder/search?q=<phrase>[&q=...]&root=dev&mode=grep|files&limit=N
+
+    grep  -> [{file_path, lines: [{line, content}]}]  (the console's shape)
+    files -> bare file paths whose CONTENT matches (no line detail, faster)
+    """
+    if not _finder_authorized():
+        return jsonify({"error": "not authorized"}), 401
+    body = request.get_json(silent=True) or {}
+    qs = request.args.getlist("q") or body.get("q") or body.get("strings") or []
+    if isinstance(qs, str):
+        qs = [qs]
+    qs = [str(s) for s in qs if str(s).strip()]
+    if not qs:
+        return jsonify({"error": "q required (one or more phrases)"}), 400
+    root_key = (request.args.get("root") or body.get("root") or "dev").strip()
+    if root_key not in _FINDER_ROOTS:
+        return jsonify({"error": f"unknown root {root_key!r}",
+                        "allowed_roots": sorted(_FINDER_ROOTS)}), 400
+    mode = (request.args.get("mode") or body.get("mode") or "grep").strip()
+    try:
+        limit = int(request.args.get("limit") or body.get("limit") or 200)
+    except (TypeError, ValueError):
+        limit = 200
+    limit = max(1, min(limit, 1000))
+    try:
+        from abstract_search.find_content import findContent
+    except ImportError:
+        return jsonify({"error": "abstract-search not installed on this central"}), 501
+    # Walk per TOP-LEVEL subtree, not the root in one call: abstract-search
+    # RAISES on a dangling symlink ("Not a valid path"), and one poisoned
+    # subtree must cost its own results, never the whole search. Skipped
+    # subtrees are NAMED in the reply — silence would read as "no matches".
+    root = _FINDER_ROOTS[root_key]
+    subtrees = [root]
+    try:
+        entries = sorted(os.listdir(root))
+        subs = [os.path.join(root, e) for e in entries
+                if os.path.isdir(os.path.join(root, e)) and e not in (".git", "venv",
+                    "node_modules", "__pycache__")]
+        files_at_root = [os.path.join(root, e) for e in entries
+                         if os.path.isfile(os.path.join(root, e))]
+        if subs:
+            subtrees = subs
+    except OSError:
+        files_at_root = []
+    hits, skipped = [], []
+
+    def _walk(sub, depth):
+        # RECURSIVE containment: a subtree that raises (e.g. the deliberate
+        # host-side tests/imports/src symlink, dangling in the VM) splits into
+        # its children and each retries — the poison costs its own directory,
+        # never its siblings. Bounded depth keeps a pathological tree cheap.
+        if len(hits) >= limit:
+            return
+        try:
+            hits.extend(findContent(directory=sub, strings=qs,
+                                    parse_lines=True,
+                                    get_lines=(mode == "grep")) or [])
+            return
+        except Exception as exc:  # noqa: BLE001
+            if depth <= 0:
+                skipped.append({"subtree": sub, "error": str(exc)[:200]})
+                return
+        try:
+            kids = sorted(os.listdir(sub))
+        except OSError:
+            skipped.append({"subtree": sub, "error": "unlistable"})
+            return
+        for k in kids:
+            kp = os.path.join(sub, k)
+            if os.path.islink(kp) and not os.path.exists(kp):
+                skipped.append({"subtree": kp, "error": "dangling symlink"})
+                continue
+            if os.path.isdir(kp) and k not in (".git", "venv", "node_modules",
+                                               "__pycache__"):
+                _walk(kp, depth - 1)
+
+    for sub in subtrees:
+        _walk(sub, 3)
+        if len(hits) >= limit:
+            break
+    hits = hits[:limit]
+    out = {"root": root, "mode": mode, "strings": qs,
+           "count": len(hits), "hits": hits}
+    if skipped:
+        out["skipped_subtrees"] = skipped
+    return jsonify(out)

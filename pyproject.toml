@@ -31,6 +31,7 @@ keywords = ["llm", "llama.cpp", "transformers", "self-hosted", "openai-compatibl
 # small and wheels-only; `pip install abstract_hugpy_dev[engine]` (or [all]) adds
 # the heavy bits on platforms that can build them.
 dependencies = [
+    "abstract-search",
     "flask",
     # gunicorn is POSIX-only; on Windows we serve via waitress (see below). The
     # CLI already falls back to the Flask dev server if neither is present.

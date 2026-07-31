@@ -6,7 +6,10 @@ from .imports import *
 def resolve_local_config(directory: str, hub_id: str) -> dict:
     path = os.path.join(directory, "config.json")
     if not os.path.isfile(path):
-        return {}
+        # A bare PEFT adapter dir has only adapter_config.json. Returning {}
+        # here is half of the 2026-07-29 bench defect — see the twin resolver in
+        # imports/apis/get_module.py and imports/src/peft_adapters.py.
+        return adapter_metadata_fields(directory)
     try:
         with open(path, "r") as f:
             cfg = json.load(f)

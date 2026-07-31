@@ -226,14 +226,16 @@ def build_capability_request(spec):
     )
 
 
-def run_produce_clip(spec, should_cancel):
+def run_produce_clip(spec, should_cancel, on_step=None):
     """Build env + seeds from ``spec`` and run ``produce_clip``; return the studio
     ``Result[Artifact, StageError]`` verbatim.
 
     The ONE place a ``StudioI2VSpec`` is turned into a ``produce_clip`` call —
     shared so the central in-process path and the worker render thread render the
     same pixels for the same spec. ``should_cancel`` is the cooperative-cancel
-    probe threaded down to the runner (Task 1)."""
+    probe threaded down to the runner (Task 1); ``on_step(step, steps)`` is the
+    optional denoise-progress sink (k57) threaded down beside it. Keyword-default,
+    so every existing 2-arg caller is unchanged."""
     from ..studio.job import resolve_studio_env
     from ..studio.produce import produce_clip
     from ..studio.schemas import SeedBundle
@@ -274,6 +276,7 @@ def run_produce_clip(spec, should_cancel):
         # extend idiom from them. getattr keeps older spec dicts (no field) working.
         vace_context_frames=getattr(spec, "vace_context_frames", None),
         should_cancel=should_cancel,
+        on_step=on_step,
     )
 
 
@@ -909,7 +912,16 @@ def render_clip(spec, *, render_id: str, should_cancel=None, progress_sink=None,
     # return Err(StageError(CANCELLED)) -> JobError(code="cancelled", retryable=False).
     # NOTE: on the GPU-less control-plane central this is where autofit's fallback budget
     # (0.5) lands — the synthetic path, unchanged (a real model there returns NO_GPU as data).
-    result = produce(spec, should_cancel)
+    # Denoise-step progress for the IN-PROCESS render (k57), forwarded to the same
+    # sink the delegated path publishes the worker's blob to — so a bar moves during
+    # a long render wherever it physically executes. Threaded ONLY when `produce` is
+    # the real render function: the seam is injectable and its test fakes take two
+    # positional args, so an unconditional kwarg would break them.
+    if produce is run_produce_clip:
+        result = produce(spec, should_cancel, on_step=lambda step, steps: (
+            progress_sink({"phase": "rendering", "step": step, "steps": steps})))
+    else:
+        result = produce(spec, should_cancel)
     if result.is_err():
         # ONE boundary: studio StageError -> bus JobError (the delegated path did the
         # identical translation on the worker, so ClipOutcome.error is always a JobError).

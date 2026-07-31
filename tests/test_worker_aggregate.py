@@ -318,9 +318,10 @@ def central(monkeypatch, tmp_path):
 
 
 def _fake_httpx(monkeypatch, calls, *, status=200, body=None):
+    """k59: the relay goes through worker_http, so the seam is httpx.request."""
     import httpx
 
-    def fake_get(url, timeout=None):
+    def fake_get(method, url, **kwargs):
         calls.append(url)
 
         class R:
@@ -331,7 +332,7 @@ def _fake_httpx(monkeypatch, calls, *, status=200, body=None):
 
         return R()
 
-    monkeypatch.setattr(httpx, "get", fake_get)
+    monkeypatch.setattr(httpx, "request", fake_get)
 
 
 def test_relay_returns_the_document_and_the_beat_summary(central, monkeypatch):
@@ -399,11 +400,11 @@ def test_worker_errors_are_data_and_are_not_cached(central, monkeypatch):
     wr, client = central
     calls = []
 
-    def boom(url, timeout=None):
+    def boom(method, url, **kwargs):
         calls.append(url)
         raise httpx.ConnectError("refused")
 
-    monkeypatch.setattr(httpx, "get", boom)
+    monkeypatch.setattr(httpx, "request", boom)
     r = client.get("/llm/workers/w1/aggregate")
     assert r.status_code == 502
     assert r.get_json()["error"]["code"] == "ConnectError"

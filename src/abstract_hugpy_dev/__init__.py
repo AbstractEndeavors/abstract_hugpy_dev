@@ -12,7 +12,7 @@ _ensure_pydantic()
 # every worker on the required version report version_ok:false forever.
 # Running-source remains authoritative (2026-07-20 skew-honesty design).
 # Exposed over HTTP at GET /version.
-__version__ = "0.1.225"
+__version__ = "0.1.226"
 
 from .imports import *
 from .managers import *

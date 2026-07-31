@@ -350,6 +350,7 @@ def run_wan_vace(
     out_root: str,
     start_image: str | None = None,
     should_cancel: "Callable[[], bool] | None" = None,
+    on_step: "Callable[[int, int], None] | None" = None,
 ) -> Result[Artifact, StageError]:
     """Produce (or resume) a Wan VACE v2v clip for ``manifest`` under ``out_root``.
 
@@ -372,7 +373,12 @@ def run_wan_vace(
     returns ``Err(StageError(CANCELLED, ...))`` BEFORE any clip is written. TRUE
     mid-denoise interruption is BOX-ONLY — this GPU-less VM short-circuits at
     preflight, so the callback path only ever executes on the real box. None
-    (default) = never cancel."""
+    (default) = never cancel.
+
+    ``on_step`` is the OPTIONAL denoise-progress sink (k57) — ``on_step(step, steps)``
+    on each callback boundary, riding the same diffusers hook as the cancel probe.
+    It is what makes the console's bar MOVE inside one long segment; best-effort, so
+    a throwing sink can never break a render. None (default) = report nothing."""
     if not isinstance(manifest, RenderManifest):
         raise TypeError(
             f"manifest must be a RenderManifest; got {type(manifest).__name__}")
@@ -462,10 +468,15 @@ def run_wan_vace(
     def _cancel_step_cb(pipe_ref, step_index, timestep, cb_kwargs):
         if should_cancel is not None and should_cancel():
             pipe_ref._interrupt = True   # diffusers checks self.interrupt each step
+        if on_step is not None:
+            try:
+                on_step(int(step_index) + 1, int(steps))
+            except Exception:  # noqa: BLE001 — telemetry never breaks a render
+                pass
         return cb_kwargs
 
     call_extra: dict = {}
-    if should_cancel is not None:
+    if should_cancel is not None or on_step is not None:
         call_extra["callback_on_step_end"] = _cancel_step_cb
 
     src_frame_dir = None

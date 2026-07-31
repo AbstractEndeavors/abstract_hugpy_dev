@@ -216,6 +216,12 @@ def _stream_checks(remote):
         check("the refusal message is preserved (won't fit)", "won't fit" in err.message)
         check("no loading status was emitted for a fast refusal",
               not any(getattr(e, "stage", None) == "awaiting-load" for e in evs))
+        # ...and it leaves NO cached verdict: "won't fit" is state-dependent —
+        # the next eviction makes it false — so it must never answer a LATER
+        # request from cache (that is what poisoned this model for a whole TTL,
+        # turning the clean cancel below into an error event).
+        check("a capacity refusal leaves NO cached load verdict (state-dependent)",
+              remote._active_load_verdict("w1", "cold-model") is None)
 
         # -- cancel-while-held: clean stop, no error ---------------------------
         async def ws_always_transient(worker, payload, rid):
@@ -239,6 +245,38 @@ def _stream_checks(remote):
               "error" not in _etypes(seen) and "token" not in _etypes(seen))
         check("cancel-while-held did surface at least one loading status first",
               any(getattr(e, "stage", None) == "awaiting-load" for e in seen))
+        # A user pulling out is NOT a load failure: a cancelled attempt must
+        # leave the load-verdict cache untouched, or one cancel would make the
+        # model answer "permanently failed" for every caller for a whole TTL.
+        check("a CANCELLED attempt leaves NO cached load verdict",
+              remote._active_load_verdict("w1", "cold-model") is None
+              and ("w1", "cold-model") not in remote._LOAD_VERDICTS)
+
+        # -- the verdict cache still does its job for the DETERMINISTIC class --
+        # (a not-a-model directory: no retry conjures a base model into a LoRA
+        # dir, so the second call must not reach the worker at all.)
+        broken = Runner(types.SimpleNamespace(model_key="broken-model"))
+        hits = {"n": 0}
+
+        async def ws_broken(worker, payload, rid):
+            hits["n"] += 1
+            raise RuntimeError("ValueError: Unrecognized model in /store/lora-dir. "
+                               "Should have a `model_type` key in its config.json")
+            yield  # pragma: no cover
+
+        remote._worker_stream = ws_broken
+        try:
+            e1 = asyncio.run(_collect(broken.stream(_req("brk-1"))))
+            check("a deterministic load failure fails fast on the first call",
+                  _etypes(e1).count("error") == 1 and hits["n"] == 1)
+            e2 = asyncio.run(_collect(broken.stream(_req("brk-2"))))
+            check("the recorded verdict answers the re-submit without a new attempt",
+                  _etypes(e2).count("error") == 1 and hits["n"] == 1)
+            check("the cached answer names the cache and repeats the real cause",
+                  "load-verdict cache" in e2[-1].message
+                  and "Unrecognized model" in e2[-1].message)
+        finally:
+            remote._clear_load_verdict("w1", "broken-model")
 
         # -- coalescing: N concurrent cold calls -> ONE *load* at a time -------
         # `loading` counts kicks INSIDE their load window (before a token, i.e.

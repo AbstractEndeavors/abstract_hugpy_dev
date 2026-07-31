@@ -99,13 +99,32 @@ def _cancelled_payload(message: str) -> dict:
         "code": "cancelled", "message": message, "retryable": False}}
 
 
+# Progress frames (k57) share the result pipe with the settled payload; this key
+# is what tells them apart. A frame is {_PROGRESS_KEY: {"phase": "rendering",
+# "step": i, "steps": n}} — never a render result, so an old parent that somehow
+# received one would simply see a dict without "ok" rather than a corrupt result.
+_PROGRESS_KEY = "__progress__"
+
+
+def _progress_frame(frame) -> "dict | None":
+    """The progress blob inside a pipe frame, or None when the frame is a settled
+    render payload."""
+    if isinstance(frame, dict) and isinstance(frame.get(_PROGRESS_KEY), dict):
+        return frame[_PROGRESS_KEY]
+    return None
+
+
 def _child_main(spec_dict: dict, conn, cancel_event) -> None:
     """CHILD entrypoint (module-level so it is spawn-picklable). Rebuild the spec
     through the SAME validating deserializer the bus uses, run the SHARED
     ``run_produce_clip`` with the cancel event bridged in as ``should_cancel``, and
     send the JSON-safe payload back over ``conn``. Every failure — including a bad
     spec — rides back as an error payload (errors-as-data); the child never lets an
-    exception escape unsent, so the parent never waits on a silent crash."""
+    exception escape unsent, so the parent never waits on a silent crash.
+
+    It ALSO streams denoise progress up the same pipe (k57): the render runs in
+    THIS process, so its step counter is invisible to the worker (and therefore to
+    central, and therefore to the operator's bar) unless it is sent."""
     payload: dict
     try:
         from ..video_intel.runners.studio_i2v import (
@@ -116,7 +135,15 @@ def _child_main(spec_dict: dict, conn, cancel_event) -> None:
 
         spec = studio_i2v_from_dict(spec_dict)
         should_cancel = cancel_event.is_set  # zero-arg probe the runner already accepts
-        result = run_produce_clip(spec, should_cancel)
+
+        def _on_step(step: int, steps: int) -> None:
+            try:
+                conn.send({_PROGRESS_KEY: {"phase": "rendering",
+                                           "step": int(step), "steps": int(steps)}})
+            except Exception:  # noqa: BLE001 — a broken pipe must not stop the render
+                pass
+
+        result = run_produce_clip(spec, should_cancel, on_step=_on_step)
         payload = artifact_result_to_payload(result)
     except Exception as exc:  # noqa: BLE001 — a child crash is errors-as-data too
         payload = _internal_payload(
@@ -152,6 +179,7 @@ def run_render_subprocess(
     cancel_flag,
     timeout_s: "float | None" = None,
     *,
+    on_progress=None,
     _target=_child_main,
     _ctx=None,
     _poll_s: float = 0.5,
@@ -164,6 +192,12 @@ def run_render_subprocess(
     it does not settle within a short grace window, killed. On timeout the child is
     killed and an honest ``internal`` (retryable) error payload is returned — the
     worker itself never blocks in native code, so it stays responsive throughout.
+
+    ``on_progress`` (k57) receives each progress blob the child streams up the
+    result pipe ({"phase": "rendering", "step": i, "steps": n}) — the worker points
+    it at the job's ``progress`` field so /studio/status, and through it central's
+    poller and the console's bar, sees movement WITHIN a render. Best-effort: a
+    throwing sink is logged and ignored. None (default) drops the frames.
 
     ``_target`` / ``_ctx`` / ``_poll_s`` are test seams (inject a fake child target,
     context, or a faster poll); production uses the real spawn context + child.
@@ -181,10 +215,30 @@ def run_render_subprocess(
     deadline = time.monotonic() + float(timeout_s)
     cancel_deadline: "float | None" = None
     outcome_kind = "ok"   # ok | timeout | cancelled
+    payload: "dict | None" = None
     try:
         while True:
             if parent_conn.poll(_poll_s):
-                break  # a payload is waiting to be read
+                # A frame is waiting. It is either a PROGRESS frame (k57 — the
+                # child's denoise step counter, which must cross the process
+                # boundary or the worker can only ever report "rendering") or the
+                # terminal payload. Progress frames are consumed and relayed; only
+                # a terminal payload ends the loop.
+                try:
+                    frame = parent_conn.recv()
+                except EOFError:
+                    break  # child closed the pipe without settling
+                prog = _progress_frame(frame)
+                if prog is not None:
+                    if on_progress is not None:
+                        try:
+                            on_progress(prog)
+                        except Exception:  # noqa: BLE001 — telemetry is never fatal
+                            logger.debug("studio render progress sink failed",
+                                         exc_info=True)
+                    continue
+                payload = frame if isinstance(frame, dict) else None
+                break
             if not proc.is_alive():
                 break  # child exited (crashed / finished without a readable payload)
             now = time.monotonic()
@@ -207,12 +261,14 @@ def run_render_subprocess(
                 _terminate(proc)
                 break
 
-        payload: "dict | None" = None
-        if parent_conn.poll(0):
+        # A child that raced the kill may still have a settled payload queued.
+        while payload is None and parent_conn.poll(0):
             try:
-                payload = parent_conn.recv()
+                frame = parent_conn.recv()
             except EOFError:
-                payload = None
+                break
+            if _progress_frame(frame) is None:
+                payload = frame if isinstance(frame, dict) else None
     finally:
         try:
             parent_conn.close()

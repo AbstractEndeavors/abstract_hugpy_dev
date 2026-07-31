@@ -11,9 +11,12 @@ llama-server --n-cpu-moe 999: experts to CPU, everything else + KV on GPU) gave
   * ground-truth reconciliation against the real coder-next shards when local
     (expert 43.59 GiB / non-expert 1.49 GiB / ec 512 / euc 10 — keeper-parsed);
   * per-layer-aware split pricing (spill.moe_split_need) incl. partial N;
-  * the _build_cmd AUTO policy matrix: MoE+hybrid -> -1 + --n-cpu-moe 999;
-    MoE+fits-whole -> --n-cpu-moe 0 (env-hack-proof); dense -> unchanged;
-    explicit n_gpu_layers / n_cpu_moe always win; engine-degrade paths;
+  * DENSE BACKBONE FIRST (operator ruling 2026-07-31): the GPU budget buys the
+    non-expert tensors before any expert layer, under EVERY alloc mode —
+    spill.moe_dense_first_plan's arithmetic and the _build_cmd matrix it feeds
+    (a stored ngl=-1 no longer disables the split; a stated layer count still
+    wins; zero-GPU modes plan nothing; dense -> unchanged; explicit n_cpu_moe
+    always wins; engine-degrade paths);
   * relaunch accepts n_cpu_moe; slot admission verdict threads it;
   * expert-aware need: the fit checks pass the empty-card 41.6GB-MoE case;
     _vram_evict_to_fit re-targets to the split instead of an impossible full
@@ -319,6 +322,67 @@ def test_moe_split_need_dense_is_none():
     assert spill.moe_split_need(None) is None
 
 
+# ═══ DENSE BACKBONE FIRST — the plan itself (operator ruling 2026-07-31) ═════
+# The backbone (attention/router/shared experts/embeddings/output + the KV that
+# rides with it) is touched by EVERY token; an expert tensor by ~10/512 of one.
+# So a GPU budget buys the backbone FIRST and the experts get the remainder —
+# under every allocation mode. These pin the arithmetic; the _build_cmd tests
+# below pin that every mode actually reaches it.
+def test_plan_dense_only_budget_spills_every_expert(moe_gguf):
+    d = spill.gguf_moe_detail(moe_gguf)
+    plan = spill.moe_dense_first_plan(d, 3332 + 100)
+    assert plan["n_cpu_moe"] == spill.MOE_ALL_LAYERS
+    assert plan["dense_fits"] is True
+    assert (plan["cpu_bytes"], plan["gpu_bytes"]) == (16000, 3332)
+
+
+def test_plan_spends_the_remainder_on_the_TOP_expert_layers(moe_gguf):
+    """--n-cpu-moe keeps the FIRST N block indices' experts on the CPU, so the
+    layers that ride the GPU are a SUFFIX — the plan fills it from the top."""
+    d = spill.gguf_moe_detail(moe_gguf)
+    plan = spill.moe_dense_first_plan(d, 3332 + 8000)
+    assert plan["n_cpu_moe"] == 1 and plan["expert_layers_on_gpu"] == 1
+    assert (plan["cpu_bytes"], plan["gpu_bytes"]) == (8000, 3332 + 8000)
+
+
+def test_plan_that_covers_everything_says_zero(moe_gguf):
+    d = spill.gguf_moe_detail(moe_gguf)
+    plan = spill.moe_dense_first_plan(d, 1 << 30)
+    assert plan["n_cpu_moe"] == 0 and plan["cpu_bytes"] == 0
+
+
+def test_plan_charges_the_extra_reserve_before_anything_lands(moe_gguf):
+    d = spill.gguf_moe_detail(moe_gguf)
+    plan = spill.moe_dense_first_plan(d, 3332 + 8000,
+                                      extra_reserve_bytes=8000)
+    assert plan["n_cpu_moe"] == spill.MOE_ALL_LAYERS
+
+
+def test_plan_backbone_larger_than_the_budget_still_leads(moe_gguf):
+    """A budget too small even for the backbone never promotes an expert layer
+    ahead of it — the backbone still goes first and the shortfall is stated."""
+    d = spill.gguf_moe_detail(moe_gguf)
+    plan = spill.moe_dense_first_plan(d, 100)
+    assert plan["n_cpu_moe"] == spill.MOE_ALL_LAYERS
+    assert plan["dense_fits"] is False
+
+
+def test_plan_threshold_is_a_block_index_not_a_position():
+    """A model whose first blocks are dense would be mispriced by position:
+    --n-cpu-moe counts BLOCK INDICES, so keeping block 9's experts on the card
+    while spilling block 5's means the threshold is 9, not 1."""
+    detail = {"is_moe": True, "expert_bytes": 300, "non_expert_bytes": 100,
+              "expert_bytes_by_layer": {5: 100, 7: 100, 9: 100}}
+    plan = spill.moe_dense_first_plan(detail, 100 + 100)
+    assert plan["n_cpu_moe"] == 9 and plan["cpu_bytes"] == 200
+
+
+def test_plan_is_none_for_a_dense_model(dense_gguf):
+    assert spill.moe_dense_first_plan(spill.gguf_moe_detail(dense_gguf),
+                                      1 << 30) is None
+    assert spill.moe_dense_first_plan(None, 1 << 30) is None
+
+
 # ═══════════ ground truth: the real coder-next shards ═══════════════════════
 _REAL_SHARD1 = ("/mnt/llm_storage/legacy/Qwen3-Coder-Next-GGUF/"
                 "Qwen3-Coder-Next-Q4_K_M-00001-of-00004.gguf")
@@ -377,6 +441,16 @@ def cmd_rig(monkeypatch, moe_gguf, dense_gguf):
     monkeypatch.setattr(serve, "LLAMA_SERVER_BIN", "/bin/echo")
     monkeypatch.setattr(sa, "_server_supports_flag", lambda b, f: True)
     auto = {"value": 17}
+    # The card, EXPLICITLY (k53). The dense-first plan prices the expert split
+    # against a real VRAM budget, so leaving that to whatever GPU the test box
+    # happens to have would make this suite's verdicts depend on the machine.
+    # Default None = "unmeasurable", which is the historical degrade (backbone
+    # on the GPU, all experts to CPU) — so every pre-k53 expectation below is
+    # unchanged, and the budget-aware tests opt in by setting rig.vram["free"].
+    vram = {"free": None}
+    monkeypatch.setattr(spill, "free_vram_bytes", lambda: vram["free"])
+    monkeypatch.setattr(spill, "vram_ctx_reserve_bytes",
+                        lambda p, n_ctx=None: (0, "test", {}))
     # **_kw so the stub tracks the real signature as it grows (n_ctx joined it
     # 2026-07-27 when the context reserve became per-model) — this rig is about
     # the MoE placement policy, never about autofit's own arithmetic.
@@ -386,7 +460,8 @@ def cmd_rig(monkeypatch, moe_gguf, dense_gguf):
     for env in ("HUGPY_ALLOC_MODE", "HUGPY_N_CPU_MOE", "HUGPY_N_GPU_LAYERS",
                 "HUGPY_HOT_CACHE_ROOT", "HUGPY_MODEL_CACHE"):
         monkeypatch.delenv(env, raising=False)
-    return type("Rig", (), {"auto": auto, "moe": moe_gguf, "dense": dense_gguf})()
+    return type("Rig", (), {"auto": auto, "vram": vram, "moe": moe_gguf,
+                            "dense": dense_gguf})()
 
 
 def _argv_pairs(argv):
@@ -512,14 +587,25 @@ def test_k37_mode_engine_disables_the_auto_split(cmd_rig, monkeypatch):
 # produces — these tests pin the whole table end-to-end so an encoding change
 # can't silently flip a mode's placement.
 #
-#   max-gpu   -> {}                     -> split   (blank default; wants speed)
-#   gpu-only  -> {"n_gpu_layers": -1}   -> NO      (demands GPU residency)
-#   ram-only  -> {"n_gpu_layers": "off"}-> NO      (demands CPU residency)
-#   max-ram   -> {"alloc_mode":"max-ram"}->NO      (operator drives the numbers)
-#   explicit  -> {"alloc_mode":"explicit"}->NO     (operator drives the numbers)
+# DENSE BACKBONE FIRST (operator ruling 2026-07-31): a mode no longer decides
+# WHETHER the dense backbone gets the GPU — only how much card the model may
+# claim. Every mode that grants any GPU budget therefore splits; the only
+# no-split modes are the ones that grant no GPU at all.
+#
+#   max-gpu   -> {}                     -> split   (blank default; the card)
+#   gpu-only  -> {"n_gpu_layers": -1}   -> WHOLE   (k55, 2026-07-31: "only"
+#                                                   means every tensor on the
+#                                                   card — n_cpu_moe 0, or a
+#                                                   refusal naming max-gpu;
+#                                                   never a partial split)
+#   ram-only  -> {"n_gpu_layers": "off"}-> NO      (zero GPU: nothing to rank)
+#   max-ram   -> {"alloc_mode":"max-ram"}->NO      (RAM holds it all here: the
+#                                                   overflow to GPU is zero)
+#   explicit  -> {"alloc_mode":"explicit"}->split  (its VRAM budget is still a
+#                                                   budget the backbone leads)
 @pytest.mark.parametrize("mode,wants_split", [
-    ("max-gpu", True), ("gpu-only", False), ("ram-only", False),
-    ("max-ram", False), ("explicit", False)])
+    ("max-gpu", True), ("ram-only", False),
+    ("max-ram", False), ("explicit", True)])
 def test_alloc_mode_decision_table(cmd_rig, monkeypatch, mode, wants_split):
     wire = AM.mode_to_spill(mode)
     # _apply_spill's mapping, applied by hand (the agent sets these envs before
@@ -541,6 +627,103 @@ def test_alloc_mode_decision_table(cmd_rig, monkeypatch, mode, wants_split):
         assert ncm is None and "--n-cpu-moe" not in argv, mode
 
 
+# ═══ gpu-only IS STRICT (operator ruling 2026-07-31, k55) ═══════════════════
+# "gpu-only must be honest to its name" — ALL tensors on the card, experts
+# included. The mode's only wire encoding is an EXPLICIT n_gpu_layers=-1
+# (mode_to_spill), so that is what these drive; a DEFAULTED -1 is the blank
+# max-gpu default and keeps the dense-first split (proved further down).
+def test_gpu_only_that_fits_whole_states_n_cpu_moe_zero(cmd_rig):
+    """The fits-whole leaf: everything on the card, and SAID so in argv. The 0
+    is not cosmetic — an explicit --n-cpu-moe 0 beats any inherited
+    LLAMA_ARG_N_CPU_MOE, so the launched placement is env-hack-proof."""
+    assert AM.mode_to_spill("gpu-only") == {"n_gpu_layers": -1}
+    cmd_rig.auto["value"] = 17
+    cmd_rig.vram["free"] = 1 << 30               # dwarfs the 19332-byte model
+    (argv, ngl, *_rest, ncm) = sa._build_cmd("moe-model", n_gpu_layers=-1,
+                                             path=cmd_rig.moe)
+    assert ngl == -1 and ncm == 0
+    assert _argv_pairs(argv)["--n-cpu-moe"] == "0"
+
+
+def test_gpu_only_that_does_not_fit_is_REFUSED_naming_max_gpu(cmd_rig):
+    """The doesn't-fit leaf: a refusal, never a quiet partial split. The same
+    budget under the blank default DOES split — that contrast is the ruling."""
+    cmd_rig.auto["value"] = 17
+    cmd_rig.vram["free"] = 3332 + 8000           # backbone + ONE expert layer
+    with pytest.raises(sa.GpuOnlyInfeasible) as exc:
+        sa._build_cmd("moe-model", n_gpu_layers=-1, path=cmd_rig.moe)
+    msg = str(exc.value)
+    assert "max-gpu" in msg and "gpu-only" in msg
+    # ... while max-gpu (the blank default) spends the very same budget on the
+    # dense-first remainder and serves.
+    (_argv, ngl, *_rest, ncm) = sa._build_cmd("moe-model", path=cmd_rig.moe)
+    assert (ngl, ncm) == (-1, 1)
+
+
+def test_gpu_only_named_as_a_mode_is_the_same_statement(cmd_rig, monkeypatch):
+    """HUGPY_ALLOC_MODE=gpu-only and the -1 wire are one operator statement, so
+    the mode name alone is enough — no n_gpu_layers argument needed."""
+    monkeypatch.setenv("HUGPY_ALLOC_MODE", "gpu-only")
+    cmd_rig.auto["value"] = 17
+    cmd_rig.vram["free"] = 1 << 30
+    (_argv, ngl, *_rest, ncm) = sa._build_cmd("moe-model", path=cmd_rig.moe)
+    assert (ngl, ncm) == (-1, 0)
+    cmd_rig.vram["free"] = 3332 + 100            # backbone only
+    with pytest.raises(sa.GpuOnlyInfeasible):
+        sa._build_cmd("moe-model", path=cmd_rig.moe)
+
+
+def test_gpu_only_on_an_unmeasurable_card_obeys_the_mode_literally(cmd_rig,
+                                                                   monkeypatch):
+    """Degrade-not-guess cuts BOTH ways: an unreadable card cannot prove the
+    model doesn't fit, so no refusal is invented — but neither is the blank
+    default's all-experts-to-CPU split, which would serve a split nobody asked
+    for under the name "only". gpu-only is obeyed literally and llama.cpp busts
+    honestly if the card turns out too small."""
+    monkeypatch.setattr(spill, "total_vram_bytes", lambda: None)
+    cmd_rig.vram["free"] = None                  # unmeasurable
+    cmd_rig.auto["value"] = 17
+    (_argv, ngl, *_rest, ncm) = sa._build_cmd("moe-model", n_gpu_layers=-1,
+                                              path=cmd_rig.moe)
+    assert (ngl, ncm) == (-1, 0)
+
+
+def test_gpu_only_unmeasurable_still_faces_the_inverse_vram_preflight(cmd_rig,
+                                                                      monkeypatch):
+    """A gpu-only plan made against an unmeasurable BUDGET priced nothing, so it
+    must not inherit the priced plan's exemption from the "-1 onto a card that
+    can't hold it" preflight — free VRAM being unreadable does not mean the
+    card's TOTAL is."""
+    monkeypatch.setattr(spill, "total_vram_bytes", lambda: 1000)  # < the model
+    cmd_rig.vram["free"] = None
+    cmd_rig.auto["value"] = 17
+    with pytest.raises(RuntimeError) as exc:
+        sa._build_cmd("moe-model", n_gpu_layers=-1, path=cmd_rig.moe)
+    assert "VRAM" in str(exc.value)
+
+
+def test_gpu_only_dense_model_is_untouched(cmd_rig):
+    """The ruling is about MoE pricing. A dense model under gpu-only emits
+    exactly today's argv — no flag, no new refusal path (a dense model that
+    can't fit is still the inverse-VRAM preflight's business, untouched)."""
+    cmd_rig.vram["free"] = 1 << 30
+    cmd_rig.auto["value"] = -1
+    (argv, ngl, *_rest, ncm) = sa._build_cmd("dense-model", n_gpu_layers=-1,
+                                             path=cmd_rig.dense)
+    assert ngl == -1 and ncm is None and "--n-cpu-moe" not in argv
+
+
+def test_explicit_n_cpu_moe_still_wins_under_gpu_only(cmd_rig):
+    """An operator who states the split himself is driving the numbers — the
+    strict path never sees the load, at any budget."""
+    cmd_rig.vram["free"] = 3332 + 100            # would refuse on its own
+    cmd_rig.auto["value"] = 17
+    (argv, ngl, *_rest, ncm) = sa._build_cmd("moe-model", n_gpu_layers=-1,
+                                             n_cpu_moe=999, path=cmd_rig.moe)
+    assert ngl == -1 and ncm == 999
+    assert _argv_pairs(argv)["--n-cpu-moe"] == "999"
+
+
 def test_max_gpu_is_the_blank_default_and_therefore_splits(cmd_rig):
     """max-gpu is what an unconfigured model resolves to (derive_alloc_mode's
     fallthrough) AND what mode_to_spill encodes as the empty wire — so "the
@@ -552,19 +735,29 @@ def test_max_gpu_is_the_blank_default_and_therefore_splits(cmd_rig):
     assert (ngl, ncm) == (-1, spill.MOE_ALL_LAYERS)
 
 
-@pytest.mark.parametrize("mode", ["max-ram", "explicit"])
-def test_mode_engine_modes_suppress_the_split_at_every_autofit(cmd_rig,
-                                                               monkeypatch, mode):
-    """max-ram / explicit are the only modes that reach the worker as
-    HUGPY_ALLOC_MODE. Both put the operator in charge of the placement numbers,
-    so the auto split stays out of the way regardless of the autofit verdict —
-    including fits-whole, where the old policy also declined."""
-    monkeypatch.setenv("HUGPY_ALLOC_MODE", mode)
+def test_max_ram_that_holds_the_whole_model_grants_no_gpu_and_never_splits(
+        cmd_rig, monkeypatch):
+    """max-ram fills RAM first and only the OVERFLOW reaches the GPU. With no
+    overflow there is no GPU budget at all, so there is nothing to rank and the
+    placement is byte-identical to before — at every autofit verdict."""
+    monkeypatch.setenv("HUGPY_ALLOC_MODE", "max-ram")
     for verdict in (-1, 0, 17):
         cmd_rig.auto["value"] = verdict
         (argv, ngl, *_rest, ncm) = sa._build_cmd("moe-model", path=cmd_rig.moe)
-        assert ncm is None and "--n-cpu-moe" not in argv, (mode, verdict)
+        assert ncm is None and "--n-cpu-moe" not in argv, verdict
         assert ngl == verdict
+
+
+def test_explicit_mode_still_leads_with_the_dense_backbone(cmd_rig, monkeypatch):
+    """explicit puts the operator in charge of the NUMBERS (its VRAM/RAM
+    budgets), not of the ORDERING. Its budget is still a GPU budget, so the
+    backbone leads and the experts take the remainder (ruling 2026-07-31)."""
+    monkeypatch.setenv("HUGPY_ALLOC_MODE", "explicit")
+    for verdict in (-1, 0, 17):
+        cmd_rig.auto["value"] = verdict
+        (argv, ngl, *_rest, ncm) = sa._build_cmd("moe-model", path=cmd_rig.moe)
+        assert (ngl, ncm) == (-1, spill.MOE_ALL_LAYERS), verdict
+        assert _argv_pairs(argv)["--n-cpu-moe"] == "999"
 
 
 def test_old_llama_server_degrades_to_layer_split(cmd_rig, monkeypatch):
@@ -609,41 +802,104 @@ def test_defaulted_minus_one_still_gets_the_moe_auto_split(cmd_rig):
     assert total == 48
 
 
-def test_explicit_minus_one_forces_all_layers_and_never_auto_splits(cmd_rig):
-    """(b) EXPLICIT -1 (runners.get / gpu-only / chaos) -> forced, policy silent.
+def test_explicit_minus_one_is_gpu_only_not_a_layer_instruction(cmd_rig):
+    """(b) EXPLICIT -1 (runners.get / the gpu-only wire / chaos / the stored
+    stamp) — re-ruled TWICE, and the second ruling stands.
 
-    This is the k14 override-wins path the offload sweep depends on; it must be
-    byte-identical to before the provenance marker existed."""
+    2026-07-31 (k53): it is not a per-layer instruction, so it must never
+    disable the split into the 17/48 hybrid that stranded 31 layers of DENSE
+    attention on the CPU. That still holds — no hybrid is reachable here.
+
+    2026-07-31 (k55): but it is not a vague "as much as you can" either. It is
+    mode_to_spill("gpu-only")'s wire, so it means ALL tensors on the card, and
+    the answer is binary. On an UNMEASURABLE card nothing can be disproved, so
+    the mode is obeyed literally (--n-cpu-moe 0) rather than degraded into the
+    blank default's all-experts-to-CPU split, which nobody asked for."""
     cmd_rig.auto["value"] = 17
     (argv, ngl, *_rest, ncm) = sa._build_cmd("moe-model", n_gpu_layers=-1,
                                              path=cmd_rig.moe)
-    assert ngl == -1
-    assert ncm is None and "--n-cpu-moe" not in argv
+    assert ngl == -1 and ncm == 0
+    assert _argv_pairs(argv)["--n-cpu-moe"] == "0"
 
 
-def test_explicit_minus_one_DOES_split_when_it_cannot_possibly_fit(cmd_rig,
-                                                                   monkeypatch):
-    """The one exception (2026-07-25): -1 wins whenever it is ACHIEVABLE, but a
-    model that cannot fit the card is not a placement — it is a stall.
-
-    A bare {"n_gpu_layers": -1} is the ROUTINE stamp here (40 of 43 persisted
-    allocations on ae), applied by the console's Max GPU button / bulk-allocate
-    / reconcile. Obeying it on an oversized MoE is exactly what stranded ae for
-    5.5h: 48.4 GB of weights at a 24 GB card, --n-cpu-moe absent, 9 failed
-    attempts, silent fallback. So when the weights are multiples of the card,
-    the split applies instead of the stall.
-
-    The sibling test above pins the other half: -1 on a model that DOES fit is
-    still forced, byte-identical. Both must hold.
-    """
-    monkeypatch.setattr(sa, "_total_gguf_bytes", lambda _p: 48 * 2 ** 30)
-    monkeypatch.setattr("abstract_hugpy_dev.managers.spill.free_vram_bytes",
-                        lambda: 24 * 2 ** 30)
+def test_explicit_positive_layer_count_is_still_obeyed_verbatim(cmd_rig):
+    """The k14/k7 lever survives the ruling: a STATED layer count (seat at full
+    offload, then relaunch DOWN through counts to measure the speed cliff) is a
+    real per-layer instruction, so it is obeyed and no split is planned. Only
+    the ambiguous -1 stamp was re-read."""
+    cmd_rig.vram["free"] = 24 * GIB               # even with a measurable card
     cmd_rig.auto["value"] = 17
+    (argv, ngl, *_rest, ncm) = sa._build_cmd("moe-model", n_gpu_layers=20,
+                                             path=cmd_rig.moe)
+    assert ngl == 20 and ncm is None and "--n-cpu-moe" not in argv
+
+
+def test_the_blank_default_prices_a_partial_split_against_the_card(
+        cmd_rig, monkeypatch):
+    """The incident case, end to end, under the BLANK default (max-gpu — the
+    mode whose contract says spill): a MoE whose experts are multiples of the
+    card. The backbone is seated first and the leftover VRAM buys expert layers
+    from the TOP block index down — never a layer split that strands dense
+    attention in RAM.
+
+    The synthetic MoE has 3332 non-expert bytes and two expert layers of 8000
+    each, so a budget that covers the backbone + ONE expert layer must land on
+    --n-cpu-moe 1 (layer 0's experts to CPU, layer 1's on the card).
+
+    Driven WITHOUT the -1: since k55 that wire is gpu-only, which refuses this
+    budget outright (the sibling test) instead of spilling — the partial split
+    is max-gpu's job, and max-gpu is what a blank model resolves to."""
+    cmd_rig.vram["free"] = 3332 + 8000 + 10       # backbone + exactly one layer
+    cmd_rig.auto["value"] = 17
+    (argv, ngl, *_rest, ncm) = sa._build_cmd("moe-model", path=cmd_rig.moe)
+    assert ngl == -1 and ncm == 1
+    assert _argv_pairs(argv)["--n-cpu-moe"] == "1"
+    # The same budget under gpu-only is a refusal, not a quieter split.
+    with pytest.raises(sa.GpuOnlyInfeasible):
+        sa._build_cmd("moe-model", n_gpu_layers=-1, path=cmd_rig.moe)
+
+
+def test_a_card_that_holds_everything_states_n_cpu_moe_zero(cmd_rig):
+    """A budget that covers the whole model puts the experts on the card too —
+    and SAYS so with an explicit --n-cpu-moe 0 rather than omitting the flag, so
+    an inherited LLAMA_ARG_N_CPU_MOE=999 (the transition-era ae unit hack)
+    cannot silently spill them."""
+    cmd_rig.vram["free"] = 8 * GIB
     (argv, ngl, *_rest, ncm) = sa._build_cmd("moe-model", n_gpu_layers=-1,
                                              path=cmd_rig.moe)
-    assert ncm, "an impossible forced -1 must fall back to the expert split"
-    assert "--n-cpu-moe" in argv and ngl == -1
+    assert ngl == -1 and ncm == 0
+    assert _argv_pairs(argv)["--n-cpu-moe"] == "0"
+
+
+def test_a_card_that_only_holds_the_backbone_spills_every_expert(cmd_rig):
+    """Budget covers the dense backbone and nothing more -> MOE_ALL_LAYERS: the
+    measured ae default (+59% tok/s at 5x less VRAM), reached by pricing rather
+    than by assumption."""
+    cmd_rig.vram["free"] = 3332 + 100
+    (_argv, ngl, *_rest, ncm) = sa._build_cmd("moe-model", path=cmd_rig.moe)
+    assert (ngl, ncm) == (-1, spill.MOE_ALL_LAYERS)
+
+
+def test_the_context_reserve_is_charged_before_the_experts(cmd_rig, monkeypatch):
+    """The KV cache lands on the card beside the weights, so the plan spends the
+    budget on it BEFORE it hands anything to the experts — otherwise a split
+    that "fits" OOMs the moment the context allocates."""
+    monkeypatch.setattr(spill, "vram_ctx_reserve_bytes",
+                        lambda p, n_ctx=None: (8000, "test", {}))
+    cmd_rig.vram["free"] = 3332 + 8000 + 10       # would have bought one layer
+    (_argv, ngl, *_rest, ncm) = sa._build_cmd("moe-model", path=cmd_rig.moe)
+    assert (ngl, ncm) == (-1, spill.MOE_ALL_LAYERS)
+
+
+def test_gpu_mem_gib_budget_caps_what_the_experts_may_claim(cmd_rig):
+    """A per-model VRAM contract (explicit mode's gpu_mem_gib) is the budget the
+    plan spends — not the whole card. 16 GiB free but a 3332+8000-byte contract
+    still means one expert layer."""
+    cmd_rig.vram["free"] = 16 * GIB
+    (_argv, ngl, *_rest, ncm) = sa._build_cmd(
+        "moe-model", path=cmd_rig.moe,
+        gpu_mem_gib=(3332 + 8000 + 10) / GIB)
+    assert (ngl, ncm) == (-1, 1)
 
 
 def test_explicit_n_cpu_moe_zero_on_an_impossible_fit_REFUSES_loudly(cmd_rig,
@@ -1014,13 +1270,30 @@ def test_moe_split_residency_never_reads_as_a_full_load(monkeypatch):
 
 
 # ═══════════ central feasibility with MoE sizing ════════════════════════════
-def test_feasibility_moe_split_makes_gpu_only_selectable():
+def test_feasibility_moe_split_makes_MAX_GPU_selectable_not_gpu_only():
+    """STRICT gpu-only (operator ruling 2026-07-31): "only" means ALL tensors on
+    the card, experts included. The split used to relax THIS gate — a 45 GiB MoE
+    on a 24 GiB card was offered gpu-only and then served with 43 GiB of experts
+    in RAM, which silently redefined the mode's name. The split's feasibility
+    home is max-gpu, whose contract already says spill."""
     dense = AM.feasible_modes("gguf", int(45 * GIB), 24 * GIB, 128 * GIB)
     assert "gpu-only" not in dense               # 45G on a 24G card: eliminated
     moe = AM.feasible_modes("gguf", int(45 * GIB), 24 * GIB, 128 * GIB,
                             moe_split_gpu_bytes=int(3 * GIB))
-    assert "gpu-only" in moe                     # the split makes it serveable
-    assert "max-gpu" in moe
+    assert "gpu-only" not in moe                 # the split does NOT relax it
+    assert "max-gpu" in moe                      # spill-and-serve lives here
+    assert moe == dense                          # the split changes no gate now
+
+
+def test_feasibility_gpu_only_survives_when_the_WHOLE_moe_fits():
+    """The mode is not banned for MoEs — it is priced honestly. A MoE that fits
+    the card whole (experts included) keeps gpu-only, at the same headroom
+    factor a dense model of the same size gets."""
+    small = int(10 * GIB)
+    moe = AM.feasible_modes("gguf", small, 24 * GIB, 128 * GIB,
+                            moe_split_gpu_bytes=int(1 * GIB))
+    assert "gpu-only" in moe
+    assert moe == AM.feasible_modes("gguf", small, 24 * GIB, 128 * GIB)
 
 
 def test_feasibility_dense_paths_are_unchanged():
@@ -1028,7 +1301,11 @@ def test_feasibility_dense_paths_are_unchanged():
     assert base == AM.feasible_modes("gguf", 5 * GIB, 24 * GIB, 128 * GIB,
                                      moe_split_gpu_bytes=None)
     tf = AM.feasible_modes("transformers", int(68 * GIB), 24 * GIB, 124 * GIB)
-    assert "gpu-only" not in tf and "max-gpu" not in tf and "ram-only" in tf
+    # gpu-only stays eliminated (68G can never ride the card whole), but
+    # max-gpu SURVIVES: it is a spill preference under the numbers rule
+    # (fits GPU+RAM combined — 118ac64, operator ruling 2026-07-29), not a
+    # fits-the-card-whole test.
+    assert "gpu-only" not in tf and "max-gpu" in tf and "ram-only" in tf
 
 
 # ═══════════ the knob: overrides + spill env wire ═══════════════════════════
@@ -1061,15 +1338,104 @@ def test_n_cpu_moe_rides_the_version_gate():
 @pytest.fixture
 def plan_rig(monkeypatch, moe_gguf):
     monkeypatch.setattr(A, "_served_gguf_geometry", lambda mk: (moe_gguf, 48))
-    for env in ("HUGPY_N_GPU_LAYERS", "HUGPY_N_CPU_MOE", "HUGPY_ALLOC_MODE"):
+    for env in ("HUGPY_N_GPU_LAYERS", "HUGPY_N_CPU_MOE", "HUGPY_ALLOC_MODE",
+                "HUGPY_GPU_MEM_GIB"):
         monkeypatch.delenv(env, raising=False)
-    return moe_gguf
+    # The card, EXPLICITLY (k55). Admission now prices the SAME dense-first plan
+    # the slot launches, so it reads real VRAM — leaving that to whatever GPU
+    # the test box happens to have would make these verdicts machine-dependent.
+    # Default None = unmeasurable, which is the slot's own degrade (all experts
+    # to CPU), so every pre-k55 expectation below is unchanged.
+    vram = {"free": None}
+    monkeypatch.setattr(spill, "free_vram_bytes", lambda: vram["free"])
+    monkeypatch.setattr(spill, "vram_ctx_reserve_bytes",
+                        lambda p, n_ctx=None: (0, "test", {}))
+    return type("Rig", (), {"path": moe_gguf, "vram": vram})()
 
 
-def test_plan_auto_eligible_defaults_to_all_experts(plan_rig):
+def test_plan_unmeasurable_card_defaults_to_all_experts(plan_rig):
+    """The historical degrade, and still the honest one: with no VRAM reading
+    the slot splits every expert to CPU, so admission prices exactly that."""
     plan = A._moe_plan_for("m")
     assert plan["n_cpu_moe"] == spill.MOE_ALL_LAYERS
     assert plan["cpu_bytes"] == 16000 and plan["gpu_weight_bytes"] == 3332
+
+
+# ═══ ADMISSION PRICES THE DENSE-FIRST PLAN (k55 — k53's flagged follow-up) ═══
+# The child spends the budget left after the backbone on EXPERT LAYERS, so
+# pricing the split as backbone-only under-reserved every load with room to
+# spare: the child took more VRAM than admission planned and the NEXT admission
+# saw a fuller card than it expected. Admission and launch now run the same
+# arithmetic on the same budget.
+def test_plan_prices_the_expert_layers_the_budget_actually_buys(plan_rig):
+    plan_rig.vram["free"] = 3332 + 8000          # backbone + ONE expert layer
+    plan = A._moe_plan_for("m")
+    assert plan["n_cpu_moe"] == 1                # the block index, not a count
+    assert plan["gpu_weight_bytes"] == 3332 + 8000
+    assert plan["cpu_bytes"] == 8000
+
+
+def test_plan_matches_the_slot_launch_byte_for_byte(plan_rig, monkeypatch):
+    """The whole point: what admission reserves and what _build_cmd launches
+    are one number. Same budget in, same n_cpu_moe and same GPU bytes out."""
+    serve = importlib.import_module("abstract_hugpy_dev.managers.serve.serve")
+    monkeypatch.setattr(serve, "LLAMA_SERVER_BIN", "/bin/echo")
+    monkeypatch.setattr(sa, "_server_supports_flag", lambda b, f: True)
+    monkeypatch.setattr(spill, "autofit_gpu_layers",
+                        lambda p, free_vram=None, extra_reserve_bytes=0,
+                        **_kw: 17)
+    for budget, want_ncm in ((3332 + 8000, 1), (3332 + 100, spill.MOE_ALL_LAYERS)):
+        plan_rig.vram["free"] = budget
+        priced = A._moe_plan_for("m")
+        (_argv, ngl, *_rest, ncm) = sa._build_cmd("m", path=plan_rig.path)
+        assert (ngl, ncm) == (-1, want_ncm), budget
+        assert priced["n_cpu_moe"] == ncm, budget
+        launched = spill.moe_dense_first_plan(
+            spill.gguf_moe_detail(plan_rig.path), budget)
+        assert priced["gpu_weight_bytes"] == launched["gpu_bytes"], budget
+        assert priced["cpu_bytes"] == launched["cpu_bytes"], budget
+
+
+def test_plan_that_keeps_everything_on_the_card_is_no_split(plan_rig):
+    """A budget that covers the whole model moves NOTHING to RAM — that is not
+    a split, so the caller falls back to the dense full-need pricing (which is
+    what the card will actually hold)."""
+    plan_rig.vram["free"] = 1 << 30
+    assert A._moe_plan_for("m") is None
+
+
+def test_plan_is_none_when_the_reserve_eats_the_whole_budget(plan_rig,
+                                                             monkeypatch):
+    """Mirror of the slot: a budget consumed by the context/projector reserve
+    plans no split at all, so admission must not price one either."""
+    monkeypatch.setattr(spill, "vram_ctx_reserve_bytes",
+                        lambda p, n_ctx=None: (1 << 40, "test", {}))
+    plan_rig.vram["free"] = 3332 + 8000
+    assert A._moe_plan_for("m") is None
+
+
+def test_plan_honors_the_models_own_gpu_mem_gib_contract(plan_rig, monkeypatch):
+    """The per-model VRAM budget caps the plan on BOTH sides of the seam (the
+    slot caps autofit's free with it; here it is the HUGPY_GPU_MEM_GIB wire)."""
+    plan_rig.vram["free"] = 1 << 30              # a card that fits everything
+    monkeypatch.setenv("HUGPY_GPU_MEM_GIB", str((3332 + 8000) / float(GIB)))
+    plan = A._moe_plan_for("m")
+    assert plan["n_cpu_moe"] == 1 and plan["cpu_bytes"] == 8000
+
+
+def test_need_detail_carries_the_planned_gpu_footprint(plan_rig, monkeypatch):
+    """The fit checks consume ``moe_split.gpu_total`` — it must be the PLANNED
+    GPU weights (backbone + the expert layers the budget bought) x the 1.15
+    weights headroom, + the whole KV, not the backbone alone."""
+    plan_rig.vram["free"] = 3332 + 8000
+    monkeypatch.setattr(A, "_incoming_need_bytes", lambda mk: 19332)
+    monkeypatch.setattr(A, "_kv_need_bytes", lambda mk, cfg=None: (500, {}))
+    monkeypatch.setattr(A, "_calib_correction", lambda mk: None)
+    det = A._incoming_need_detail("m")
+    ms = det["moe_split"]
+    assert ms["n_cpu_moe"] == 1
+    assert ms["gpu_total"] == int((3332 + 8000) * 1.15) + 500
+    assert ms["cpu_bytes"] == 8000
 
 
 def test_plan_explicit_layer_designation_wins(plan_rig, monkeypatch):
@@ -1236,8 +1602,9 @@ def test_moe_fits_nothing_is_the_break_leaf():
 
 # ── the dense / transformers leaves stay exactly as they were ────────────────
 def test_dense_gguf_leaves_are_unchanged():
+    # fits-whole -> gpu-only since the operator default order 2026-07-31
     fits = AM.default_allocation("gguf", 5 * GIB, 24 * GIB, 128 * GIB)
-    assert fits["mode"] == "max-gpu" and fits["spill"] == {}
+    assert fits["mode"] == "gpu-only" and fits["spill"] == {"n_gpu_layers": -1}
     big = AM.default_allocation("gguf", 68 * GIB, 24 * GIB, 128 * GIB)
     assert big["mode"] == "max-ram"
     huge = AM.default_allocation("gguf", 400 * GIB, 24 * GIB, 128 * GIB)
@@ -1246,7 +1613,7 @@ def test_dense_gguf_leaves_are_unchanged():
 
 def test_transformers_leaves_match_the_established_behaviour():
     """The transformers branch was already correct; the tree must not move it."""
-    for size, gpu, ram, want in ((5 * GIB, 24 * GIB, 124 * GIB, "max-gpu"),
+    for size, gpu, ram, want in ((5 * GIB, 24 * GIB, 124 * GIB, "gpu-only"),
                                  (68 * GIB, 24 * GIB, 124 * GIB, "ram-only"),
                                  (200 * GIB, 24 * GIB, 124 * GIB, "max-gpu")):
         got = AM.default_allocation("transformers", size, gpu, ram)
@@ -1255,17 +1622,17 @@ def test_transformers_leaves_match_the_established_behaviour():
                                                        gpu, ram)
 
 
-def test_fitting_model_derives_max_gpu_not_gpu_only():
-    """The one deliberate departure from the sketch's literal words, pinned so
-    it cannot be 'fixed' by accident: the 'gpu large enough' leaf derives
-    max-gpu (fit-and-spill), NOT gpu-only (all-or-bust). A DEFAULT must never
-    promise a bust — the fit test is a headroom heuristic against TOTAL
-    capacity, not a measurement of what is free right now. gpu-only stays
-    reachable by explicit operator choice."""
+def test_fitting_model_derives_gpu_only():
+    """Operator default order 2026-07-31: a model that fits the card WHOLE
+    derives gpu-only (full-card residency) — the 07-25 max-gpu departure is
+    reversed now that gpu-only is strict-and-honest (k55): a fit miss under
+    contention is an explicit refusal naming max-gpu, not a llama.cpp OOM.
+    Oversized/unknown sizes never reach this leaf, so the default stays a
+    success path per (model x worker)."""
     for engine in ("transformers", "gguf"):
         got = AM.default_allocation(engine, 5 * GIB, 24 * GIB, 128 * GIB)
-        assert got["mode"] == "max-gpu"
-        assert got["spill"] == {}                # never {"n_gpu_layers": -1}
+        assert got["mode"] == "gpu-only"
+        assert got["spill"] == {"n_gpu_layers": -1}
 
 
 # ── degrade-not-guess: a default is never derived from a guessed number ──────
@@ -1300,9 +1667,9 @@ def test_unreadable_moe_detail_degrades_to_the_dense_path():
     # no moe detail supplied at all -> pure dense path
     assert AM.default_allocation("gguf", 45 * GIB, 24 * GIB, 128 * GIB
                                  )["mode"] == "max-ram"
-    # is_moe False is dense too
+    # is_moe False is dense too (fits whole -> gpu-only, 2026-07-31 order)
     assert AM.default_allocation("gguf", 5 * GIB, 24 * GIB, 128 * GIB,
-                                 moe={"is_moe": False})["mode"] == "max-gpu"
+                                 moe={"is_moe": False})["mode"] == "gpu-only"
 
 
 # ── the two views agree; the mirrored constant cannot drift ──────────────────

@@ -249,6 +249,42 @@ class ReservationRegistry:
             return 0
         return sum(int(r.get("peak_bytes") or 0) for r in self.active(worker_id))
 
+    def active_snapshot(self) -> Dict[str, Dict[str, Any]]:
+        """READ-ONLY {run_id: row} of the claims that are active RIGHT NOW — the
+        listing/observability read (k57).
+
+        Unlike ``active()``/``get()`` this NEVER writes: the lapsed-lease sweep is
+        expressed as a WHERE predicate (``heartbeat_at + lease_ttl_s >= now``)
+        instead of the UPDATE those paths run, and the connection is opened
+        ``mode=ro``. That matters because the placement projection behind
+        GET /video/jobs consulted the registry ONCE PER ROW: each call took a write
+        lock on a store that live renderers heartbeat into, so a 40-row listing
+        serialized behind ~40 write transactions (busy_timeout 2s each) and the feed
+        hung for minutes. A read path must never contend with a running render — an
+        unexpired-only SELECT is exactly as honest, since the sweep's only effect on
+        a READER was hiding the very rows this predicate hides.
+
+        {} on any store error (fail-open: no claim beats a broken-store stall)."""
+        if not self._ensure():
+            return {}
+        try:
+            conn = retry_on_emfile(lambda: sqlite3.connect(
+                "file:" + self.path + "?mode=ro", uri=True, timeout=2.0))
+            try:
+                conn.execute("PRAGMA busy_timeout=2000")
+                cur = conn.execute(
+                    "SELECT * FROM reservations WHERE state='active' "
+                    "AND (heartbeat_at + lease_ttl_s) >= ?", (time.time(),))
+                cols = [c[0] for c in cur.description]
+                rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+            finally:
+                conn.close()
+            self._ok()
+            return {str(r.get("run_id")): r for r in rows if r.get("run_id")}
+        except Exception as exc:  # noqa: BLE001
+            self._note_failure("active_snapshot", exc)
+            return {}
+
     def get(self, run_id: str) -> Optional[Dict[str, Any]]:
         if not run_id or not self._ensure():
             return None

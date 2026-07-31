@@ -224,6 +224,28 @@ def _install_engine(args: argparse.Namespace) -> int:
     return 0
 
 
+def _reclassify_images(args: argparse.Namespace) -> int:
+    """One-shot re-stamp of image tasks derived from each model dir itself.
+
+    The k61 corrector: the fleet's existing WRONG stamps (a complete
+    Flux2KleinPipeline marked image-to-image only, a LoRA dir left null and
+    defaulted to text-generation) get fixed by CODE on every box, instead of by
+    hand on one. Dry by default — pass --apply to write."""
+    from abstract_hugpy_dev.imports.apis.reclassify import reclassify_images
+
+    report = reclassify_images(apply=args.apply)
+    changed = report["changed"]
+    print(f"hugpy reclassify-images: scanned {report['scanned']} dir(s), "
+          f"{len(changed)} to correct "
+          f"({'APPLIED' if report['applied'] else 'dry run — nothing written'})")
+    for c in changed:
+        why = c.get("pipeline_class") or ("adapter-only dir" if c["adapter"] else c["source"])
+        print(f"  {c['name']}: {c['from']} -> {c['to']}   [{why}]")
+    if changed and not report["applied"]:
+        print("  re-run with --apply to write the sidecars + discovery report")
+    return 0
+
+
 def _detect_profile() -> tuple[str, str]:
     """Pick cpu-worker/gpu-worker by probing local hardware. Returns
     (profile, reason) — the reason is always printed, detection is never silent.
@@ -364,6 +386,13 @@ def main(argv: list[str] | None = None) -> int:
                    help="print the pip command and exit without running it")
     i.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
 
+    r = sub.add_parser("reclassify-images",
+                       help="re-derive image-model tasks from each model dir's own "
+                            "declaration (diffusers model_index.json / adapter-only "
+                            "dirs) and re-stamp the wrong ones")
+    r.add_argument("--apply", action="store_true",
+                   help="write the corrected tasks (default: dry run)")
+
     # Split: everything after `worker` belongs to the agent's parser.
     if argv and argv[0] == "worker":
         return _worker(w, argv[1:])
@@ -387,6 +416,8 @@ def main(argv: list[str] | None = None) -> int:
         return _bot(args)
     if args.cmd == "chat":
         return _chat(args)
+    if args.cmd == "reclassify-images":
+        return _reclassify_images(args)
     parser.error("unknown command")
     return 2
 

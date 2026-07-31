@@ -134,11 +134,15 @@ def test_placement_unknown_task_none(bus):
 def test_placement_reservation_wins_with_overlay(bus, monkeypatch):
     from abstract_hugpy_dev.video_intel.reservation import registry as REG
 
-    def _fake_get(run_id):
-        return {"run_id": run_id, "state": "active", "worker_id": "ae-worker-1",
-                "gpu": "ae", "task": "studio_i2v", "peak_bytes": 20 * 1024 ** 3}
+    # k57: placement reads the registry's READ-ONLY snapshot ({run_id: row}) once
+    # per page instead of a per-row get() (whose lapsed-lease sweep took a write
+    # lock live renderers contend for), so that is the seam to fake here.
+    def _fake_snapshot():
+        return {"run-42": {"run_id": "run-42", "state": "active",
+                           "worker_id": "ae-worker-1", "gpu": "ae",
+                           "task": "studio_i2v", "peak_bytes": 20 * 1024 ** 3}}
 
-    monkeypatch.setattr(REG.reservation_registry, "get", _fake_get)
+    monkeypatch.setattr(REG.reservation_registry, "active_snapshot", _fake_snapshot)
     pl = PL.job_placement("run-42", "studio_i2v")
     assert pl["source"] == "reservation"
     assert pl["worker_id"] == "ae-worker-1"

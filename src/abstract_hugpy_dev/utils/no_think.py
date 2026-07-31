@@ -76,6 +76,7 @@ __all__ = [
     "apply_no_think",
     "finalize_no_think",
     "execute_prompt_no_think",
+    "StreamingThinkSplitter",
 ]
 
 NO_THINK_DIRECTIVE = "/no_think"
@@ -99,6 +100,87 @@ def strip_think(text: str) -> tuple[str, str]:
         return "", ""
     reasoning = "\n".join(m.group(1).strip() for m in THINK_BLOCK_RE.finditer(text))
     return THINK_BLOCK_RE.sub("", text).strip(), reasoning.strip()
+
+
+_OPEN_RE = re.compile(r"<think(?:ing)?>", re.IGNORECASE)
+_CLOSE_RE = re.compile(r"</think(?:ing)?>", re.IGNORECASE)
+# The longest tag we might be MID-way through at a buffer boundary — used to
+# decide how much of the tail to hold back so a tag split across tokens
+# ("<thi" + "nk>") is never emitted as literal text.
+_TAG_PREFIXES = ("<think>", "</think>", "<thinking>", "</thinking>")
+
+
+class StreamingThinkSplitter:
+    """Incrementally route a token stream into (answer, reasoning).
+
+    The /v1 mount receives the reasoning ALREADY RE-INLINED as ``<think>…
+    </think>`` in the content (ccp_runner re-inlines what llama.cpp put in
+    reasoning_content — see this module's header). An OpenAI-style client such
+    as OpenCode renders a collapsible reasoning panel ONLY when the reasoning
+    arrives in ``delta.reasoning_content``, not as literal ``<think>`` text in
+    the answer. This splitter re-separates the two AS THEY STREAM so the console
+    gets a proper reasoning channel (operator 2026-07-31: "no_think should be
+    applied to all responses … the think var available in the console and
+    collapsed upon its output").
+
+    Stream-safe by construction: ``feed(token)`` returns ``(answer_delta,
+    reasoning_delta)`` and NEVER emits a partial tag — a tag split across tokens
+    is held in an internal buffer until it resolves. ``flush()`` drains the tail
+    at end-of-stream; an unclosed ``<think>`` (budget ran out mid-thought) drains
+    as reasoning, never as answer.
+    """
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._in_think = False
+
+    @staticmethod
+    def _safe_prefix_len(buf: str) -> int:
+        """How many trailing chars to HOLD BACK because they may begin a tag."""
+        for cut in range(1, min(len(buf), 10) + 1):
+            tail = buf[-cut:].lower()
+            if any(p.startswith(tail) for p in _TAG_PREFIXES):
+                return cut
+        return 0
+
+    def feed(self, token: str) -> "tuple[str, str]":
+        self._buf += (token or "")
+        answer, reasoning = [], []
+        while self._buf:
+            if not self._in_think:
+                m = _OPEN_RE.search(self._buf)
+                if m:
+                    answer.append(self._buf[:m.start()])
+                    self._buf = self._buf[m.end():]
+                    self._in_think = True
+                    continue
+                hold = self._safe_prefix_len(self._buf)
+                if hold:
+                    answer.append(self._buf[:-hold]); self._buf = self._buf[-hold:]
+                else:
+                    answer.append(self._buf); self._buf = ""
+                break
+            else:
+                m = _CLOSE_RE.search(self._buf)
+                if m:
+                    reasoning.append(self._buf[:m.start()])
+                    self._buf = self._buf[m.end():]
+                    self._in_think = False
+                    continue
+                hold = self._safe_prefix_len(self._buf)
+                if hold:
+                    reasoning.append(self._buf[:-hold]); self._buf = self._buf[-hold:]
+                else:
+                    reasoning.append(self._buf); self._buf = ""
+                break
+        return "".join(answer), "".join(reasoning)
+
+    def flush(self) -> "tuple[str, str]":
+        """Drain the tail. Unclosed think → reasoning; otherwise → answer."""
+        rest, self._buf = self._buf, ""
+        if not rest:
+            return "", ""
+        return ("", rest) if self._in_think else (rest, "")
 
 
 def with_no_think(user_text: str) -> str:

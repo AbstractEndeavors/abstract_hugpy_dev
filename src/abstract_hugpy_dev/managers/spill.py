@@ -271,23 +271,60 @@ def total_vram_bytes() -> Optional[int]:
     return _total_vram(_env_int("HUGPY_MAIN_GPU") or 0)
 
 
+def _rss_anon_bytes(pid: int) -> Optional[int]:
+    """RssAnon (anonymous, non-reclaimable resident) for ``pid`` from
+    /proc/<pid>/status, in bytes. None if unreadable (non-Linux, permission, or
+    the process exited between enumeration and read)."""
+    try:
+        with open(f"/proc/{pid}/status", "r", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("RssAnon:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
 def ram_worker_bytes() -> Optional[int]:
-    """RSS of THIS worker's own process tree (the agent + every slot child it
-    spawned), in bytes. This is ``worker_usage`` for the budget-bar spec: the
-    RAM hugpy itself holds, distinct from external processes central can't see.
-    Best-effort via psutil (children(recursive=True)); None if unmeasurable."""
+    """NON-RECLAIMABLE RAM this worker's process tree holds (the agent + every
+    slot child), in bytes. ``worker_usage`` for the budget-bar spec: the RAM
+    hugpy itself actually consumes, distinct from external processes.
+
+    Sums **RssAnon**, NOT VmRSS (operator ruling 2026-07-31, option (a)). VmRSS
+    counts memory-mapped GGUF weight pages, which are clean, file-backed page
+    cache the kernel reports as AVAILABLE (it is total−MemAvailable that defines
+    box-used). Counting them as "used" made the bar read ~74/88 GiB when the box
+    truly used ~20; and because ``ram_external_bytes`` is
+    ``max(0, box_used − worker_usage)``, an inflated worker figure OVERSHOT the
+    whole box's real usage and clamped external to 0 — a doubly-wrong bar. The
+    RSS-counts-mmap'd-GGUF landmine, surfacing on the RAM bar.
+
+    ⚠ NOT ``memory_full_info().uss``: USS still counts these pages, because a
+    llama.cpp weight mmap is a PRIVATE file mapping (clean but not shared), so
+    USS ≈ VmRSS here (measured). RssAnon is the anonymous-only footprint that
+    matches the kernel's used/available split.
+
+    RssAnon comes from /proc (cheap); psutil only enumerates the tree. Per-proc
+    fallback to VmRSS where /proc is unreadable (never fabricate). None if
+    nothing was measurable at all."""
     try:
         import psutil
         me = psutil.Process()
-        total = me.memory_info().rss
-        for child in me.children(recursive=True):
-            try:
-                total += child.memory_info().rss
-            except Exception:  # noqa: BLE001 — a child may exit mid-walk
-                continue
-        return int(total)
+        procs = [me] + me.children(recursive=True)
     except Exception:  # noqa: BLE001 — no psutil / permission: don't fabricate
         return None
+    total = 0
+    measured = False
+    for p in procs:
+        try:
+            anon = _rss_anon_bytes(p.pid)
+            if anon is None:
+                anon = p.memory_info().rss   # non-Linux / unreadable: RSS fallback
+            total += anon
+            measured = True
+        except Exception:  # noqa: BLE001 — a child may exit mid-walk
+            continue
+    return int(total) if measured else None
 
 
 def ram_external_bytes() -> Optional[int]:
@@ -845,6 +882,84 @@ def moe_split_need(detail: dict, n_cpu_moe: Optional[int] = None) -> "Optional[d
             "layers_on_cpu": n}
 
 
+def moe_dense_first_plan(detail: dict,
+                         gpu_budget_bytes: Optional[int],
+                         *, extra_reserve_bytes: int = 0) -> "Optional[dict]":
+    """DENSE BACKBONE FIRST: how to spend a GPU budget on a MoE model.
+
+    Operator ruling 2026-07-31 (k53): for ANY MoE model the dense backbone —
+    attention, router, shared experts, embeddings/output, and the KV cache that
+    rides with them — is FIRST in line for whatever GPU budget the allocation
+    mode grants, REGARDLESS of mode. The expert FFN tensors get only what is
+    left. The inversion this retires is the one that stranded ae: a stale
+    ``{"n_gpu_layers": -1}`` row read as an explicit demand, disabled the split,
+    and llama.cpp then answered with a 17/48 LAYER split — 31 layers of DENSE
+    attention on the CPU while expert weights sat on the card. Dense bytes are
+    touched by EVERY token; expert bytes by ~expert_used/expert_count of one.
+    Dense-on-CPU is therefore always the wrong trade.
+
+    ``gpu_budget_bytes`` is the budgetable VRAM this load may claim (the mode's
+    number: the free card for gpu-only/max-gpu, ``gpu_mem_gib`` for explicit,
+    the RAM overflow for max-ram). ``extra_reserve_bytes`` is VRAM that lands on
+    the card beside the weights (mmproj projector + the KV/context reserve) and
+    is charged BEFORE anything is placed.
+
+    Returns ``None`` for a dense/unreadable detail (caller keeps its existing
+    pricing), else::
+
+        {"n_cpu_moe": N,            # the --n-cpu-moe llama-server must launch with
+         "expert_layers_on_gpu": k, # experts of the k HIGHEST block indices
+         "cpu_bytes": …,            # expert bytes that land in host RAM
+         "gpu_bytes": …,            # dense + the experts that fit
+         "dense_fits": bool,        # the backbone itself fits the budget
+         "budget_bytes": …}         # what was actually spent against
+
+    llama-server's ``--n-cpu-moe N`` keeps the experts of the FIRST N BLOCK
+    INDICES on the CPU, so the layers that ride the GPU are a SUFFIX of the
+    block range — the plan fills that suffix from the top down and reports the
+    threshold as the block index of the lowest expert layer kept on the card
+    (not a positional count: a model whose first blocks are dense would be
+    mispriced by position). ``MOE_ALL_LAYERS`` when nothing is left for the
+    experts — the measured coder-next default (+59% tok/s at 5x less VRAM);
+    ``0`` when the whole expert set fits, which is the honest, env-hack-proof
+    way to say "everything on the card" (an explicit ``--n-cpu-moe 0`` also
+    beats any inherited ``LLAMA_ARG_N_CPU_MOE``).
+    """
+    if not isinstance(detail, dict) or not detail.get("is_moe"):
+        return None
+    expert = int(detail.get("expert_bytes") or 0)
+    nexpert = int(detail.get("non_expert_bytes") or 0)
+    by_layer = {int(k): int(v) for k, v in
+                (detail.get("expert_bytes_by_layer") or {}).items()}
+    layers = sorted(by_layer)
+    budget = int(gpu_budget_bytes or 0) - int(extra_reserve_bytes or 0)
+    dense_fits = budget >= nexpert
+    # The backbone is charged first, always. Whatever is left buys expert
+    # layers from the TOP block index down (the suffix --n-cpu-moe expresses).
+    remaining = budget - nexpert if dense_fits else 0
+    kept = 0
+    for i in reversed(layers):
+        if by_layer[i] <= remaining:
+            remaining -= by_layer[i]
+            kept += 1
+        else:
+            break
+    if kept <= 0:
+        n_cpu_moe = MOE_ALL_LAYERS
+    elif kept >= len(layers):
+        n_cpu_moe = 0
+    else:
+        n_cpu_moe = layers[len(layers) - kept]
+    cpu_bytes = (expert if n_cpu_moe == MOE_ALL_LAYERS
+                 else sum(b for i, b in by_layer.items() if i < n_cpu_moe))
+    return {"n_cpu_moe": int(n_cpu_moe),
+            "expert_layers_on_gpu": int(kept),
+            "cpu_bytes": int(cpu_bytes),
+            "gpu_bytes": int(nexpert + expert - cpu_bytes),
+            "dense_fits": bool(dense_fits),
+            "budget_bytes": int(budget)}
+
+
 def n_cpu_moe_env() -> Optional[int]:
     """Explicit per-request/per-model n_cpu_moe from HUGPY_N_CPU_MOE (the spill
     wire, set by the worker's _apply_spill), or None when unset. The number of
@@ -1377,6 +1492,16 @@ def priority_device_env() -> str:
     """explicit mode's priority device ("gpu" default | "ram")."""
     raw = (_env("HUGPY_PRIORITY_DEVICE") or "gpu").strip().lower()
     return "ram" if raw == "ram" else "gpu"
+
+
+def no_evict_env() -> bool:
+    """k56 POLITE LOAD: True when this request's spill asked for a load that may
+    spend only genuinely free headroom and must NEVER evict a resident
+    (HUGPY_NO_EVICT, set per request by agent._apply_spill and cleared when
+    absent). Unset -> False, i.e. the declare-need-then-evict doctrine that
+    remains the rule for every unflagged load."""
+    raw = (_env("HUGPY_NO_EVICT") or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
 
 
 # RAM safety factor for the max-ram fill (mirror of _VRAM_SAFETY: never budget

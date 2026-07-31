@@ -294,6 +294,28 @@ def reconcile_store_route():
     return jsonify(report), (200 if apply else 202)
 
 
+# ── Image-task re-classification (the k61 one-shot) ───────────────────────
+# Re-derives each model's task from its OWN directory (a diffusers
+# model_index.json pipeline class, or an adapter-only dir) and re-stamps the
+# sidecar + the discovery row where they disagree. Same MONITOR-FIRST posture as
+# reconcile: {"apply": false} (the default) reports what WOULD change and touches
+# nothing. This exists so the fleet's wrong stamps — flux2 marked
+# image-to-image-only, an image LoRA left null and read as an LLM — are corrected
+# by code on every box instead of by hand on one.
+@llm_bp.route("/models/reclassify-images", methods=["POST"])
+def reclassify_images_route():
+    body = request.get_json(silent=True) or {}
+    apply = bool(body.get("apply", False))
+    from ....imports.apis.reclassify import reclassify_images
+    report = reclassify_images(apply=apply)
+    if apply and report["changed"]:
+        # Tasks changed => every derived registry row and every cached status
+        # that keyed on the old task is stale.
+        refresh_registry(run_discovery=False)
+        invalidate_model_status_cache("image tasks reclassified")
+    return jsonify(report), (200 if apply else 202)
+
+
 @llm_bp.route("/models/<model_key>", methods=["GET"])
 def get_model(model_key):
     manifest = get_models_dict(dict_return=True)

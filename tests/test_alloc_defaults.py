@@ -2,17 +2,19 @@
 
 Two halves of the operator ask:
   1. the BLANK default is derived per (model x worker) by FEASIBILITY, engine-
-     aware: GGUF -> max-gpu always; a transformers model too big for the box's
-     GPU but fitting RAM -> ram-only ON THAT WORKER (the only feasible option, so
-     it IS the default, and it must SERVE — defaults-are-promises);
+     aware: fits-the-card-whole -> gpu-only (operator default order 2026-07-31:
+     prefer full-card residency); oversized/unknown keep their spill-capable
+     leaves (GGUF degrade -> max-gpu; a transformers model too big for the
+     box's GPU but fitting RAM -> ram-only ON THAT WORKER — the only feasible
+     option, so it IS the default, and it must SERVE — defaults-are-promises);
   2. the SELECTABLE set is bounded to what's feasible (feasible_modes) so an
      infeasible mode is never offered — enforced at /assign (and the bulk path)
      with an honest numbers-naming 409/skip, surfaced on the serving row.
 
 Covers:
-  * feasible_default_mode matrix (gguf any-size, transformers 68/24/124 ->
-    ram-only, 5/24 -> max-gpu, 200/24/124 -> max-gpu (fits neither), unknown ->
-    max-gpu);
+  * feasible_default_mode matrix (oversized gguf -> max-gpu, fits-whole ->
+    gpu-only, transformers 68/24/124 -> ram-only, 5/24 -> gpu-only,
+    200/24/124 -> max-gpu (fits neither), unknown -> max-gpu);
   * feasible_modes matrix per engine (incl. the 68/24/124 case -> exactly
     (ram-only, max-gpu, max-ram); only gpu-only is eliminated for an oversized
     transformers model — max-gpu is a spill PREFERENCE, not a whole-card
@@ -68,17 +70,21 @@ check("gguf any size -> max-gpu (partial offload universal), even oversized",
 check("transformers 68GB / 24GB GPU / 124GB RAM -> ram-only (only feasible)",
       feasible_default_mode("transformers", 68 * GIB, 24 * GIB, 124 * GIB)
       == "ram-only")
-check("transformers 5GB / 24GB GPU -> max-gpu (plausibly fits GPU)",
+check("transformers 5GB / 24GB GPU -> gpu-only (fits whole; operator default "
+      "order 2026-07-31: prefer full-card residency)",
       feasible_default_mode("transformers", 5 * GIB, 24 * GIB, 124 * GIB)
-      == "max-gpu")
+      == "gpu-only")
+check("gguf 5GB / 24GB GPU -> gpu-only (dense fits-whole leaf, same order)",
+      feasible_default_mode("gguf", 5 * GIB, 24 * GIB, 124 * GIB)
+      == "gpu-only")
 check("transformers 200GB / 24GB GPU / 124GB RAM -> max-gpu (fits NEITHER, "
       "honest refusal downstream — no invented fourth state)",
       feasible_default_mode("transformers", 200 * GIB, 24 * GIB, 124 * GIB)
       == "max-gpu")
 # headroom boundary: exactly at 0.9x GPU still fits; just over falls to ram-only
-check("transformers at exactly 0.9x GPU total -> max-gpu (within headroom)",
+check("transformers at exactly 0.9x GPU total -> gpu-only (within headroom)",
       feasible_default_mode("transformers", int(_GPU_FIT_HEADROOM * 24 * GIB),
-                            24 * GIB, 124 * GIB) == "max-gpu")
+                            24 * GIB, 124 * GIB) == "gpu-only")
 check("transformers just over 0.9x GPU total (but fits RAM) -> ram-only",
       feasible_default_mode("transformers", int(_GPU_FIT_HEADROOM * 24 * GIB) + 1,
                             24 * GIB, 124 * GIB) == "ram-only")
@@ -220,8 +226,9 @@ for mk in ("tf-big", "tf-small", "g-big", "unk"):
 check("seam: oversized transformers blank default SERVES as ram-only "
       "({'n_gpu_layers':'off'})",
       store.spill_for(w["id"], "tf-big") == {"n_gpu_layers": "off"})
-check("seam: fitting transformers blank default -> {} (max-gpu, unchanged)",
-      store.spill_for(w["id"], "tf-small") == {})
+check("seam: fitting transformers blank default -> {'n_gpu_layers': -1} "
+      "(gpu-only; operator default order 2026-07-31)",
+      store.spill_for(w["id"], "tf-small") == {"n_gpu_layers": -1})
 check("seam: GGUF blank default -> {} (max-gpu always, any size)",
       store.spill_for(w["id"], "g-big") == {})
 check("seam: unknown-size transformers blank default -> {} (max-gpu, degrade)",
@@ -436,8 +443,10 @@ check("seam: the derived split DECLARES both sides — 1.49 GiB of non-expert "
 check("seam: THE LIVE BUG — a MoE never receives the bare {'n_gpu_layers': -1} "
       "stamp that would disable the load-time auto split",
       _derived != {"n_gpu_layers": -1})
-check("seam: a DENSE gguf is untouched by the tree -> {} (max-gpu, unchanged)",
-      store.spill_for(w["id"], "gguf-dense") == {})
+check("seam: a fits-whole DENSE gguf derives gpu-only -> {'n_gpu_layers': -1} "
+      "(operator default order 2026-07-31; the MoE split branch above is "
+      "untouched by it)",
+      store.spill_for(w["id"], "gguf-dense") == {"n_gpu_layers": -1})
 
 # an operator's explicit choice ALWAYS wins — derivation is blank-only.
 store.assign_model(w["id"], "moe-big", spill={"n_gpu_layers": -1})

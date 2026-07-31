@@ -334,8 +334,22 @@ def _classification_checks(remote):
     check("a template error reaching the timeout wrapper reports request shape",
           "request shape" in late.lower())
     genuine = remote._cold_timeout_message("Big-GGUF", WORKER, "connection reset")
-    check("a genuine load timeout still says what it always said",
-          "did not finish loading" in genuine and "too large for the box" in genuine)
+    # OPERATOR DIRECTIVE 2026-07-29 (specificity): "why is it unsure of what the
+    # actual problem was? … this needs to be specific". The old wording hedged —
+    # "the model may be too large for the box or the load stalled" — which is a
+    # GUESS between two unrelated causes, and it buried the one actionable line
+    # (the worker's own error). It is gone on purpose; asserting it here
+    # contradicted this very file's "NEVER speculates" checks 15 lines above.
+    # What must hold now is that the message is SPECIFIC and ATTRIBUTED.
+    gl = genuine.lower()
+    check("a genuine load timeout names the model and the worker",
+          "big-gguf" in gl and "ae" in gl)
+    check("a genuine load timeout quotes the WORKER'S OWN error as the cause "
+          "(the one actionable line), not a guess",
+          "connection reset" in gl and "cause" in gl)
+    check("a genuine load timeout does NOT hedge between box size and a stall",
+          "too large for the box" not in gl and "load stalled" not in gl
+          and " may be " not in gl)
 
 
 # ---------------------------------------------------------------------------

@@ -476,7 +476,13 @@ def fit_plan(model_key: str, need_bytes: int, storage: dict,
     have = 0
     for r in rows:
         if r["model_key"] == model_key:
-            have = int(r.get("bytes") or 0)
+            # k60: only bytes on a REAPABLE store are headroom this pull already
+            # holds. A read-through copy on the shared catalog is not — the pull
+            # still has to land its own copy on the worker's own drive, and
+            # `used` no longer counts the shared bytes either, so crediting them
+            # here would under-state the delta by the same amount.
+            if r.get("counts_toward_budget", True):
+                have = int(r.get("bytes") or 0)
             break
     delta = max(0, need - have)          # NEW bytes this pull will add
 

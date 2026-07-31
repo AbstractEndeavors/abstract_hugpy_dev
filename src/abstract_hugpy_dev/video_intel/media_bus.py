@@ -61,7 +61,8 @@ CREATE TABLE IF NOT EXISTS media_jobs (
     claim_token  TEXT,
     created      REAL,
     updated      REAL,
-    progress_json TEXT
+    progress_json TEXT,
+    stage_log_json TEXT
 )
 """
 
@@ -264,6 +265,23 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
+def _connect_ro() -> sqlite3.Connection:
+    """A READ-ONLY handle for the observability reads (get / list_jobs) — k57.
+
+    Opened ``mode=ro`` so the connection physically cannot take a write lock, with
+    a SHORT busy timeout: a panel poll must degrade to "no rows this tick" rather
+    than sit for 30s behind a renderer's write. WAL lets this reader run fully
+    concurrently with the heartbeating writers — it never blocks them and they
+    never block it. Falls back to the read/write handle when the DB file does not
+    exist yet (a first-boot read before any enqueue)."""
+    try:
+        conn = sqlite3.connect("file:" + DB_PATH + "?mode=ro", uri=True, timeout=5.0)
+        conn.execute("PRAGMA busy_timeout=5000")
+        return conn
+    except sqlite3.OperationalError:
+        return _connect()
+
+
 def _ensure_db() -> None:
     global _initialized
     if _initialized:
@@ -302,6 +320,36 @@ def _ensure_db() -> None:
                 conn.execute("ALTER TABLE media_jobs ADD COLUMN principal TEXT")
             except sqlite3.OperationalError:
                 pass  # column already present (fresh CREATE or prior migration)
+            # Idempotent migration for the STAGE TIMELINE (the "what is it doing /
+            # where did it fail" feature): an append-only per-job JSON list of coarse
+            # stage entries ({stage, ts, ts_last, count, detail?, + terminal outcome}).
+            # Unlike progress_json (the latest live blob, OVERWRITTEN each call and
+            # NULLED at terminal), this is RETAINED through a done/failed/cancelled
+            # terminal so the panel can show the full sequence a render DID + the exact
+            # failing stage. A pre-feature DB just starts every existing row at an empty
+            # (NULL) timeline, which reads as "no history recorded" — the correct default.
+            try:
+                conn.execute("ALTER TABLE media_jobs ADD COLUMN stage_log_json TEXT")
+            except sqlite3.OperationalError:
+                pass  # column already present (fresh CREATE or prior migration)
+            # k57 LISTING INDEXES. The catalog table has carried only its implicit
+            # PRIMARY KEY since day one, so every GET /video/jobs query was a FULL
+            # SCAN + sort over the whole history — on a live central that is ~1.5k
+            # rows on shared storage, several of them holding multi-MB result blobs,
+            # which measured 6s (in-flight) and 21s (terminal) per call. These two
+            # indexes turn both listing queries into a bounded range scan in the
+            # exact (status, order-by) shape list_jobs uses. Idempotent + additive;
+            # writers are unaffected beyond the usual index maintenance.
+            for _idx_sql in (
+                "CREATE INDEX IF NOT EXISTS idx_media_jobs_status_created "
+                "ON media_jobs(status, created)",
+                "CREATE INDEX IF NOT EXISTS idx_media_jobs_status_updated "
+                "ON media_jobs(status, updated)",
+            ):
+                try:
+                    conn.execute(_idx_sql)
+                except sqlite3.OperationalError:
+                    pass  # a locked/older DB just runs unindexed, as it did before
         finally:
             conn.close()
         _initialized = True
@@ -442,6 +490,326 @@ def _load_progress(progress_json: Optional[str]) -> Optional[dict]:
         return json.loads(progress_json)
     except Exception:  # noqa: BLE001
         return None
+
+
+# --------------------------------------------------------------------------- #
+# STAGE TIMELINE — an append-only, per-job record of the COARSE stages a render
+# moved through, RETAINED through the terminal write (progress_json is the latest
+# live frame blob and is nulled at terminal; this is the durable "what it did /
+# where it failed" history the Active-Processes expandable renders). Each entry:
+#   {stage, ts (first-seen), ts_last (last-updated), count (# set_progress hits in
+#    this stage — so a 48-frame render loop is ONE 'rendering' row, not 48),
+#    detail? (a short human line), + terminal outcome on the final entry}.
+# Everything here is BEST-EFFORT / never-fatal (mirrors set_progress): a timeline
+# hiccup can never fail a render — every call site wraps these in try/except.
+# --------------------------------------------------------------------------- #
+_STAGE_LOG_MAX = 60   # cap so a pathological/looping job can't grow it unbounded
+
+
+def _fmt_gib(nbytes) -> Optional[str]:
+    try:
+        return f"{float(nbytes) / (1024 ** 3):.1f} GiB"
+    except (TypeError, ValueError):
+        return None
+
+
+def _coarse_stage(progress) -> Optional[str]:
+    """The COARSE phase key a live progress blob is in — the granularity the timeline
+    dedups on. Prefers an explicit hold ``phase`` (awaiting_capacity), then the
+    runner's ``stage`` (loading / branching / generating / assembling / archiving),
+    else a generic 'working'. None for a non-dict/empty blob."""
+    if not isinstance(progress, dict):
+        return None
+    ph = progress.get("phase")
+    if isinstance(ph, str) and ph.strip():
+        return ph
+    st = progress.get("stage")
+    if isinstance(st, str) and st.strip():
+        return st
+    return "working"
+
+
+def _stage_detail(progress) -> Optional[str]:
+    """A short, HONEST 'what it's doing' line for a live blob — built ONLY from fields
+    the blob actually carries (never fabricated). Covers the reservation HOLD marker,
+    the studio-movie nested segment blob, and the scene/frame-loop blob."""
+    if not isinstance(progress, dict):
+        return None
+    # Reservation HOLD (awaiting_capacity) — surface the measured shortfall + overtakes.
+    if progress.get("phase") == "awaiting_capacity":
+        reason = progress.get("reason") if isinstance(progress.get("reason"), dict) else {}
+        line = "awaiting GPU capacity"
+        sb = reason.get("short_by_bytes")
+        g = _fmt_gib(sb) if sb is not None else None
+        if g:
+            line += f" — short by {g}"
+        ot = progress.get("overtaken")
+        if isinstance(ot, int) and ot > 0:
+            line += f" · jumped {ot}×"
+        return line
+    bits: List[str] = []
+    sd, stot = progress.get("segment_done"), progress.get("segment_total")
+    if isinstance(sd, int) and isinstance(stot, int):
+        bits.append(f"segment {sd}/{stot}")
+    cur = progress.get("current")
+    if isinstance(cur, dict):
+        cap = cur.get("capability")
+        if isinstance(cap, str) and cap:
+            bits.append(cap)
+        # MODEL ATTRIBUTION (k58): a movie segment whose capability the movie-level pin
+        # cannot serve resolves its own model, and that substitution has to be legible
+        # in the TIMELINE, not just in movie.json after the render. Only shown when the
+        # blob carries it (never fabricated).
+        mid = cur.get("model_id")
+        if isinstance(mid, str) and mid:
+            bits.append(f"model {mid}")
+        if cur.get("model_source") == "capability_fallback":
+            pin = cur.get("pinned_model_id")
+            bits.append(f"capability fallback (pin {pin} does not serve {cap})"
+                        if isinstance(pin, str) and pin else "capability fallback")
+        w = cur.get("worker")
+        if isinstance(w, dict):
+            wstage = w.get("stage") or w.get("phase")
+            if isinstance(wstage, str) and wstage:
+                bits.append(f"worker {wstage}")
+        prm = cur.get("prompt")
+        if isinstance(prm, str) and prm.strip() and not bits:
+            bits.append(prm.strip()[:60])
+    done, total = progress.get("done"), progress.get("total")
+    if isinstance(done, int) and isinstance(total, int):
+        bits.append(f"frame {done}/{total}")
+    lbl = progress.get("label")
+    if isinstance(lbl, str) and lbl.strip() and not bits:
+        bits.append(lbl.strip()[:80])
+    return " · ".join(bits) if bits else None
+
+
+def _as_pair(a, b):
+    """(done, total) as ints when BOTH are honest non-negative numbers with total>0,
+    else None. Guards every fraction below — a bar is never drawn from half a pair."""
+    if isinstance(a, bool) or isinstance(b, bool):
+        return None
+    if not isinstance(a, (int, float)) or not isinstance(b, (int, float)):
+        return None
+    if b <= 0 or a < 0:
+        return None
+    return (float(a), float(b))
+
+
+def _within_segment_fraction(progress: dict):
+    """0..1 through the CURRENT unit of work, or None when nothing reports it.
+
+    Sources, in order: an explicit ``fraction``/``percent``; the runner's denoise
+    STEP counter (``step``/``steps`` — what diffusers' callback_on_step_end feeds,
+    forwarded verbatim from the worker's render blob); a frame counter. Read from
+    the live blob's ``current.worker`` sub-object first (a movie segment delegated
+    to the ae worker nests the worker's own blob there) and then from the top level
+    (an in-process render writes it flat). NEVER fabricated: a render whose runner
+    reports nothing yields None and the bar stays at the segment granularity."""
+    scopes = []
+    cur = progress.get("current")
+    if isinstance(cur, dict):
+        w = cur.get("worker")
+        if isinstance(w, dict):
+            scopes.append(w)
+        scopes.append(cur)
+    scopes.append(progress)
+    for sc in scopes:
+        frac = sc.get("fraction")
+        if isinstance(frac, (int, float)) and not isinstance(frac, bool) and 0 <= frac <= 1:
+            return float(frac)
+        pct = sc.get("percent")
+        if isinstance(pct, (int, float)) and not isinstance(pct, bool) and 0 <= pct <= 100:
+            return float(pct) / 100.0
+        for done_key, total_key in (("step", "steps"), ("done", "total"),
+                                    ("frame", "frames")):
+            pair = _as_pair(sc.get(done_key), sc.get(total_key))
+            if pair:
+                return min(1.0, pair[0] / pair[1])
+    return None
+
+
+def _progress_ratio(progress) -> Optional[float]:
+    """The job's overall 0..1 completion, or None when the runner reports nothing
+    measurable (the panel then shows no bar rather than a fake one).
+
+    A segmented render (studio movie / scene) is ``(segments_done + within-segment
+    fraction) / segment_total`` — so the bar MOVES during a long single segment
+    instead of sitting at 0 until the segment lands, which is exactly the "progress
+    bar never updates" the operator reported. A flat render is just its own
+    within-unit fraction. A held (awaiting_capacity) job has made no progress by
+    definition -> 0.0, so the bar reads honestly as "not started"."""
+    if not isinstance(progress, dict):
+        return None
+    if progress.get("phase") == "awaiting_capacity":
+        return 0.0
+    seg = _as_pair(progress.get("segment_done"), progress.get("segment_total"))
+    inner = _within_segment_fraction(progress)
+    if seg:
+        done, total = seg
+        if inner is not None and done < total:
+            done += inner
+        return max(0.0, min(1.0, done / total))
+    return inner
+
+
+def _progress_detail(progress) -> Optional[dict]:
+    """The NUMERIC bits behind the bar, for a panel that wants to label it:
+    ``{segment_done, segment_total, step, steps, fraction}`` (omit-when-unset).
+    None when the blob carries no numbers at all."""
+    if not isinstance(progress, dict):
+        return None
+    out: dict = {}
+    seg = _as_pair(progress.get("segment_done"), progress.get("segment_total"))
+    if seg:
+        out["segment_done"] = int(seg[0])
+        out["segment_total"] = int(seg[1])
+    for sc in ((progress.get("current") or {}).get("worker")
+               if isinstance(progress.get("current"), dict) else None,
+               progress):
+        if not isinstance(sc, dict):
+            continue
+        pair = _as_pair(sc.get("step"), sc.get("steps"))
+        if pair and "step" not in out:
+            out["step"] = int(pair[0])
+            out["steps"] = int(pair[1])
+    frac = _within_segment_fraction(progress)
+    if frac is not None:
+        out["fraction"] = round(frac, 4)
+    return out or None
+
+
+def _load_stage_log(raw) -> list:
+    if not raw:
+        return []
+    try:
+        v = json.loads(raw)
+        return v if isinstance(v, list) else []
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _append_stage_log(job_id: str, stage: Optional[str], detail: Optional[str],
+                      terminal_extra: Optional[dict] = None) -> None:
+    """Append (or COALESCE) a timeline entry for ``job_id``. Same coarse ``stage`` as
+    the last entry (and NOT a terminal entry) -> bump its ``count``/``ts_last`` and
+    refresh ``detail`` (a frame loop stays one row). A different stage, or a terminal
+    entry, -> a new row. Un-gated (the runner owns its own job_id, like set_progress).
+    Best-effort — the ONE caller-side contract is to wrap this so a DB hiccup never
+    fails a render."""
+    if not stage:
+        return
+    now = time.time()
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT stage_log_json FROM media_jobs WHERE job_id=?", (job_id,),
+        ).fetchone()
+        if row is None:
+            return  # unknown id — nothing to record against
+        log = _load_stage_log(row[0])
+        if log and log[-1].get("stage") == stage and not terminal_extra:
+            last = log[-1]
+            last["count"] = int(last.get("count", 1)) + 1
+            last["ts_last"] = now
+            if detail:
+                last["detail"] = detail
+        else:
+            entry = {"stage": stage, "ts": now, "ts_last": now, "count": 1}
+            if detail:
+                entry["detail"] = detail
+            if terminal_extra:
+                entry.update(terminal_extra)
+            log.append(entry)
+        if len(log) > _STAGE_LOG_MAX:
+            log = log[-_STAGE_LOG_MAX:]
+        conn.execute(
+            "UPDATE media_jobs SET stage_log_json=? WHERE job_id=?",
+            (json.dumps(log), job_id),
+        )
+    finally:
+        conn.close()
+
+
+def _record_terminal_stage(job_id: str, status: str, result) -> None:
+    """Write the FINAL timeline entry carrying the outcome — RETAINED through terminal
+    (progress_json is nulled, this is not). For a failure it carries the exact
+    ``code``/``message``/``retryable`` AND ``failed_at_stage`` (the live stage the job
+    was in when it broke — the operator's "where is it failing"). Best-effort."""
+    extra: dict = {}
+    detail: Optional[str] = None
+    err = getattr(result, "error", None)
+    if status == "done":
+        detail = "completed"
+    elif err is not None:
+        code = getattr(err, "code", None)
+        msg = getattr(err, "message", None)
+        retry = getattr(err, "retryable", None)
+        detail = msg or status
+        extra = {"code": code, "message": msg,
+                 "retryable": bool(retry) if retry is not None else None}
+    else:
+        detail = status
+    # Which live stage were we in when the terminal hit? The last non-terminal row.
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT stage_log_json FROM media_jobs WHERE job_id=?", (job_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    prior = [e for e in _load_stage_log(row[0] if row else None)
+             if e.get("stage") not in _TERMINAL_STATES]
+    if prior:
+        extra["failed_at_stage"] = prior[-1].get("stage")
+    _append_stage_log(job_id, status, detail, terminal_extra=extra)
+
+
+def build_failure_summary(result, stage_log) -> Optional[dict]:
+    """Terminal FAILURE detail for the panel: ``{stage, code, message, retryable}`` —
+    the whole point of the expandable on a broken render. ``result`` is the parsed
+    JobResult dict (or None); ``stage_log`` the parsed timeline list. None unless the
+    job terminated NOT-ok with an error object. ``stage`` = the recorded
+    ``failed_at_stage`` (where it broke), else None."""
+    if not isinstance(result, dict) or result.get("ok"):
+        return None
+    err = result.get("error")
+    if not isinstance(err, dict):
+        return None
+    stage = None
+    for e in reversed(stage_log or []):
+        if e.get("failed_at_stage"):
+            stage = e.get("failed_at_stage")
+            break
+    retry = err.get("retryable")
+    return {
+        "stage": stage,
+        "code": err.get("code"),
+        "message": err.get("message"),
+        "retryable": bool(retry) if retry is not None else None,
+    }
+
+
+def _last_movement_ts(stage_log, updated) -> Optional[float]:
+    """The epoch ts of the most recent timeline movement — the HONEST "time since last
+    movement" basis, tied to the CURRENT stage rather than a bare row clock. Falls back
+    to the row's ``updated`` when the timeline is empty."""
+    ts = None
+    for e in (stage_log or []):
+        for k in ("ts_last", "ts"):
+            v = e.get(k)
+            if isinstance(v, (int, float)):
+                ts = v if ts is None else max(ts, v)
+    return ts if ts is not None else updated
+
+
+def _current_stage(stage_log) -> Optional[str]:
+    """The stage a job is CURRENTLY in — the last non-terminal timeline row, or None."""
+    for e in reversed(stage_log or []):
+        s = e.get("stage")
+        if s and s not in _TERMINAL_STATES:
+            return s
+    return None
 
 
 def _mark_awaiting_capacity(job_id: str, reason: Optional[dict],
@@ -726,6 +1094,15 @@ def run_claimed(job_id: str, worker_token: str) -> Optional[JobResult]:
         )
     finally:
         conn.close()
+    # STAGE TIMELINE terminal entry — RETAINED (the progress_json blob above was
+    # nulled; this is not). Carries the outcome: the exact code/message/retryable +
+    # failed_at_stage on a failure. Best-effort — a timeline hiccup never masks the
+    # real terminal write above.
+    try:
+        _record_terminal_stage(job_id, status, result)
+    except Exception:  # noqa: BLE001
+        logger.debug("media_bus: terminal stage record failed (non-fatal) for %s",
+                     job_id, exc_info=True)
     # One-directional bridge (A/P0-2): mark the terminal state in comms.JobStore
     # (done | failed | cancelled), carrying the clip uri on success + the
     # attribution (k9). Best-effort.
@@ -762,6 +1139,16 @@ def cancel(job_id: str) -> dict:
                 "updated=? WHERE job_id=? AND status='queued'",
                 (result_json, time.time(), job_id),
             )
+            # STAGE TIMELINE: record the pre-start cancel as a retained terminal
+            # entry too (best-effort). Uses this connection's own write above; the
+            # append opens its own connection (WAL, single-writer per row is fine).
+            try:
+                _append_stage_log(job_id, "cancelled", "cancelled before it started",
+                                  terminal_extra={"code": "cancelled",
+                                                  "message": "cancelled before it started",
+                                                  "retryable": False})
+            except Exception:  # noqa: BLE001
+                pass
             # Bridge the immediate (pre-start) terminal so a cancel-before-run
             # shows as cancelled in GET /llm/jobs too. Best-effort; the name is
             # read from the row so no signature change is needed.
@@ -903,6 +1290,15 @@ def set_progress(job_id: str, progress: dict) -> None:
         )
     finally:
         conn.close()
+    # STAGE TIMELINE: append/coalesce a coarse-stage entry so the panel has the full
+    # sequence a render moved through (deduped — a 48-frame loop stays ONE 'rendering'
+    # row with a running count, not 48). Best-effort; a timeline hiccup never fails a
+    # generation (mirrors the whole set_progress contract).
+    try:
+        _append_stage_log(job_id, _coarse_stage(progress), _stage_detail(progress))
+    except Exception:  # noqa: BLE001
+        logger.debug("media_bus: stage-log append failed (non-fatal) for %s",
+                     job_id, exc_info=True)
     # One-directional bridge (A/P0-2): mirror this live progress blob into the
     # comms.JobStore so GET /llm/jobs carries the running job's stage + log tail +
     # honest stall clock (not green-but-empty). Best-effort by construction (the
@@ -929,22 +1325,41 @@ def get(job_id: str) -> dict:
     ignore it are unaffected, and the placement projection reads it. Unknown id ->
     all-null view."""
     _ensure_db()
-    conn = _connect()
+    conn = _connect_ro()
     try:
         row = conn.execute(
-            "SELECT name, status, result_json, progress_json FROM media_jobs WHERE job_id=?",
+            "SELECT name, status, result_json, progress_json, stage_log_json, updated "
+            "FROM media_jobs WHERE job_id=?",
             (job_id,),
         ).fetchone()
     finally:
         conn.close()
     if row is None:
         return {"job_id": job_id, "name": None, "status": None,
-                "result": None, "progress": None}
-    name, status, result_json, progress_json = row
+                "result": None, "progress": None,
+                # Additive telemetry fields (empty for an unknown id) so a consumer
+                # can read them unconditionally without a shape check.
+                "stage_log": [], "failure": None,
+                "last_movement_ts": None, "current_stage": None}
+    name, status, result_json, progress_json, stage_log_json, updated = row
     result = json.loads(result_json) if result_json else None
     progress = json.loads(progress_json) if progress_json else None
+    stage_log = _load_stage_log(stage_log_json)
     return {"job_id": job_id, "name": name, "status": status,
-            "result": result, "progress": progress}
+            "result": result, "progress": progress,
+            # ADDITIVE (the exhaustive per-process telemetry): the retained stage
+            # TIMELINE (survives terminal), the terminal FAILURE summary (stage/code/
+            # message/retryable — "where it's failing"), the last-movement ts (honest
+            # stall basis tied to the current stage), and the current stage. Existing
+            # keys are unchanged.
+            "stage_log": stage_log,
+            "failure": build_failure_summary(result, stage_log),
+            "last_movement_ts": _last_movement_ts(stage_log, updated),
+            "current_stage": _current_stage(stage_log),
+            # The numeric bar (k57) — 0..1 overall, plus the numbers behind it.
+            # None when the runner reports nothing measurable (no fabricated bar).
+            "progress_ratio": _progress_ratio(progress),
+            "progress_detail": _progress_detail(progress)}
 
 
 # --------------------------------------------------------------------------- #
@@ -957,50 +1372,143 @@ def get(job_id: str) -> dict:
 _INFLIGHT_STATES = ("queued", "claimed", "running", "cancelling")
 _TERMINAL_STATES = ("done", "failed", "cancelled")
 
+# How many timeline entries a LIVE row carries into the listing. The panel wants
+# "the last few events", not the whole 60-entry history, and the feed is polled
+# every couple of seconds — so live rows ship a TAIL and the row's
+# ``stage_log_total`` says how much was elided (the per-id GET has the rest).
+# TERMINAL rows are never trimmed: a failed render must show its full sequence.
+_STAGE_TAIL = 6
 
-def _project_job_row(r) -> dict:
-    job_id, name, status, created, updated, principal, progress_json = r
-    return {
+# Stale-in-flight cutoff (k57 item 5). A bus row still claiming an in-flight
+# status whose PROGRESSED_AT (last real movement — the stage-timeline clock, not
+# the row's `updated`, which any rewrite bumps) is older than this was abandoned
+# by a process that died without a terminal write: six studio_i2v daemon rows from
+# 2026-07-29 were still rendering as "running" in the Active panel two days later.
+# They are HIDDEN from the default listing rather than deleted — this is a read
+# path, and it must never write (a renderer's own DB is not a view's to mutate).
+# The window is deliberately long: a job legitimately HELD for GPU capacity only
+# re-writes its marker when the hold CHANGES, so its movement clock can idle for
+# hours while it is perfectly alive. Env-overridable; default 6h.
+def _stale_inflight_seconds() -> float:
+    raw = (os.environ.get("HUGPY_MEDIA_BUS_STALE_SECONDS") or "").strip()
+    if not raw:
+        return 21600.0
+    try:
+        v = float(raw)
+        return v if v > 0 else 21600.0
+    except ValueError:
+        return 21600.0
+
+
+def _project_job_row(r, *, tail: bool = False, now: Optional[float] = None,
+                     stale_cutoff: Optional[float] = None) -> dict:
+    (job_id, name, status, created, updated, principal, progress_json,
+     stage_log_json, result_json) = r
+    stage_log = _load_stage_log(stage_log_json)
+    result = json.loads(result_json) if result_json else None
+    progress = _load_progress(progress_json)
+    progressed_at = _last_movement_ts(stage_log, updated)
+    row = {
         "job_id": job_id,
         "name": name,
         "status": status,
         "created": created,
         "updated": updated,
         "principal": principal,
-        "progress": _load_progress(progress_json),
+        "progress": progress,
+        # ADDITIVE per-process telemetry (identical to media_bus.get()'s): the
+        # retained stage TIMELINE, the terminal FAILURE summary, the last-movement
+        # ts (stall basis), and the current stage. Terminal rows (include_terminal)
+        # carry their full timeline + failure so a failed render stays inspectable.
+        "stage_log": stage_log[-_STAGE_TAIL:] if tail else stage_log,
+        "stage_log_total": len(stage_log),
+        "failure": build_failure_summary(result, stage_log),
+        "last_movement_ts": progressed_at,
+        "current_stage": _current_stage(stage_log),
+        # k57: the numeric bar + the numbers behind it, and the movement clock the
+        # stale filter ages on (surfaced so the panel can SAY why a row is hidden).
+        "progress_ratio": _progress_ratio(progress),
+        "progress_detail": _progress_detail(progress),
+        "progressed_at": progressed_at,
     }
+    if stale_cutoff is not None:
+        row["stale"] = bool(progressed_at is not None and progressed_at < stale_cutoff)
+        if row["stale"] and now is not None and progressed_at is not None:
+            row["stale_for_s"] = round(now - progressed_at, 1)
+    return row
 
 
-def list_jobs(include_terminal: bool = False, limit: int = 50) -> List[dict]:
+_INFLIGHT_SELECT = (
+    "SELECT job_id, name, status, created, updated, principal, progress_json, "
+    "stage_log_json, NULL "
+    "FROM media_jobs WHERE status IN (?,?,?,?) ORDER BY created ASC LIMIT ?")
+
+# The same query with the stale rows dropped in SQL. `updated` is bumped by every
+# write that also moves the timeline, so movement_ts <= updated always: an
+# `updated` older than the cutoff is stale BEYOND DOUBT and can be excluded before
+# LIMIT (so a pile of abandoned rows can never crowd live work out of the page).
+# The exact (timeline-based) test still runs per row afterwards for the rest.
+_INFLIGHT_SELECT_FRESH = (
+    "SELECT job_id, name, status, created, updated, principal, progress_json, "
+    "stage_log_json, NULL "
+    "FROM media_jobs WHERE status IN (?,?,?,?) AND updated >= ? "
+    "ORDER BY created ASC LIMIT ?")
+
+# Terminal rows need result_json for the failure envelope — but ONLY a FAILED row
+# has one, and a DONE movie's result blob runs to megabytes (2.7 MB on the live
+# central). Reading those blobs to throw them away was a second-order cost of the
+# ?all=1 listing, so the CASE keeps sqlite from touching the overflow pages of the
+# rows whose result we would discard anyway.
+_TERMINAL_SELECT = (
+    "SELECT job_id, name, status, created, updated, principal, progress_json, "
+    "stage_log_json, CASE WHEN status='failed' THEN result_json END "
+    "FROM media_jobs WHERE status IN (?,?,?) ORDER BY updated DESC LIMIT ?")
+
+
+def list_jobs(include_terminal: bool = False, limit: int = 50,
+              include_stale: bool = False) -> List[dict]:
     """Bus-wide job listing for GET /video/jobs.
 
     In-flight rows (queued/claimed/running/cancelling) in FIFO order by ``created``
     by default; ``include_terminal`` appends up to ``limit`` recent terminal rows
     (done/failed/cancelled), newest-updated first. Each row is a dict:
-    {job_id, name, status, created, updated, principal, progress(parsed|None)} —
-    ``progress`` carries the live per-frame blob AND the ``awaiting_capacity`` hold
-    marker (phase/reason/held_since/overtaken) verbatim. Read-only; ``limit`` is
-    clamped to 1..200. The caller enriches each row with a placement object."""
+    {job_id, name, status, created, updated, principal, progress(parsed|None),
+     stage_log(tail on live rows)/stage_log_total, failure, progress_ratio,
+     progress_detail, progressed_at, stale} — ``progress`` carries the live
+    per-frame blob AND the ``awaiting_capacity`` hold marker verbatim.
+
+    STALE in-flight rows (no movement for ``_stale_inflight_seconds``, i.e. a job
+    orphaned by a dead process) are hidden unless ``include_stale``; they are still
+    reachable per-id and via the terminal/stale filters, and are never mutated here.
+
+    READ-ONLY BY CONSTRUCTION (k57): opened ``mode=ro``, so this path cannot take a
+    write lock even by accident, and it does NO per-row work beyond parsing the
+    columns it already selected — no network call, no second store, no lock a
+    renderer holds. ``limit`` is clamped to 1..200. The caller enriches the rows
+    with placement from a single ``PlacementSnapshot``."""
     _ensure_db()
     try:
         limit = int(limit)
     except (TypeError, ValueError):
         limit = 50
     limit = max(1, min(limit, 200))
-    conn = _connect()
+    now = time.time()
+    stale_cutoff = now - _stale_inflight_seconds()
+    conn = _connect_ro()
     try:
-        rows = conn.execute(
-            "SELECT job_id, name, status, created, updated, principal, progress_json "
-            "FROM media_jobs WHERE status IN (?,?,?,?) ORDER BY created ASC LIMIT ?",
-            (*_INFLIGHT_STATES, limit),
-        ).fetchall()
-        out = [_project_job_row(r) for r in rows]
+        if include_stale:
+            rows = conn.execute(_INFLIGHT_SELECT,
+                                (*_INFLIGHT_STATES, limit)).fetchall()
+        else:
+            rows = conn.execute(_INFLIGHT_SELECT_FRESH,
+                                (*_INFLIGHT_STATES, stale_cutoff, limit)).fetchall()
+        out = [_project_job_row(r, tail=True, now=now, stale_cutoff=stale_cutoff)
+               for r in rows]
+        if not include_stale:
+            out = [row for row in out if not row.get("stale")]
         if include_terminal:
-            trows = conn.execute(
-                "SELECT job_id, name, status, created, updated, principal, progress_json "
-                "FROM media_jobs WHERE status IN (?,?,?) ORDER BY updated DESC LIMIT ?",
-                (*_TERMINAL_STATES, limit),
-            ).fetchall()
+            trows = conn.execute(_TERMINAL_SELECT,
+                                 (*_TERMINAL_STATES, limit)).fetchall()
             out.extend(_project_job_row(r) for r in trows)
         return out
     finally:

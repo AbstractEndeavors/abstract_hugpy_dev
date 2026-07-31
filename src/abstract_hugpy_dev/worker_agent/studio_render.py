@@ -192,6 +192,17 @@ class StudioRenderManager:
         try:
             with self._lock:
                 job.progress = {"phase": "rendering", "started_at": job.started_at}
+
+            def _publish(blob: dict) -> None:
+                """Merge a render-progress frame into the job's live blob (k57), so
+                GET /studio/status/<id> — and central's poller, which forwards this
+                blob verbatim to the media bus — reports STEP i/N instead of a bare
+                "rendering" for the whole render."""
+                with self._lock:
+                    if job.status != "running":
+                        return          # settled/cancelled — don't resurrect a blob
+                    job.progress = {"phase": "rendering",
+                                    "started_at": job.started_at, **blob}
             # k17 deadlock fix: run the GPU render in a KILLABLE, timeout-bounded
             # CHILD PROCESS (spawn), so a native torch/CUDA/PIL stall in the render
             # tail (fp32 VAE decode / postprocess under VRAM contention) can never
@@ -209,10 +220,14 @@ class StudioRenderManager:
 
                 spec = studio_i2v_from_dict(job.spec)
                 should_cancel = lambda: job.cancel.is_set()  # noqa: E731
-                result = run_produce_clip(spec, should_cancel)
+                result = run_produce_clip(
+                    spec, should_cancel,
+                    on_step=lambda step, steps: _publish(
+                        {"step": step, "steps": steps}))
                 payload = artifact_result_to_payload(result)
             else:
-                payload = _studio_subproc.run_render_subprocess(job.spec, job.cancel)
+                payload = _studio_subproc.run_render_subprocess(
+                    job.spec, job.cancel, on_progress=_publish)
             with self._lock:
                 job.result = payload
                 job.status = "done"

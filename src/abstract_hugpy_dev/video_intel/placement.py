@@ -112,18 +112,25 @@ def _light_placement(name: Optional[str]) -> Optional[Dict[str, Any]]:
     return _prune({"source": "template", **locus})
 
 
-def _reservation_placement(job_id: str,
-                           name: Optional[str]) -> Optional[Dict[str, Any]]:
-    """Tier 1: the ACTIVE reservation claim for this run, overlaid with the
-    template's device/process. None when there is no live claim (or on error)."""
+def _active_claims() -> Dict[str, Dict[str, Any]]:
+    """{run_id: claim row} for every live reservation, via the registry's READ-ONLY
+    snapshot. {} when the registry is absent or unhappy — placement then falls back
+    to the static template tier, exactly as before."""
     try:
         from .reservation.registry import reservation_registry as rr
     except Exception:  # noqa: BLE001
-        return None
+        return {}
     try:
-        row = rr.get(job_id)
+        return rr.active_snapshot()
     except Exception:  # noqa: BLE001 — a store hiccup is not a placement
-        return None
+        return {}
+
+
+def _reservation_placement(row: Optional[Dict[str, Any]],
+                           name: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Tier 1: the ACTIVE reservation claim for this run (a row from
+    ``_active_claims``), overlaid with the template's device/process. None when
+    there is no live claim."""
     if not row or row.get("state") != "active":
         return None
     peak = row.get("peak_bytes")
@@ -145,18 +152,52 @@ def _reservation_placement(job_id: str,
     return _prune(out)
 
 
+class PlacementSnapshot:
+    """A ONE-SHOT placement resolver for a whole listing (k57).
+
+    Reads every live reservation ONCE (one read-only query, no write lock) and
+    memoizes the per-task template tier, so projecting N rows costs O(1) I/O
+    instead of the O(N) sqlite write transactions + O(N) measured.json reads the
+    per-row ``job_placement`` path used to cost. Cheap to construct; build one per
+    request and throw it away (it is a SNAPSHOT — it must not outlive the response,
+    or it would report a released claim as live)."""
+
+    def __init__(self, active: Optional[Dict[str, Dict[str, Any]]] = None) -> None:
+        self._active = active if active is not None else _active_claims()
+        self._templates: Dict[Optional[str], Optional[Dict[str, Any]]] = {}
+
+    def _template(self, name: Optional[str]) -> Optional[Dict[str, Any]]:
+        if name not in self._templates:
+            self._templates[name] = _template_placement(name)
+        return self._templates[name]
+
+    def placement_for(self, job_id: Optional[str],
+                      name: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Same contract (and same tier order) as ``job_placement``, resolved from
+        the snapshot. FAIL-OPEN: any error -> None."""
+        try:
+            row = self._active.get(job_id) if job_id else None
+            pl = _reservation_placement(row, name)
+            if pl:
+                return pl
+            return self._template(name)
+        except Exception:  # noqa: BLE001
+            logger.debug("placement_for failed for %s", job_id, exc_info=True)
+            return None
+
+
 def job_placement(job_id: str,
                   name: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """The placement object for a bus job, or None.
 
     Shape (omit-when-unset): ``{source: "reservation"|"template", host?, worker_id?,
     gpu?, process?, reserved_bytes?}``. An active reservation wins over the static
-    template hint. FAIL-OPEN: any error anywhere -> None (never raises)."""
+    template hint. FAIL-OPEN: any error anywhere -> None (never raises).
+
+    Single-job convenience (the per-id status route). A LISTING must use
+    ``PlacementSnapshot`` instead — calling this per row is what hung GET /video/jobs."""
     try:
-        pl = _reservation_placement(job_id, name)
-        if pl:
-            return pl
-        return _template_placement(name)
+        return PlacementSnapshot().placement_for(job_id, name)
     except Exception:  # noqa: BLE001
         logger.debug("job_placement failed for %s", job_id, exc_info=True)
         return None

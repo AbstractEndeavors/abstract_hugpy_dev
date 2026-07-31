@@ -19,6 +19,7 @@ No pathlib anywhere. os.path only (there is none here — pure orchestration).
 
 from __future__ import annotations
 
+import inspect
 import uuid
 from datetime import datetime, timezone
 from typing import Callable
@@ -74,6 +75,18 @@ _DISPATCH = {
 }
 
 _DEFAULT_SEED = 0
+
+
+def _accepts_on_step(runner) -> bool:
+    """True when ``runner`` declares an ``on_step`` parameter (or **kwargs). Cheap
+    reflection over a tiny dispatch table, done once per render — not per step."""
+    try:
+        params = inspect.signature(runner).parameters
+    except (TypeError, ValueError):  # a builtin/unintrospectable shim
+        return False
+    if "on_step" in params:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
 def _default_seeds() -> SeedBundle:
@@ -159,6 +172,7 @@ def produce_clip(
     vace_context_frames: tuple[str, ...] | None = None,
     requested_frames: int | None = None,
     should_cancel: Callable[[], bool] | None = None,
+    on_step: Callable[[int, int], None] | None = None,
 ) -> Result[Artifact, StageError]:
     """Resolve ``request``, build its manifest, and run the bound runner.
 
@@ -178,7 +192,14 @@ def produce_clip(
     ``lambda: media_bus.is_cancelling(job_id)``. When it fires mid-render the runner
     aborts BEFORE writing a clip and returns ``Err(StageError(CANCELLED, ...))``, so
     resume/idempotency stay intact (a cancelled run leaves no clip -> a re-run
-    regenerates). None (the default) is the historical no-cancel behavior."""
+    regenerates). None (the default) is the historical no-cancel behavior.
+
+    ``on_step`` is the sibling OPTIONAL denoise-progress sink (k57), threaded down
+    the same way: ``on_step(step, steps)`` per diffusers callback boundary. The
+    spine never sources it either — the bus adapter / worker render thread supplies
+    a sink that publishes the numbers as job progress, which is what lets the
+    console's bar move DURING a segment instead of only between segments. None
+    (the default) reports nothing."""
     binding_res = CapabilityRouter().resolve(request)
     if binding_res.is_err():
         return binding_res            # propagate the router's Err verbatim (INV-3)
@@ -261,4 +282,11 @@ def produce_clip(
     runner_kwargs = {"start_image": start_image}
     if should_cancel is not None:
         runner_kwargs["should_cancel"] = should_cancel
+    # Same forward-only-when-supplied rule, plus a capability check: only the
+    # DENOISE runners (wan) have a step loop to report, and callers now pass a sink
+    # unconditionally. Forwarding it to a synthetic/ffmpeg/rife runner — or to a
+    # test shim — would be a TypeError, and there is nothing for those to report
+    # anyway, so an un-stepped runner just renders as before.
+    if on_step is not None and _accepts_on_step(runner):
+        runner_kwargs["on_step"] = on_step
     return runner(manifest, out_root, **runner_kwargs)

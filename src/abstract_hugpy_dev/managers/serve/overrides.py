@@ -57,6 +57,35 @@ ALLOWED_FIELDS = {
                       # compresses lower-priority neighbours within bands)
     "priority_device",  # explicit mode: which device the target favors
                         # ("gpu" default | "ram")
+    # ── k56 (operator ruling 2026-07-31) — the two GENERAL placement options ──
+    "worker_prefs",   # ORDERED worker preference: ["ae", "computron"]. The
+                      # generalization of designation from ONE hard binding to a
+                      # ranked candidate list — resolution tries them in order
+                      # and takes the FIRST whose admission accepts, and a model
+                      # carrying a list NEVER lands off it (designation hardness
+                      # is preserved per candidate). A single-entry list is the
+                      # degenerate case and behaves exactly as the one hard
+                      # designation always did. Model-scoped by necessity: the
+                      # designation SoT (worker["models"] membership, one set per
+                      # WORKER) can express "designated to both" but has nowhere
+                      # to put a cross-worker ORDER.
+    "no_evict",       # POLITE LOAD: admission may spend only genuinely free
+                      # headroom (free VRAM after the tolerance-band flex) and
+                      # never evicts a resident to land. The deliberate inverse
+                      # of declare-need-then-evict, which stays the rule for
+                      # every unflagged load. Composes with worker_prefs: try
+                      # each candidate politely, refuse honestly if none admits.
+                      # k62: this boolean is now the ALL-WORKERS DEFAULT — the
+                      # per-worker map below overrides it per candidate.
+    "no_evict_by_worker",  # k62 — politeness INDIVIDUALIZED per (model ×
+                      # worker): {"ae": true, "computron": false}. Politeness is
+                      # a statement about ONE box's contention, not about the
+                      # model (flux2 is polite on ae's contended 3090 and holds
+                      # ordinary eviction rights on computron), so it belongs at
+                      # the same grain as the decision it changes. Central
+                      # resolves map[W] if W is in it, else ``no_evict``, and
+                      # simply includes/omits the spill key for THAT worker —
+                      # the wire and the worker's admission are untouched.
 }
 _INT_FIELDS = {"n_gpu_layers", "n_cpu_moe", "threads", "llama_ctx", "ttl_seconds",
                "priority"}
@@ -319,6 +348,15 @@ def gguf_variants_detail(model_key: str, model_dir: str, cfg=None) -> dict:
     }
 
 
+def _truthy(value) -> bool:
+    """The one on/off reading for the polite levers — a JSON bool from the
+    console and the "yes"/"on"/"1" spellings a curl or a hand-edited file uses
+    must mean the same thing on both."""
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
 def _coerce(field: str, value):
     if value is None or value == "":
         return None  # signals "clear this field"
@@ -342,6 +380,58 @@ def _coerce(field: str, value):
             logger.warning("ignoring unknown priority_device %r (gpu|ram)", value)
             return None
         return v
+    if field == "worker_prefs":
+        # Accept a list (the console) or a comma string (curl/scripts). Order is
+        # the whole point, so dedupe PRESERVING first position; an empty result
+        # clears the key, which is what "no preference" must look like on disk.
+        raw = value.split(",") if isinstance(value, str) else list(value or [])
+        out, seen = [], set()
+        for item in raw:
+            name = str(item).strip()
+            if not name or name.lower() in seen:
+                continue
+            seen.add(name.lower())
+            out.append(name)
+        return out or None
+    if field == "no_evict":
+        # OFF removes the key rather than storing false (same discipline as the
+        # bnb lever): the file then holds only real operator opt-ins, and an
+        # absent entry unambiguously means the normal declare-need-then-evict.
+        return True if _truthy(value) else None
+    if field == "no_evict_by_worker":
+        # k62. Accept the console's {"ae": true} or a curl/script string
+        # ("ae=yes,computron=no"). Name handling mirrors worker_prefs — strip,
+        # drop blanks, dedupe case-insensitively keeping the FIRST spelling —
+        # because both keys are matched against the same worker id/name forms
+        # and two spellings of one box would be two different verdicts.
+        #
+        # Unlike the model-wide boolean, ``false`` is STORED here: an explicit
+        # no is how a worker opts OUT of a polite default, which is a different
+        # statement from "unset, follow the default". Removing the entry is how
+        # you go back to the default; an empty map clears the key entirely.
+        if isinstance(value, str):
+            items = []
+            for part in value.split(","):
+                if not part.strip():
+                    continue
+                name, sep, val = part.partition("=")
+                if not sep:
+                    name, sep, val = part.partition(":")
+                items.append((name, val if sep else "yes"))
+        elif isinstance(value, dict):
+            items = list(value.items())
+        else:
+            logger.warning("ignoring no_evict_by_worker of type %s (want a map)",
+                           type(value).__name__)
+            return None
+        out, seen = {}, set()
+        for name, val in items:
+            name = str(name).strip()
+            if not name or name.lower() in seen:
+                continue
+            seen.add(name.lower())
+            out[name] = _truthy(val)
+        return out or None
     if field in _INT_FIELDS:
         return int(value)
     if field in _FLOAT_FIELDS:
@@ -387,6 +477,81 @@ def set_override(model_key: str, fields: dict) -> dict:
         except Exception as exc:  # noqa: BLE001
             logger.debug("physical-state drop after override skipped: %s", exc)
     return current
+
+
+def placement_prefs(model_key: str) -> tuple:
+    """k56: ``(ordered worker preference list, polite)`` for a model.
+
+    THE one reader for both flags, so routing, the warm gate, the emission seam
+    and the console can never disagree about what was set. Totally guarded — an
+    unreadable overrides file degrades to ``([], False)``, which is the
+    pre-k56 behaviour exactly (no list, ordinary declare-need-then-evict).
+
+    ~-TOLERANT: routing reaches this with whatever spelling the caller used,
+    while the console writes the registry key. A placement the operator set
+    must not go silently un-applied because one side said "Qwen~X" and the
+    other "X" (the k30 class of invisible mismatch), so an exact miss falls
+    back to a bare-key, case-insensitive match.
+
+    k62: the polite half of this tuple is the ALL-WORKERS DEFAULT. A caller that
+    is deciding about ONE worker must use :func:`placement_policy` /
+    :func:`polite_on_worker` instead — see them for why."""
+    prefs, polite, _by_worker = placement_policy(model_key)
+    return prefs, polite
+
+
+def placement_policy(model_key: str) -> tuple:
+    """k62: ``(ordered worker preference, model-wide polite, per-worker polite)``.
+
+    The full placement statement, and the superset :func:`placement_prefs`
+    returns the first two of. The third element is the ``no_evict_by_worker``
+    map: politeness individualized per (model × worker), because contention is
+    a property of a BOX, not of a model — flux2 is polite on ae's contended
+    3090 and keeps ordinary eviction rights on computron.
+
+    Same total guarding as placement_prefs: an unreadable overrides file
+    degrades to ``([], False, {})``, which is pre-k56 behaviour exactly."""
+    try:
+        ov = get_override(model_key) or {}
+        if not ov:
+            want = _bare_key(str(model_key)).lower()
+            for k, row in (_load() or {}).items():
+                if _bare_key(str(k)).lower() == want and isinstance(row, dict):
+                    ov = row
+                    break
+    except Exception:  # noqa: BLE001 — placement must never break over a read
+        return [], False, {}
+    prefs = ov.get("worker_prefs")
+    prefs = [str(w) for w in prefs if str(w).strip()] if isinstance(prefs, list) else []
+    by_worker = ov.get("no_evict_by_worker")
+    by_worker = ({str(k): bool(v) for k, v in by_worker.items() if str(k).strip()}
+                 if isinstance(by_worker, dict) else {})
+    return prefs, bool(ov.get("no_evict")), by_worker
+
+
+def resolve_polite(polite: bool, by_worker: dict, forms) -> bool:
+    """Effective politeness for ONE worker: ``map[W]`` when W is in the map,
+    else the model-wide boolean. PURE (no disk read) so the routing loop resolves
+    every candidate off a single policy read.
+
+    ``forms``: the worker's id/name spellings, matched case-insensitively — the
+    same tolerance ``_pref_index`` applies, and for the same reason: the console
+    posts ids, an operator editing the file writes names, and a politeness that
+    silently failed to match would evict on a box the operator marked polite."""
+    want = {str(f).strip().lower() for f in (forms or []) if str(f).strip()}
+    for name, val in (by_worker or {}).items():
+        if str(name).strip().lower() in want:
+            return bool(val)
+    return bool(polite)
+
+
+def polite_on_worker(model_key: str, *forms) -> bool:
+    """Convenience: is ``model_key`` polite on the worker named by ``forms``
+    (any mix of id/name spellings)? One-shot readers (the warm gate, the spill
+    emission) use this; the routing loop reads the policy once and calls
+    :func:`resolve_polite` per candidate."""
+    _prefs, polite, by_worker = placement_policy(model_key)
+    return resolve_polite(polite, by_worker, forms)
 
 
 def effective_alloc_mode(model_key: str) -> str:

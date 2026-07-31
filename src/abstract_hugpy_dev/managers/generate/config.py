@@ -15,7 +15,10 @@ from .imports import (
     ErrorEvent,
     StreamEvent,
     TokenEvent,
-    DEFAULT_LOCAL_FILES_ONLY
+    DEFAULT_LOCAL_FILES_ONLY,
+    AdapterBaseUnavailable,
+    resolve_adapter_pair,
+    standalone_load_refusal,
 )
 logger = get_logFile("deepcoder")
 _SENTINEL = object()
@@ -46,6 +49,15 @@ class DeepCoderConfig:
     trust_remote_code: bool = False
     model_key: Optional[str] = None
 
+    # PEFT: when model_dir is a bare LoRA ADAPTER dir, model_dir is rewritten to
+    # the BASE model and this holds the adapter. DeepCoder._load_model has read
+    # `cfg.adapter_dir` since the adapter branch was written, but this field did
+    # not exist and nothing ever set it — so the branch was dead and the adapter
+    # dir went to transformers as if it were a model ("Unrecognized model in
+    # <dir>. Should have a `model_type` key in its config.json"). Resolved in
+    # build_deepcoder_runtime; see imports/src/peft_adapters.py.
+    adapter_dir: Optional[str] = None
+
     max_new_tokens_cap: int = 16000
 
     cpu_threads: Optional[int] = None
@@ -61,6 +73,7 @@ class DeepCoderConfig:
             self.use_flash_attention,
             self.local_files_only,
             self.trust_remote_code,
+            self.adapter_dir,            # distinct cache slot per adapter
             self.max_new_tokens_cap,
             self.cpu_threads,
             self.cpu_interop_threads,
@@ -114,6 +127,35 @@ def build_deepcoder_runtime(
                 f"call ensure_model({model_key!r}) first."
             )
 
+    # PEFT / bare-adapter dirs. A LoRA dir has adapter_config.json and NO
+    # config.json, so it has no `model_type` and transformers refuses it with
+    # "Unrecognized model in <dir>" — the 2026-07-29 bench failure for
+    # qwen3.5-test-stage1-lora, Qwen2.5-1.5B-LFGRPO-300S and
+    # veeraragavan410~Llama-3.2-3B-sentiment. Rewrite model_dir to the BASE model
+    # from the store and carry the adapter separately; DeepCoder._load_model
+    # applies it with PeftModel.from_pretrained (peft is lazy-imported by
+    # require_peft, which refuses with `pip install peft` if it's missing).
+    #
+    # Local store ONLY — an absent base raises AdapterBaseUnavailable naming the
+    # id to acquire. It never becomes a silent multi-GB download.
+    #
+    # Ordinary model dirs come back unchanged, so this is inert for everything
+    # that already worked. A dir that is neither loadable nor an adapter (a
+    # bespoke-runtime repo mis-registered as transformers) is named for what it
+    # is instead of dying inside from_pretrained.
+    adapter_dir = None
+    try:
+        model_dir, adapter_dir = resolve_adapter_pair(model_dir)
+    except AdapterBaseUnavailable as exc:
+        raise RuntimeError(f"{model_key}: {exc}") from exc
+    if adapter_dir:
+        logger.info("%s is a PEFT adapter; base=%s adapter=%s",
+                    model_key, model_dir, adapter_dir)
+    else:
+        refusal = standalone_load_refusal(model_dir)
+        if refusal:
+            raise RuntimeError(f"{model_key}: {refusal}")
+
     chosen_device, chosen_dtype = pick_device_and_dtype(torch, device, torch_dtype)
 
     # SECURITY: trust_remote_code lets a model repo run arbitrary Python on load.
@@ -137,6 +179,7 @@ def build_deepcoder_runtime(
         max_concurrent_generations=max_concurrent_generations,
         cpu_threads=cpu_threads,
         cpu_interop_threads=cpu_interop_threads,
+        adapter_dir=adapter_dir,
     )
 build_deepcoder_config = build_deepcoder_runtime
 

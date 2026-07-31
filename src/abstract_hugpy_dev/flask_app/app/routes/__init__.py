@@ -4,6 +4,7 @@ from .search_routes import search_bp
 from .upload_routes import upload_bp
 from .worker_routes import worker_bp
 from .v1_routes import v1_bp
+from .messages_routes import messages_bp
 from .prompt_routes import prompt_bp
 from .ml_routes import ml_bp
 from .phone_brick_routes import phone_brick_bp

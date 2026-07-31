@@ -15,6 +15,11 @@ refresh_registry() explicitly — e.g. on hugpy module startup.
 """
 
 from .imports import *
+from ...src.model_classifier import (
+    ADAPTER_TASK, NEEDS_CLASSIFICATION_TASK, adapter_refusal,
+    classify_model_dir, needs_classification_refusal, pipeline_class_name,
+    tasks_for_pipeline_class,
+)
 
 # EMFILE burst hardening (incident 2026-07-23): media_models.json lives on the
 # virtiofs mount; the restart-open burst threw EMFILE here (logged via
@@ -286,7 +291,17 @@ def _base_tasks(framework, row):
     if m in _VISION:  return ["image-text-to-text", "text-generation"]
     if m in _VIDEO_T2V: return ["text-to-video"]
     if m in _VIDEO_I2V: return ["image-to-video"]
-    return ["text-generation"]                          # conservative floor
+    # THE FLOOR IS NOT A DEFAULT (k61, 2026-07-31). It stands only on POSITIVE
+    # evidence that this is a transformers-shaped model: a model_type, an
+    # architectures list, or a hub pipeline/library tag. A row with NONE of those
+    # is not a chat model — it is a row nobody has classified, and the old
+    # unconditional `["text-generation"]` is what let an image LoRA be offered as
+    # an LLM (and refuse every image call with "supported: ['text-generation']").
+    # Unclassified says so, and refuses with the remedy named.
+    if (m or row.get("architectures") or row.get("pipeline_tag")
+            or row.get("library_name")):
+        return ["text-generation"]                      # conservative floor
+    return [NEEDS_CLASSIFICATION_TASK]
 
 
 def _derive_tasks(framework, row):
@@ -352,7 +367,8 @@ def _correct_video_task(framework, tasks, row):
     Fires only when the config's own ``model_type`` names a video architecture, so a
     real text model can never be re-labelled by this. Absent/unreadable config → the
     task list is returned untouched."""
-    if framework == "gguf" or "text-generation" not in tasks:
+    if framework == "gguf" or not ({"text-generation", NEEDS_CLASSIFICATION_TASK}
+                                   & set(tasks)):
         return tasks
     mt = (row.get("model_type") or "").lower()
     if not mt:
@@ -363,6 +379,141 @@ def _correct_video_task(framework, tasks, row):
     if mt in _VIDEO_I2V:
         return ["image-to-video"]
     return tasks
+
+
+# Path segments that mark a GGUF as a COMPONENT of a diffusion/video pipeline
+# rather than a standalone servable model. A diffusion checkpoint splits into
+# sub-trees (the text encoder, the VAE, the transformer/unet); the encoder is
+# very often a real LLM architecture in its own right (LTX-2 ships a Gemma-3
+# text encoder), so it CANNOT be told apart from a chat model by its header —
+# only by WHERE it lives. LTX-2.3-uncensored-fp8 was routed to the llama chat
+# path and rejected at load because its registered file is
+# ``split/text_encoders/gemma-3-12b-it-...gguf``.
+_PIPELINE_COMPONENT_DIRS = ("text_encoders", "text_encoder", "vae",
+                            "transformer", "unet", "image_encoder")
+
+
+def _correct_pipeline_component(framework, tasks, row):
+    """A GGUF that is a sub-component of a diffusion/video pipeline is NOT a
+    chat model, however chat-like its architecture looks.
+
+    PATH-AUTHORITATIVE, and deliberately narrow: it fires ONLY when the row's
+    own file path contains a pipeline-component directory segment
+    (``.../text_encoders/…``, ``.../vae/…``). A standalone Gemma/Qwen GGUF lives
+    at its model root, never under one of those segments, so this can never
+    re-label a genuine chat model. Returns ``["pipeline-component"]`` — a task
+    with no runner, so the derive keeps the row visible but flags it
+    ``serveable: False`` with an honest reason instead of letting it advertise
+    text-generation and crash at the loader (silent-unavailability-by-
+    misclassification, operator doctrine 2026-07-29: a model must be knowable,
+    not hidden behind a misleading failure)."""
+    if framework != "gguf":
+        return tasks
+    fn = str(row.get("filename") or row.get("effective_gguf") or "")
+    segs = {s.lower() for s in fn.replace("\\", "/").split("/")}
+    if segs & set(_PIPELINE_COMPONENT_DIRS):
+        return ["pipeline-component"]
+    return tasks
+
+
+def _correct_diffusers_task(framework, tasks, row):
+    """A diffusers pipeline's ``model_index.json`` is AUTHORITATIVE about its task.
+
+    CONTENT-AUTHORITATIVE OVERRIDE, shaped like ``_correct_video_task`` and for the
+    same reason: by the time we get here the task list may not have come from
+    ``_base_tasks`` at all — ``_base_tasks`` short-circuits on a STORED value, and
+    the stored value is exactly what was wrong.
+
+    THE INCIDENT (2026-07-31). ``FLUX.2-klein-base-9B-bucket-uncensored`` is a
+    complete pipeline — ``model_index.json`` says ``Flux2KleinPipeline`` — but all
+    three task stores had it stamped ``["image-to-image"]`` only, so every
+    text-to-image call refused and the operator's flux2 attempts all failed. The
+    pipeline had been declaring the truth about itself the whole time; nothing read
+    it. Now the declaration WINS over the stamp, which is what stops the fleet's
+    hand-corrected data from regressing on the next walk.
+
+    Narrow by construction: fires only when the dir actually carries a
+    ``model_index.json`` whose ``_class_name`` maps to image tasks. Video pipelines
+    (Wan/LTX/Cog/…) return None from the classifier and are left to
+    ``_correct_video_task``; a dir with no model_index.json is untouched."""
+    if framework == "gguf":
+        return tasks
+    d = row.get("dir")
+    if not d:
+        return tasks
+    cls = pipeline_class_name(d)
+    if not cls:
+        return tasks
+    derived = tasks_for_pipeline_class(cls, index=None)
+    if not derived:
+        return tasks
+    if list(tasks) != list(derived):
+        logger.info("classify: %s declares %s -> tasks %s (was %s)",
+                    row.get("name") or row.get("hub_id") or d, cls, derived, tasks)
+    return list(derived)
+
+
+def _inherit_adapter_base_task(framework, tasks, row):
+    """A PAIRABLE PEFT adapter serves whatever its BASE serves.
+
+    An adapter is a delta: ``qwen3.5-test-stage1-lora`` has no task of its own, but
+    it names ``base_model_name_or_path`` and the load path (resolve_adapter_pair)
+    loads that base and applies the delta — so the base's task IS the row's task.
+    Deriving it from the base is a READ, not a guess, which is what lets k61 remove
+    the text-generation default without turning every working PEFT row into
+    "unclassified". The base's own config.json is consulted; when the base is not
+    on disk the row stays unclassified (and the base-present gate above already
+    refuses by naming the base to acquire).
+
+    Fires only on an otherwise-unclassified row — an adapter that states its task
+    keeps it."""
+    if tasks != [NEEDS_CLASSIFICATION_TASK]:
+        return tasks
+    base = row.get("base_model")
+    if not base:
+        return tasks
+    try:
+        from ...src.peft_adapters import find_base_model_dir
+        base_dir = find_base_model_dir(base)
+    except Exception:  # noqa: BLE001 — an unresolvable base is simply not here
+        return tasks
+    if not base_dir:
+        return tasks
+    inherited = _base_tasks(framework, _enrich_model_type(
+        framework, {"dir": base_dir, "hub_id": base}))
+    if inherited == [NEEDS_CLASSIFICATION_TASK]:
+        return tasks
+    logger.info("classify: %s is a delta on %s -> inherits tasks %s",
+                row.get("name") or row.get("hub_id"), base, inherited)
+    return inherited
+
+
+def _correct_adapter_only(framework, tasks, row):
+    """A dir holding only LoRA/adapter weights is an ADAPTER, never a model.
+
+    ``Flux-Uncensored-V2`` is a single ``lora.safetensors`` with no
+    ``model_index.json`` and no ``config.json``. It carried ``tasks: null``, null
+    defaulted to text-generation, and an image LoRA was offered as an LLM. An
+    adapter now says what it is: the non-servable ``adapter`` task (never null,
+    never text-generation), so the row stays visible and refuses by NAMING the
+    base to apply it to — the same keep-and-explain treatment PEFT adapters and
+    pipeline components already get."""
+    if framework == "gguf" or row.get("base_model"):
+        # A row carrying base_model is a PAIRABLE PEFT adapter: the base-present
+        # gate above serves it (base + delta) or refuses by naming the base. Its
+        # task is the BASE's task and must survive — this corrector speaks only
+        # for the shape nothing can pair.
+        return tasks
+    d = row.get("dir")
+    if not d:
+        return tasks
+    verdict = classify_model_dir(d)
+    if not verdict.get("adapter"):
+        return tasks
+    if list(tasks) != [ADAPTER_TASK]:
+        logger.info("classify: %s holds adapter weights only -> tasks ['%s'] (was %s)",
+                    row.get("name") or row.get("hub_id") or d, ADAPTER_TASK, tasks)
+    return [ADAPTER_TASK]
 
 
 def _enrich_model_type(framework, row):
@@ -427,21 +578,52 @@ def derive_model_config_row(name, row):
     if not hub_id or "/" not in hub_id:
         return None, f"unusable hub_id {row.get('hub_id')!r}"
 
-    # PEFT adapter gate: an adapter is a delta on a base model. It needs
-    # base_model_name_or_path, and that base must be on disk to serve.
-    # base-less or base-absent adapters are dropped here so they never
-    # enter the registry and detonate inside from_pretrained on first use.
+    # PEFT adapter gate: an adapter is a delta on a base model, so it needs
+    # base_model_name_or_path AND that base on disk before it can serve.
+    #
+    # It used to DROP the row (`return None, ...`). That is the silent-
+    # unavailability defect the operator named on 2026-07-29: the model is
+    # DOWNLOADED and on the models tab's disk, and vanishing it leaves the
+    # operator with a directory nothing will explain. The row is KEPT and
+    # flagged unserveable with a reason that names the base to acquire — same
+    # treatment the no-runner case below already gets. The load path
+    # (managers/generate/config.py -> resolve_adapter_pair) refuses with the
+    # same text, and SERVES the row outright once the base lands.
     peft_base = row.get("base_model")
+    peft_reason = None
     if peft_base and not base_present(peft_base):
-        return None, f"peft adapter base {peft_base!r} not on disk; acquire it first"
+        peft_reason = (f"PEFT adapter (base {peft_base!r}) — the adapter is on "
+                       f"disk but its base model is NOT in this store, and an "
+                       f"adapter cannot be loaded without it. FIX: acquire "
+                       f"{peft_base!r} into the store, then this row serves.")
 
     framework = _derive_framework(name, hub_id, row)
     row = _enrich_model_type(framework, row)   # believe the model when it names itself
     tasks = _derive_tasks(framework, row)
     tasks = _correct_gguf_vision(framework, tasks, row)   # mmproj-authoritative, not pipeline_tag/path
     tasks = _correct_video_task(framework, tasks, row)    # config-authoritative: t2v/vace are NOT chat models
+    tasks = _correct_diffusers_task(framework, tasks, row) # model_index-authoritative: the pipeline's own declaration wins
+    tasks = _correct_adapter_only(framework, tasks, row)   # content-authoritative: a LoRA dir is a delta, not a model
+    tasks = _inherit_adapter_base_task(framework, tasks, row)  # a pairable delta serves what its base serves
+    tasks = _correct_pipeline_component(framework, tasks, row)  # path-authoritative: an encoder/vae split is not a chat model
     primary = row.get("primary_task") if row.get("primary_task") in tasks else tasks[0]
     no_runner = [t for t in tasks if (framework, t) not in RUNNER_PAIRS]
+    # A pipeline component fails the runner test (no ("gguf","pipeline-component")
+    # pair) so it is KEPT-but-unserveable; give the refusal a CAUSE + FIX rather
+    # than a bare task name the UI can't explain.
+    if no_runner == ["pipeline-component"] and not peft_reason:
+        peft_reason = (f"{name}: this GGUF is a sub-component of a diffusion/"
+                       f"video pipeline (its file lives under "
+                       f"{row.get('filename')!r}), not a standalone chat model. "
+                       f"FIX: serve it through its pipeline (Studio/video), or "
+                       f"re-register the parent model under a video task.")
+    # k61: the two "not a servable model" verdicts refuse with a CAUSE + FIX
+    # instead of a bare task name — and, crucially, instead of silently reading
+    # as a text-generation model.
+    if not peft_reason and tasks == [ADAPTER_TASK]:
+        peft_reason = adapter_refusal(name, base_model=peft_base)
+    if not peft_reason and tasks == [NEEDS_CLASSIFICATION_TASK]:
+        peft_reason = needs_classification_refusal(name)
     on_disk = bool(row.get("dir"))
     if no_runner and not on_disk:
         # Nothing can serve it AND it isn't downloaded → don't surface a dead
@@ -464,13 +646,28 @@ def derive_model_config_row(name, row):
             or row.get("max_position_embeddings") or DEFAULT_MAX_TOKENS_LOCAL,
         "filename": row.get("filename"), "include": row.get("include"),
         "port": row.get("port"), "host": row.get("host"),
-        "serveable": not no_runner,
-        "unserveable_tasks": no_runner,
+        # SERVEABLE = at least one advertised task has a runner (k61). It used to
+        # mean "EVERY task has one", which made a partially-servable row read as
+        # dead: an inpaint pipeline advertises image-to-image (runner: yes) AND
+        # image-inpainting (runner: no), and the old rule hid the img2img it can
+        # actually serve. `unserveable_tasks` still names the ones that can't.
+        "serveable": bool([t for t in tasks if (framework, t) in RUNNER_PAIRS])
+                     and not peft_reason,
+        "unserveable_tasks": no_runner or (list(tasks) if peft_reason else []),
+        # Classification verdicts, carried by name so every reader (UI picker,
+        # serve refusal, re-stamp) sees the same fact the derive saw.
+        **({"adapter": True} if tasks == [ADAPTER_TASK] else {}),
+        **({"needs_classification": True}
+           if tasks == [NEEDS_CLASSIFICATION_TASK] else {}),
+        # Why it can't serve, in words, when it can't. Named so the UI and the
+        # serve refusal can both quote a CAUSE + FIX instead of leaving the
+        # caller with a bare boolean (or, before this, "Unrecognized model").
+        **({"unserveable_reason": peft_reason} if peft_reason else {}),
         # Provenance DECORATION (civitai sidecar via the comfy sweep) — this
         # derive rebuilds rows with a fixed schema, so decoration must be
         # passed through by name or it silently dies here. No serving
         # semantics; civitai_base_model deliberately NOT base_model (that
-        # field means PEFT adapter and trips the base_present drop above).
+        # field means PEFT adapter and trips the base_present gate above).
         **{k: row[k] for k in ("display_name", "civitai_id",
                                "civitai_version_id", "civitai_base_model")
            if row.get(k) is not None},

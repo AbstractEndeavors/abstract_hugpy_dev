@@ -5,3 +5,4 @@ from .chunking import *
 from .schemas import *
 from .utils import *
 from .except_utils import *
+from .peft_adapters import *

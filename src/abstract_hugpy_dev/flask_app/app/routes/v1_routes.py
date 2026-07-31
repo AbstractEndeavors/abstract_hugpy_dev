@@ -130,6 +130,9 @@ def v1_models():
         model = update_model_status(model)
         if model.get("status") != "installed":
             continue
+        # Derived facts that aren't ModelConfig FIELDS ride in `extra` (the
+        # class's leftover catcher), so read both — a top-level value wins.
+        extra = model.get("extra") if isinstance(model.get("extra"), dict) else {}
         data.append({
             "id": key,
             "object": "model",
@@ -142,6 +145,15 @@ def v1_models():
             # text-to-image + image-to-image model looked t2i-only).
             "tasks": model.get("tasks") or ([model.get("primary_task")] if model.get("primary_task") else []),
             "context_length": model.get("model_max_length"),
+            # k61 — WHY a listed model cannot be picked for a task. Adapters and
+            # pipeline components are real, present files; they are simply not
+            # servable on their own. The task-filtered pickers show them greyed
+            # with this reason rather than either offering them (they refuse) or
+            # hiding them (the operator then can't see the file they downloaded).
+            "adapter": bool(model.get("adapter", extra.get("adapter"))),
+            "serveable": model.get("serveable", extra.get("serveable", True)),
+            "unserveable_reason": model.get(
+                "unserveable_reason", extra.get("unserveable_reason")),
             "media_default": (key == media_default),
             # Additive: ⛔ blocked from the serving pool by the operator. A call
             # naming a blocked model fails fast with the distinct blocked reason.
@@ -286,6 +298,26 @@ def v1_chat_completions():
 
         async def sse():
             usage = None
+            # Re-separate re-inlined <think> into reasoning_content so a client
+            # like OpenCode renders a collapsible reasoning panel instead of raw
+            # <think> text (operator 2026-07-31). Only when NOT buffering for
+            # tools — the tools path parses the whole buffer at done and its
+            # <tool_call> block must be seen intact.
+            from ....utils.no_think import StreamingThinkSplitter
+            splitter = None if tools_preamble else StreamingThinkSplitter()
+
+            def _emit_split(text: str):
+                """Yield content / reasoning_content deltas for a token."""
+                if splitter is None:
+                    if text:
+                        yield chunk({"content": text})
+                    return
+                ans, rea = splitter.feed(text)
+                if rea:
+                    yield chunk({"reasoning_content": rea})
+                if ans:
+                    yield chunk({"content": ans})
+
             yield chunk({"role": "assistant", "content": ""})
             # Streaming with tools buffers the whole reply and parses at done —
             # the simplest CORRECT behavior: a <tool_call> block is only
@@ -301,10 +333,17 @@ def v1_chat_completions():
                         if tools_preamble:
                             buffered.append(ev.text)
                         else:
-                            yield chunk({"content": ev.text})
+                            for c in _emit_split(ev.text):
+                                yield c
                     elif t == "done":
                         usage = getattr(ev, "usage", None)
                         finish = _finish_reason(ev.finish_reason)
+                        if splitter is not None:
+                            ans, rea = splitter.flush()
+                            if rea:
+                                yield chunk({"reasoning_content": rea})
+                            if ans:
+                                yield chunk({"content": ans})
                         if tools_preamble:
                             clean_text, tool_calls = _parse_tool_calls("".join(buffered))
                             buffered = []
@@ -402,6 +441,21 @@ def v1_chat_completions():
 
     content = "".join(text_parts)
     message = {"role": "assistant", "content": content}
+    # Non-streaming: hand reasoning back under reasoning_content (OpenAI reasoning
+    # shape) so OpenCode collapses it, instead of leaving <think> inline in the
+    # answer (operator 2026-07-31). Skipped for the tools path — the buffered
+    # <tool_call> block is parsed out of `content` below. reasoning_content is
+    # omitted when there is none, so a plain answer is byte-identical to before.
+    if not tools_preamble:
+        from ....utils.no_think import strip_think
+        _ans, _reasoning = strip_think(content)
+        # Rewrite when the reply CARRIED think tags at all — including an EMPTY
+        # <think></think> a chat template pre-opened, which has no reasoning to
+        # surface but must still not sit in the answer as literal tags.
+        if _ans != content or _reasoning:
+            message = {"role": "assistant", "content": _ans}
+            if _reasoning:
+                message["reasoning_content"] = _reasoning
     if tools_preamble:
         # Errors-as-data: _parse_tool_calls returns (original text, None) on
         # no/malformed calls, so the worst case is a plain content answer —

@@ -57,10 +57,14 @@ amendment 3: n_gpu_layers semantics NEVER change on the wire):
 
 Both mean max-gpu TO THE WORKER, and neither reaches it as a mode key: the
 explicit form is stripped at the emission seam (WorkerStore.spill_for), so the
-wire is byte-identical to today's {} in both cases. That stripping is REQUIRED,
-not cosmetic — a literal HUGPY_ALLOC_MODE=max-gpu on a worker would suppress its
-auto MoE split (slot_agent gates the auto policy on "any k37 alloc_mode set"),
-silently making an explicit max-gpu WORSE than a blank one.
+wire is byte-identical to today's {} in both cases. The stripping stays because
+the wire contract is frozen, but it is no longer LOAD-BEARING for placement: a
+mode key on the worker used to suppress the auto MoE split entirely (making an
+explicit max-gpu WORSE than a blank one), and since the dense-backbone-first
+ruling (2026-07-31) no mode can suppress it — every mode that grants a GPU
+budget spends it on the dense backbone first (managers.serve.slot_agent.
+_moe_gpu_budget + spill.moe_dense_first_plan). What a mode still decides is HOW
+MUCH card the model may claim.
 
 The old code collapsed the explicit form to {} here, which fed it straight into
 the clear path: selecting max-gpu in the console DELETED the row instead of
@@ -116,6 +120,23 @@ NEW_SPILL_KEYS = frozenset({"alloc_mode", "leniency_pct", "priority_device",
 # First worker package version whose spill/env plumbing honors the new keys
 # (Slice B2 ships in this cut). Anything older gets the max-gpu fallback.
 MODE_MIN_PKG_VERSION = "0.1.203"
+
+# ── k56: POLITE LOAD (``no_evict``) ─────────────────────────────────────────
+# The per-model inverse of declare-need-then-evict (which stays the rule for
+# unflagged loads): admission may spend only GENUINELY FREE headroom — the free
+# VRAM left after the tolerance-band flex — and never triggers an eviction.
+#
+# It rides the SAME spill wire as the mode keys but carries its OWN version
+# gate, because it ships a whole cut later (0.1.226) and the two must not be
+# conflated: a 0.1.210 worker honors alloc_mode perfectly and would still evict
+# a resident for a polite load. Deliberately NOT in NEW_SPILL_KEYS — that set
+# means "downgrade the whole spill to max-gpu ({} autofit)", which for a polite
+# load would silently DROP the politeness and keep the placement, i.e. exactly
+# the silent-no-op failure the gate exists to prevent. The gate below strips the
+# key and says so LOUDLY instead; central's resolution refuses to route a polite
+# model to a worker that predates it (see workers._polite_admits).
+NO_EVICT_SPILL_KEY = "no_evict"
+NO_EVICT_MIN_PKG_VERSION = "0.1.226"
 
 # Modes a non-GGUF (transformers/comfy) model may select. Slice C wired the gap
 # loaders to the spill seam, and this slice (2026-07-24, operator-approved)
@@ -267,15 +288,17 @@ def feasible_modes(engine: Any,
 
       * ``gpu-only`` — the model fits the GPU total within the headroom factor
         (``model <= _GPU_FIT_HEADROOM * gpu_total``). All-or-bust on the GPU, so
-        it must plausibly fit the GPU alone.
+        it must plausibly fit the GPU alone. STRICT for a MoE too (operator
+        ruling 2026-07-31): the FULL footprint is priced, experts included —
+        see ``moe_split_gpu_bytes`` below.
       * ``ram-only`` — the model fits RAM total (``model <= ram_total``). Binds
         the CPU; never touches the GPU.
       * ``max-gpu`` — GGUF: ALWAYS (partial offload spills whatever won't fit to
-        RAM, so it is universally feasible). Transformers/comfy: ONLY if the
-        model fits the GPU total (same headroom test as gpu-only) — the gap
-        loaders place whole-tensor, so an oversized transformers model genuinely
-        cannot use the GPU and max-gpu must NOT be offered (the operator's
-        68 GB-on-24 GB case).
+        RAM, so it is universally feasible). Transformers/comfy: the same
+        numbers rule as max-ram — fits GPU+RAM COMBINED (118ac64, operator
+        ruling 2026-07-29: max-gpu is a spill PREFERENCE; the non-GGUF loaders
+        honor the spill via max_memory / cpu_offload, so a fits-the-card-whole
+        gate here made spill-capable models unassignable).
       * ``max-ram`` — a split exists: the model fits RAM+GPU COMBINED (its
         overflow rides the GPU). Engine-agnostic as of 2026-07-24: GGUF and
         non-GGUF both honor it (transformers RAM-priority max_memory, diffusers
@@ -294,14 +317,26 @@ def feasible_modes(engine: Any,
     measurement); ``max-ram`` is now engine-agnostic and eliminated only by the
     numbers.
 
-    ``moe_split_gpu_bytes`` (MoE, 2026-07-24): for a detected-MoE GGUF the
-    caller passes the GPU-side need of the expert split (non-expert bytes —
-    surfaced by gguf_variants_detail's ``moe`` at enrichment). GPU-fit tests
-    (gpu-only / a non-GGUF-style max-gpu check) then price THAT instead of the
-    full file: under the auto policy (and/or an operator ``n_cpu_moe``) the
-    card only ever holds the non-expert share, so eliminating gpu-only against
-    the full 41.6GB would wrongly bar a mode the split makes serveable. Dense
-    models pass None — byte-identical."""
+    ``moe_split_gpu_bytes`` (MoE, 2026-07-24): the GPU-side need of a detected
+    MoE's expert split (non-expert bytes — surfaced by gguf_variants_detail's
+    ``moe`` at enrichment); None for dense models. It USED to relax the gpu-only
+    gate: a 45 GiB MoE on a 24 GiB card was offered gpu-only because the split
+    would only put ~3 GiB on the card.
+
+    ⚠ IT NO LONGER DOES (operator ruling 2026-07-31: "gpu-only must be honest to
+    its name"). ALL tensors on the card, experts included — a MoE whose full
+    footprint doesn't fit VRAM makes gpu-only INFEASIBLE, not "feasible with the
+    experts quietly in RAM", which silently redefined *only*. The
+    GPU-maximal-then-spill behavior the split expresses belongs to **max-gpu**,
+    whose contract already says spill and which is UNCONDITIONALLY feasible for
+    a GGUF for exactly that reason (the partial-offload/expert split is what
+    makes any size serveable) — so the split's feasibility home is that branch,
+    not this one, and nothing is lost by pricing gpu-only honestly.
+
+    The argument is still accepted: callers pass it, and central reports it in
+    ``feasibility_context`` so a 409 can name the numbers the decision saw. It
+    is deliberately inert as a GATE — the split relaxes no mode's elimination
+    now that the mode it relaxed is the one that must not be relaxed."""
     size = _as_int(model_bytes)
     gpu_total = _as_int(gpu_total_bytes)
     ram_total = _as_int(ram_total_bytes)
@@ -324,23 +359,27 @@ def feasible_modes(engine: Any,
     if bool(bnb) and not gguf and size:
         size = bnb_effective_bytes(size) or size
     unknown_size = size is None
-    # The GPU-side footprint used for GPU-fit tests: the MoE split's non-expert
-    # share when known (never larger than the full size), else the full size.
-    moe_gpu = _as_int(moe_split_gpu_bytes)
-    gpu_size = min(size, moe_gpu) if (size is not None and moe_gpu) else size
 
     out = []
     for mode in ALLOC_MODES:
         if mode == "gpu-only":
-            # Fits GPU (headroom). Unknown size/gpu_total -> don't eliminate.
+            # Fits GPU (headroom), priced on the FULL footprint — a MoE gets no
+            # discount here (see moe_split_gpu_bytes above: "only" means the
+            # experts are on the card too, and a footprint that needs RAM is
+            # max-gpu's job). Unknown size/gpu_total -> don't eliminate.
             feasible = (unknown_size or gpu_total is None
-                        or gpu_size <= _GPU_FIT_HEADROOM * gpu_total)
+                        or size <= _GPU_FIT_HEADROOM * gpu_total)
         elif mode == "ram-only":
             feasible = (unknown_size or ram_total is None
                         or size <= ram_total)
         elif mode == "max-gpu":
             if gguf:
-                feasible = True                  # partial offload: universal
+                # Partial offload: universal — AND the home of the MoE expert
+                # split since the 2026-07-31 gpu-only ruling. "As much GPU as
+                # fits, spill the rest" is precisely what a dense-first expert
+                # split does, so an oversized MoE is feasible HERE and only
+                # here.
+                feasible = True
             else:
                 # SAME numbers rule as max-ram (operator ruling 2026-07-29:
                 # "feasible modes should be auto-derived from auto setting; if
@@ -415,9 +454,10 @@ def feasible_default_mode(engine: Any,
     :func:`default_allocation` instead. The two agree by construction: the MoE
     branch below delegates to it.
 
-      * GGUF DENSE (any size) -> ``max-gpu`` ALWAYS. Partial offload makes every
-        size feasible on any GPU (spill the rest to RAM), so this is today's
-        blank default, unchanged, and independent of the box totals.
+      * GGUF DENSE -> ``gpu-only`` when it fits the card whole (operator
+        default order 2026-07-31: prefer full-card residency), else the
+        max-ram/ram-only tail; unknown size/totals degrade to ``max-gpu``
+        (partial offload keeps every size servable — never guess).
       * GGUF MoE (``moe`` supplied and is_moe, 2026-07-25) -> the operator's MoE
         branch via ``default_allocation``: ``explicit`` when the non-expert
         share fits the GPU and the experts fit RAM, else that function's
@@ -510,12 +550,11 @@ def default_allocation(engine: Any,
                                                           └ no ─ ram? ─► ram-only
                                                                        └► break
 
-    (*) the tree's "-- gpu only" leaf is implemented as ``max-gpu``, not
-    ``gpu-only``. Both are GPU placement; max-gpu spills a miss instead of
-    busting, which is the only honest spelling for a DEFAULT nobody chose (and
-    it keeps this leaf byte-identical to today). The full reasoning is on
-    ``_gpu_else_ram`` below — it is the one deliberate departure from the
-    sketch's literal words, and it is called out rather than done silently.
+    (*) the tree's "-- gpu only" leaf is implemented LITERALLY as ``gpu-only``
+    since 2026-07-31 (operator default order; between 07-25 and 07-31 it read
+    max-gpu as a bust-avoidance departure — history and the reversal argument
+    are on ``_gpu_else_ram`` below). Only a fits-the-card-whole model reaches
+    it; every other leaf keeps a spill-capable or split spelling.
 
     THE MoE LEAF IS THE POINT. coder-next Q4_K_M is 45 GiB of file but only
     1.49 GiB of NON-EXPERT tensors; the 43.59 GiB of experts are meant for RAM.
@@ -611,40 +650,34 @@ def default_allocation(engine: Any,
         """The shared 'gpu large enough? else ram large enough? else break'
         tail — identical for transformers and for dense GGUF.
 
-        THE "gpu large enough -> gpu only" LEAF READS AS ``max-gpu``, NOT
-        ``gpu-only``. This is a deliberate, doctrine-driven reading of the
-        operator's tree, and the one place this implementation does not take
-        the sketch's words literally — flagged here because it is a judgement
-        call, not an oversight:
+        THE "gpu large enough -> gpu only" LEAF READS AS ``gpu-only``, taking
+        the operator's tree at its literal word (operator order 2026-07-31:
+        "change the default to gpu only rather than max-gpu"). HISTORY: from
+        2026-07-25 to 2026-07-31 this leaf deliberately read max-gpu — the
+        argument was that the fit test is a headroom heuristic against TOTAL
+        capacity, so a contended card could turn a derived gpu-only into a
+        hard OOM nobody chose. Two things changed under that argument:
 
-          * the tree's leaf label means "put it on the GPU" — a PLACEMENT
-            intent. In the five-mode vocabulary that intent has two spellings:
-            ``gpu-only`` (all layers on the card, no spill, OOM if wrong) and
-            ``max-gpu`` (as much GPU as fits, spill the remainder). Both put it
-            on the GPU; they differ only in what happens when the estimate is
-            slightly off.
-          * this is a DEFAULT, and defaults-are-promises. The fit test is a
-            headroom heuristic against TOTAL capacity, not a live measurement of
-            what is free right now — another model may already hold the card.
-            ``gpu-only`` turns every such miss into a hard OOM; ``max-gpu``
-            spills the remainder and still serves. A default must be a success
-            path on the real fleet, so the non-busting spelling is the only
-            honest one for a value nobody chose.
-          * ``gpu-only`` remains fully reachable — the operator selects it
-            explicitly when they want all-or-bust, and that choice always wins.
-            Deriving it would be central quietly making a bust-on-error promise
-            on the operator's behalf.
-          * it also keeps this leaf byte-identical to today's shipped behavior
-            ({} on the wire), so the tree changes ONLY the MoE case it was
-            written to fix.
+          * gpu-only is STRICT and HONEST now (k55): the fits-whole test here
+            is the same full-footprint pricing admission re-checks at load
+            time, and a miss is an explicit refusal naming max-gpu as the
+            remedy — not a llama.cpp OOM mid-load. The bust this leaf used to
+            fear became a diagnosable, recoverable verdict.
+          * defaults-are-promises still holds BECAUSE the leaf is guarded:
+            only a model that fits the card WHOLE derives gpu-only. Oversized
+            dense stays max-ram/ram-only below, MoE keeps its explicit-split
+            branch, and every degrade-not-guess path still lands on max-gpu.
+            The default remains a success path per (model x worker) — it just
+            prefers full-card residency wherever that is genuinely available.
         """
         if gpu_fits:
-            return _plain("max-gpu",
+            return _plain("gpu-only",
                           f"{label}: {size / _GIB_F:.2f} GiB fits the "
                           f"{gpu_total / _GIB_F:.2f} GiB GPU "
-                          f"(<= {_GPU_FIT_HEADROOM:.0%} headroom) -> max-gpu "
-                          "(GPU placement, fit-and-spill rather than "
-                          "all-or-bust: a DEFAULT must never promise a bust)")
+                          f"(<= {_GPU_FIT_HEADROOM:.0%} headroom) -> gpu-only "
+                          "(full-card residency; operator default order "
+                          "2026-07-31 — oversized models still derive a "
+                          "spill-capable mode below)")
         if ram_total is None:
             return _plain("max-gpu",
                           f"{label}: too big for the GPU but RAM total is "
@@ -1083,6 +1116,25 @@ def worker_honors_mode_keys(pkg_version: Any) -> bool:
     return have is not None and need is not None and have >= need
 
 
+def worker_honors_no_evict(pkg_version: Any) -> bool:
+    """True when a worker's reported package version honors the polite-load
+    flag (>= NO_EVICT_MIN_PKG_VERSION). Unknown/unparseable -> False (fail
+    SAFE, same rule as worker_honors_mode_keys: never promise politeness we
+    can't prove the worker keeps — a dropped no_evict evicts residents)."""
+    have = _ver_tuple(pkg_version)
+    need = _ver_tuple(NO_EVICT_MIN_PKG_VERSION)
+    return have is not None and need is not None and have >= need
+
+
+def no_evict_downgrade_note(pkg_version: Any, worker_name: str = "") -> str:
+    """The LOUD note for a polite load aimed at a worker that predates it."""
+    return (f"worker {worker_name or '?'} (pkg {pkg_version or 'unknown'}) "
+            f"predates the polite-load flag (needs >= "
+            f"{NO_EVICT_MIN_PKG_VERSION}); no_evict STRIPPED — this worker "
+            f"would evict residents to make room, so central does not route a "
+            f"polite model here (update the worker to honor it)")
+
+
 def gate_spill_for_worker(spill: "Optional[dict]", pkg_version: Any,
                           worker_name: str = "") -> "tuple[dict, Optional[str]]":
     """THE version gate at emission: a spill carrying NEW mode keys is only
@@ -1090,15 +1142,25 @@ def gate_spill_for_worker(spill: "Optional[dict]", pkg_version: Any,
     autofit) for that request, with a note the caller logs/surfaces.
 
     Returns ``(spill_to_emit, downgrade_note)``. A spill with no new keys
-    passes through untouched (None note) regardless of version."""
+    passes through untouched (None note) regardless of version.
+
+    k56: ``no_evict`` is gated SEPARATELY (its own, later min version) and is
+    stripped rather than collapsing the spill — see NO_EVICT_SPILL_KEY. Checked
+    first so a polite spill carrying no mode keys at all is still gated."""
     s = dict(spill or {})
+    polite_note = None
+    if s.get(NO_EVICT_SPILL_KEY) and not worker_honors_no_evict(pkg_version):
+        s.pop(NO_EVICT_SPILL_KEY, None)
+        polite_note = no_evict_downgrade_note(pkg_version, worker_name)
     if not (set(s) & NEW_SPILL_KEYS):
-        return s, None
+        return s, polite_note
     if worker_honors_mode_keys(pkg_version):
-        return s, None
+        return s, polite_note
     mode = s.get("alloc_mode") or "explicit"
     note = (f"worker {worker_name or '?'} (pkg {pkg_version or 'unknown'}) "
             f"predates allocation-mode spill keys (needs >= "
             f"{MODE_MIN_PKG_VERSION}); '{mode}' downgraded to max-gpu "
             f"(autofit) for this request — update the worker to honor it")
-    return {}, note
+    # A worker old enough to miss the mode keys misses politeness too; report
+    # BOTH downgrades or the operator fixes one and re-hits the other.
+    return {}, "; ".join(n for n in (polite_note, note) if n)

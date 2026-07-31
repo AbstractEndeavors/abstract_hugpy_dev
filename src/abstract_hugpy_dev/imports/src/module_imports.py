@@ -292,8 +292,15 @@ def require_peft():
     try:
         from peft import PeftModel
     except ImportError as exc:
+        # `peft` is an EXTRA (pyproject: finetune = ["peft"]), deliberately not a
+        # base dependency — this package keeps base installs lean, and most
+        # workers never touch an adapter. So an adapter row on a worker without
+        # the extra must DEGRADE with the fix in the message, never crash
+        # opaquely: the operator pushes it over the existing /ops/pip relay.
         raise RuntimeError(
-            "PEFT adapter requested but `peft` is not installed; "
-            "pip install peft"
+            "this model is a PEFT/LoRA adapter, but `peft` is not installed on "
+            "this worker, so the adapter cannot be applied to its base model. "
+            "FIX: install it here — `pip install peft` (or POST /ops/pip with "
+            "packages=['peft'] then /ops/restart)."
         ) from exc
     return PeftModel

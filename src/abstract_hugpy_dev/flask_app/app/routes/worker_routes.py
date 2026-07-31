@@ -108,12 +108,46 @@ def _blocked_keys() -> set:
         return set()
 
 
+def _polite_warm_ok(worker, model_key) -> bool:
+    """k56: may a POLITE (``no_evict``) model be warmed onto this worker?
+
+    Only when central can prove the model lands in genuinely free VRAM. An
+    unflagged model is always warmable (True) — this gate exists solely for the
+    flagged case. Fails OPEN on anything unprovable (unsizable model, no VRAM
+    figure, an unreadable overrides file): the worker's own polite admission is
+    the authority, so central's job here is to skip the warms it can already
+    see would have to evict, never to invent a refusal.
+
+    k62 — politeness is resolved for THIS worker (``no_evict_by_worker`` beats
+    the model-wide default), so a model that is polite on the contended card is
+    still warmed normally onto the box where the operator left it assertive.
+    """
+    worker = worker or {}
+    try:
+        from ....managers.serve.overrides import polite_on_worker
+        if not polite_on_worker(model_key, worker.get("id"), worker.get("name")):
+            return True
+        verdict = _worker_fit(model_key, worker)
+        if verdict.get("vram_free") is None or verdict.get("need") is None:
+            return True
+        if verdict.get("gpu_resident"):
+            return True
+    except Exception:  # noqa: BLE001 — a gate miss must not stop ordinary warms
+        return True
+    logger.info(
+        "polite warm skipped: %s is polite ON WORKER %s and would need an "
+        "eviction to land there (no_evict) — leaving it cold rather than "
+        "displacing a resident",
+        model_key, worker.get("name") or worker.get("id"))
+    return False
+
+
 def _kick_warm(worker, model_keys, source: str) -> list:
     """Probe the given models on the worker in ONE background thread.
 
     Returns the models actually scheduled (cooldown/busy-filtered). Safe to
     call from any request: never blocks, never raises."""
-    import httpx
+    from ..functions.imports.utils import worker_http
     wid = (worker or {}).get("id") or ""
     base = ((worker or {}).get("url") or "").rstrip("/")
     if not wid or not base:
@@ -125,6 +159,14 @@ def _kick_warm(worker, model_keys, source: str) -> list:
     # candidate, never a transfer target.
     blocked = _blocked_keys()
     model_keys = [mk for mk in (model_keys or []) if mk not in blocked]
+    # k56 POLITE WARM. A warm probe is a LOAD: it runs the worker's admission,
+    # which for an unflagged model evicts to fit. A polite model must never be
+    # warmed by evicting anyone, and the probe carries no spill (so the worker
+    # never sees the flag on this path) — the gate therefore belongs here,
+    # beside the block filter directly above and for the identical reason: this
+    # is the ONE choke every central-initiated warm passes through (reconcile,
+    # assign-warm, and any future caller).
+    model_keys = [mk for mk in model_keys if _polite_warm_ok(worker, mk)]
     if not model_keys:
         return []
     now = _time.monotonic()
@@ -144,9 +186,13 @@ def _kick_warm(worker, model_keys, source: str) -> list:
         try:
             for mk in due:
                 try:
-                    httpx.post(base + "/probe/" + mk, timeout=900.0)
+                    worker_http.post(worker, "/probe/" + mk, call="load")
                 except Exception:
-                    pass   # best-effort; the next reconcile retries post-cooldown
+                    # Best-effort; the next reconcile retries post-cooldown. A
+                    # WorkerUnreachable here is the breaker doing its job — the
+                    # box is down, so the remaining models in `due` will fail
+                    # fast too instead of each burning a thread for minutes.
+                    pass
         finally:
             with _warm_lock:
                 _warm_busy.discard(wid)
@@ -659,6 +705,18 @@ def workers_list():
         _wildcards = worker_wildcard_state()
     except Exception:  # noqa: BLE001 — the flag map must never break /llm/workers
         _wildcards = {}
+    # k59 REACHABILITY, from central's own facts (no worker I/O on this hot
+    # read — that is the whole point of the endpoint). A worker whose circuit
+    # breaker is open is one central has failed to reach N times in a row; the
+    # console must SHOW that rather than let every click silently time out.
+    # Heartbeat `status` cannot say it: a box can be beating (worker->central)
+    # while central->worker is black-holed, which is exactly the direction chat
+    # offload uses.
+    try:
+        from ..functions.imports.utils.worker_http import breaker_snapshot
+        _breakers = breaker_snapshot()
+    except Exception:  # noqa: BLE001 — reachability never breaks the roster
+        _breakers = {}
     for w in rows:
         w["required_pkg_version"] = required
         # Tri-state on purpose (console pill): True = converged on the pin,
@@ -669,6 +727,10 @@ def workers_list():
                            else w.get("pkg_version") == required)
         w["boot_prewarm"] = _stars.get(w.get("id")) or None
         w["wildcard"] = bool(_wildcards.get(w.get("id")))
+        _br = _breakers.get(w.get("id")) or {}
+        w["unreachable"] = bool(_br.get("open"))
+        w["unreachable_reason"] = (_br.get("reason") or None
+                                   if w["unreachable"] else None)
     # Call-time attribution (2026-07-14): stamp each worker's pid_registry
     # unattributed entries that are a RELAY-dispatched foreign GPU service
     # (identity-render) with the identity slug + job_id of the active
@@ -1135,11 +1197,14 @@ def workers_health(worker_id):
     if worker is None:
         abort(404, description="Unknown worker id.")
 
+    from ..functions.imports.utils import worker_http
+
     url = (worker.get("url") or "").rstrip("/") + "/health"
     try:
-        import httpx
-
-        resp = httpx.get(url, timeout=5.0)
+        # force=True: this route IS the "is it back yet?" question, so it must
+        # dial even while the breaker is open — and its answer is what closes
+        # the breaker for every other caller.
+        resp = worker_http.get(worker, "/health", call="probe", force=True)
         resp.raise_for_status()
         return jsonify({"reachable": True, "url": url, "health": resp.json()})
     except Exception as exc:
@@ -1773,7 +1838,7 @@ def chat_cancel(request_id):
     worker owns it; every online worker gets the cancel, the owner stops, the
     rest 404 harmlessly.
     """
-    import httpx
+    from ..functions.imports.utils import worker_http
     from abstract_hugpy_dev.comms import bus, job_store, TOPIC_CONTROL_CANCEL
 
     # Direct store cancel first — its return is cross-process truth (live
@@ -1784,12 +1849,14 @@ def chat_cancel(request_id):
                                  reason="cancelled via /llm/chat/cancel")
     bus.publish(TOPIC_CONTROL_CANCEL, job_id=request_id, source="web",
                 payload={"reason": "cancelled via /llm/chat/cancel"})
+    # This fan-out is SERIAL and sits in the request path, so it is the exact
+    # shape k59 bounds: N workers x the probe budget is the worst case, and a
+    # box that is already known-down costs nothing at all (breaker).
     for w in list_workers():
         if w.get("status") != "online":
             continue
-        url = (w.get("url") or "").rstrip("/") + f"/infer/cancel/{request_id}"
         try:
-            r = httpx.post(url, timeout=4.0)
+            r = worker_http.post(w, f"/infer/cancel/{request_id}", call="probe")
             if r.status_code == 200:
                 cancelled = True
         except Exception:
@@ -1806,16 +1873,17 @@ def workers_unload(worker_id):
     the registry) — this only drops it from the worker's live cache so the VRAM
     is reclaimed. Relays to the worker's /models/unload.
     """
-    import httpx
+    from ..functions.imports.utils import worker_http
 
     worker = get_worker(worker_id)
     if worker is None:
         abort(404, description="Unknown worker id.")
     body = request.get_json(silent=True) or {}
-    url = (worker.get("url") or "").rstrip("/") + "/models/unload"
     try:
-        r = httpx.post(url, json=body, timeout=30.0)
+        r = worker_http.post(worker, "/models/unload", json=body, call="control")
         return jsonify(r.json())
+    except worker_http.WorkerUnreachable as exc:
+        return jsonify({**exc.as_error(), "evicted": False})
     except Exception as exc:
         return jsonify({"ok": False, "evicted": False,
                         "error": f"{type(exc).__name__}: {exc}"})
@@ -1834,10 +1902,15 @@ def _relay_worker_op(worker_id: str, op_path: str, body: dict,
     ("pin is broken"). For those ops a connect-class failure gets ONE retry
     after a 3s pause; if that also can't connect, the answer is an honest
     503 "agent is restarting" instead of the generic 502. Every other op
-    keeps the historical single-shot behavior exactly."""
+    keeps the historical single-shot behavior exactly.
+
+    k59: ``timeout`` is now the READ budget only — the connect budget is
+    worker_http's short, non-negotiable one. The per-verb read budgets stay
+    exactly as they were (a restart ACKs in seconds, a pip install does not),
+    but a powered-off box now costs ~3 s instead of the full op budget."""
     import time as _time
 
-    import httpx
+    from ..functions.imports.utils import worker_http
     from .comms_routes import audit
 
     worker = get_worker(worker_id)
@@ -1845,25 +1918,36 @@ def _relay_worker_op(worker_id: str, op_path: str, body: dict,
         abort(404, description="Unknown worker id.")
     audit(f"worker.{action}", {"worker_id": worker_id,
                                "worker": worker.get("name"), "body": body})
-    url = (worker.get("url") or "").rstrip("/") + op_path
 
     def _fail(exc):
+        # Report the UNDERLYING transport error, not the wrapper's class name:
+        # the console has always keyed the cause off this code ("ConnectError",
+        # "ReadTimeout"), and k59 changed how the call is made, not what failed.
+        cause = getattr(exc, "__cause__", None) or exc
         return jsonify({"ok": False,
-                        "error": {"code": type(exc).__name__,
-                                  "message": str(exc)}}), 502
+                        "error": {"code": type(cause).__name__,
+                                  "message": str(cause)}}), 502
 
-    _connect_errors = (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadError)
+    def _call():
+        return worker_http.post(worker, op_path, json=body,
+                                read_timeout=timeout)
+
     try:
-        r = httpx.post(url, json=body, timeout=timeout)
+        r = _call()
         return jsonify(r.json()), r.status_code
-    except _connect_errors as exc:
-        if not retry_on_connect:
+    except worker_http.WorkerUnreachable as exc:
+        # The breaker's own refusal is not a transport blip to retry through —
+        # it already means "this box has not answered N times in a row", so the
+        # 3s re-dial below would just be a fourth confirmation. Surface it.
+        if exc.tripped:
+            return jsonify(exc.as_error()), 503
+        if not (retry_on_connect and worker_http.is_connect_error(exc)):
             return _fail(exc)
         _time.sleep(3.0)
         try:
-            r = httpx.post(url, json=body, timeout=timeout)
+            r = _call()
             return jsonify(r.json()), r.status_code
-        except _connect_errors:
+        except worker_http.WorkerUnreachable:
             return jsonify({"ok": False, "error": {
                 "code": "AgentRestarting",
                 "message": ("worker agent is restarting to apply a previous "
@@ -1904,11 +1988,20 @@ def reset_aggregate_cache() -> None:
 def _fetch_worker_aggregate(worker: dict, timeout: float = 10.0) -> tuple:
     """One GET against the worker's /ops/aggregate. Errors are DATA, never a
     traceback — the same contract _relay_worker_op keeps for the POST ops."""
-    import httpx
+    from ..functions.imports.utils import worker_http
 
-    url = (worker.get("url") or "").rstrip("/") + "/ops/aggregate"
     try:
-        r = httpx.get(url, timeout=timeout)
+        r = worker_http.get(worker, "/ops/aggregate", call="status",
+                            read_timeout=timeout)
+    except worker_http.WorkerUnreachable as exc:
+        # A tripped breaker is "not even trying, come back later" — a 503 with
+        # retry-after. An attempt that actually failed keeps the historical 502
+        # and reports the underlying transport error verbatim.
+        if exc.tripped:
+            return exc.as_error(), 503
+        cause = exc.__cause__ or exc
+        return {"ok": False, "error": {"code": type(cause).__name__,
+                                       "message": str(cause)}}, 502
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": {"code": type(exc).__name__,
                                        "message": str(exc)}}, 502
@@ -3276,17 +3369,19 @@ def workers_probe(worker_id):
     Body: {"model_key": ...}. Relays to the worker's /probe, which loads the
     model on its GPU and returns {fit, vram_free_before/after, vram_used}.
     """
-    import httpx
+    from ..functions.imports.utils import worker_http
 
     body = AssignRequest(**(request.get_json(silent=True) or {}))
     worker = get_worker(worker_id)
     if worker is None:
         abort(404, description="Unknown worker id.")
-    url = (worker.get("url") or "").rstrip("/") + "/probe/" + body.model_key
     try:
-        # Loading can be slow (download + load), so allow generous time.
-        r = httpx.post(url, timeout=900.0)
+        # Loading can be slow (download + load), so allow generous READ time —
+        # but reaching the box is still a 3s question (call class "load").
+        r = worker_http.post(worker, "/probe/" + body.model_key, call="load")
         return jsonify(r.json())
+    except worker_http.WorkerUnreachable as exc:
+        return jsonify({**exc.as_error(), "fit": False})
     except Exception as exc:
         return jsonify({"ok": False, "fit": False,
                         "error": f"{type(exc).__name__}: {exc}"})
@@ -3414,6 +3509,17 @@ def _worker_fit(model_key, worker):
             "band_floor_bytes": band_floor_bytes,
             "band_floor_admissible": band_floor_admissible,
             "partial_offload_admissible": partial_offload_admissible}
+
+
+# k56: hand the store THE fit function (not a copy of its arithmetic) so a
+# polite model's central-side "does this land in genuinely free room?" test and
+# the console's placement preflight are one and the same verdict. Registered at
+# import, exactly like the web->core provider seams in resolvers.remote.
+try:
+    from ..functions.imports.utils.workers import set_free_room_probe
+    set_free_room_probe(_worker_fit)
+except Exception:  # noqa: BLE001 — unregistered degrades to "worker decides"
+    logger.debug("free-room probe not registered", exc_info=True)
 
 
 def _worker_already_has(worker: dict, model_key: str) -> bool:
@@ -3640,8 +3746,9 @@ def workers_load(worker_id):
     _apply_spill on every call), AND additionally forwarded on THIS warm's
     /probe POST so the seat that happens right here honors it immediately
     instead of waiting for the first real inference call to apply it."""
-    import httpx
     import threading
+
+    from ..functions.imports.utils import worker_http
 
     raw = request.get_json(silent=True) or {}
     body = AssignRequest(**raw)
@@ -3692,8 +3799,6 @@ def workers_load(worker_id):
 
     # passed (or forced/undecided) → assign, then warm in the background
     assign_model(worker_id, body.model_key, spill=body.spill)
-    base = (worker.get("url") or "").rstrip("/")
-    url = base + "/probe/" + body.model_key
 
     def _warm():
         # Best-effort warm, but NEVER silent: the probe outcome (the worker's
@@ -3709,8 +3814,9 @@ def workers_load(worker_id):
                 # Wipe the model's files on the worker + re-pull from central BEFORE
                 # warming. A full download can take minutes, so it rides this same
                 # background thread — the request never blocks.
-                httpx.post(base + "/models/redownload",
-                           json={"model_key": body.model_key}, timeout=3600.0)
+                worker_http.post(worker, "/models/redownload",
+                                 json={"model_key": body.model_key},
+                                 call="transfer")
             # Forward the spill override (n_gpu_layers / n_cpu_moe / …) on the
             # probe itself so an explicit split is honored on THIS seat, not
             # just on some later /infer call. Older workers (pre this change)
@@ -3735,8 +3841,9 @@ def workers_load(worker_id):
                 except Exception:  # noqa: BLE001 — never fail a load over this
                     _spill = None
             probe_body = {"spill": _spill} if _spill else {}
-            r = httpx.post(url, json=probe_body,
-                           timeout=900.0)  # worker loads synchronously; can be slow
+            # worker loads synchronously; can be slow (call class "load")
+            r = worker_http.post(worker, "/probe/" + body.model_key,
+                                 json=probe_body, call="load")
             try:
                 report.update(r.json())
             except Exception:

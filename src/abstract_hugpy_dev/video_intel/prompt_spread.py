@@ -52,6 +52,7 @@ lie.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -128,8 +129,8 @@ SPREAD_SYSTEM = (
     "2. Rewrite ONLY the segments marked REGENERATE. Segments marked LOCKED are "
     "the user's own work: use them as context, never restate or replace them.\n"
     "3. Write one chronological cinematic paragraph per segment. Plain "
-    "renderable description: subject, action, camera, light. No headings, no "
-    "markdown, no lists, no reasoning, no commentary.\n"
+    "renderable description: subject, action, camera, light. No markdown, no "
+    "lists, no reasoning, no commentary.\n"
     "4. Incorporate EVERY direction given for a segment.\n"
     "5. NEVER invent identity attributes (age, gender, clothing, ethnicity, "
     "hair, build) for a named character. If it is not in the locked identity "
@@ -137,14 +138,26 @@ SPREAD_SYSTEM = (
     "6. Respect each segment's join description — it says what is carried over "
     "from the shot before it.\n"
     "\n"
-    "Return ONLY a JSON object, no fence and no prose around it:\n"
-    '{"segments": [{"segment_id": "...", "operation": '
-    '"generate_from_direction|enhance_scene|generate|keep", "prompt": "...", '
-    '"negative": "...", "continuity_note": "...", "directions_used": [0], '
-    '"warnings": []}], "invented_identity_attributes": [], "warnings": []}\n'
-    "One entry per REGENERATE segment and nothing else. "
-    '"continuity_note" is one short sentence on how the shot connects to its '
-    "neighbours."
+    # THE CONTRACT (operator 2026-07-31): the UI already holds the segment
+    # structure — ids, operations, negatives — and sends it in; the backend
+    # assembles the result object from what it already knows. So the model is
+    # asked for the ONE thing only it can write: the prose. A small instruct
+    # model reliably writes a labelled paragraph; it does NOT reliably emit a
+    # nested JSON envelope, and demanding one was the #1 spread failure ('did
+    # not return the JSON object the spread contract requires').\n"
+    "OUTPUT FORMAT — for EACH segment I ask you to write, output its id on its "
+    "own line wrapped in double brackets, then its paragraph on the next "
+    "line(s):\n"
+    "\n"
+    "[[the-segment-id]]\n"
+    "The cinematic paragraph for that shot goes here.\n"
+    "\n"
+    "[[the-next-segment-id]]\n"
+    "Its paragraph.\n"
+    "\n"
+    "Use the EXACT segment ids I give you. One paragraph per REGENERATE "
+    "segment. No JSON, no headings, nothing else — just the [[id]] lines and "
+    "the paragraphs."
 )
 
 NEGATIVE_SYSTEM = (
@@ -523,8 +536,13 @@ def build_spread_messages(req: SpreadRequest) -> List[Dict[str, str]]:
         parts.append(f"Additional context to honour: {req.hint}")
     ids = ", ".join(req.target_ids)
     parts.append(
-        f"Write ONLY these {len(req.target_ids)} segments: {ids}. "
-        "Return the JSON object described in your instructions and nothing else."
+        f"Write ONLY these {len(req.target_ids)} segments, as ONE coherent "
+        f"continuous piece so they hold together as a single film: {ids}.\n"
+        "For each, output its id on its own line in double brackets, then its "
+        "paragraph — for example:\n"
+        f"[[{req.target_ids[0]}]]\n"
+        "<the shot's cinematic paragraph>\n"
+        "Use these exact ids. No JSON, no headings, nothing else."
     )
     return [
         {"role": "system", "content": SPREAD_SYSTEM},
@@ -566,93 +584,204 @@ def _clean_str(v: Any) -> str:
     return v.strip() if isinstance(v, str) else ""
 
 
-def parse_spread_reply(text: str, target_ids) -> Dict[str, Any]:
-    """Parse the generator's JSON into replacements for the TARGET rows only.
+# The [[segment-id]] marker the new contract asks for. Tolerant of surrounding
+# markdown/punctuation (** [[id]] ** :), and of one OR two brackets, because a
+# small model drops a bracket often enough to matter. The id is matched back to
+# a REQUESTED id, so a stray "[[note]]" never becomes a segment.
+_LABEL_RE = re.compile(r"\[\[\s*(.+?)\s*\]\]|(?<!\[)\[\s*([^\[\]\n]{1,80}?)\s*\](?!\])")
 
-    Raises :class:`SpreadParseError` (carrying the raw text) when nothing
-    parseable arrives, or when the reply parses but contains no usable segment —
-    those are 502s that say so. NEVER fabricates a segment: a target the model
-    skipped comes back as a WARNING and an absent row, so the UI leaves the
-    user's existing text alone.
+
+def _norm_id(s: str) -> str:
+    """Fold an id for tolerant matching: lowercase, and strip everything that is
+    not a letter or digit (so 'seg-1', 'seg_1', 'Seg 1', 'SEG1' all agree)."""
+    return re.sub(r"[^a-z0-9]", "", str(s or "").lower())
+
+
+def _split_paragraphs(text: str) -> List[str]:
+    """Blank-line-separated, trimmed, non-empty blocks — the natural shape of a
+    model that writes 'one paragraph per shot' without being told to label them."""
+    return [p.strip() for p in re.split(r"\n\s*\n", text or "") if p.strip()]
+
+
+def _target_meta(target) -> "Tuple[List[str], Dict[str, Dict[str, Any]]]":
+    """Return (ordered_ids, per-id meta) from a SpreadRequest OR a bare id list.
+
+    The backend already HOLDS the structure — operations, negatives, which rows
+    carry a direction — so the model is never asked to reproduce it (operator
+    2026-07-31). ``meta[id]`` = {operation, negative, directions_used} assembled
+    from the request; a bare id list (older callers/tests) gets sane defaults.
+    """
+    segs = getattr(target, "target_segments", None)
+    if segs is None:
+        ids = [str(x) for x in target]
+        return ids, {i: {"operation": "generate", "negative": "",
+                         "directions_used": []} for i in ids}
+    ordered = list(getattr(target, "target_ids", ()) or
+                   [s["segment_id"] for s in segs])
+    meta: Dict[str, Dict[str, Any]] = {}
+    for s in segs:
+        sid = s.get("segment_id")
+        has_dir = bool(_clean_str(s.get("direction")))
+        meta[sid] = {
+            "operation": "generate_from_direction" if has_dir else "generate",
+            "negative": _clean_str(s.get("negative")),
+            "directions_used": [0] if has_dir else [],
+        }
+    return ordered, meta
+
+
+def _labelled_blocks(raw: str, norm_to_id: Dict[str, str]) -> "Dict[str, str]":
+    """``{segment_id: prose}`` for every [[id]] / [id] marker that resolves to a
+    REQUESTED id. The prose is the text from the marker to the next marker."""
+    out: Dict[str, str] = {}
+    hits = []
+    for m in _LABEL_RE.finditer(raw):
+        label = m.group(1) if m.group(1) is not None else m.group(2)
+        sid = norm_to_id.get(_norm_id(label))
+        if sid:
+            hits.append((m.start(), m.end(), sid))
+    for i, (_s, end, sid) in enumerate(hits):
+        nxt = hits[i + 1][0] if i + 1 < len(hits) else len(raw)
+        prose = raw[end:nxt].strip().strip(":").strip()
+        if prose and sid not in out:   # first labelled block for an id wins
+            out[sid] = prose
+    return out
+
+
+def parse_spread_reply(text, target) -> Dict[str, Any]:
+    """Divvy ONE coherent generator reply into per-segment replacements.
+
+    The spread is a SINGLE call for continuity (the model sees the whole
+    timeline and writes all the requested shots as one coherent piece); this
+    function splits that reply back into the TARGET rows. ``target`` may be a
+    :class:`SpreadRequest` (preferred — carries operations/negatives to
+    assemble) or a bare iterable of target ids (older callers/tests).
+
+    Readers, in order, each falling through to the next (operator 2026-07-31:
+    "it should generate the scenes, which it probably did — it's the parser on
+    this end that is no good"):
+      1. ``[[segment-id]]`` labelled paragraphs (the contract we now ask for);
+      2. the legacy JSON envelope (a model that still emits one still works);
+      3. POSITIONAL divvy — an unlabelled coherent reply split into paragraphs
+         and mapped onto the target rows IN TIMELINE ORDER. This is the case
+         that was failing: the model wrote N good scenes and the JSON-only
+         parser threw them away.
+
+    NEVER fabricates: a target the reply doesn't cover comes back under
+    ``missing_segments`` and is left unchanged. Raises :class:`SpreadParseError`
+    (carrying the raw) only when the reply is empty or nothing maps to any
+    requested row.
     """
     from ..utils.json_scavenge import extract_json_array, extract_json_object
 
     raw = (text or "").strip()
-    wanted = list(target_ids)
-    wanted_set = set(wanted)
+    ordered, meta = _target_meta(target)
+    wanted_set = set(ordered)
+    norm_to_id = {_norm_id(sid): sid for sid in ordered}
+    warnings: List[str] = []
+    invented: List[str] = []
+    # {segment_id: (prose, op_override, neg_override, continuity, directions_override)}
+    prose_by_id: Dict[str, str] = {}
+    op_override: Dict[str, str] = {}
+    neg_override: Dict[str, str] = {}
+    cont_by_id: Dict[str, str] = {}
+    dir_override: Dict[str, List[Any]] = {}
 
-    parsed: Any = extract_json_object(raw)
-    if parsed is None:
-        arr = extract_json_array(raw, accept_lone_object=False)
-        if arr is not None:
-            parsed = {"segments": arr}
-    if parsed is None:
+    if not raw:
+        raise SpreadParseError("the generator returned an empty reply", raw)
+
+    # ── reader 1: labelled [[id]] blocks ────────────────────────────────────
+    blocks = _labelled_blocks(raw, norm_to_id)
+    for sid, prose in blocks.items():
+        prose_by_id[sid] = prose
+
+    # ── reader 2: legacy JSON envelope ──────────────────────────────────────
+    if not prose_by_id:
+        parsed: Any = extract_json_object(raw)
+        if parsed is None:
+            arr = extract_json_array(raw, accept_lone_object=False)
+            if arr is not None:
+                parsed = {"segments": arr}
+        if isinstance(parsed, dict) and isinstance(parsed.get("segments"), list):
+            warnings += [w for w in (parsed.get("warnings") or []) if isinstance(w, str)]
+            invented += [w for w in (parsed.get("invented_identity_attributes") or [])
+                         if isinstance(w, str)]
+            for row in parsed["segments"]:
+                if not isinstance(row, dict):
+                    continue
+                raw_sid = _clean_str(row.get("segment_id"))
+                sid = norm_to_id.get(_norm_id(raw_sid))
+                if not sid:
+                    if raw_sid:
+                        # A LOCKED (or unknown) row: dropped LOUDLY. Applying a
+                        # row the user did not select would overwrite work they
+                        # chose to keep, making the selection checkbox a lie.
+                        warnings.append(
+                            f"the generator returned segment {raw_sid!r}, which "
+                            "was not selected — it was discarded and that row is "
+                            "unchanged")
+                    continue
+                if sid in prose_by_id:
+                    continue
+                prose = _clean_str(row.get("prompt"))
+                if not prose:
+                    continue
+                prose_by_id[sid] = prose
+                op = row.get("operation")
+                if op in VALID_OPERATIONS:
+                    op_override[sid] = op
+                if _clean_str(row.get("negative")):
+                    neg_override[sid] = _clean_str(row.get("negative"))
+                if _clean_str(row.get("continuity_note")):
+                    cont_by_id[sid] = _clean_str(row.get("continuity_note"))
+                if isinstance(row.get("directions_used"), list):
+                    dir_override[sid] = row["directions_used"]
+                invented += [x for x in (row.get("invented_identity_attributes") or [])
+                             if isinstance(x, str)]
+
+    # ── reader 3: positional divvy of an unlabelled coherent reply ──────────
+    # Only fires when the reply can cover the request: one target takes the whole
+    # reply; N targets need at least N paragraphs (assign the first N in timeline
+    # order). FEWER paragraphs than multiple targets is NOT a coherent N-scene
+    # reply — a preamble line like "Sure! Here are your shots" must fail
+    # honestly (below), never be pasted into a shot.
+    if not prose_by_id:
+        paras = _split_paragraphs(raw)
+        if len(ordered) == 1:
+            prose_by_id[ordered[0]] = raw
+        elif len(paras) >= len(ordered):
+            for sid, para in zip(ordered, paras):
+                prose_by_id[sid] = para
+            if len(paras) > len(ordered):
+                warnings.append(
+                    f"the generator returned {len(paras)} paragraphs for "
+                    f"{len(ordered)} selected shots — the first {len(ordered)} "
+                    "were used in order")
+
+    if not prose_by_id:
         raise SpreadParseError(
-            "the generator did not return the JSON object the spread contract "
-            "requires", raw)
+            "the generator's reply could not be divided into the selected "
+            "shots — no labelled [[id]] sections, no JSON, and no paragraphs to "
+            "map", raw)
 
-    rows = parsed.get("segments")
-    if not isinstance(rows, list):
-        raise SpreadParseError(
-            "the generator's reply contained no \"segments\" list", raw)
-
-    warnings: List[str] = [w for w in (parsed.get("warnings") or [])
-                           if isinstance(w, str)]
-    invented: List[str] = [w for w in (parsed.get("invented_identity_attributes") or [])
-                           if isinstance(w, str)]
-
+    # ── assemble the result rows (structure from the request, prose from the model) ──
     segments: List[Dict[str, Any]] = []
-    seen: set = set()
-    for row in rows:
-        if not isinstance(row, dict):
+    for sid in ordered:
+        if sid not in prose_by_id:
             continue
-        sid = _clean_str(row.get("segment_id"))
-        if not sid:
-            continue
-        if sid not in wanted_set:
-            # A LOCKED (or unknown) row. Dropped, loudly. The user did not select
-            # it, so applying it would overwrite work they chose to keep — that
-            # would make the selection checkbox a lie.
-            warnings.append(
-                f"the generator returned segment {sid!r}, which was not selected "
-                "— it was discarded and that row is unchanged")
-            continue
-        if sid in seen:
-            warnings.append(f"the generator returned segment {sid!r} twice — "
-                            "the first version was kept")
-            continue
-        prompt = _clean_str(row.get("prompt"))
-        if not prompt:
-            warnings.append(f"the generator returned an empty prompt for {sid!r} "
-                            "— that row is unchanged")
-            continue
-        seen.add(sid)
-        op = row.get("operation")
-        if op not in VALID_OPERATIONS:
-            op = "generate"
-        row_invented = [x for x in (row.get("invented_identity_attributes") or [])
-                        if isinstance(x, str)]
-        invented.extend(row_invented)
-        directions = row.get("directions_used")
-        if not isinstance(directions, list):
-            directions = []
+        m = meta.get(sid, {})
         segments.append({
             "segment_id": sid,
-            "operation": op,
-            "prompt": prompt,
-            "negative": _clean_str(row.get("negative")),
-            "continuity_note": _clean_str(row.get("continuity_note")),
-            "directions_used": directions,
-            "warnings": [w for w in (row.get("warnings") or [])
-                         if isinstance(w, str)],
+            "operation": op_override.get(sid) or m.get("operation") or "generate",
+            "prompt": prose_by_id[sid],
+            "negative": neg_override.get(sid, m.get("negative", "")),
+            "continuity_note": cont_by_id.get(sid, ""),
+            "directions_used": dir_override.get(sid, m.get("directions_used", [])),
+            "warnings": [],
         })
 
-    if not segments:
-        raise SpreadParseError(
-            "the generator returned no usable segments for the rows that were "
-            "selected", raw)
-
-    missing = [sid for sid in wanted if sid not in seen]
+    seen = {s["segment_id"] for s in segments}
+    missing = [sid for sid in ordered if sid not in seen]
     if missing:
         warnings.append(
             "the generator did not write " + ", ".join(repr(m) for m in missing)

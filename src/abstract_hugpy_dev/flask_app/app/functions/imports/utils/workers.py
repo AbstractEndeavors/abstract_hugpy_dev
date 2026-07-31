@@ -704,7 +704,21 @@ def _task_capable(worker: Dict[str, Any], task: Optional[str]) -> bool:
     caps = worker.get("task_capabilities")
     if not isinstance(caps, dict) or task not in caps:
         return True
-    return bool(caps.get(task))
+    if bool(caps.get(task)):
+        return True
+    # COMFY-BACKED IMAGE GEN (2026-07-29) — the vision carve-out's twin. The
+    # find_spec map equates text-to-image with "diffusers importable in the
+    # worker venv", but a comfy-served model never touches diffusers: the job
+    # goes over HTTP to ComfyUI's own process/env. ae proved the failure —
+    # heartbeating text-to-image:False (no diffusers) while comfy.available
+    # was True with 20 checkpoints listed, so every comfy request was skipped
+    # into "no registered worker is available". comfy.available is the real
+    # gate for this family; honor it before declaring the worker incapable.
+    if task in ("text-to-image", "image-to-image"):
+        comfy = worker.get("comfy")
+        if isinstance(comfy, dict) and comfy.get("available"):
+            return True
+    return False
 
 
 def _comfy_id_lock_capable(worker: Dict[str, Any]) -> bool:
@@ -741,6 +755,11 @@ def _has_usable_gpu(worker: Dict[str, Any]) -> bool:
 
 
 _GIB = 2 ** 30
+
+# Last-logged "reclaimable collapse" signature per worker — the once-per-state
+# dedupe for the guard-chain diagnostic below (per-process, like the sibling
+# module-level caches here).
+_RECLAIM_COLLAPSE_SEEN: Dict[str, tuple] = {}
 
 # Spill keys that constitute a PERSISTED placement intent. If a (worker, model)
 # spill carries ANY of these, it is NOT blank — the capability-aware default is
@@ -1508,6 +1527,40 @@ def allocated_totals(worker: Dict[str, Any]) -> Dict[str, Any]:
             "allocated_unknown_count": unknown}
 
 
+def _row_store_class(m: Dict[str, Any]) -> str:
+    """Which STORE a worker's storage row sits on: ``shared`` (the fleet's
+    central catalog this box only reads through), ``unreapable`` (a store the
+    box never declared local & disposable), or ``reapable`` (the worker's own
+    evictable cache). k60, operator 2026-07-31.
+
+    A CURRENT worker stamps ``store`` on the row. A released worker
+    (<=0.1.226) doesn't, so fall back to the store-gate ``why`` verdict it has
+    always sent — that fallback is what makes the accounting fix land on the
+    fleet at the next central restart instead of waiting on a wheel roll.
+    """
+    store = str(m.get("store") or "").strip().lower()
+    if store in ("shared", "unreapable", "reapable"):
+        return store
+    why = str(m.get("why") or "")
+    if "shared/central storage" in why:
+        return "shared"
+    if "model store not marked reapable" in why:
+        return "unreapable"
+    return "reapable"
+
+
+def _row_counts_toward_budget(m: Dict[str, Any]) -> bool:
+    """True when a storage row's bytes belong in the worker's eviction economy.
+
+    Shared-catalog and never-opted-in rows are SHOWN but never priced: they can
+    never be deleted from here, so charging them against the worker budget
+    manufactures a permanent "over budget" — which reads to an operator as "an
+    auto-delete is coming" (the ae 2.8 TiB / 800 GB alarm, 2026-07-31)."""
+    if "counts_toward_budget" in m:
+        return bool(m.get("counts_toward_budget"))
+    return _row_store_class(m) == "reapable"
+
+
 def storage_proposal(worker: Dict[str, Any]) -> Dict[str, Any]:
     """Derive a worker's local-STORAGE view + a guarded LRU eviction PROPOSAL.
 
@@ -1593,6 +1646,38 @@ def storage_proposal(worker: Dict[str, Any]) -> Dict[str, Any]:
     disk_total = _as_int(disk.get("total_bytes"))
 
     cache_used = _as_int(storage.get("cache_used_bytes")) if reported else None
+    # ── k60: SHARED-STORE BYTES ARE NOT IN THE EVICTION ECONOMY ─────────────
+    # (operator, 2026-07-31.) A row on the shared/central catalog — or on a store
+    # the box never declared reapable — can NEVER be deleted from this worker, so
+    # it must not be priced against the worker budget. ae read "2.8 TiB used /
+    # 800 GB budget · ⚠ over budget · 2.0 TiB over" on a 1.7 TiB box because the
+    # fleet's whole shared catalog was summed as this worker's resident cache;
+    # the deletes were correctly refused at every guard, but the NUMBER said an
+    # auto-evict was imminent. Only the accounting was wrong — the guards stay.
+    #
+    # A CURRENT worker already excludes those bytes from cache_used_bytes and
+    # reports the remainder as `unbudgeted_bytes`. A RELEASED worker still sends
+    # the shared bytes inside cache_used, so central discounts them here from the
+    # per-row store-gate verdicts it has always received — that is what makes
+    # this land on the live fleet without waiting for a wheel roll.
+    _raw_rows = (storage.get("models") or []) if reported else []
+    _unbudgeted_rows = [m for m in _raw_rows
+                        if isinstance(m, dict) and m.get("model_key")
+                        and not _row_counts_toward_budget(m)]
+    unbudgeted_from_rows = sum(_as_int(m.get("bytes")) or 0 for m in _unbudgeted_rows)
+    shared_from_rows = sum(_as_int(m.get("bytes")) or 0 for m in _unbudgeted_rows
+                           if _row_store_class(m) == "shared")
+    worker_unbudgeted = (_as_int(storage.get("unbudgeted_bytes"))
+                         if reported else None)
+    cache_used_reported = cache_used
+    if cache_used is not None and worker_unbudgeted is None and unbudgeted_from_rows:
+        # Released worker: subtract what it priced but may never reap. Floored at
+        # 0 — a measured root can legitimately be smaller than the row sum.
+        cache_used = max(0, cache_used - unbudgeted_from_rows)
+    unbudgeted_bytes = (worker_unbudgeted if worker_unbudgeted is not None
+                        else unbudgeted_from_rows)
+    _worker_shared = _as_int(storage.get("shared_bytes")) if reported else None
+    shared_bytes = _worker_shared if _worker_shared is not None else shared_from_rows
     # ORPHANED (unattributed-on-disk) residue reported by the worker (release-
     # bound field). Passed through verbatim: model dirs / stalled .part sets on
     # disk that match NO current assignment (computron's 5.7G Qwen2.5-VL-3B
@@ -1692,6 +1777,18 @@ def storage_proposal(worker: Dict[str, Any]) -> Dict[str, Any]:
         why = m.get("why") or ""
         protected = bool(m.get("protected"))
         is_pinned = bool(m.get("pinned") or pinned_cfg.get(mk))
+        # k60 STORE CLASS. A shared/unreapable row is protected UNCONDITIONALLY
+        # (it is a filesystem fact, not a policy label) and is never a proposal
+        # candidate — belt to the worker's own gate and to wipe_model's jail,
+        # never a replacement for either.
+        store_class = _row_store_class(m)
+        counts = _row_counts_toward_budget(m)
+        if not counts:
+            protected = True
+            if not why:
+                why = ("shared/central storage — never reaped"
+                       if store_class == "shared"
+                       else "model store not marked reapable")
         # Worker-reported protection is trusted ONLY for reasons that are not
         # pure attribution ("shared/central storage — never reaped", "model
         # store not marked reapable", live-use guards). A released worker
@@ -1755,8 +1852,15 @@ def storage_proposal(worker: Dict[str, Any]) -> Dict[str, Any]:
             # as missing, never as an active transfer.
             "provisioning": mk in provisioning_now,
             "assigned": bool(m.get("assigned")),
+            # k60: which store the bytes are on, and whether they were priced
+            # against the budget. The console sections the shared rows off with
+            # these so the operator can SEE why the used figure shrank.
+            "store": store_class,
+            "counts_toward_budget": counts,
         })
-        if not protected:
+        if not protected and counts:
+            # Proposals may name ONLY reapable rows (k60 ruling 2). `protected`
+            # already excludes them; `counts` says so in the store's own terms.
             candidates.append((lp, b, mk))
 
     # ── reclaimable-count trace (operator ask, 2026-07-17): "yell out the
@@ -1767,12 +1871,27 @@ def storage_proposal(worker: Dict[str, Any]) -> Dict[str, Any]:
     # that cost a day to localize by hand).
     _rows_in = len([m for m in (raw_models or []) if isinstance(m, dict) and m.get("model_key")])
     if _rows_in and not candidates:
-        logger.warning(
-            "reclaimable collapse on %s: worker reported %d storage rows but 0 "
-            "survived central's guard chain (protected breakdown: %s)",
-            worker.get("name") or worker.get("id", "?")[:8], _rows_in,
-            {w: sum(1 for m in models_out if m.get("why") == w)
-             for w in {m.get("why") for m in models_out if m.get("protected")}})
+        _breakdown = {w: sum(1 for m in models_out if m.get("why") == w)
+                      for w in {m.get("why") for m in models_out if m.get("protected")}}
+        # ONCE PER STATE, not once per heartbeat (operator, 2026-07-29: this
+        # line was repeating every second per gunicorn worker for a condition
+        # that is STEADY STATE on ae/op — shared/central storage is never
+        # reaped, and that's by design, not a collapse to shout about). The
+        # diagnostic stays, but it only speaks when the signature CHANGES;
+        # unchanged repeats drop to debug.
+        _wname = worker.get("name") or worker.get("id", "?")[:8]
+        _sig = (_rows_in, tuple(sorted(_breakdown.items())))
+        if _RECLAIM_COLLAPSE_SEEN.get(_wname) != _sig:
+            _RECLAIM_COLLAPSE_SEEN[_wname] = _sig
+            logger.warning(
+                "reclaimable collapse on %s: worker reported %d storage rows but 0 "
+                "survived central's guard chain (protected breakdown: %s) — "
+                "logged once; repeats at debug until this changes",
+                _wname, _rows_in, _breakdown)
+        else:
+            logger.debug(
+                "reclaimable collapse on %s (unchanged): %d rows, %s",
+                _wname, _rows_in, _breakdown)
 
     proposed: List[Dict[str, Any]] = []
     proposed_free = 0
@@ -1853,7 +1972,11 @@ def storage_proposal(worker: Dict[str, Any]) -> Dict[str, Any]:
     #   * resident   = bytes ACTUALLY on disk. The worker's measured cache_used is
     #     the authority; the per-model on-disk sum is the fallback/cross-check.
     # The disk-pressure GAUGE is derived from RESIDENT only.
-    resident_from_models = sum(int(m.get("bytes") or 0) for m in models_out)
+    # k60: the gauge's fallback sum prices ONLY budget-bearing rows, exactly like
+    # cache_used above — otherwise a worker with no measured figure would put the
+    # shared catalog straight back into the disk-pressure reading.
+    resident_from_models = sum(int(m.get("bytes") or 0) for m in models_out
+                               if m.get("counts_toward_budget", True))
     resident_bytes = cache_used if cache_used is not None else (
         resident_from_models if reported else None)
     attributed = {
@@ -1877,6 +2000,14 @@ def storage_proposal(worker: Dict[str, Any]) -> Dict[str, Any]:
         "orphaned_bytes": orphaned_bytes,
         "orphaned_count": orphaned_count,
         "orphaned_items": orphaned_items,
+        # SHARED / UNREAPABLE (k60): on disk here, but NOT this worker's to
+        # evict — labeled, never priced. A fourth class beside attributed,
+        # resident-attributed and orphaned. UI: "shared catalog (never evicted)".
+        "unbudgeted_bytes": unbudgeted_bytes,
+        "unbudgeted_count": len(_unbudgeted_rows),
+        "shared_bytes": shared_bytes,
+        "shared_count": sum(1 for m in _unbudgeted_rows
+                            if _row_store_class(m) == "shared"),
     }
     # The disk-pressure gauge: RESIDENT over budget. Attribution is deliberately
     # excluded — an over-subscribed assignment set is surfaced via
@@ -1894,7 +2025,16 @@ def storage_proposal(worker: Dict[str, Any]) -> Dict[str, Any]:
         **resident,
         **gauge,
         "reported": reported,
+        # BUDGET-BEARING used (k60): shared/unreapable bytes discounted out.
         "cache_used_bytes": cache_used,
+        # What the worker actually put on the wire, so the discount is auditable
+        # rather than a silent shrink (equals cache_used_bytes on a current one).
+        "cache_used_reported_bytes": cache_used_reported,
+        "store_root": (storage.get("store_root") or "") if reported else "",
+        "store_root_shared": bool(storage.get("store_root_shared")) if reported else False,
+        "store_root_budgeted": (bool(storage.get("store_root_budgeted"))
+                                if reported and storage.get("store_root_budgeted") is not None
+                                else None),
         "disk_free": disk_free,
         "disk_total": disk_total,
         "reserve": reserve,
@@ -2137,15 +2277,176 @@ def _route_tier(worker: Dict[str, Any], model_key: str, wanted: set) -> str:
     return "capability"
 
 
+# ── k56: ordered worker preference + polite (no-evict) load ─────────────────
+# Two GENERAL per-model placement options (operator ruling 2026-07-31), both
+# persisted model-scoped in the serve-overrides layer (managers.serve.overrides
+# ALLOWED_FIELDS) — see placement_prefs there for why that is the SoT for an
+# ORDER when designation itself is per-worker set membership.
+#
+# Neither has any effect unless the operator sets it: no list ⇒ the pref index
+# is a constant 0 and the rank tuple is the old one; no polite flag ⇒ admission
+# is untouched. That is the whole compatibility argument for the degenerate
+# single-designation case being byte-identical.
+#
+# THE FREE-ROOM PROBE is injected rather than imported: the fit arithmetic lives
+# in worker_routes._worker_fit (which knows model sizing, calibration and the
+# tolerance bands) and this module must not import the route layer. Routes
+# register it at import time; unregistered (standalone / a bare central) ⇒
+# central proves nothing and the worker's own polite admission decides, which
+# is the honest degradation rather than a second, drifting copy of the math.
+_free_room_probe: Optional[Any] = None
+
+
+def set_free_room_probe(fn: Optional[Any]) -> None:
+    """Register the (model_key, worker) -> fit verdict probe (routes -> store)."""
+    global _free_room_probe
+    _free_room_probe = fn
+    logger.info("free-room probe registered: %s", getattr(fn, "__name__", fn))
+
+
+def placement_prefs(model_key: str) -> tuple:
+    """``(ordered worker preference, polite)`` for a model — guarded re-export
+    of the overrides reader so routing never imports the serve layer directly
+    and a missing overrides module degrades to pre-k56 behaviour."""
+    prefs, polite, _by_worker = placement_policy(model_key)
+    return prefs, polite
+
+
+def placement_policy(model_key: str) -> tuple:
+    """k62: ``(prefs, model-wide polite, per-worker polite map)`` — the guarded
+    re-export routing actually resolves against. Read ONCE per pick, then
+    :func:`_polite_on` answers per candidate."""
+    try:
+        from ......managers.serve.overrides import placement_policy as _pp
+        return _pp(model_key)
+    except Exception:  # noqa: BLE001 — placement must never break routing
+        return [], False, {}
+
+
+def _worker_forms(worker: Dict[str, Any]) -> set:
+    """The id/name spellings a worker answers to, lowercased."""
+    return {str(worker.get("id") or "").strip().lower(),
+            str(worker.get("name") or "").strip().lower()} - {""}
+
+
+def _polite_on(worker: Dict[str, Any], polite: bool, by_worker: dict) -> bool:
+    """k62: is the model polite ON THIS WORKER? ``map[W]`` when the operator
+    named W, else the model-wide default. Politeness is per (model × worker)
+    because contention is a property of the box: the same model may have to be
+    polite on a contended card and keep ordinary eviction rights elsewhere."""
+    try:
+        from ......managers.serve.overrides import resolve_polite
+        return resolve_polite(polite, by_worker, _worker_forms(worker))
+    except Exception:  # noqa: BLE001 — degrade to the model-wide answer
+        return bool(polite)
+
+
+def _pref_index(worker: Dict[str, Any], prefs: List[str]) -> Optional[int]:
+    """Position of ``worker`` in the operator's ordered list, or None when it is
+    OFF the list. Matched on id OR name, case-insensitively: the console posts
+    ids, an operator editing the file by hand writes names, and a designation
+    that silently failed to match would land the model somewhere it was never
+    designated — the exact failure the hardness rule forbids."""
+    forms = _worker_forms(worker)
+    for i, want in enumerate(prefs):
+        if str(want).strip().lower() in forms:
+            return i
+    return None
+
+
+def _prefs_scope(candidates: List[Dict[str, Any]], prefs: List[str],
+                 model_key: str) -> List[Dict[str, Any]]:
+    """Restrict candidates to the ordered list — designation hardness, per
+    candidate. A model carrying a list NEVER lands off it, so an empty result is
+    the correct answer (the caller refuses/holds honestly) and not a reason to
+    fall back to the wider fleet. Logged when it bites, because "my model went
+    nowhere" must never be a silent scope decision."""
+    kept = [w for w in candidates if _pref_index(w, prefs) is not None]
+    if not kept:
+        logger.warning(
+            "model %s has an ordered worker preference %s and NONE of them is "
+            "an eligible candidate right now — refusing rather than landing "
+            "off-list (designation is hard per candidate)", model_key, prefs)
+    return kept
+
+
+def _polite_admits(worker: Dict[str, Any], model_key: str) -> tuple:
+    """Would a POLITE load of ``model_key`` land on ``worker`` without evicting?
+
+    Returns ``(admits, reason)``. Two gates, in this order:
+
+      1. VERSION. Politeness is a promise kept by the WORKER's admission
+         (no_evict rides the spill wire). A worker that predates it would evict
+         residents to make room, so a polite model is not routed there at all —
+         the loud alternative to a silently-dropped flag.
+      2. FREE ROOM. Central proves the model fits the worker's currently-free
+         VRAM. It can only ever prove the NEGATIVE case: an unsizable model, an
+         unregistered probe or a worker reporting no VRAM figure means central
+         knows nothing, so the candidate is admitted here and the worker's own
+         (measured, band-flexed) admission makes the real call. Central refusing
+         on an unproven guess would strand a model that would have fitted.
+    """
+    try:
+        from ......managers.alloc_modes import (worker_honors_no_evict,
+                                                NO_EVICT_MIN_PKG_VERSION)
+        if not worker_honors_no_evict(worker.get("pkg_version")):
+            return False, (f"pkg {worker.get('pkg_version') or 'unknown'} "
+                           f"predates polite load (needs >= "
+                           f"{NO_EVICT_MIN_PKG_VERSION})")
+    except Exception:  # noqa: BLE001 — an unreadable gate must not strand a load
+        pass
+    probe = _free_room_probe
+    if probe is None:
+        return True, "free room unproven (no probe registered) — worker decides"
+    try:
+        verdict = probe(model_key, worker) or {}
+    except Exception:  # noqa: BLE001 — a preflight miss is not a refusal
+        return True, "free room unproven (preflight failed) — worker decides"
+    if verdict.get("vram_free") is None or verdict.get("need") is None:
+        return True, "free room unproven (unsizable) — worker decides"
+    if verdict.get("gpu_resident"):
+        return True, "fits free VRAM"
+    return False, (verdict.get("reason")
+                   or "does not fit free VRAM without evicting a resident")
+
+
+def _emit_route_refuse(model_key: str, reason: str,
+                       considered: List[Dict[str, Any]]) -> None:
+    """Telemetry: WHY nothing was picked. Rides the same eviction feed as
+    route.select, so the console shows a polite model's non-landing as an event
+    with a cause instead of an unexplained absence. Best-effort, always."""
+    try:
+        from ......comms.evictions import emit_eviction_event
+        emit_eviction_event(
+            "route.refuse",
+            model_key=model_key,
+            reason=reason,
+            alternatives=[{"worker": w.get("name") or w.get("id") or "",
+                           "reason": w.get("_refuse_reason") or ""}
+                          for w in considered][:6] or None,
+        )
+    except Exception:  # noqa: BLE001 — telemetry never breaks routing
+        logger.debug("route.refuse telemetry skipped for %s", model_key,
+                     exc_info=True)
+
+
 def _routing_rank(worker: Dict[str, Any], model_key: str, wanted: set,
-                  starred: bool) -> tuple:
+                  starred: bool, pref_index: int = 0) -> tuple:
     """The shared sort key for every routing decision (primary pick + reroute).
 
     ONE function so ``pick_for_model`` and ``candidates_for_model`` can never
     drift apart — the relay's reroute walk must agree with the pick it is
     falling back from, or a "reroute" silently becomes a re-decision.
+
+    ``pref_index`` (k56) is term ⓪: the operator's ORDERED worker preference
+    outranks every derived signal below it, because "try ae, then computron" is
+    a stated decision and a derived ordering that could outvote it would not be
+    an order. Defaults to 0 for every worker when no list is set, so the tuple
+    is a constant prefix and the ranking is byte-identical to pre-k56.
     """
     return (
+        # ⓪ the operator's stated candidate order (k56); 0 for all when unset.
+        pref_index,
         # ① designation is a HARD scope: home before any wildcard catch.
         1 if worker.get("_wildcard_catch") else 0,
         # ② measured-resident now — no reload, no cold provision.
@@ -2988,6 +3289,54 @@ class WorkerStore:
             return _public_view(worker)
 
     def spill_for(self, worker_id: str, model_key: str) -> Dict[str, Any]:
+        """THE emitted spill for (worker, model) — the placement contract below
+        plus the MODEL-scoped polite-load flag (k56).
+
+        ``no_evict`` is added HERE, after the placement derivation, and for the
+        same reason the bnb lever is added inside it: politeness is an ADMISSION
+        policy, not a placement, so it must ride whatever placement won —
+        persisted, derived, or blank max-gpu — without being able to change it.
+        It carries its OWN version gate (NO_EVICT_MIN_PKG_VERSION), so a worker
+        that predates the flag never receives it; central's resolution already
+        declines to route a polite model to such a worker, and this is the
+        belt-and-braces at the wire.
+
+        k62 — politeness is per (model × WORKER), and this is the seam where
+        that becomes true on the wire: central resolves the effective flag for
+        THIS worker and includes or omits the key accordingly. The worker side
+        is unchanged; a box simply receives no_evict on the models the operator
+        marked polite THERE.
+        """
+        out = self._placement_spill_for(worker_id, model_key)
+        try:
+            from ......managers.serve.overrides import (placement_policy,
+                                                        resolve_polite)
+            from ......managers.alloc_modes import (worker_honors_no_evict,
+                                                    no_evict_downgrade_note,
+                                                    NO_EVICT_SPILL_KEY)
+            _prefs, polite, by_worker = placement_policy(model_key)
+            if not (polite or by_worker):
+                return out
+            worker = self._load().get(worker_id) or {}
+            forms = _worker_forms(worker) | {str(worker_id).strip().lower()}
+            if not resolve_polite(polite, by_worker, forms):
+                logger.debug("polite-load flag omitted for %s on %s: not polite "
+                             "on this worker", model_key, worker_id)
+                return out
+            if not worker_honors_no_evict(worker.get("pkg_version")):
+                logger.warning("polite load for %s: %s", model_key,
+                               no_evict_downgrade_note(
+                                   worker.get("pkg_version"),
+                                   worker.get("name") or worker_id))
+                return out
+            out = dict(out)
+            out[NO_EVICT_SPILL_KEY] = True
+        except Exception:  # noqa: BLE001 — never break the relay over the flag
+            logger.debug("polite-load flag skipped for %s on %s", model_key,
+                         worker_id, exc_info=True)
+        return out
+
+    def _placement_spill_for(self, worker_id: str, model_key: str) -> Dict[str, Any]:
         """Per-assignment spill override for (worker, model), or {} for
         max-gpu (autofit). THE version-gated emission seam (k37): a spill
         carrying the NEW allocation-mode keys (alloc_mode/leniency_pct/
@@ -3326,6 +3675,12 @@ class WorkerStore:
         restricts to boxes whose ComfyUI advertises the IPAdapter nodes.
 
         Preference order:
+            0. the operator's ORDERED worker preference (k56), when the model
+               carries one: candidates are restricted to the list and tried in
+               its order, first admitting worker wins. A polite (``no_evict``)
+               model additionally requires a candidate that can take it out of
+               genuinely free room; if none can, this returns None with the
+               reason on the telemetry feed rather than evicting anyone.
             1. HOME workers (designated / resident / granted) before wildcard
                catches — this ordering IS the overflow mechanism (operator
                doctrine 2026-07-23): a designated model tries its home workers
@@ -3392,6 +3747,20 @@ class WorkerStore:
             if matched:
                 candidates = matched
 
+        # k56 — the operator's ORDERED worker preference. A HARD scope (a model
+        # with a list never lands off it), applied after the eligibility gates
+        # so a listed-but-blocked/incapable worker is skipped rather than
+        # bypassing them. Absent list ⇒ untouched.
+        prefs, polite, polite_by_worker = placement_policy(model_key)
+        if prefs:
+            candidates = _prefs_scope(candidates, prefs, model_key)
+            if not candidates:
+                _emit_route_refuse(
+                    model_key,
+                    f"no worker on the preference list {prefs} is an eligible "
+                    f"candidate right now", [])
+                return None
+
         # Ranking (capability already filtered above) — the shared _routing_rank
         # key: designation, then MEASURED-RESIDENT, then ALLOCATED, then the
         # capability rank that was always here (⭐ boot star as the ambiguity
@@ -3410,9 +3779,48 @@ class WorkerStore:
             return bool(s) and bool(wanted_forms & _match_keys(str(s)))
 
         def _rank(w: Dict[str, Any]):
-            return _routing_rank(w, model_key, wanted_forms, _starred(w))
+            return _routing_rank(w, model_key, wanted_forms, _starred(w),
+                                 (_pref_index(w, prefs) or 0) if prefs else 0)
         candidates.sort(key=_rank)
         chosen = candidates[0]
+
+        # k56 POLITE LOAD — "first whose admission accepts", walked in the order
+        # just sorted. The unflagged path never enters here (nothing polite
+        # anywhere), so this is purely additive. When nothing admits we return
+        # None with the honest reason on the telemetry feed rather than picking a
+        # box that would have to evict someone: that refusal IS the feature.
+        #
+        # k62: politeness is resolved PER CANDIDATE. A candidate the model is not
+        # polite on skips the free-room gate entirely and wins on the ordinary
+        # declare-need-then-evict rule — which is exactly the point of the map
+        # (polite on the contended card, assertive on the spare one), and is why
+        # the hold log names the WORKER whose politeness caused each skip.
+        if polite or polite_by_worker:
+            reasons = []
+            chosen = None
+            for w in candidates:
+                wname = w.get("name") or w.get("id")
+                if not _polite_on(w, polite, polite_by_worker):
+                    logger.info("polite load: %s is NOT polite on %s — ordinary "
+                                "admission applies", model_key, wname)
+                    chosen = w
+                    break
+                ok, why = _polite_admits(w, model_key)
+                reasons.append(dict(w, _refuse_reason=f"polite on {wname}: {why}"))
+                if ok:
+                    logger.info("polite load: %s admits %s without evicting (%s)",
+                                wname, model_key, why)
+                    chosen = w
+                    break
+            if chosen is None:
+                logger.warning(
+                    "polite load: no candidate admits %s without eviction — "
+                    "holding rather than evicting a resident (%s)", model_key,
+                    "; ".join(f"{r.get('name') or r.get('id')}: "
+                              f"{r.get('_refuse_reason')}" for r in reasons))
+                _emit_route_refuse(
+                    model_key, "no candidate admits without eviction", reasons)
+                return None
 
         # WHY this box (operator incident 2026-07-28) — emitted on the PICK, not
         # on the reroute walk, so the feed carries exactly one selection event
@@ -3535,6 +3943,22 @@ class WorkerStore:
             if matched:
                 candidates = matched
 
+        # k56: the SAME two placement scopes the pick applies — for the same
+        # reason the rank key is shared. A reroute that landed off the
+        # preference list, or on a box that must evict to take a polite model,
+        # would be a re-decision the operator never made.
+        prefs, polite, polite_by_worker = placement_policy(model_key)
+        if prefs:
+            candidates = _prefs_scope(candidates, prefs, model_key)
+        if polite or polite_by_worker:
+            # Per-candidate, exactly as the pick resolves it: a worker the model
+            # is not polite on stays a reroute target under the ordinary rule.
+            candidates = [w for w in candidates
+                          if not _polite_on(w, polite, polite_by_worker)
+                          or _polite_admits(w, model_key)[0]]
+        if not candidates:
+            return []
+
         # Star store read ONCE (never per candidate), alias-tolerant — see
         # pick_for_model's _rank for the rationale (ambiguity tie-break only).
         star_map = _star_map()
@@ -3545,7 +3969,8 @@ class WorkerStore:
             return bool(s) and bool(wanted_forms & _match_keys(str(s)))
 
         def _rank(w: Dict[str, Any]):
-            return _routing_rank(w, model_key, wanted_forms, _starred(w))
+            return _routing_rank(w, model_key, wanted_forms, _starred(w),
+                                 (_pref_index(w, prefs) or 0) if prefs else 0)
 
         return sorted(candidates, key=_rank)
 
@@ -3905,14 +4330,18 @@ def _health_probe_timeout_s() -> float:
 
 
 def _fetch_health(worker_id: str, url: str) -> None:
-    """Probe body — runs on a daemon thread; stores into the cache. Never raises."""
+    """Probe body — runs on a daemon thread; stores into the cache. Never raises.
+
+    k59: goes through the sanctioned client, so it inherits the short connect
+    budget AND the per-worker breaker — a powered-off box stops being probed
+    every few seconds by every held call in the process."""
     data = None
     try:
-        import json as _json
-        from urllib.request import urlopen
-        with urlopen(url.rstrip("/") + "/health",
-                     timeout=_health_probe_timeout_s()) as resp:
-            data = _json.loads(resp.read().decode("utf-8", "replace"))
+        from . import worker_http
+        resp = worker_http.get({"id": worker_id, "url": url}, "/health",
+                               call="probe",
+                               read_timeout=_health_probe_timeout_s())
+        data = resp.json()
     except Exception:  # noqa: BLE001 — an unreachable worker is data, not a crash
         data = None
     with _HEALTH_LOCK:

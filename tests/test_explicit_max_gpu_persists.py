@@ -112,8 +112,10 @@ check("a blank assign persists NOTHING (a derived default is not a choice)",
 check("derived max-gpu on a SMALL model also persists nothing",
       (store.assign_model(wid, "small") is not None
        and not (store._load()[wid].get("spill_by_model") or {}).get("small")))
-check("default_allocation still encodes a derived max-gpu as {} (unpersisted)",
-      default_allocation("gguf", 2 * GIB, 24 * GIB, 64 * GIB)["spill"] == {})
+check("default_allocation still encodes a derived max-gpu as {} (unpersisted); "
+      "unknown size is the degrade-not-guess path that derives max-gpu since "
+      "fits-whole now derives gpu-only (operator default order 2026-07-31)",
+      default_allocation("gguf", None, 24 * GIB, 64 * GIB)["spill"] == {})
 
 # ── 1. explicit max-gpu ROUND-TRIPS ─────────────────────────────────────────
 store.assign_model(wid, "vl7b", spill={"alloc_mode": "max-gpu"})

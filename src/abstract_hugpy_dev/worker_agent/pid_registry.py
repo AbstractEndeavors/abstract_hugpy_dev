@@ -258,6 +258,20 @@ class PidRegistry:
             if not lst:
                 self._foreign_calls.pop(service, None)
 
+    def active_foreign_call(self, service: str,
+                            ttl: Optional[float] = None) -> Optional[dict]:
+        """The most-recent still-live foreign call for ``service``, or ``None``.
+
+        The public read of the call table ``reconcile`` uses for attribution.
+        The comfy idle watchdog (k54) asks THIS before freeing comfy's VRAM: a
+        registered call means this worker has a generation in flight against
+        that service, which is an absolute veto on reclaiming its memory. Same
+        leaked-record TTL as attribution — one definition of "a live call", so
+        the watchdog and the heartbeat can never disagree about it."""
+        with self._lock:
+            return self._active_foreign_call_locked(
+                service, ttl if ttl is not None else _FOREIGN_CALL_TTL_S)
+
     def _active_foreign_call_locked(self, service: str, ttl: float) -> Optional[dict]:
         """The most-recent still-live foreign call for ``service`` (caller holds the
         lock). Entries older than ``ttl`` are treated as leaked and ignored (the
@@ -526,6 +540,10 @@ def record_foreign_call(service: str, model_key: Optional[str] = None,
 def end_foreign_call(service: str, job_id: Optional[str] = None,
                      model_key: Optional[str] = None) -> None:
     return _REGISTRY.end_foreign_call(service, job_id=job_id, model_key=model_key)
+
+
+def active_foreign_call(service: str, ttl: Optional[float] = None) -> Optional[dict]:
+    return _REGISTRY.active_foreign_call(service, ttl=ttl)
 
 
 def snapshot_for_heartbeat() -> dict:

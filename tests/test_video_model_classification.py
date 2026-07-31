@@ -57,10 +57,16 @@ def _wan_dir(tmp_path, model_type="t2v"):
 
 
 def test_a_t2v_model_is_not_a_chat_model(tmp_path):
-    """THE BUG. Without enrichment the row claims text-generation."""
+    """THE BUG. Without enrichment the row has no task of its own.
+
+    (k61, 2026-07-31: the floor this precondition used to assert —
+    ``["text-generation"]`` for a row that says NOTHING about itself — is gone.
+    A no-signal row is now ``needs-classification``: it refuses with a remedy
+    instead of promising to be a chat model. The point of THIS test is unchanged
+    — enrichment is what makes the Wan row classify correctly.)"""
     row = {"hub_id": "Wan-AI/Wan2.1-T2V-1.3B", "dir": _wan_dir(tmp_path)}
-    assert M._derive_tasks("transformers", row) == ["text-generation"], (
-        "precondition: a row with no model_type hits the conservative floor")
+    assert M._derive_tasks("transformers", row) == ["needs-classification"], (
+        "precondition: a row with no model_type has nothing to classify on")
     enriched = M._enrich_model_type("transformers", row)
     assert enriched["model_type"] == "t2v"
     assert M._derive_tasks("transformers", enriched) == ["text-to-video"]
@@ -169,3 +175,39 @@ def test_the_corrector_only_overrides_text_generation(tmp_path):
     (e.g. text-to-image) is never rewritten, even for a Wan dir."""
     row = {"dir": _wan_dir(tmp_path), "tasks": ["text-to-image"]}
     assert M._correct_video_task("transformers", ["text-to-image"], row) == ["text-to-image"]
+
+
+# ── pipeline-component GGUFs (LTX text-encoder split) ────────────────────────
+# A diffusion/video pipeline splits into sub-trees; its text encoder is often a
+# real LLM architecture (LTX-2 ships a Gemma-3 encoder) and CANNOT be told from
+# a chat model by its header — only by its path. LTX-2.3-uncensored-fp8 was
+# routed to the llama chat path and rejected at load because its registered file
+# is split/text_encoders/gemma-3-12b-it-...gguf (fleet bench 2026-07-30).
+
+def test_ltx_text_encoder_split_is_a_pipeline_component():
+    row = {"filename": "split/text_encoders/gemma-3-12b-it-qat-UD-Q4_K_XL.gguf"}
+    assert M._correct_pipeline_component("gguf", ["text-generation"], row) == ["pipeline-component"]
+
+
+def test_vae_split_is_a_pipeline_component():
+    row = {"filename": "split/vae/diffusion_pytorch_model.gguf"}
+    assert M._correct_pipeline_component("gguf", ["text-generation"], row) == ["pipeline-component"]
+
+
+def test_standalone_gemma_gguf_is_left_a_chat_model():
+    """The whole point of the path guard: a real Gemma/Qwen GGUF at its model
+    root is NOT under a component segment, so it stays servable."""
+    row = {"filename": "gemma-3-12b-it-Q4_K_M.gguf"}
+    assert M._correct_pipeline_component("gguf", ["text-generation"], row) == ["text-generation"]
+
+
+def test_component_word_in_the_name_only_does_not_trip_it():
+    """A model whose FILENAME contains 'encoder' but has no component PATH
+    segment must not be swept up — the signal is the directory, not the word."""
+    row = {"filename": "my-text-encoder-tuned-Q4_K_M.gguf"}
+    assert M._correct_pipeline_component("gguf", ["text-generation"], row) == ["text-generation"]
+
+
+def test_pipeline_component_guard_is_gguf_only():
+    row = {"filename": "unet/text_encoder/model.safetensors"}
+    assert M._correct_pipeline_component("transformers", ["text-generation"], row) == ["text-generation"]

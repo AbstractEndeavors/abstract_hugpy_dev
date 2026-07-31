@@ -90,6 +90,18 @@ def _operator_or_worker() -> bool:
             return True
     except Exception:  # noqa: BLE001
         pass
+    # A valid API key may READ telemetry (operator ask 2026-07-29: bench
+    # clients associate eviction events with their own call windows). Reads
+    # only — ingest keeps the strict worker-enrollment gate above; a key that
+    # can already drive generations learns nothing new from seeing evictions.
+    try:
+        from .worker_routes import _bearer_token
+        from ..functions.imports.utils.api_keys import key_id_for_token
+        tok = _bearer_token()
+        if tok and key_id_for_token(tok):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
     return _worker_authorized()
 
 
@@ -165,7 +177,14 @@ def evictions_stream():
     comment when idle so a proxy does not reap the connection, and returns after
     STREAM_MAX_S so a forgotten tab cannot pin a thread — EventSource reconnects
     on its own, and the reconnect replays from the cursor, so the operator sees
-    no gap."""
+    no gap.
+
+    k59: also takes a slot from the fast-read reserve. STREAM_MAX_S bounds how
+    long ONE stream holds a thread; it does nothing about how MANY do. Past the
+    reserve's cap this returns an honest 503 + Retry-After rather than taking
+    the last thread and making an unrelated endpoint time out instead."""
+    from ..functions.imports.utils import pool_guard
+
     if not _operator_or_worker():
         return jsonify({"error": "not authorized"}), 401
     try:
@@ -176,6 +195,13 @@ def evictions_stream():
 
     def sse(payload: dict) -> bytes:
         return f"data: {json.dumps(payload, default=str)}\n\n".encode("utf-8")
+
+    try:
+        slot = pool_guard.stream_slot()
+        slot.__enter__()
+    except pool_guard.StreamCapacityExceeded as exc:
+        return (jsonify(exc.as_error()), 503,
+                {"Retry-After": str(exc.retry_after)})
 
     def generate():
         store = evictions_mod.get_store()
@@ -215,8 +241,18 @@ def evictions_stream():
                 yield b": heartbeat\n\n"
             time.sleep(POLL_S)
 
+    def guarded():
+        """Hold the reserve slot for the generator's whole life. Flask closes
+        the generator when the client disconnects (GeneratorExit), so the
+        finally runs on a walked-away tab too — a slot that leaked on
+        disconnect would shrink the reserve one abandoned tab at a time."""
+        try:
+            yield from generate()
+        finally:
+            slot.__exit__(None, None, None)
+
     return Response(
-        stream_with_context(generate()),
+        stream_with_context(guarded()),
         mimetype="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
                  "Connection": "keep-alive"},

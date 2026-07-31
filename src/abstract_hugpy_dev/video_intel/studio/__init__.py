@@ -56,7 +56,15 @@ from .manifest import (
     render_manifest_from_dict,
     render_manifest_to_dict,
 )
-from .router import CapabilityRouter
+from .movie_plan import (
+    SegmentModel,
+    SegmentPlan,
+    plan_segments,
+    preflight_movie,
+    resolve_segment_model,
+    segment_capability,
+)
+from .router import CapabilityRouter, capable_model_ids
 from .schemas import (
     AdapterRef,
     CapabilityRequest,
@@ -85,7 +93,9 @@ __all__ = [
     "CAPABILITY_TASKS", "MODEL_REGISTRY", "PLANNED_CAPABILITIES", "RUNNER_REGISTRY",
     "RunnerSpec", "gated_runners", "model_gate_reasons", "runner_available",
     "runner_gate_reason", "unpinned_models", "validate_registry",
-    "CapabilityRouter",
+    "CapabilityRouter", "capable_model_ids",
+    "SegmentModel", "SegmentPlan", "plan_segments", "preflight_movie",
+    "resolve_segment_model", "segment_capability",
     "make_render_manifest", "render_manifest_from_dict", "render_manifest_to_dict",
     "AdapterRef", "CapabilityRequest", "ControlRef", "Job", "LedgerEvent",
     "ModelBinding", "ModelConfig", "ProvenanceStub", "RenderManifest", "Resolution",

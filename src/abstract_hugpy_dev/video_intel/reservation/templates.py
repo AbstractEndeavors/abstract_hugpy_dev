@@ -25,12 +25,17 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from dataclasses import dataclass, replace
 from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
 _GIB = 1024 ** 3
+
+# measured.json memo (see _read_measured): {"key": (path, mtime_ns, size), "value": {}}
+_measured_lock = threading.Lock()
+_measured_cache: Dict[str, Any] = {"key": None, "value": {}}
 
 
 def _measured_path() -> str:
@@ -292,8 +297,31 @@ TEMPLATES: Dict[str, ReservationTemplate] = {
 # --------------------------------------------------------------------------- #
 def _read_measured() -> Dict[str, Any]:
     """Best-effort read of p7's measured.json. {} on any problem (missing file,
-    parse error, wrong shape) — the estimates then stand. Never raises."""
+    parse error, wrong shape) — the estimates then stand. Never raises.
+
+    MEMOIZED on (path, mtime, size) — k57. ``load_template`` is called once PER ROW
+    by the placement projection behind GET /video/jobs, so an un-cached read meant
+    one blocking open()+parse of a file on the shared /mnt storage for every job in
+    the listing (a leading term in the >60s listing hang). The stat is the cache key,
+    so an operator rewriting measured.json is still picked up on the next call."""
     path = _measured_path()
+    try:
+        st = os.stat(path)
+        key = (path, st.st_mtime_ns, st.st_size)
+    except OSError:
+        key = (path, None, None)
+    with _measured_lock:
+        if _measured_cache.get("key") == key:
+            return _measured_cache["value"]
+    value = _read_measured_uncached(path)
+    with _measured_lock:
+        _measured_cache["key"] = key
+        _measured_cache["value"] = value
+    return value
+
+
+def _read_measured_uncached(path: str) -> Dict[str, Any]:
+    """The actual file read + shape tolerance behind the memo."""
     try:
         with open(path, "r", encoding="utf-8") as fh:
             raw = fh.read()

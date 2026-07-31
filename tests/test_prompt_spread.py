@@ -273,7 +273,11 @@ def test_think_is_stripped_before_the_json_is_scavenged(monkeypatch):
     assert "/no_think" in calls.user
 
 
-def test_unparseable_output_is_an_honest_502_with_the_raw_text(monkeypatch):
+def test_a_preamble_that_cannot_cover_the_shots_is_an_honest_502(monkeypatch):
+    # A single throwaway line for TWO selected shots is not a coherent 2-scene
+    # reply: one paragraph cannot cover two shots, so it fails honestly (with the
+    # raw) rather than pasting "Sure! Here are your shots" into a shot. This is
+    # the guard that keeps the tolerant divvy from fabricating.
     _patch_executor(monkeypatch, "Sure! Here are some lovely shots for you.")
     r = client.post("/video/prompt/assist", json=_spread_body(2, n_fixed=0))
     assert r.status_code == 502
@@ -282,11 +286,34 @@ def test_unparseable_output_is_an_honest_502_with_the_raw_text(monkeypatch):
     assert "lovely shots" in data["raw"]
 
 
-def test_only_reasoning_is_an_honest_502(monkeypatch):
-    _patch_executor(monkeypatch, "<think>still thinking about it")
+def test_two_unlabelled_paragraphs_are_divvied_into_the_two_shots(monkeypatch):
+    # THE OPERATOR'S CASE (2026-07-31): "it was asked to generate 2 scenes ... it
+    # should do that, which it probably did. it's the parser on this end that is
+    # no good." The model wrote two coherent paragraphs with NO JSON and NO
+    # labels; the old parser threw them away demanding a JSON envelope. Now they
+    # are divvied onto the two selected shots in timeline order.
+    reply = ("A lone figure crosses a rain-slick rooftop at dawn, silver light "
+             "on wet tiles.\n\n"
+             "The camera pushes in as sparks scatter and the city wakes below.")
+    _patch_executor(monkeypatch, reply)
+    r = client.post("/video/prompt/assist", json=_spread_body(2, n_fixed=0))
+    assert r.status_code == 200, r.get_json()
+    segs = r.get_json()["segments"]
+    assert [s["segment_id"] for s in segs] == ["segment-0", "segment-1"]
+    assert segs[0]["prompt"].startswith("A lone figure")
+    assert segs[1]["prompt"].startswith("The camera pushes in")
+
+
+def test_segments_json_kept_INSIDE_a_think_block_is_now_recovered(monkeypatch):
+    # THE WIN: wazimondo~Qwen3.6-35B (the default spread generator) is a
+    # reasoning model that wraps its whole answer in <think>. Before, that was a
+    # hard 502 "only reasoning and no output". Now the JSON inside the think
+    # block is salvaged and parses to real segments.
+    inner = _segments_reply(["segment-0"])
+    _patch_executor(monkeypatch, f"<think>{inner}</think>")
     r = client.post("/video/prompt/assist", json=_spread_body(1, n_fixed=0))
-    assert r.status_code == 502
-    assert "no-think directive" in r.get_json()["error"]
+    assert r.status_code == 200, r.get_json()
+    assert r.get_json()["segments"][0]["segment_id"] == "segment-0"
 
 
 def test_a_worker_failure_is_a_502_not_a_500(monkeypatch):

@@ -30,6 +30,11 @@ class ModelMetadata:
     # peft / adapter — set only for LoRA-style adapters
     peft_type:                  Optional[str]       = None   # "LORA", etc.
     base_model:                 Optional[str]       = None   # base_model_name_or_path
+    # True when the dir holds ONLY adapter weights (k61): a delta, not a servable
+    # model. Carried here so the verdict survives into the discovery row instead
+    # of being re-guessed — or, as it was, read as a null task and defaulted to
+    # text-generation.
+    adapter:                    Optional[bool]      = None
 
     # architecture
     architectures:              Optional[List[str]] = None

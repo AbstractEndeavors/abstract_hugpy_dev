@@ -600,6 +600,48 @@ def _ensure_present(payload: dict, central_url: str | None, state=None) -> None:
         logger.warning("provisioning check for %s failed: %s", model_key, exc)
 
 
+def _model_key_refusal(payload: dict, central_url: str | None) -> "str | None":
+    """Why this request names no servable model — the 400 text — or None.
+
+    A worker serves THE MODEL IT WAS ASKED FOR. Without this gate a request
+    whose ``model_key`` is absent falls all the way through to
+    ``resolve_model_key``'s last resort (the chat default) and the box answers
+    with a completely different model, labelled with the caller's request: a
+    silent substitution that reads as a working answer at every layer above.
+    An UNKNOWN key is the same failure with an extra step — it raised a KeyError
+    deep in resolution and came back as an opaque 500.
+
+    Refusing here makes both honest and actionable: 400, name the key, say what
+    the worker has to do about it.
+
+    ``task`` WITHOUT a model_key is deliberately still allowed: TASK_DEFAULTS is
+    a per-task designation the caller opted into by naming the task, not the
+    fallthrough this exists to kill.
+
+    Side effect (the same one ``_ensure_present`` performs): a key central knows
+    under another name is REWRITTEN to the canonical local key, so resolution
+    downstream works on the name this worker registered."""
+    model_key = payload.get("model_key")
+    if model_key is None or not str(model_key).strip():
+        if payload.get("task"):
+            return None
+        return ("model_key is required: this worker serves the model you name "
+                "and never substitutes a default — pass model_key (or a task, "
+                "to use that task's designated default)")
+    try:
+        from .provision import ensure_model_registered
+        canonical = ensure_model_registered(model_key, central_url)
+    except Exception as exc:  # noqa: BLE001 — can't tell -> don't invent a 400
+        logger.warning("model_key check for %s failed: %s", model_key, exc)
+        return None
+    if not canonical:
+        return (f"unknown model_key {model_key!r}: this worker has no such "
+                "model and central could not teach it one — check the key, or "
+                "register/assign the model first. No default was substituted.")
+    payload["model_key"] = canonical
+    return None
+
+
 def _ensure_present_streaming(payload: dict, central_url: str | None, state=None):
     """Provision the model, yielding SSE 'status' events with download progress.
 
@@ -781,6 +823,38 @@ def _cleanup_file(path: str | None) -> None:
             pass
 
 
+def _jsonable(o):
+    """Deep-convert a task result to plain JSON types. model_dump() SHOULD do
+    this alone, but a nested pydantic model has escaped it in the field
+    (2026-07-29, ae: 'Object of type GeneratedImage is not JSON serializable'
+    from jsonify — ComfyUI generated the image, then the response died, and
+    central held/retried a request that had actually SUCCEEDED, re-generating
+    for 25 minutes). The envelope must never lose a finished result to a
+    serialization quirk, so sanitize recursively and stringify as a last
+    resort — a lossy string beats a 500 that throws the work away."""
+    if hasattr(o, "model_dump"):
+        try:
+            o = o.model_dump()
+        except Exception:  # noqa: BLE001
+            o = getattr(o, "__dict__", None) or str(o)
+    elif hasattr(o, "dict") and callable(getattr(o, "dict")) \
+            and not isinstance(o, dict):
+        try:
+            o = o.dict()                      # pydantic v1 residents
+        except Exception:  # noqa: BLE001
+            o = str(o)
+    if isinstance(o, dict):
+        return {k: _jsonable(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple, set)):
+        return [_jsonable(v) for v in o]
+    if isinstance(o, (str, int, float, bool)) or o is None:
+        return o
+    if isinstance(o, (bytes, bytearray)):
+        import base64 as _b
+        return _b.b64encode(bytes(o)).decode("ascii")
+    return str(o)
+
+
 def _run_once(payload: dict) -> dict:
     #from abstract_hugpy_dev.managers.dispatch import execute_prompt
 
@@ -793,8 +867,10 @@ def _run_once(payload: dict) -> dict:
         # Return the full result envelope so ANY task (embed, vision, whisper, …)
         # round-trips back to central as its real result_type — not just chat
         # text. Central's DelegatingRunner validates this into result_type.
+        # Sanitized DEEP (_jsonable): jsonify must never 500 on a result that
+        # the engine already finished producing.
         if hasattr(result, "model_dump"):
-            return result.model_dump()
+            return _jsonable(result)
         # Non-pydantic fallback (shouldn't happen for a registered runner).
         return {
             "ok": getattr(result, "ok", True),
@@ -836,6 +912,11 @@ _SPILL_ENV = {
     "alloc_mode": "HUGPY_ALLOC_MODE",
     "leniency_pct": "HUGPY_LENIENCY_PCT",
     "priority_device": "HUGPY_PRIORITY_DEVICE",
+    # k56 polite load: admission may spend only genuinely free headroom and
+    # never evicts a resident. Cleared-when-absent (below) — a leaked polite
+    # flag would silently make the NEXT model refuse instead of making room,
+    # which is a dead-wrong knob in the other direction.
+    "no_evict": "HUGPY_NO_EVICT",
 }
 
 # Mode-contract keys are CLEARED when absent from a request's spill: a leaked
@@ -843,7 +924,7 @@ _SPILL_ENV = {
 # next model's placement (a dead-wrong knob), unlike the layer/budget knobs
 # whose stickiness is long-standing behavior we don't change here.
 _SPILL_ENV_CLEAR_WHEN_ABSENT = ("alloc_mode", "leniency_pct", "priority_device",
-                                "n_cpu_moe", "bnb_4bit",
+                                "n_cpu_moe", "bnb_4bit", "no_evict",
                                 # n_gpu_layers MUST be cleared too (2026-07-27).
                                 # It was the one spill key that persisted, and
                                 # the env is PROCESS-WIDE on the agent — so one
@@ -2595,10 +2676,20 @@ def _reap_scan(state: "WorkerState") -> dict:
         # re-checks the same gate at delete time.
         rp = os.path.realpath(path) if path else ""
         if not _model_store_reapable(rp):
-            why = ("shared/central storage — never reaped"
-                   if (not rp or _on_shared_model_store(rp))
+            shared = (not rp) or _on_shared_model_store(rp)
+            why = ("shared/central storage — never reaped" if shared
                    else "model store not marked reapable")
-            protected.append({"model_key": mk, "bytes": size, "why": why})
+            # k60 ACCOUNTING (operator, 2026-07-31): these bytes are NOT in this
+            # worker's eviction economy, so they must not be priced against its
+            # budget. The row still ships (the console shows WHAT is on the
+            # drive) but carries `store` + counts_toward_budget=False so every
+            # downstream sum can label it instead of charging for it. ae read
+            # "2.8 TiB used / 800 GB budget · ⚠ over budget" on a 1.7 TiB hot
+            # drive because the SHARED catalog was summed as resident cache —
+            # and "over budget" reads to an operator as "a delete is coming".
+            protected.append({"model_key": mk, "bytes": size, "why": why,
+                              "store": "shared" if shared else "unreapable",
+                              "counts_toward_budget": False})
             continue
         # 📌 pin AND assignment do NOT protect files (operator, 2026-07-17):
         # both designate only ROUTING/attribution that survives restarts — neither
@@ -2615,9 +2706,11 @@ def _reap_scan(state: "WorkerState") -> dict:
         # mid-pull delete corrupts the fetch). The store-reapable + shared/central
         # sentinel gates above already ran; the path jail runs at wipe time.
         if _residency(mk) == "static":
-            protected.append({"model_key": mk, "bytes": size, "why": "static"})
+            protected.append({"model_key": mk, "bytes": size, "why": "static",
+                              "store": "reapable", "counts_toward_budget": True})
         elif mk in loaded or mk in loading:
-            protected.append({"model_key": mk, "bytes": size, "why": "loaded"})
+            protected.append({"model_key": mk, "bytes": size, "why": "loaded",
+                              "store": "reapable", "counts_toward_budget": True})
         else:
             # Assigned-but-cold falls through here — a reclaimable candidate.
             # Store-root copy path travels on the row so _reap_reclaim/wipe act on
@@ -2634,10 +2727,25 @@ def _reap_scan(state: "WorkerState") -> dict:
             _kick_learn_configs(state, unresolved)
         except Exception:  # noqa: BLE001
             pass
+    # k60: split the protected pile by whether it is IN the eviction economy.
+    # Only reapable-store rows are budget-bearing; shared/unreapable rows are
+    # reported and labeled, never priced (see the store gate above).
+    unbudgeted = [r for r in protected if not r.get("counts_toward_budget", True)]
     out = {
         "reclaimable": reclaimable,
         "protected": protected,
         "reclaimable_bytes": sum(r["bytes"] for r in reclaimable),
+        # BUDGET-BEARING vs LABELED-ONLY bytes (k60). budgeted_bytes is what
+        # used/need_bytes may be computed from; unbudgeted_bytes is the shared
+        # catalog / never-opted-in store, shown but never charged.
+        "budgeted_bytes": (sum(r["bytes"] for r in reclaimable)
+                           + sum(r["bytes"] for r in protected
+                                 if r.get("counts_toward_budget", True))),
+        "unbudgeted_bytes": sum(r["bytes"] for r in unbudgeted),
+        "unbudgeted_count": len(unbudgeted),
+        "shared_bytes": sum(r["bytes"] for r in unbudgeted
+                            if r.get("store") == "shared"),
+        "shared_count": sum(1 for r in unbudgeted if r.get("store") == "shared"),
         # DIAGNOSTICS (slice 3, B): make a broken/empty scan self-describing so it
         # can never masquerade as a clean empty store. scan_keys_considered = the
         # full key domain; scan_rows = rows actually classified (reclaimable +
@@ -2787,6 +2895,35 @@ def _models_store_root() -> str | None:
     except Exception:  # noqa: BLE001
         pass
     return None
+
+
+def _path_on_shared_store(path: str) -> bool:
+    """True when `path` lives on the SHARED/central catalog (sentinel or the
+    per-box env flag). Thin, never-raising wrapper over the SAME predicate the
+    delete guard uses, so labeling and protection can never disagree."""
+    try:
+        from .provision import _on_shared_model_store
+        return bool(path) and bool(_on_shared_model_store(os.path.realpath(path)))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _store_root_budgeted() -> bool:
+    """True when this worker's OWN store root is a reapable store — the only
+    case where a measured store-root size is budget-bearing (k60).
+
+    On ae the root resolves onto the shared catalog, so the measured walk
+    returns the WHOLE FLEET's resident catalog (2.8 TiB). Pricing that against
+    an 800 GB worker cap produced a permanent "⚠ over budget · 2.0 TiB over" on
+    a 1.7 TiB box — an eviction reading for files this box may never delete.
+    Fail SAFE: any resolution failure returns False, so an unknown root is
+    LABELED rather than charged (never the other way round)."""
+    try:
+        from .provision import _model_store_reapable
+        root = _models_store_root()
+        return bool(root) and bool(_model_store_reapable(os.path.realpath(root)))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _measured_store_bytes() -> int | None:
@@ -2971,10 +3108,17 @@ def _orphan_scan(state: "WorkerState", known_keys: set) -> dict:
 
 def _storage_model_row(mk: str, size: int, loaded: set, loading: set,
                        provisioning: set, assigned: set,
-                       why_hint: str = "") -> dict:
+                       why_hint: str = "", store: str = "reapable",
+                       counts_toward_budget: bool = True) -> dict:
     """One per-model row for the heartbeat storage view: bytes + every
     protection flag + a human `why`. loaded is ALREADY answer-inclusive
-    (loaded_model_keys() ∪ _slot_occupants()) at the caller."""
+    (loaded_model_keys() ∪ _slot_occupants()) at the caller.
+
+    ``store`` / ``counts_toward_budget`` (k60) carry _reap_scan's STORE-GATE
+    classification onto the wire: "shared" (the central catalog this box only
+    reads through) and "unreapable" (a store the box never opted in to) are
+    LABELED, never priced — they contribute zero to used/need_bytes. Only
+    "reapable" rows are in this worker's eviction economy."""
     is_pinned = _pinned(mk)
     is_static = _residency(mk) == "static"
     is_loaded = mk in loaded
@@ -3037,6 +3181,9 @@ def _storage_model_row(mk: str, size: int, loaded: set, loading: set,
         "assigned": is_assigned,
         "protected": protected,
         "why": why,
+        # k60: which STORE the bytes sit on, and whether they are budget-bearing.
+        "store": store,
+        "counts_toward_budget": bool(counts_toward_budget),
     }
 
 
@@ -3066,11 +3213,13 @@ def _worker_storage(state: "WorkerState") -> dict:
     heartbeats on boxes with many large models).
 
     Shape:
-      { cache_used_bytes:int,  # sum of on-disk bytes of ALL local models
-                               # (reclaimable + protected); symlinks count 0
+      { cache_used_bytes:int,  # on-disk bytes of the models on a REAPABLE store
+                               # (k60: shared/unreapable rows count 0 here);
+                               # symlinks count 0
+        unbudgeted_bytes:int,  # the shared/unreapable bytes — shown, never priced
         disk_free:int,         # = disk.free_bytes (kept for console convenience)
         models:[ {model_key, bytes, pinned, loaded, loading, provisioning,
-                  assigned, protected, why} ] }
+                  assigned, protected, why, store, counts_toward_budget} ] }
 
     Comfy rows never appear (skipped by _reap_scan — operator symlinks), so they
     neither inflate cache_used_bytes nor get proposed for eviction.
@@ -3098,7 +3247,9 @@ def _worker_storage(state: "WorkerState") -> dict:
     assigned = set(state.assigned_models or [])
 
     models: list[dict] = []
-    cache_used = 0
+    cache_used = 0        # BUDGET-BEARING bytes only (reapable stores)
+    unbudgeted_bytes = 0  # shared catalog / never-opted-in store — labeled only
+    unbudgeted_count = 0
     for row in scan.get("reclaimable", []):
         size = int(row.get("bytes", 0) or 0)
         cache_used += size
@@ -3106,10 +3257,21 @@ def _worker_storage(state: "WorkerState") -> dict:
                                          loading, provisioning, assigned))
     for row in scan.get("protected", []):
         size = int(row.get("bytes", 0) or 0)
-        cache_used += size
+        # k60: a row the STORE GATE protects (shared catalog, or a store this
+        # box never declared reapable) contributes ZERO to used/need_bytes. It
+        # still ships — tagged `shared`/`unreapable` — so the console can show
+        # what occupies the drive without implying an eviction is coming.
+        counts = bool(row.get("counts_toward_budget", True))
+        if counts:
+            cache_used += size
+        else:
+            unbudgeted_bytes += size
+            unbudgeted_count += 1
         models.append(_storage_model_row(row.get("model_key"), size, loaded,
                                          loading, provisioning, assigned,
-                                         why_hint=row.get("why", "")))
+                                         why_hint=row.get("why", ""),
+                                         store=row.get("store") or "reapable",
+                                         counts_toward_budget=counts))
     models.sort(key=lambda m: m["bytes"], reverse=True)
 
     disk = _disk_status()
@@ -3119,6 +3281,17 @@ def _worker_storage(state: "WorkerState") -> dict:
     # store root is the honest number the gauge should read. Keep the sum as a
     # cross-check diagnostic; fall back to it only if the root can't be measured.
     measured = _measured_store_bytes()
+    # k60 ACCOUNTING GATE. The measured walk is only the WORKER'S OWN cache when
+    # the store root is a reapable store. When the root resolves onto the shared
+    # catalog (ae) it measures the whole fleet's resident catalog, so charging it
+    # to this worker's budget is a category error — that is the 2.8 TiB / 800 GB
+    # "⚠ over budget" the operator correctly read as "an auto-delete is coming".
+    # On such a box the budget number is the reapable-row sum (typically 0) and
+    # the measurement is still reported, under a name that cannot be priced.
+    root_budgeted = _store_root_budgeted()
+    store_root_measured = measured
+    if not root_budgeted:
+        measured = None
     # ORPHANED (unattributed-on-disk) residue — model dirs / stalled .part sets
     # that match NO current model. Every name a live model might be known by, so
     # the diff doesn't false-flag a resident model as orphaned.
@@ -3158,8 +3331,21 @@ def _worker_storage(state: "WorkerState") -> dict:
         pass
     out = {
         "cache_used_bytes": measured if measured is not None else cache_used,
-        "cache_used_measured_bytes": measured,      # None if root unresolved
+        "cache_used_measured_bytes": measured,      # None if root unresolved/shared
         "cache_used_model_sum_bytes": cache_used,   # legacy per-model-dir sum
+        # k60 — the accounting split, so central/console never have to guess:
+        #   unbudgeted_*   bytes on a shared/unreapable store: SHOWN, never priced
+        #   store_root_*   what the root actually is, and whether it is budget-bearing
+        "unbudgeted_bytes": unbudgeted_bytes,
+        "unbudgeted_count": unbudgeted_count,
+        "shared_bytes": int(scan.get("shared_bytes") or 0),
+        "shared_count": int(scan.get("shared_count") or 0),
+        "store_root": _models_store_root() or "",
+        "store_root_budgeted": root_budgeted,
+        "store_root_shared": _path_on_shared_store(_models_store_root() or ""),
+        # The raw measurement of the root, ALWAYS honest and never the budget
+        # number when the root isn't budget-bearing (that is cache_used_bytes).
+        "store_root_measured_bytes": store_root_measured,
         # Orphaned residue (release-bound). UI labels it "unattributed on disk".
         "orphaned_bytes": orphans["bytes"],
         "orphaned_count": orphans["count"],
@@ -3309,6 +3495,18 @@ def build_app(state: "WorkerState") -> Flask:
         # runner's error path, so the console shows the REAL cause.
         try:
             _apply_spill(payload.pop("spill", None))
+            # Never serve a model nobody asked for (see _model_key_refusal):
+            # an absent/unknown key is a 400 here, not a default stand-in.
+            _refusal = _model_key_refusal(payload, state.central_url)
+            if _refusal:
+                _aggregate.record_serve(
+                    _agg_key, ok=False,
+                    latency_ms=(time.time() - _agg_t0) * 1000.0,
+                    error=f"BadRequest: {_refusal}", task=_agg_task)
+                return jsonify({
+                    "ok": False, "error": _refusal,
+                    "worker": {"id": state.worker_id, "name": state.name},
+                }), 400
             _ensure_present(payload, state.central_url, state=state)
             # Per-model generation gate: serialize entry into an in-process
             # (llama.cpp/transformers) runner so concurrent /infer calls can't
@@ -3389,6 +3587,21 @@ def build_app(state: "WorkerState") -> Flask:
         _agg_key = payload.get("model_key")
         _agg_task = payload.get("task")
         _agg_t0 = time.time()
+        # Same refusal as /infer, and BEFORE the Response: a stream that has
+        # already started can only report this as a mid-body SSE surprise, and
+        # the caller would have no status code to route on. The registration
+        # lookup this performs is the one _ensure_present_streaming does first
+        # anyway (idempotent), so it costs the stream nothing.
+        _refusal = _model_key_refusal(payload, state.central_url)
+        if _refusal:
+            _aggregate.record_serve(
+                _agg_key, ok=False,
+                latency_ms=(time.time() - _agg_t0) * 1000.0,
+                error=f"BadRequest: {_refusal}", task=_agg_task)
+            return jsonify({
+                "ok": False, "error": _refusal,
+                "worker": {"id": state.worker_id, "name": state.name},
+            }), 400
         try:
             gate_token = gen_gate.acquire_for_payload(payload)
         except gen_gate.ModelBusy as busy:
@@ -5800,43 +6013,103 @@ def _moe_detail_for(model_key: str) -> "dict | None":
         return None
 
 
+def _moe_auto_gpu_budget(model_key: str, path: str) -> "int | None":
+    """The VRAM budget the SLOT will plan this MoE against — the SAME arithmetic
+    ``slot_agent._moe_gpu_budget`` applies, so admission and launch price ONE
+    number: budgetable free VRAM, capped by the model's own ``gpu_mem_gib``
+    contract (the ``HUGPY_GPU_MEM_GIB`` wire ``_apply_spill`` writes), less what
+    lands on the card beside the weights (the mmproj projector + the KV/context
+    reserve).
+
+    ``None`` when the card is unmeasurable — the slot's own degrade there is
+    all-experts-to-CPU, so the caller must price THAT, not a plan invented from
+    missing data. ``0`` when the reserve consumes the whole budget (the slot
+    plans no split at all)."""
+    from ..managers import spill as _spill
+    budget = _spill.free_vram_bytes()
+    try:
+        raw = (os.environ.get("HUGPY_GPU_MEM_GIB") or "").strip()
+        cap = int(float(raw) * 2 ** 30) if raw else None
+    except (TypeError, ValueError):
+        cap = None
+    if cap is not None:
+        budget = min(budget, cap) if budget else cap
+    if not budget:
+        return None
+    # The context reserve is priced at the ctx this model will actually serve
+    # (the ctx_pct allocation), exactly as the slot does — an unset ctx_pct
+    # leaves it to vram_ctx_reserve_bytes' own resolution, which is what the
+    # slot's default ctx path lands on too.
+    ctx, _pct, _mx = _resolved_ctx(model_key)
+    reserve = _spill.vision_projector_bytes(path)
+    try:
+        reserve += int(_spill.vram_ctx_reserve_bytes(path, ctx)[0])
+    except Exception:  # noqa: BLE001 — a reserve probe never breaks pricing
+        pass
+    return max(0, int(budget) - reserve)
+
+
 def _moe_plan_for(model_key: str) -> "dict | None":
     """The MoE split that GOVERNS this model's next load, or None (dense path).
 
     Returns {"path", "n_cpu_moe", "gpu_weight_bytes", "cpu_bytes", "detail"}:
       * explicit HUGPY_N_CPU_MOE (the n_cpu_moe spill/override wire) WINS — the
-        split is priced per-layer-exactly at that N (spill.moe_split_need);
+        split is priced per-layer-exactly at that N (spill.moe_split_need),
+        because that N is exactly what the child launches with;
       * else AUTO-ELIGIBLE: a detected-MoE GGUF with NO explicit layer
         designation (HUGPY_N_GPU_LAYERS unset/auto) and no k37 mode engine
-        active — priced at all-experts-on-CPU (MOE_ALL_LAYERS). As of
-        2026-07-25 this IS the default placement for such a model (operator:
-        "the default needs to be the MoE split for all GGUFs that it applies
-        to"); the only remaining question at the caller is VIABILITY — the
-        experts must fit budgetable host RAM. Fits-whole no longer exempts a
-        MoE from the split: the ae measurement makes the split both faster and
-        ~5x cheaper in VRAM, so pinning a fits-whole MoE onto the card was
-        strictly worse AND monopolised the card.
+        active — priced by the DENSE-FIRST PLAN against this box's real VRAM
+        budget (k55, 2026-07-31). As of 2026-07-25 the split IS the default
+        placement for such a model (operator: "the default needs to be the MoE
+        split for all GGUFs that it applies to"); the only remaining question
+        at the caller is VIABILITY — the experts must fit budgetable host RAM.
     Explicit n_gpu_layers / gpu-only / ram-only / max-ram / explicit-mode all
-    return None here: explicit operator placement always wins over auto."""
+    return None here: explicit operator placement always wins over auto.
+
+    WHY THE DENSE-FIRST PLAN AND NOT ``moe_split_need`` (k53's flagged
+    follow-up). The auto case used to be priced at all-experts-on-CPU
+    (MOE_ALL_LAYERS) — backbone-only on the card. Since dense-backbone-first
+    (da2b5d9) the child spends whatever budget is LEFT after the backbone on
+    expert layers, so it can take materially more VRAM than admission planned,
+    and the NEXT admission then sees a fuller card than it expected. Pricing
+    the same plan the same way (spill.moe_dense_first_plan against the same
+    budget — see _moe_auto_gpu_budget) makes admission and launch agree
+    byte-for-byte. An UNMEASURABLE card keeps MOE_ALL_LAYERS, which is
+    precisely the slot's own degrade there; a plan that puts EVERYTHING on the
+    card (n_cpu_moe 0) moves nothing to RAM, so it is no split at all and falls
+    to the dense full-need pricing."""
     det = _moe_detail_for(model_key)
     if not det:
         return None
     try:
         from ..managers import spill as _spill
+        ppath, _tl = _served_gguf_geometry(model_key)
         ncm = _spill.n_cpu_moe_env()
+        split = None
         if ncm is None:
             intent, requested = _gguf_ngl_intent(model_key)
             if intent != "auto" or requested is not None:
                 return None                      # explicit layer designation wins
             if _spill.alloc_mode_env() is not None:
                 return None                      # k37 mode engine owns placement
-            ncm = _spill.MOE_ALL_LAYERS
+            budget = _moe_auto_gpu_budget(model_key, ppath) if ppath else None
+            if budget is None:
+                ncm = _spill.MOE_ALL_LAYERS      # unmeasurable card: slot degrade
+            elif not budget:
+                return None                      # no GPU budget -> slot plans no split
+            else:
+                plan = _spill.moe_dense_first_plan(det, budget)
+                if not plan:
+                    return None
+                ncm = int(plan["n_cpu_moe"])
+                split = {"gpu_bytes": int(plan["gpu_bytes"]),
+                         "cpu_bytes": int(plan["cpu_bytes"])}
         elif ncm <= 0:
             return None                          # explicit "experts on GPU" = no split
-        split = _spill.moe_split_need(det, ncm)
+        if split is None:
+            split = _spill.moe_split_need(det, ncm)
         if not split or not split.get("cpu_bytes"):
             return None                          # nothing moves -> dense pricing
-        ppath, _tl = _served_gguf_geometry(model_key)
         return {"path": ppath, "n_cpu_moe": int(ncm),
                 "gpu_weight_bytes": int(split["gpu_bytes"]),
                 "cpu_bytes": int(split["cpu_bytes"]), "detail": det}
@@ -5969,8 +6242,11 @@ def _incoming_need_detail(model_key: str) -> dict:
            "weights": int(weights), "kv": int(kv or 0), **det}
     # MoE expert split (2026-07-24): when a MoE split governs this model
     # (explicit n_cpu_moe, or auto-eligible under the default placement), carry
-    # the TYPED need alongside the opaque total: GPU-side = non-expert weights
-    # (x the same 1.15 headroom the weights term uses) + the WHOLE KV (all
+    # the TYPED need alongside the opaque total: GPU-side = the weights the plan
+    # actually leaves on the card — the dense backbone PLUS whatever expert
+    # layers the dense-first budget bought (k55; it was backbone-only, which
+    # under-priced every launch that had room to spare) — x the same 1.15
+    # headroom the weights term uses, + the WHOLE KV (all
     # layers stay on the GPU under the split); CPU-side = the expert bytes
     # (RAM/page-cache, mirroring cpu_resident_bytes accounting). Since
     # 2026-07-25 fit paths PREFER ``moe_split.gpu_total`` whenever it is present
@@ -6741,6 +7017,58 @@ def _comfy_base_url(state: "WorkerState") -> str:
     COMFY_URL (see _apply_settings_env); default 127.0.0.1:8188 matches
     managers/comfy/comfy_runner._comfy_url()."""
     return (os.environ.get("COMFY_URL") or "http://127.0.0.1:8188").rstrip("/")
+
+
+# ── comfy idle-VRAM watchdog (k54, operator directive 2026-07-31) ────────────
+# A dead/idle ComfyUI process must never permanently squat the card (the live
+# case: 2874 MiB held for 61 h with an empty queue). The predicate + the reclaim
+# live in worker_agent.comfy_watchdog — self-contained and probe-injectable, so
+# it never imports this module back; the worker binds the real box-touching
+# probes here, once, and the watchdog holds only the idle clock.
+_COMFY_WATCHDOG = None
+
+
+def _comfy_vram_now(fresh: bool = False) -> "int | None":
+    """Comfy's measured VRAM, optionally bypassing the ~8s nvidia-smi cache.
+
+    ``fresh`` is what makes the post-/free re-measure honest: without it the
+    verification read would return the cached PRE-free figure and every
+    successful reclaim would report itself as a failure."""
+    if fresh:
+        _GPU_PROC_CACHE["at"] = 0.0
+    return _comfy_process_vram()
+
+
+def _comfy_watchdog(state: "WorkerState"):
+    """The process-wide watchdog, built on first use (so a box that never runs
+    the residency loop never constructs one). ``state`` only reaches it through
+    the bound probes."""
+    global _COMFY_WATCHDOG
+    if _COMFY_WATCHDOG is None:
+        from .comfy_watchdog import ComfyIdleWatchdog
+        _COMFY_WATCHDOG = ComfyIdleWatchdog(
+            vram_probe=_comfy_vram_now,
+            url_probe=lambda: _comfy_base_url(state),
+            free_call=lambda: _comfy_free_models(state),
+            emit=_evt_emit)
+    return _COMFY_WATCHDOG
+
+
+def _comfy_reclaim_idle_vram(state: "WorkerState", incoming_model: "str | None",
+                             need_bytes: "int | None" = None) -> int:
+    """CONTENTION reclaim: bytes freed from an IDLE comfy for a load that needs
+    them, 0 when comfy is busy / holds nothing / can't be proved idle.
+
+    The mirror of ``_worker_ensure_comfy_headroom`` (Fix B), which evicts managed
+    models FOR comfy: this frees comfy FOR a managed model. Both are best-effort
+    and neither is allowed to raise into the path that called it."""
+    try:
+        res = _comfy_watchdog(state).reclaim(incoming_model=incoming_model,
+                                             need_bytes=need_bytes)
+        return int(res.get("freed_bytes") or 0)
+    except Exception as exc:  # noqa: BLE001 — a reclaim attempt never breaks admission
+        logger.warning("comfy idle reclaim failed: %s", exc)
+        return 0
 
 
 def _model_footprint_before_evict(model_key: str, host_mode: str,
@@ -8044,6 +8372,16 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
     DELTA still has to fit, so a re-seat that genuinely wants more than the card
     can give still refuses honestly.
 
+    POLITE LOAD (k56, operator ruling 2026-07-31). When the request's spill
+    carries ``no_evict`` (spill.no_evict_env), this function may spend only
+    GENUINELY FREE headroom: the tolerance-band flex still runs (compressing the
+    subject's OWN ctx costs no resident anything), and the honest GGUF partial
+    offload still applies (it is sized from free VRAM alone) — but the size-up
+    planner and the eviction walk are SKIPPED and the refusal says so. This is
+    the deliberate inverse of declare-need-then-evict, which stays the rule for
+    every unflagged load; the flag is per-model and off by default, so nothing
+    below changes for an ordinary admission.
+
     Returns a typed verdict:
       {"action": "proceed"|"evicted"|"refuse", "evicted": [mk...],
        "freed_bytes": int, "reason": {...}|None}
@@ -8056,6 +8394,14 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
     # must serve fully (-1), never stay pinned to a stale layer count.
     _FLEX_CTX_FLOOR.pop(model_key, None)
     _clear_partial_ngl(model_key)
+    # k56: read the polite flag ONCE, here, so every branch below asks the same
+    # question of the same request (the env is per-request and cleared when
+    # absent, so a mid-admission re-read could disagree with itself).
+    try:
+        from ..managers.spill import no_evict_env
+        polite = no_evict_env()
+    except Exception:  # noqa: BLE001 — an unreadable flag is not a policy
+        polite = False
     total = _total_vram_bytes()
     if not total:
         return {"action": "proceed", "evicted": [], "freed_bytes": 0,
@@ -8174,9 +8520,11 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
                 "moe": {k: moe_commit.get(k) for k in
                         ("n_cpu_moe", "gpu_total", "cpu_bytes", "expert_count",
                          "expert_used_count", "sparsity")},
-                "note": (f"MoE expert split: all layers on GPU "
-                         f"(~{_human_bytes(moe_commit.get('gpu_total'))} "
-                         f"non-expert + KV), expert tensors "
+                "note": (f"MoE expert split (--n-cpu-moe "
+                         f"{moe_commit['n_cpu_moe']}): all layers on GPU "
+                         f"(~{_human_bytes(moe_commit.get('gpu_total'))} of "
+                         f"dense backbone + the expert layers the budget bought "
+                         f"+ KV), the remaining expert tensors "
                          f"(~{_human_bytes(moe_commit.get('cpu_bytes'))}) on CPU")}
 
     # ── SUBJECT CREDIT (operator, 2026-07-27) ───────────────────────────────
@@ -8242,6 +8590,16 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
         # against the raw device read after evicting. Feeding it the credited
         # figure here would make the target systematically un-deliverable and
         # push it down its "under-delivered" branch. Byte-identical to today.
+        #
+        # k56: a POLITE load skips the size-up entirely. It is a BONUS that buys
+        # a better layer count BY EVICTING, and "never evict" outranks "seat it
+        # better" — the model takes the room that is genuinely free, which is
+        # exactly what the flag promised.
+        if polite:
+            return {"action": "proceed", "evicted": [], "freed_bytes": 0,
+                    "reason": None,
+                    "note": ("polite load (no_evict): admitted into free room; "
+                             "the eviction-aware size-up was skipped")}
         _up = _plan_autofit_against_reclaimable(
             state, model_key, _partition_residents(state, model_key)[0],
             _free_vram_bytes())
@@ -8354,6 +8712,34 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
     # they do in the preview. The loop below still re-tests `_fits()` and
     # re-proves protection per victim (the device moves for reasons no plan
     # models), so the PLAN chooses and the LOOP verifies.
+    #
+    # k56: a POLITE load does not reach the walk at all. Flex has run (it costs
+    # residents nothing), the free room was not enough, and the flag says that
+    # is the end of what this load may spend — so `candidates` is emptied and
+    # the function falls through to the partial-offload/refusal tail, which is
+    # sized from FREE VRAM alone and therefore still honest under the flag.
+    # Emptying the list (rather than branching around the loop) is deliberate:
+    # every downstream count and telemetry line then reports the truth —
+    # nothing was evicted FOR THIS LOAD. What was spared is kept in
+    # `polite_spared` so the refusal can NAME it: "3 idle residents were
+    # spared" is the whole story here, and the orphan-message honesty fix
+    # (2026-07-27) forbids letting an empty candidate list read as "nothing was
+    # attributable" when in fact we chose not to touch what was.
+    polite_spared: list[dict] = []
+    if polite:
+        polite_spared = list(candidates)
+        logger.info(
+            "polite load (no_evict): %s needs %s and free room is short — "
+            "NOT evicting any of the %d evictable resident(s); the load takes "
+            "free headroom or refuses", model_key, _human_bytes(need),
+            len(candidates))
+        for _c in candidates:
+            _evt_emit("candidate.skip", model_key=_c.get("model_key"),
+                      tier=_telemetry_tier(_c.get("host_mode")),
+                      incoming_model=model_key,
+                      reason="polite load (no_evict) — never evicts",
+                      vram_bytes=_c.get("vram_bytes"))
+        candidates = []
     _fv_for_need = _free_eff()               # incl. the subject credit: we must
     _ev_need = (max(0, ceiling_reserve - (_fv_for_need - need))
                 if _fv_for_need is not None else None)   # only evict the REMAINING
@@ -8407,11 +8793,38 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
                       error=str(res.get("reason") or "eviction freed nothing"))
 
     final = _fits()
+    # ── stage 2.4 (k54): claim IDLE comfy VRAM before degrading or refusing ──
+    # Every managed candidate has been walked and it still doesn't fit. Comfy is
+    # protected from EVICTION here (it is out of allocations and the worker does
+    # not own its residency policy) — but a comfy holding VRAM with an empty
+    # queue and no registered call is not serving anyone, and refusing a load (or
+    # crippling it into a partial offload) for bytes nobody is using is exactly
+    # the gap k54 closes. Contention waives the idle TTL; clauses 1-3 still bind
+    # absolutely, so a comfy mid-render is never touched. Costs one cheap /queue
+    # read on the unhappy path only, and 0 on a box with no comfy.
+    #
+    # k56: NOT under a polite load. Reclaiming an idle comfy's VRAM is still
+    # taking room off another process to make this load land — the flag says
+    # this load spends only what is already free, and "idle" is a judgement the
+    # polite promise does not get to make on someone else's behalf.
+    _comfy_freed = 0
+    if not final and not polite:
+        _comfy_freed = _comfy_reclaim_idle_vram(state, model_key, need_bytes=need)
+        if _comfy_freed:
+            freed += _comfy_freed
+            final = _fits()
     if final:
         if moe_commit is not None:
             return _moe_admit_verdict(evicted, freed)
-        return {"action": "evicted", "evicted": evicted,
-                "freed_bytes": freed, "reason": None}
+        out = {"action": "evicted", "evicted": evicted,
+               "freed_bytes": freed, "reason": None}
+        if _comfy_freed:
+            # Name it: the operator must never have to guess which of the two
+            # reclaim mechanisms actually produced the room.
+            out["comfy_freed_bytes"] = _comfy_freed
+            out["note"] = (f"reclaimed {_human_bytes(_comfy_freed)} from an idle "
+                           f"ComfyUI (empty queue, no call)")
+        return out
 
     # `fv` is the RAW device read — what the refusal below REPORTS, because the
     # operator must see the card as the driver sees it. `fv_eff` is what the
@@ -8525,13 +8938,24 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
     # at all on an occupied card, say the occupancy is unattributed instead of
     # the self-contradictory "evicted 0 ... 0 protected still hold the card".
     holders: list[str] = []
+    # k56: the polite clause comes FIRST because it is the whole reason this
+    # refusal exists — the room was there, this load was told not to take it.
+    if polite:
+        holders.append(
+            "POLITE LOAD (no_evict): this model may spend only genuinely free "
+            "headroom, so nothing was evicted"
+            + (f" — {len(polite_spared)} evictable idle resident(s) were SPARED "
+               f"(~{_human_bytes(sum(int(r.get('vram_bytes') or 0) for r in polite_spared))} "
+               f"between them, which an ordinary load would have reclaimed)"
+               if polite_spared else " (and nothing was evictable anyway)"))
     if protected:
         holders.append(f"{len(protected)} protected resident(s) still hold the card")
     if evict_failed:
         holders.append(f"{len(evict_failed)} eviction attempt(s) failed to free "
                        "their resident")
     _attr = {"vram_attributed_bytes": None, "vram_unattributed_bytes": None}
-    if not protected and not evict_failed and not candidates and not evicted:
+    if (not protected and not evict_failed and not candidates and not evicted
+            and not polite_spared):
         # THE ORPHAN-MESSAGE HONESTY FIX (operator, 2026-07-27). This clause used
         # to assert, unconditionally, that the card was held by "process(es) this
         # worker cannot map to a model_key (orphaned/adopted child or out-of-band
@@ -8636,6 +9060,15 @@ def _vram_evict_to_fit(state: "WorkerState", model_key: str,
     # ADDITIVE and OMITTED-WHEN-UNSET — the fleet is 0.1.216 and a released
     # consumer must not meet a field it can't model. A non-resident subject and
     # an unread attribution therefore produce a byte-identical reason dict.
+    if polite:
+        # k56, same additive/omitted-when-unset discipline: an unflagged load
+        # produces a byte-identical reason dict. Central surfaces these on the
+        # telemetry stream so the console can say WHY it didn't land.
+        reason["no_evict"] = True
+        reason["polite_spared"] = [{"model_key": r.get("model_key"),
+                                    "vram_bytes": r.get("vram_bytes"),
+                                    "host_mode": r.get("host_mode")}
+                                   for r in polite_spared]
     if subject_held:
         reason["subject_resident_bytes"] = subject_held
         reason["free_vram_effective_bytes"] = fv_eff
@@ -9041,16 +9474,56 @@ def _effective_config() -> dict:
     return out
 
 
+def _path_device(path: str):
+    """The device id `path` lives on, or None if it can't be stat'd — how
+    _disk_status decides whether two roots are the same volume (one entry) or
+    two tiers worth reporting separately."""
+    try:
+        return os.stat(path).st_dev
+    except OSError:
+        return None
+
+
 def _disk_status() -> dict:
     """Free/total bytes of the volume holding this worker's MODEL ROOT — the
     disk a designation's pull lands on. Central's assign/load preflight uses
-    this so a model that won't fit is refused early (409), not mid-pull."""
+    this so a model that won't fit is refused early (409), not mid-pull.
+
+    k60 (operator, 2026-07-31): the row must report the drive the MODEL STORE
+    ROOT actually lives on — resolved the same way the reaper/heartbeat resolve
+    it (``_models_store_root``) — not DEFAULT_ROOT, which on a two-tier box (hot
+    NVMe store + a mounted shared catalog) can be the OTHER volume entirely. The
+    first entry is therefore never mislabeled. When DEFAULT_ROOT sits on a
+    different device it is reported as a SECOND tier instead of replacing the
+    first, each tagged with whether it is the shared/central catalog.
+    """
     try:
         import shutil
         from ..imports.src.constants.constants import DEFAULT_ROOT
-        root = DEFAULT_ROOT if os.path.isdir(DEFAULT_ROOT) else os.path.expanduser("~")
-        u = shutil.disk_usage(root)
-        return {"root": root, "free_bytes": u.free, "total_bytes": u.total}
+        base = (str(DEFAULT_ROOT) if os.path.isdir(str(DEFAULT_ROOT))
+                else os.path.expanduser("~"))
+        model_root = _models_store_root() or base
+        tiers: list[dict] = []
+        seen_devices: set = set()
+        for label, path in (("model root", model_root), ("default root", base)):
+            if not path or not os.path.isdir(path):
+                continue
+            dev = _path_device(path)
+            if dev is None:
+                continue
+            if dev in seen_devices:
+                continue                       # same volume — one entry is enough
+            seen_devices.add(dev)
+            u = shutil.disk_usage(path)
+            tiers.append({"label": label, "root": path, "free_bytes": u.free,
+                          "total_bytes": u.total,
+                          "shared": _path_on_shared_store(path)})
+        if not tiers:
+            return {}
+        primary = tiers[0]
+        return {"root": primary["root"], "free_bytes": primary["free_bytes"],
+                "total_bytes": primary["total_bytes"],
+                "shared": primary["shared"], "tiers": tiers}
     except Exception:  # noqa: BLE001
         return {}
 
@@ -9301,6 +9774,23 @@ def _vram_headroom_sweep(state: "WorkerState") -> None:
 def _vram_headroom_sweep_body(state: "WorkerState", total: int, fv: int) -> None:
     """The sweep's decision + eviction. Split out only so the telemetry run
     scope above can wrap it; the logic is unchanged."""
+    # ── stage 0 (k54): an IDLE comfy pays before any managed model does ──────
+    # The card is over the ceiling. If part of what is holding it is a comfy
+    # process with an empty queue and no registered call, that is dead weight —
+    # reclaiming it costs nothing anyone is using, while evicting a managed
+    # resident costs a reload. So the idle squatter yields FIRST; if that alone
+    # gets the card back under the pressure reserve, no model is touched at all.
+    # The TTL is waived here (contention beats idleness); clauses 1-3 still bind,
+    # so a comfy that is actually rendering is never disturbed.
+    if _comfy_reclaim_idle_vram(state, incoming_model=None):
+        fv_after = _free_vram_bytes()
+        if fv_after is not None and fv_after >= _vram_pressure_reserve_bytes(total):
+            _evt_emit("headroom.done", trigger="sweep", evicted=["comfy"],
+                      outcome="fit",
+                      note="idle comfy VRAM reclaimed — no model evicted")
+            return
+        if fv_after is not None:
+            fv = fv_after
     # Over the ceiling with no load driving admission. Evict the coldest EVICTABLE
     # idle resident, applying the SAME protection rules as _vram_evict_to_fit.
     busy_slots = _busy_slot_models()
@@ -9385,6 +9875,15 @@ def _residency_sweep_loop(state: "WorkerState") -> None:
             _vram_headroom_sweep(state)
         except Exception as exc:  # noqa: BLE001 — the loop must never die
             logger.warning("VRAM headroom sweep failed: %s", exc)
+        try:
+            # k54: the idle-comfy watchdog. No new timer — it rides this same
+            # 60s beat (minimize-loading doctrine: a timer is wrong by default,
+            # and this one is a debounce on an existing loop, not a schedule).
+            # Silent on every box where comfy holds nothing.
+            _comfy_watchdog(state).tick(free_vram_bytes=_free_vram_bytes(),
+                                        total_vram_bytes=_total_vram_bytes())
+        except Exception as exc:  # noqa: BLE001 — the loop must never die
+            logger.warning("comfy idle watchdog pass failed: %s", exc)
         try:
             _residency_sweep_once(started_at)
         except Exception as exc:  # noqa: BLE001 — the loop must never die

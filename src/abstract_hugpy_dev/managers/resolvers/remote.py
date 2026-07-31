@@ -1056,6 +1056,36 @@ _PERMANENT_LOAD_MARKERS = (
     "failed to load model from file", "error loading model",
     "check_tensor_dims", "wrong shape", "missing tensor",
     "unknown model architecture", "unsupported model architecture",
+    # NOT-A-LOADABLE-MODEL DIR (incident 2026-07-29). A bare LoRA-adapter
+    # directory (no ``model_type`` in config.json) fails transformers'
+    # AutoConfig in <1s, deterministically, on every attempt:
+    #   ValueError: Unrecognized model in …/qwen3.5-test-stage1-lora. Should
+    #   have a `model_type` key in its config.json
+    # Classified transient, the hold re-posted it to the worker every ~2.5s
+    # for over half an hour (the storm this list exists to prevent). No retry
+    # can conjure a base model into an adapter dir.
+    "unrecognized model", "model_type",
+    # RESPONSE-ENVELOPE FAILURE (incident 2026-07-29). The worker FINISHED the
+    # work (ComfyUI generated the image) and then failed to serialize the
+    # result ("TypeError: Object of type GeneratedImage is not JSON
+    # serializable"). Deterministic per attempt — every retry re-runs a whole
+    # generation and dies at the same jsonify — so central held one request
+    # for 25 minutes of wasted GPU. A serialization bug is code, not load
+    # state: fail fast and name it. (Worker-side fix: agent._jsonable.)
+    "not json serializable",
+    # MISSING PYTHON DEPENDENCY IN THE WORKER VENV (incident 2026-07-29).
+    #   ValueError: Using a `device_map` … requires `accelerate`. You can
+    #   install it with `pip install accelerate`
+    # Deterministic on every attempt until someone pip-installs the package
+    # (the /ops/pip relay exists for exactly that) — holding 92s per request
+    # and then hedging "stalled or too large" buried the one actionable line.
+    # "no module named" is the same class from the import side.
+    "requires `accelerate`", "pip install accelerate", "no module named",
+    # WEIGHTS/CONFIG MISMATCH (2026-07-29, Surogate-3.5-2B on ae): transformers
+    # raises when checkpoint tensor shapes disagree with the model's config —
+    # a broken/partial snapshot or wrong config.json. Deterministic per
+    # attempt, the transformers twin of the gguf check_tensor_dims class above.
+    "ignore_mismatched_sizes", "size mismatch for",
     # The SLOT path's wording for the same condition: slot_agent now separates a
     # child that DIED (the loader rejected the file) from one that hung, and says
     # "hard load failure" for the former. Previously both read "did not become
@@ -1068,6 +1098,52 @@ _PERMANENT_LOAD_MARKERS = (
 def _is_permanent_load_error(err: Any) -> bool:
     low = str(getattr(err, "message", None) or err or "").lower()
     return any(m in low for m in _PERMANENT_LOAD_MARKERS)
+
+
+# PERMANENT-FOR-THIS-ATTEMPT vs DETERMINISTIC-UNTIL-REPAIRED. Everything above is
+# permanent in the sense the hold cares about: retrying *this* attempt cannot fix
+# it, so fail fast (unchanged). But only a subset is permanent in the sense the
+# load-verdict CACHE cares about — i.e. still true for the NEXT request.
+#
+# These markers are STATE-dependent: nothing needs repairing for them to stop
+# being true. VRAM frees the moment something is evicted (⭐ eviction is never
+# time-vetoed — freshness is rank, not veto); disk frees when the reaper runs; a
+# missing model appears when its download lands; a pinned/absent worker comes
+# back on its next heartbeat; an operator BLOCK must lift the instant it is
+# lifted, not one TTL later. Caching any of those would make central refuse a
+# request it could now serve — a timer standing in for a measurement, which the
+# operator's residency doctrine rules wrong by default.
+#
+# So: still an honest FAST refusal, never a cached one. What DOES get cached is
+# the deterministic-until-repaired class the cache was built for — a corrupt or
+# mismatched weight file, a not-a-model directory, an unknown architecture, a
+# missing worker-venv dependency, a serialization bug: conditions that require a
+# human/pip/file fix and will fail identically on every attempt until they get it.
+_STATE_DEPENDENT_LOAD_MARKERS = (
+    # capacity / placement — freed by eviction or a smaller footprint
+    "won't fit", "wont fit", "won’t fit", "loadrefusal", "budgetrefusal",
+    "out of memory", "insufficient storage",
+    # inventory / provisioning — resolved by a download or freed disk
+    "could not provision", "could not fetch model", "not found on central",
+    # routing / availability — resolved by a heartbeat or a policy flag
+    "no capable worker", "no registered worker", "no worker is available",
+    "no worker available", "requested worker",
+    "local serving disabled", "hugpy_no_local_serving",
+    # operator BLOCK — unblocking must take effect immediately, never after a TTL
+    "blocked from the serving pool",
+)
+
+
+def _is_cacheable_load_verdict(err: Any) -> bool:
+    """True only for a permanent load failure that is ALSO deterministic until
+    somebody repairs something — the only class it is honest to answer a LATER
+    request from without re-attempting. See _STATE_DEPENDENT_LOAD_MARKERS."""
+    low = str(getattr(err, "message", None) or err or "").lower()
+    if not low.strip():
+        return False
+    if not any(m in low for m in _PERMANENT_LOAD_MARKERS):
+        return False
+    return not any(m in low for m in _STATE_DEPENDENT_LOAD_MARKERS)
 
 
 # A REQUEST-SHAPE failure — the messages the caller sent are malformed for THIS
@@ -1159,6 +1235,95 @@ class _RelayUnbuildable(Exception):
 # atomic (no await between them). Per-process, like the relay in-flight gate.
 _COLD_KICKING: set = set()
 
+# ---------------------------------------------------------------------------
+# DISPATCH QUEUE, half 2 of 2 — the shared VERDICT (operator, 2026-07-29:
+# "queues, please, implement a queue"). _COLD_KICKING above is the queue's
+# admission half: one attempt drives, everyone else waits in line. This is the
+# outcome half: when the driving attempt fails PERMANENTLY, that verdict is
+# recorded here so every queued waiter — and every re-submit of the same
+# request arriving for the next TTL window — fails fast from the cache instead
+# of launching its own doomed attempt against the worker. Without this, a
+# client that re-submits after each failure restarts the whole hold from
+# scratch and the fleet sees one attempt every poll interval, indefinitely
+# (the qwen3.5-test-stage1-lora storm: ~24 attempts/minute for 30+ minutes).
+#
+# TTL-bounded, never sticky forever: a repaired model (file fixed, base model
+# wired, worker updated) serves again one TTL after its last failure. A
+# SUCCESSFUL serve clears the verdict immediately. Per-process, like
+# _COLD_KICKING and the admission cap (same v0 honesty).
+# ---------------------------------------------------------------------------
+
+_LOAD_VERDICTS: Dict[tuple, tuple] = {}   # (worker_id, model_key) -> (expires_ts, message)
+_LOAD_VERDICTS_LOCK = threading.Lock()
+
+
+def _load_verdict_ttl_s() -> float:
+    """How long a permanent load failure is answered from the cache. Default
+    120s — long enough to absorb a re-submitting client/bench, short enough
+    that a genuine fix (file repaired, worker restarted) is picked up without
+    operator action. Operator-tunable (defaults are promises)."""
+    return _env_float("HUGPY_LOAD_VERDICT_TTL_S", 120.0)
+
+
+def _record_load_verdict(worker_id, model_key: str, message: str) -> None:
+    """Record a verdict, but ONLY for the deterministic-until-repaired class.
+
+    The gate lives here, not at the call sites, so no present or future caller
+    can poison the cache by forgetting it. Two things must never be cached:
+      * a STATE-dependent refusal (won't fit / no worker / disk full / blocked) —
+        it stops being true the moment residency or the fleet changes, so a
+        cached copy would refuse a request central could now serve;
+      * a CANCEL — a user pulling out is not a load failure. Cancels reach this
+        function only as an empty/absent message (the hold loop returns before
+        recording), and an empty message is refused below, so one cancelled
+        attempt can never mark a model unservable for the whole TTL.
+    Both still fail FAST where they are raised; they just leave nothing behind.
+    """
+    if not _is_cacheable_load_verdict(message):
+        return
+    with _LOAD_VERDICTS_LOCK:
+        _LOAD_VERDICTS[(worker_id or "", model_key)] = (
+            time.time() + _load_verdict_ttl_s(), str(message or ""))
+
+
+def _clear_load_verdict(worker_id, model_key: str) -> None:
+    with _LOAD_VERDICTS_LOCK:
+        _LOAD_VERDICTS.pop((worker_id or "", model_key), None)
+
+
+def _active_load_verdict(worker_id, model_key: str) -> "Optional[str]":
+    """The cached permanent-failure message for (worker, model), or None.
+    Expired entries are dropped on read (self-cleaning; the dict only ever
+    holds keys that failed within the last TTL, so it stays tiny)."""
+    key = (worker_id or "", model_key)
+    with _LOAD_VERDICTS_LOCK:
+        entry = _LOAD_VERDICTS.get(key)
+        if not entry:
+            return None
+        expires, message = entry
+        if time.time() >= expires:
+            _LOAD_VERDICTS.pop(key, None)
+            return None
+        return message
+
+
+def _verdict_message(model_key: str, worker: "Optional[dict]", cached: str) -> str:
+    wname = (worker or {}).get("name") or (worker or {}).get("id") or "worker"
+    return (f"'{model_key}' on '{wname}' failed to load moments ago and the "
+            f"failure is permanent (retrying cannot fix it): {cached} — "
+            f"answered from the load-verdict cache without re-attempting; "
+            f"the verdict expires {int(_load_verdict_ttl_s())}s after the "
+            f"failure, sooner if the model serves successfully elsewhere.")
+
+
+def _retry_backoff_next(current_s: float) -> float:
+    """Exponential pacing for hold-loop retries that are making NO progress:
+    double up to a cap (default 30s). While a load reports genuine forward
+    progress the caller keeps the base poll instead — a loading model deserves
+    tight polling; a failing one does not."""
+    cap = _env_float("HUGPY_COLD_HOLD_BACKOFF_MAX_S", 30.0)
+    return min(max(current_s, _cold_hold_poll_s()) * 2.0, cap)
+
 
 def _loading_status(request_id: str, model_key: str, worker: Optional[dict],
                     progress: Optional[float], message: Optional[str]) -> "StatusEvent":
@@ -1198,18 +1363,34 @@ def _cold_timeout_message(model_key: str, worker: Optional[dict],
     if last_err and _is_request_shape_error(last_err):
         return _request_shape_message(model_key, worker, last_err)
     wname = (worker or {}).get("name") or (worker or {}).get("id") or "worker"
-    tail = f" (last: {last_err})" if last_err else ""
     if ceiling:
-        why = (f"the hold hit its hard ceiling — it kept reporting progress but "
-               f"never became ready")
-    elif stalled_for is not None:
-        where = f" at {last_progress}" if last_progress else ""
-        why = (f"no forward progress{where} for {int(stalled_for)}s — the load "
-               f"stalled, or the model is too large for the box")
-    else:
-        why = "the model may be too large for the box or the load stalled"
-    return (f"'{model_key}' did not finish loading on '{wname}' in time"
-            f"{tail} — {why}; try again or assign it elsewhere.")
+        tail = f" (last: {last_err})" if last_err else ""
+        return (f"'{model_key}' did not finish loading on '{wname}' in time"
+                f"{tail} — the hold hit its hard ceiling — it kept reporting "
+                f"progress but never became ready; try again or assign it "
+                f"elsewhere.")
+    # SPECIFICITY DISCIPLINE (operator, 2026-07-29: "why is it unsure of what
+    # the actual problem was? … this needs to be specific"). When the worker
+    # NAMED an error, that error IS the diagnosis — repeating it inside a
+    # "stalled, or too large" menu re-labels a known fault as two guesses,
+    # both usually wrong (the trigger was a missing `accelerate` dependency
+    # reported verbatim and then hedged into a size problem). Speculate ONLY
+    # when nothing at all was observed, and say that that's the situation.
+    if last_err:
+        for_s = (f" after {int(stalled_for)}s with no forward progress"
+                 if stalled_for is not None else "")
+        # The named error IS the diagnosis (specificity discipline) — but the
+        # last observed progress still says WHERE it stopped, and losing it
+        # regressed the 2026-07-28 "no numbers at all" report. Both ride.
+        at = f" (last observed progress: {last_progress})" if last_progress else ""
+        return (f"'{model_key}' failed to become ready on '{wname}'{for_s}{at}. "
+                f"The worker's last reported error is the cause: {last_err}")
+    where = f" at {last_progress}" if last_progress else ""
+    dur = f" for {int(stalled_for)}s" if stalled_for is not None else ""
+    return (f"'{model_key}' made no forward progress{where}{dur} on '{wname}' "
+            f"and the worker reported no error — the load went silent. Check "
+            f"the worker's own logs for the cause (OOM kills and hung IO die "
+            f"without reporting); try again or assign it elsewhere.")
 
 
 # A worker answering "busy" is a worker that is DEMONSTRABLY ALIVE AND WORKING.
@@ -1496,41 +1677,66 @@ async def _worker_stream(worker: dict, payload: dict, request_id: str):
     Raising before the first event lets the caller fall back to local; a short
     connect timeout makes a dead worker fail over fast, a long read timeout
     leaves room for generation.
-    """
-    import httpx
 
+    k59: the timeouts now come from the sanctioned client (call class "relay":
+    short connect, a 600 s SILENCE budget between chunks) and the call is
+    breaker-gated. This is the single most expensive call central makes — it
+    holds a gunicorn thread for the whole generation — so a worker that has
+    stopped answering must fail over to local INSTANTLY rather than after
+    another connect timeout per attempt.
+    """
+    from abstract_hugpy_dev.flask_app.app.functions.imports.utils import (
+        worker_http)
+
+    key = worker_http.breaker_key(worker)
+    worker_http.guard(key, url=worker_http.base_url(worker))
     url = worker["url"].rstrip("/") + "/infer/stream"
-    timeout = httpx.Timeout(600.0, connect=4.0)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        async with client.stream("POST", url, json=payload) as resp:
-            if resp.status_code >= 400:
-                # Read the worker's own error envelope before discarding the
-                # response — the streaming twin of the parse _worker_run_once
-                # already does. Without it a gen-gate hold (503 model_busy) and
-                # a capacity verdict (507 refused) are the same opaque string to
-                # the caller, and the cold-hold cannot tell "hold this" from
-                # "fail this". See _WorkerHTTPError.
-                body = None
-                try:
-                    await resp.aread()
-                    body = resp.json()
-                except Exception:  # noqa: BLE001 — a bodyless 5xx is still a 5xx
+    try:
+        client_cm = worker_http.async_client("relay")
+    except worker_http.TRANSPORT_ERRORS as exc:  # pragma: no cover — construction
+        worker_http.note_failure(key, exc)
+        raise
+    try:
+        async with client_cm as client:
+            async with client.stream("POST", url, json=payload) as resp:
+                # The head arrived: whatever the status, this box is REACHABLE.
+                # A 503 gen-gate hold is not a breaker event.
+                worker_http.note_ok(key)
+                if resp.status_code >= 400:
+                    # Read the worker's own error envelope before discarding the
+                    # response — the streaming twin of the parse _worker_run_once
+                    # already does. Without it a gen-gate hold (503 model_busy) and
+                    # a capacity verdict (507 refused) are the same opaque string to
+                    # the caller, and the cold-hold cannot tell "hold this" from
+                    # "fail this". See _WorkerHTTPError.
                     body = None
-                raise _WorkerHTTPError(resp.status_code, body, url)
-            async for line in resp.aiter_lines():
-                if not line or not line.startswith("data:"):
-                    continue
-                raw = line[len("data:"):].strip()
-                if not raw:
-                    continue
-                try:
-                    d = json.loads(raw)
-                except ValueError:
-                    continue
-                ev = _event_from_worker_line(d, request_id)
-                if ev is None:      # suppressed (worker's inner dispatch banner)
-                    continue
-                yield ev
+                    try:
+                        await resp.aread()
+                        body = resp.json()
+                    except Exception:  # noqa: BLE001 — a bodyless 5xx is still a 5xx
+                        body = None
+                    raise _WorkerHTTPError(resp.status_code, body, url)
+                async for line in resp.aiter_lines():
+                    if not line or not line.startswith("data:"):
+                        continue
+                    raw = line[len("data:"):].strip()
+                    if not raw:
+                        continue
+                    try:
+                        d = json.loads(raw)
+                    except ValueError:
+                        continue
+                    ev = _event_from_worker_line(d, request_id)
+                    if ev is None:  # suppressed (worker's inner dispatch banner)
+                        continue
+                    yield ev
+    except worker_http.TRANSPORT_ERRORS as exc:
+        # Only a TRANSPORT failure counts against the box. A mid-stream read
+        # timeout does too: a relay that has gone silent past the budget is
+        # indistinguishable from a hung box, and that is exactly the state the
+        # breaker exists to stop re-entering.
+        worker_http.note_failure(key, exc)
+        raise
 
 
 async def _worker_run_once(worker: dict, payload: dict, result_type, request_id: str, model_key: str):
@@ -1547,30 +1753,33 @@ async def _worker_run_once(worker: dict, payload: dict, result_type, request_id:
     whole request on central — a phantom local fallback that looked random
     because it depended on what the model said.
     """
-    import httpx
+    from abstract_hugpy_dev.flask_app.app.functions.imports.utils import (
+        worker_http)
 
     url = worker["url"].rstrip("/") + "/infer"
-    timeout = httpx.Timeout(3600.0, connect=4.0)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.post(url, json=payload)
-        if resp.status_code >= 400:
-            # The agent ships failures AS DATA (ok:false + error + traceback
-            # tail) alongside the 4xx/5xx status; a bare raise_for_status()
-            # discarded that body and reduced the console to "Server error
-            # '500 …'" with no cause. Surface the worker's own reason — the
-            # caller (DelegatingRunner) stamps the worker name onto it.
-            # Same envelope, same class as the streaming path — so the one-shot
-            # runner's hold classifies a 503 gen-gate hold exactly as stream()
-            # does instead of matching on prose.
-            body = None
-            try:
-                body = resp.json()
-            except ValueError:
+    # Same discipline as _worker_stream: short connect, long read (call class
+    # "relay_long" — the whole generation arrives as one body), breaker-gated.
+    with worker_http.breaker_scope(worker):
+        async with worker_http.async_client("relay_long") as client:
+            resp = await client.post(url, json=payload)
+            if resp.status_code >= 400:
+                # The agent ships failures AS DATA (ok:false + error + traceback
+                # tail) alongside the 4xx/5xx status; a bare raise_for_status()
+                # discarded that body and reduced the console to "Server error
+                # '500 …'" with no cause. Surface the worker's own reason — the
+                # caller (DelegatingRunner) stamps the worker name onto it.
+                # Same envelope, same class as the streaming path — so the one-shot
+                # runner's hold classifies a 503 gen-gate hold exactly as stream()
+                # does instead of matching on prose.
                 body = None
-            if body is not None or resp.status_code >= 500:
-                raise _WorkerHTTPError(resp.status_code, body, url)
-            resp.raise_for_status()
-        data = resp.json()
+                try:
+                    body = resp.json()
+                except ValueError:
+                    body = None
+                if body is not None or resp.status_code >= 500:
+                    raise _WorkerHTTPError(resp.status_code, body, url)
+                resp.raise_for_status()
+            data = resp.json()
     if isinstance(data, dict):
         data.setdefault("request_id", request_id)
         data.setdefault("model_key", model_key)
@@ -1627,17 +1836,23 @@ def make_peer_runner(peer, framework: str, task: str):
             # httpx, byte-faithful — see _worker_run_once: abstract_apis'
             # load_inner_json re-parses string fields and corrupts JSON-shaped
             # model replies, failing validation.
-            import httpx
+            from abstract_hugpy_dev.flask_app.app.functions.imports.utils import (
+                worker_http)
             payload = {"delegated": True, "task": task, **req.model_dump()}
             # Same wire scrub as _relay_payload: a peer on a released build
             # forbids unknown keys, and alloc dumps even when None.
             payload.pop("alloc", None)
             url = peer.base_url.rstrip("/") + "/api/llm/execute"
-            timeout = httpx.Timeout(float(self.cfg.timeout_s or 3600), connect=4.0)
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                resp = await client.post(url, json=payload)
-                resp.raise_for_status()
-                data = resp.json()
+            # A peer is another central, not a worker, but the call shape is
+            # identical (long relay over the LAN) so it takes the same short
+            # connect + breaker discipline, keyed on the peer's base url.
+            with worker_http.breaker_scope(peer.base_url):
+                async with worker_http.async_client(
+                        "relay_long",
+                        read_timeout=float(self.cfg.timeout_s or 3600)) as client:
+                    resp = await client.post(url, json=payload)
+                    resp.raise_for_status()
+                    data = resp.json()
             return self.result_type.model_validate(data)
 
     return PeerRunner
@@ -1845,6 +2060,10 @@ def make_delegating_runner(framework: str, task: str):
             stall_s = _cold_hold_stall_s()
             last_move = start
             last_err = ""
+            # Retry pacing: base poll while the load PROGRESSES, exponential
+            # backoff (doubling to a cap) while it does not — a failing attempt
+            # must not be re-fired at storm rate. See _retry_backoff_next.
+            retry_wait = _cold_hold_poll_s()
             # Last progress line we actually OBSERVED, so a terminal
             # message can say where it stopped, not just that it did.
             last_progress = None
@@ -1871,6 +2090,13 @@ def make_delegating_runner(framework: str, task: str):
                         worker = None
                     if not worker:
                         break  # no worker selected → refusal / local below (fail fast)
+                    # Dispatch-queue verdict: this (worker, model) failed
+                    # PERMANENTLY within the TTL — answer from the cache, do
+                    # not launch another doomed attempt (see _LOAD_VERDICTS).
+                    _cached = _active_load_verdict(worker.get("id"), self.model_key)
+                    if _cached and not _local_fallback_allowed():
+                        raise RuntimeError(
+                            _verdict_message(self.model_key, worker, _cached))
                     if hold and not admitted:
                         admitted = True
                         permit = _admit_cold_hold(self.model_key, worker, start)
@@ -1905,12 +2131,15 @@ def make_delegating_runner(framework: str, task: str):
                         _record_serve_metrics(
                             worker, self.model_key,
                             {"timings": getattr(_res, "timings", None)})
+                        _clear_load_verdict(worker.get("id"), self.model_key)
                         return _res
                     except Exception as exc:
                         if _is_request_shape_error(exc) and not _local_fallback_allowed():
                             # Malformed for this model's chat template — fail FAST
                             # and name the real fault. Never held (running it local
                             # would fail the same way, and holding it is the hang).
+                            # Deliberately NOT recorded as a load verdict: the
+                            # fault is this request's messages, not the model.
                             raise RuntimeError(
                                 _request_shape_message(self.model_key, worker, exc)) from exc
                         if _local_fallback_allowed():
@@ -1918,6 +2147,9 @@ def make_delegating_runner(framework: str, task: str):
                                            exc, self.model_key)
                             action = "local"
                         elif (not hold) or _is_permanent_load_error(exc):
+                            if _is_permanent_load_error(exc):
+                                _record_load_verdict(worker.get("id"),
+                                                     self.model_key, str(exc))
                             raise RuntimeError(
                                 f"worker {worker.get('name') or worker.get('id')} "
                                 f"failed for {self.model_key}: {exc} (local fallback "
@@ -1933,6 +2165,10 @@ def make_delegating_runner(framework: str, task: str):
                     # action == "retry": transient hold. Honest-fail / stall / ceiling.
                     moved, _prog, _msg, honest = _cold_progress(self.model_key, worker, start)
                     if honest:
+                        # The worker's load-state names a hard failure — record
+                        # it so queued/re-submitted calls fail fast (see
+                        # _LOAD_VERDICTS) instead of re-driving the same load.
+                        _record_load_verdict(worker.get("id"), self.model_key, honest)
                         raise RuntimeError(
                             f"worker {worker.get('name') or worker.get('id')} failed to "
                             f"load {self.model_key}: {honest}")
@@ -1952,7 +2188,10 @@ def make_delegating_runner(framework: str, task: str):
                             self.model_key, worker, last_err,
                             last_progress=last_progress,
                             stalled_for=now - last_move))
-                    await asyncio.sleep(_cold_hold_poll_s())
+                    if moved:
+                        retry_wait = _cold_hold_poll_s()    # progressing: poll tight
+                    await asyncio.sleep(retry_wait)
+                    retry_wait = _retry_backoff_next(retry_wait)
                     continue
             finally:
                 # The permit is a cold-hold admission, not a request permit: it is
@@ -2055,6 +2294,8 @@ def make_delegating_runner(framework: str, task: str):
                                                ev.message, self.model_key)
                                 raise _RelayUnbuildable()
                             if _is_permanent_load_error(ev.message):
+                                _record_load_verdict(worker.get("id"),
+                                                     self.model_key, str(ev.message))
                                 raise _LoadFailed(_humanize_worker_error(wname, ev.message))
                             raise _ColdRetry(ev.message)   # transient — hold + retry
                         yield ev
@@ -2112,6 +2353,8 @@ def make_delegating_runner(framework: str, task: str):
                                        exc, self.model_key)
                         raise _RelayUnbuildable()
                     if _is_permanent_load_error(exc):
+                        _record_load_verdict(worker.get("id"),
+                                             self.model_key, str(exc))
                         raise _LoadFailed(f"worker {wname} failed for {self.model_key}: {exc}")
                     raise _ColdRetry(str(exc))            # transient — hold + retry
 
@@ -2122,6 +2365,9 @@ def make_delegating_runner(framework: str, task: str):
             stall_s = _cold_hold_stall_s()
             last_move = start
             last_err = ""
+            # Retry pacing — the streaming twin of run()'s: base poll while the
+            # load progresses, exponential backoff while it does not.
+            retry_wait = _cold_hold_poll_s()
             # Last progress line we actually OBSERVED, so a terminal
             # message can say where it stopped, not just that it did.
             last_progress = None
@@ -2152,6 +2398,15 @@ def make_delegating_runner(framework: str, task: str):
                         worker = None
                     if not worker:
                         break  # no worker selected → refusal / local below (fail fast)
+                    # Dispatch-queue verdict — the streaming twin of run()'s
+                    # check: a permanent failure recorded within the TTL answers
+                    # from the cache; no new attempt reaches the worker.
+                    _cached = _active_load_verdict(worker.get("id"), self.model_key)
+                    if _cached and not _local_fallback_allowed():
+                        yield ErrorEvent(request_id=req.request_id,
+                                         message=_verdict_message(
+                                             self.model_key, worker, _cached))
+                        return
                     if hold and not admitted:
                         admitted = True
                         try:
@@ -2232,6 +2487,7 @@ def make_delegating_runner(framework: str, task: str):
                                     permit.release()
                                     permit = None
                                 warm = True
+                                _clear_load_verdict(wid, self.model_key)
                             yield ev
                         return  # attempt completed (tokens/done or interrupted) — terminal
                     except _RelayUnbuildable:
@@ -2262,6 +2518,9 @@ def make_delegating_runner(framework: str, task: str):
                     # stall/ceiling clocks, then retry.
                     moved, prog, msg, honest = _cold_progress(self.model_key, worker, start)
                     if honest:
+                        # Hard load failure from the worker's load-state — record
+                        # so queued/re-submitted calls answer from the cache.
+                        _record_load_verdict(wid, self.model_key, honest)
                         yield ErrorEvent(request_id=req.request_id,
                                          message=_humanize_worker_error(
                                              worker.get("name") or wid, honest))
@@ -2281,7 +2540,10 @@ def make_delegating_runner(framework: str, task: str):
                                              ceiling=now > deadline))
                         return
                     yield _loading_status(req.request_id, self.model_key, worker, prog, msg)
-                    await asyncio.sleep(_cold_hold_poll_s())
+                    if moved:
+                        retry_wait = _cold_hold_poll_s()    # progressing: poll tight
+                    await asyncio.sleep(retry_wait)
+                    retry_wait = _retry_backoff_next(retry_wait)
                     continue
             finally:
                 # Cold-hold permit returned the moment this call stops holding —

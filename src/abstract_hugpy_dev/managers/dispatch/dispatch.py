@@ -271,10 +271,14 @@ def _next_lru_evictable(exclude: str, run_id: str = "") -> Optional[str]:
 
     Candidates are the model_keys currently holding a runner in ``_INSTANCES``,
     minus the model being loaded, minus everything the registered ``_EVICTABLE``
-    predicate rejects (static, pinned, gate-busy, slot-backed). Ordered by
-    ``_LAST_USED`` ascending — the coldest yields first. A never-touched resident
-    (warmed by the filler, never requested) sorts oldest and yields first, which
-    is exactly right."""
+    predicate rejects. Those rejections are ONLY: 🔒static (the one residency
+    lock), actively-answering (an in-flight generation), and slot-backed (weights
+    in another process, so dropping the proxy frees nothing). 📌 pin is NOT among
+    them — pin is routing DESIGNATION only (survives restarts) and has no bearing
+    on residency or eviction (operator ruling 2026-07-15/07-17); a pinned model
+    yields to contention like any other. Ordered by ``_LAST_USED`` ascending —
+    the coldest yields first. A never-touched resident (warmed by the filler,
+    never requested) sorts oldest and yields first, which is exactly right."""
     if _EVICTABLE is None:
         return None
     residents = {mk for (mk, _task) in loaded_model_keys()}
@@ -313,8 +317,10 @@ def ensure_headroom_for_load(model_key: str, trigger: str = "load") -> List[str]
     return and the load proceeds (or fails) EXACTLY as it does today: contention
     only ADDS room, it never changes the too-big error envelope.
 
-    No-op on bare central / when no fit-guard is registered. Returns the list of
-    yielded model_keys (for logging + tests).
+    No-op on bare central / when no fit-guard is registered, and on a POLITE
+    load (k56, spill ``no_evict``): a model that may spend only genuinely free
+    headroom yields nothing and evicts nobody. Returns the list of yielded
+    model_keys (for logging + tests).
 
     CROSS-TIER (slice 10): after the in-process LRU yield, a registered make-room
     hook (set_make_room) runs a SECOND pass that also evicts SLOT-CHILD squatters
@@ -344,7 +350,22 @@ def _headroom_pass(model_key: str, trigger: str, run_id: str) -> List[str]:
     # a plain contention pass has no group and renders exactly as before.
     _emit("headroom.start", run_id=run_id, incoming_model=model_key,
           trigger=trigger, group=_current_group())
-    if _FIT_CHECK is not None:
+    # k56 POLITE LOAD: this pass exists to TAKE room from residents, so a load
+    # flagged no_evict skips the in-process yield entirely. The cross-tier hook
+    # below still runs — it is the honest-refusal path, and it reads the same
+    # flag to decide between "admit into free room" and "refuse without
+    # touching anyone". Unflagged loads are untouched.
+    try:
+        from ..spill import no_evict_env
+        _polite = no_evict_env()
+    except Exception:  # noqa: BLE001 — an unreadable flag is not a policy
+        _polite = False
+    if _polite:
+        logger.info("polite load (no_evict): skipping the in-process contention "
+                    "yield for %s — it may only take genuinely free room", model_key)
+        _emit("candidate.skip", run_id=run_id, incoming_model=model_key,
+              tier="in-process", reason="polite load (no_evict) — never evicts")
+    if _FIT_CHECK is not None and not _polite:
         with _CONTENTION_LOCK:
             while not _FIT_CHECK(model_key):
                 _emit("fit.fail", run_id=run_id, incoming_model=model_key)
