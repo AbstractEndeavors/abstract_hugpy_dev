@@ -228,6 +228,47 @@ sys.stdout.write(json.dumps(out))
 _LLAMA_PROBE_CACHE: dict | None = None
 _LLAMA_PROBE_TIMEOUT = 60.0
 
+# Native llama-server ENGINE build id, cached for the process's life (the binary
+# doesn't change under a running agent; a `hugpy install-engine` swap re-execs).
+# ``False`` = probed and unresolvable (no native binary / --version failed) — a
+# real answer, so it caches too and the heartbeat carries an explicit null. Item
+# L (k65): the spawn now probes engine capability but the build id (a bare commit
+# like ``1 (039e20a)``) was tracked NOWHERE — surface it beside pkg_version so
+# engine skew across the fleet is visible in /llm/workers.
+_ENGINE_BUILD_CACHE: "str | bool | None" = None
+
+
+def _engine_build() -> "str | None":
+    """The native llama-server build id — ``<build> (<commit>)`` from
+    ``llama-server --version`` (e.g. ``1 (039e20a)``), or ``None`` when no native
+    engine is resolvable / the probe fails. Cached (see ``_ENGINE_BUILD_CACHE``).
+
+    llama.cpp prints ``version: <N> (<hash>)`` on stderr (older builds on stdout),
+    so both streams are scanned. Fully defensive: any failure -> ``None`` cached,
+    never an exception into the heartbeat."""
+    global _ENGINE_BUILD_CACHE
+    if _ENGINE_BUILD_CACHE is not None:
+        return _ENGINE_BUILD_CACHE or None
+    build: "str | None" = None
+    try:
+        from ..engine.resolve import server_bin
+        binpath = server_bin()
+        if binpath:
+            proc = subprocess.run([binpath, "--version"],
+                                  capture_output=True, text=True, timeout=10)
+            blob = (proc.stderr or "") + "\n" + (proc.stdout or "")
+            for line in blob.splitlines():
+                line = line.strip()
+                # `version: 1 (039e20a)` -> `1 (039e20a)`
+                if line.lower().startswith("version:"):
+                    build = line.split(":", 1)[1].strip() or None
+                    if build:
+                        break
+    except Exception:  # noqa: BLE001 — telemetry probe never breaks a beat
+        build = None
+    _ENGINE_BUILD_CACHE = build if build else False
+    return build
+
 
 def llama_cpp_cuda_status() -> dict:
     """Whether *llama.cpp* (GGUF backend) was built with GPU offload support, and
@@ -1057,6 +1098,20 @@ def _adopt_storage_inputs(state: "WorkerState", worker: dict | None) -> None:
     am = worker.get("model_alloc_modes")
     if isinstance(am, dict):
         _RUNTIME_SETTINGS["alloc_mode"] = {k: str(v) for k, v in am.items() if v}
+    # k67 lever-projection — the operator's PERSISTED per-model spill (raw
+    # spill_by_model, already on the heartbeat via _public_view). Request loads
+    # apply the spill from the request payload (_apply_spill), but a WORKER-
+    # INITIATED seat (boot star, slot-fill, static reconcile) never did — so an
+    # explicit lever like {n_cpu_moe: 20} was silently recomputed by the card-
+    # filling planner (the lever-exhaustion matrix, 2026-07-31). Adopt it here so
+    # _apply_persisted_spill_for can re-supply it before a background spawn. Raw
+    # (not the emitted/derived spill): the operator's OWN numbers are what a
+    # background load must honor; blank/MoE derivation stays the worker's auto
+    # job. Absent map leaves the prior value untouched (additive wire idiom).
+    sbm = worker.get("spill_by_model")
+    if isinstance(sbm, dict):
+        _RUNTIME_SETTINGS["spill_by_model"] = {
+            k: dict(v) for k, v in sbm.items() if isinstance(v, dict) and v}
     storage = worker.get("storage")
     if isinstance(storage, dict) and storage.get("allocated_count") is not None:
         state.allocated = {
@@ -2315,6 +2370,32 @@ def _apply_spill(spill: dict | None) -> None:
         if isinstance(val, (list, tuple)):
             val = ",".join(str(x) for x in val)
         os.environ[env_name] = str(val)
+
+
+def _apply_persisted_spill_for(model_key: str | None) -> None:
+    """Apply the operator's PERSISTED per-model spill before a WORKER-INITIATED
+    seat (boot star / slot-fill / static reconcile), so an explicit lever the
+    request path would have applied (_apply_spill) is not silently recomputed by
+    the card-filling planner on a background load — the k67 lever-projection gap.
+
+    Reads the raw spill central projected onto _RUNTIME_SETTINGS['spill_by_model']
+    (adopted from the heartbeat) and routes it through the SAME _apply_spill the
+    request handlers use, so it clears any prior model's mode-contract envs first
+    (n_cpu_moe/alloc_mode/... are cleared-when-absent) and cannot leak across
+    seats. A model with nothing persisted still calls _apply_spill({}) — that is
+    the correct RESET, not a no-op, so the previous seat's levers don't linger.
+    Fully guarded: a projection miss must never break a background load."""
+    try:
+        by_model = _RUNTIME_SETTINGS.get("spill_by_model") or {}
+        spill = by_model.get(model_key) if model_key else None
+        _apply_spill(dict(spill) if isinstance(spill, dict) else None)
+        if spill:
+            logger.info("background seat for %s: applied persisted spill %s "
+                        "(operator lever honored before spawn, k67)",
+                        model_key, spill)
+    except Exception:  # noqa: BLE001 — a background load must never crash on this
+        logger.debug("persisted-spill apply skipped for %s", model_key,
+                     exc_info=True)
 
 
 def _sse(payload: dict) -> bytes:
@@ -4902,6 +4983,11 @@ def _kick_provision(state: "WorkerState", model_key: str,
                         if mk not in _slot_occupants():
                             logger.info("preloading (warming) %s…%s", mk,
                                         " [static — forced]" if (_res == "static" and not _preload) else "")
+                            # k67 lever-projection: post-provision preload is a
+                            # worker-initiated seat — apply the persisted lever
+                            # before the in-process load (same re-supply as the
+                            # slot filler and the boot star).
+                            _apply_persisted_spill_for(mk)
                             runner = runner_for(model_key=mk)   # builds + caches the runner
                             # runner_for only BUILDS the runner; lazy in-process
                             # runners (transformers/DeepCoder) defer the weight load
@@ -5486,6 +5572,15 @@ def _log_blocked_skip_once(model_key: str, where: str) -> None:
 _BOOT_PREWARM_DONE: set = set()
 _BOOT_PREWARM_LOCK = threading.Lock()
 
+# The CURRENTLY-designated boot star for this worker (or None), refreshed on
+# every register/heartbeat reply — distinct from _BOOT_PREWARM_DONE (a fired-
+# once latch that also retains un-starred models). k67 item K reads this so the
+# headroom sweep and the star agree on ONE verdict for a fitting resident: a
+# star whose stable footprint fits under the pressure ceiling is kept warm by
+# NOT sweeping it (convergence WITHOUT any re-warm, so the 2026-07-23 boot-once
+# revert stands — a swept-then-rewarmed loop never forms).
+_BOOT_STAR_CURRENT: "str | None" = None
+
 
 def _star_is_loaded(model_key: str) -> bool:
     """True iff the star model is CURRENTLY resident on this worker — in-process
@@ -5591,6 +5686,10 @@ def _load_star_if_absent(state: "WorkerState", model_key: str) -> None:
                     from abstract_hugpy_dev.managers.dispatch.dispatch import runner_for
                     logger.info("boot star: loading %s (on-demand, evictable)…",
                                 canonical)
+                    # k67 lever-projection: worker-initiated seat — apply the
+                    # operator's persisted spill before the in-process load, the
+                    # same re-supply the slot filler does above.
+                    _apply_persisted_spill_for(canonical)
                     runner = runner_for(model_key=canonical)
                     _materialize(runner)
                     logger.info("boot star: loaded %s (resident, FIFO-evictable) — "
@@ -5636,6 +5735,12 @@ def _adopt_boot_prewarm(state: "WorkerState", worker: "dict | None") -> None:
     beat arrives, that beat sees the latch and no-ops — the same set entry serves
     as both the in-flight guard and the completed-forever guard."""
     star = (worker or {}).get("boot_prewarm")
+    # Refresh the current-star pointer EVERY beat (central re-sends it whenever
+    # set; absence means unset), so the sweep's fitting-star protection tracks
+    # the live designation rather than the fired-once latch. Done before the
+    # boot-once guards below, which are unchanged.
+    global _BOOT_STAR_CURRENT
+    _BOOT_STAR_CURRENT = star if (star and isinstance(star, str)) else None
     if not star or not isinstance(star, str):
         return
     # PROCESS-LIFETIME done-latch: fire the boot star at most once, ever. Claim
@@ -7718,13 +7823,52 @@ def _actively_replying(model_key: str, slot_busy: "set | None" = None) -> bool:
     return False
 
 
+# A slot's ``busy`` flag is ``inflight > 0``, and that counter can LEAK: a
+# client disconnect or a GC'd streaming generator whose ``finally`` never runs
+# leaves inflight stuck > 0. A leaked flag then pins the resident as "actively
+# replying" FOREVER, and the admission/sweep filters push it into ``protected``
+# — the k67 item B incident, where the headroom sweep warned "nothing evictable
+# — every resident is static or actively replying" while MN-GRAND-23.5B +
+# Qwen3.5-9B sat ~20 GiB idle, so admission thrashed (4 loads / two 500s)
+# instead of evicting to fit. Only 🔒static + a GENUINELY in-flight reply may
+# block eviction (eviction-protection-two-classes-only); a leaked counter is
+# neither. Corroborate the flag with recency below.
+_SLOT_BUSY_STALE_S = float(
+    os.environ.get("HUGPY_SLOT_BUSY_STALE_S", "900") or 900)
+
+
 def _busy_slot_models() -> set:
     """Model_keys whose slot is BUSY right now (a live request in the child) —
-    the slot-side 'actively replying' signal. Empty on any read failure."""
+    the slot-side 'actively replying' signal. Empty on any read failure.
+
+    A slot claiming busy but whose ``last_used`` aged past ``_SLOT_BUSY_STALE_S``
+    has a LEAKED inflight counter, not a live reply, so it is NOT reported busy
+    (k67 item B — a leaked flag must never protect an idle resident from
+    evict-to-fit). ``last_used`` is stamped at request start; a genuine
+    generation completes well within the (generous, env-overridable) window,
+    while a leaked counter ages without bound. A slot with no ``last_used`` yet
+    reported (0/None) is trusted as-is — inflight cannot be > 0 without a start."""
     try:
         from ..managers.serve.slots import SlotPool
-        return {s.get("model_key") for s in SlotPool().statuses()
-                if s.get("model_key") and s.get("busy")}
+        now = time.time()
+        busy: set = set()
+        for s in SlotPool().statuses():
+            mk = s.get("model_key")
+            if not mk or not s.get("busy"):
+                continue
+            last = s.get("last_used") or 0
+            try:
+                aged = last and (now - float(last)) > _SLOT_BUSY_STALE_S
+            except (TypeError, ValueError):
+                aged = False
+            if aged:
+                logger.warning(
+                    "slot busy flag for %s is STALE (%.0fs since last_used > %.0fs "
+                    "ceiling) — treating inflight as LEAKED, resident is evictable "
+                    "(k67 item B)", mk, now - float(last), _SLOT_BUSY_STALE_S)
+                continue
+            busy.add(mk)
+        return busy
     except Exception:  # noqa: BLE001
         return set()
 
@@ -9720,6 +9864,11 @@ def _fill_empty_slots(state: "WorkerState") -> None:
             try:
                 logger.info("slot fill: seating %s (%s) in an empty slot",
                             mk, _residency(mk))
+                # k67 lever-projection: this is a WORKER-INITIATED seat, so the
+                # request-path _apply_spill never ran — re-supply the operator's
+                # persisted lever before the seat materializes (clears the prior
+                # candidate's mode envs first, so it cannot leak across seats).
+                _apply_persisted_spill_for(mk)
                 from abstract_hugpy_dev.managers.dispatch.dispatch import runner_for
                 runner = runner_for(model_key=mk)   # builds the LAZY wrapper only
                 # The seat happens on first .runner access (get_llama_runner ->
@@ -9780,6 +9929,36 @@ def _vram_headroom_sweep(state: "WorkerState") -> None:
                 pass
 
 
+def _starred_and_fits_ceiling(model_key: str, resident: dict, total: "int|None") -> bool:
+    """k67 item K — is ``model_key`` the CURRENT boot star AND does its stable
+    footprint fit under the pressure ceiling (``total * ceiling_frac``)?
+
+    When True the headroom SWEEP leaves it warm instead of evicting it: keeping
+    a fitting star resident is the star's whole purpose, and doing it by NOT
+    sweeping (rather than by re-warming after a sweep) is what makes sweep and
+    star converge on one verdict — no evict→re-warm oscillation, and the
+    boot-once revert is untouched (nothing reloads here). A star whose footprint
+    ALONE exceeds the ceiling does NOT fit, so it stays a plain evictable
+    resident (it simply cannot be kept warm without breaching the ceiling).
+
+    Sweep-only: admission evict-to-fit (a real incoming load) may STILL take the
+    star's room — that is demand-driven, one-shot, and boot-once means it will
+    not thrash back. Degrades to False (no protection) on any missing datum."""
+    try:
+        if not _BOOT_STAR_CURRENT or model_key != _BOOT_STAR_CURRENT:
+            return False
+        t = int(total or 0)
+        if t <= 0:
+            return False
+        size = int(resident.get("vram_bytes") or 0)
+        if size <= 0:
+            return False                      # unmeasured footprint -> don't shield
+        ceiling = int(t * _vram_ceiling_frac())
+        return size <= ceiling
+    except Exception:  # noqa: BLE001 — a shield miss just leaves it evictable
+        return False
+
+
 def _vram_headroom_sweep_body(state: "WorkerState", total: int, fv: int) -> None:
     """The sweep's decision + eviction. Split out only so the telemetry run
     scope above can wrap it; the logic is unchanged."""
@@ -9824,6 +10003,14 @@ def _vram_headroom_sweep_body(state: "WorkerState", total: int, fv: int) -> None
         if _actively_replying(mk, busy_slots):
             _evt_emit("candidate.skip", model_key=mk, tier=_tier,
                       reason="actively replying (in-flight/busy)")
+            continue
+        if _starred_and_fits_ceiling(mk, r, total):
+            # k67 item K: the boot star fits under the ceiling — keep it warm by
+            # NOT sweeping it. This is the ONLY star/sweep interaction, and it is
+            # convergent: no re-warm, so no oscillation, and the boot-once revert
+            # stands. A real incoming load can still evict it (admission path).
+            _evt_emit("candidate.skip", model_key=mk, tier=_tier,
+                      reason="boot star, fits under ceiling (kept warm, k67)")
             continue
         # No `queued_ahead` here — there is no subject load this pass; a resident
         # with in-flight work is already protected by _actively_replying above.
@@ -10341,6 +10528,11 @@ def _heartbeat_loop(client: CentralClient, state: WorkerState, args) -> None:
                     # never live disk metadata — so a not-yet-effective self-update
                     # shows as skew, not cosmetic convergence (2026-07-20 ae).
                     "pkg_version": _running_pkg_version(args.pkg_name),
+                    # ENGINE build id beside the pkg version (item L, k65): the
+                    # native llama-server commit (`1 (039e20a)`) so engine skew is
+                    # visible in /llm/workers alongside version skew. None when the
+                    # box has no native engine (serves in-process). Additive field.
+                    "engine_build": _engine_build(),
                     "role": state.role,
                     "rpc_endpoint": state.rpc_endpoint,
                     "free_ram": _free_ram_bytes(),
@@ -10465,6 +10657,8 @@ def _register(client: CentralClient, state: WorkerState, args) -> None:
         "worker_id": state.worker_id,
         # HONEST version: running image, not live disk metadata (see heartbeat).
         "pkg_version": _running_pkg_version(args.pkg_name),
+        # ENGINE build id from first contact (item L, k65) — see heartbeat.
+        "engine_build": _engine_build(),
         "engine": llama_cpp_cuda_status(),
         "pool": os.environ.get("WORKER_POOL", ""),
         "caps": _local_caps(),

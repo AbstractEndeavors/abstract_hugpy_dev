@@ -373,13 +373,55 @@ class PidRegistry:
         explained: set = set()
         foreign_rows: List[dict] = []
         with self._lock:
+            # MEASURED-TRUTH in-process sizing (E/M ruling 2026-07-31): the SIZE
+            # of an in-process model comes from nvidia-smi's per-PID mib, NOT the
+            # torch weight ESTIMATE (which omitted the CUDA context / KV / allocator
+            # hold — pid 94035 measured 4074 MiB but was attributed 1800, hiding
+            # ~2.3 GiB). Several in-process models can share the ONE worker-python
+            # PID, and nvidia-smi cannot split that lump per model, so we split the
+            # measured lump proportionally to each model's torch estimate (even
+            # split when no estimate), giving the LAST peer the remainder so the
+            # per-PID rows sum BYTE-FOR-BYTE to that PID's mib. The estimate is
+            # preserved as ``last_vram_bytes_planned`` — the PLANNED figure the
+            # panel shows BESIDE the measurement, never in place of it.
+            _inproc_by_pid: Dict[int, List[dict]] = {}
+            for _rec in self._records.values():
+                if _rec.get("host_mode") == "in_process" and _rec.get("pid") is not None:
+                    _inproc_by_pid.setdefault(_rec["pid"], []).append(_rec)
+            _inproc_attr: Dict[str, dict] = {}   # mk -> {"vb", "planned"}
+            for _p, _peers in _inproc_by_pid.items():
+                _est = {r["model_key"]: int(
+                    (inprocess_bytes.get(r["model_key"]) or {}).get("vram_bytes") or 0)
+                    for r in _peers}
+                if _p in gpu_procs:
+                    _lump = int(gpu_procs[_p].get("mib") or 0) * _MIB
+                    _tot = sum(_est.values())
+                    _keys = [r["model_key"] for r in _peers]
+                    _assigned = 0
+                    for _i, _mk in enumerate(_keys):
+                        if _i == len(_keys) - 1:
+                            _share = _lump - _assigned        # remainder → exact sum
+                        elif _tot > 0:
+                            _share = _lump * _est[_mk] // _tot
+                        else:
+                            _share = _lump // len(_keys)
+                        _assigned += _share
+                        _inproc_attr[_mk] = {"vb": _share, "planned": _est[_mk]}
+                else:
+                    # PID isn't a GPU compute app (no CUDA context this beat) — no
+                    # measurement to split; the estimate is the only signal, and
+                    # these bytes are NOT in nvidia-smi's total so no double count.
+                    for _mk, _e in _est.items():
+                        _inproc_attr[_mk] = {"vb": _e, "planned": _e}
+
             for rec in self._records.values():
                 mk = rec["model_key"]
                 mode = rec.get("host_mode")
                 pid = rec.get("pid")
                 if mode == "in_process":
-                    ip = inprocess_bytes.get(mk) or {}
-                    vb = int(ip.get("vram_bytes") or 0)
+                    a = _inproc_attr.get(mk) or {}
+                    vb = int(a.get("vb") or 0)
+                    rec["last_vram_bytes_planned"] = a.get("planned")
                     if pid is not None and pid in gpu_procs:
                         explained.add(pid)      # the shared worker-python lump
                 elif mode == "comfy":
@@ -476,13 +518,22 @@ class PidRegistry:
             for mk in list(self._records.keys()):
                 rec = self._records[mk]
                 alive = self._verify_locked(mk) is not None
-                models.append({
+                row = {
                     "model_key": mk,
                     "pid": rec.get("pid"),
                     "host_mode": rec.get("host_mode"),
                     "vram_bytes": rec.get("last_vram_bytes"),
                     "alive": alive,
-                })
+                }
+                # PLANNED-beside-MEASURED (E/M): an in-process row's torch weight
+                # estimate rides alongside its measured bytes so the panel can show
+                # the disagreement (measured = weights + CUDA context/KV) rather
+                # than blend it. Omit-when-unset — subprocess/comfy rows never carry
+                # a planned estimate, and an old consumer just ignores the key.
+                planned = rec.get("last_vram_bytes_planned")
+                if planned is not None:
+                    row["vram_bytes_planned"] = planned
+                models.append(row)
             # Recognized-foreign rows (already alive-by-construction: they were in
             # this beat's nvidia-smi output). Append as extra model rows so they read
             # as attributed, not anonymous.

@@ -41,6 +41,19 @@ def _slugify(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", str(value).strip()).strip("_").lower()
 
 
+def _bare_tail(value: str) -> str:
+    """The model name without its ``publisher~`` collision qualifier.
+
+    Central keys a name-collision family as ``Owner~Repo``; the bare ``Repo`` is
+    the SAME model. Routing already treats the two as one (``_match_keys`` adds
+    the "~"-tail), but the canonical registry resolver did not, so a bare key
+    slug-compared against an ``Owner~Repo`` key never matched and central kept
+    offering the bare twin as if it were a distinct (routable) model. k67.
+    """
+    s = str(value)
+    return s.split("~", 1)[1] if "~" in s else s
+
+
 def assure_model_key(model_key):
     """
     Resolve a user-provided model key, repo id, manifest slug, folder name,
@@ -55,6 +68,13 @@ def assure_model_key(model_key):
         return model_key
 
     slug = _slugify(model_key)
+    bare_slug = _slugify(_bare_tail(model_key))
+
+    # A last-resort bare-tail match, tried only after every stronger signal
+    # below fails, so an exact / org-qualified / hub_id / folder hit always
+    # wins first. Recorded here and applied after the loop so a precise match
+    # later in the registry is never pre-empted by a looser bare-tail one.
+    bare_fallback = None
 
     for key, values in MODEL_REGISTRY.items():
         if _slugify(key) == slug:
@@ -68,4 +88,11 @@ def assure_model_key(model_key):
         if folder and _path_suffix_matches(folder, model_key):
             return key
 
-    return None
+        # Bare key ↔ Owner~Repo: the input's bare tail slug-equals this key's
+        # bare tail (so "Qwen3-Coder-Next-GGUF" resolves to the canonical
+        # "Qwen~Qwen3-Coder-Next-GGUF" row). Held, not returned, so it only
+        # applies when nothing stronger matched anywhere in the registry.
+        if bare_fallback is None and _slugify(_bare_tail(key)) == bare_slug:
+            bare_fallback = key
+
+    return bare_fallback

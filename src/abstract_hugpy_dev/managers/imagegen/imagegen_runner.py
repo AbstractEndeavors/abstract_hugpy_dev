@@ -163,6 +163,253 @@ def _place_diffusers_pipeline(pipe, cuda: bool, model_key: str) -> str:
     return "cuda"
 
 
+# ---------------------------------------------------------------------------
+# Honest footprint pricing + quant election + deterministic VRAM unwind (k66).
+#
+# The RULING (operator 2026-07-31) for EVERY load call: "route -> is moe? is
+# 4bit? BE that size -> queue evict -> allocate, serve." For a diffusers
+# pipeline the honest size is the artifact's REAL bytes on disk, priced BEFORE
+# the load — never an fp16 election that balloons past the card. The t2i path
+# (ImageGenRunner) used to skip this entirely: it loaded fp16 and .to(cuda)
+# with no ladder, so FLUX.2-klein (transformer ~18 GiB + Qwen3 text_encoder
+# ~16 GiB of bf16 weights, despite the "bucket" in its name) ballooned to
+# 22.37 GiB and OOM'd on a ~22.4-GiB-free card. Both image runners now share
+# ONE priced loader: no path is exempt (load-call-pipeline ruling).
+# ---------------------------------------------------------------------------
+
+# bnb nf4 stores quantized params at ~0.5 byte/param plus a small scale/absmax
+# overhead — empirically ~3.6x smaller than a bf16/fp16 param (2 bytes). Only
+# the transformer + text_encoder are quantized (the VAE stays fp16), but those
+# are ~99% of the weight bytes, so pricing the whole load against /_QUANT_SHRINK
+# is honest-to-slightly-conservative.
+_QUANT_SHRINK = 3.6
+
+
+def _quantize_mode() -> str:
+    """auto (default) | always | never. HUGPY_IMAGEGEN_QUANTIZE governs both
+    image runners; the older HUGPY_IMG2IMG_QUANTIZE name is still honored so no
+    existing operator override silently changes meaning."""
+    return (os.environ.get("HUGPY_IMAGEGEN_QUANTIZE")
+            or os.environ.get("HUGPY_IMG2IMG_QUANTIZE")
+            or "auto").lower()
+
+
+def _weight_bytes(model_dir: str) -> int:
+    """The on-disk weight bytes (.safetensors/.bin) under ``model_dir`` — the
+    honest footprint the pipeline occupies at its stored precision. This is the
+    number stage 2 prices against, NOT a momentary free-VRAM guess."""
+    total = 0
+    for root, _dirs, files in os.walk(model_dir):
+        for fn in files:
+            if fn.endswith((".safetensors", ".bin")):
+                try:
+                    total += os.path.getsize(os.path.join(root, fn))
+                except OSError:
+                    pass
+    return total
+
+
+def _free_vram_bytes() -> "int | None":
+    """Budgetable free VRAM via the shared spill seam (operator reserve already
+    subtracted), falling back to the raw torch probe. None when unmeasurable."""
+    try:
+        from ..spill import free_vram_bytes
+        fv = free_vram_bytes()
+        if fv is not None:
+            return fv
+    except Exception:  # noqa: BLE001 — no seam: try the raw probe
+        pass
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return int(torch.cuda.mem_get_info()[0])
+    except Exception:  # noqa: BLE001 — no cuda / can't tell
+        pass
+    return None
+
+
+def _should_quantize(weight_bytes: int, free_vram: "int | None", mode: str) -> bool:
+    """Pure pricing decision (stage 2): quantize to 4-bit when the honest fp16
+    footprint would not fit the budgetable free VRAM (85% headroom for activations
+    + the transient load arena). ``always``/``never`` are operator overrides. When
+    free VRAM is unmeasurable in ``auto`` we do NOT quantize (fits assumed) — the
+    load-and-place path stays the historical one rather than guessing blind."""
+    if mode == "never":
+        return False
+    if mode == "always":
+        return True
+    if free_vram is None:
+        return False
+    return weight_bytes > free_vram * 0.85
+
+
+def _log_plan(plan: Dict[str, Any]) -> None:
+    fv = plan.get("free_vram")
+    logger.warning(
+        "imagegen PLAN: model=%s weights=%.1fGiB free_vram=%s "
+        "planned_footprint=%.1fGiB decision=%s",
+        plan["model"], plan["weight_bytes"] / 2 ** 30,
+        ("%.1fGiB" % (fv / 2 ** 30)) if fv else "unknown",
+        plan["planned_bytes"] / 2 ** 30, plan["decision"],
+    )
+
+
+def _elect_quantization(model_dir: str, model_key: str, cuda: bool):
+    """Stage 2 of the load pipeline: price the planned footprint from real disk
+    bytes, decide fp16-vs-4bit, log the PLAN line, and build the quant config.
+    Returns ``(quant_config_or_None, plan)``. Never raises — a missing
+    bitsandbytes/diffusers quant stack degrades to a priced fp16 plan (and the
+    load may then legitimately need CPU-offload or refuse; that is admission's
+    call, not a silent OOM)."""
+    weight_bytes = _weight_bytes(model_dir)
+    plan: Dict[str, Any] = {
+        "model": model_key, "weight_bytes": weight_bytes,
+        "free_vram": None, "decision": "fp16", "planned_bytes": weight_bytes,
+    }
+    if not cuda:
+        plan["decision"] = "cpu (fp32)"
+        _log_plan(plan)
+        return None, plan
+
+    mode = _quantize_mode()
+    free_vram = _free_vram_bytes()
+    plan["free_vram"] = free_vram
+
+    if not _should_quantize(weight_bytes, free_vram, mode):
+        plan["decision"] = "fp16-whole"
+        _log_plan(plan)
+        return None, plan
+
+    try:
+        import bitsandbytes  # noqa: F401 — availability probe
+        import torch
+        from diffusers import PipelineQuantizationConfig
+        quant_config = PipelineQuantizationConfig(
+            quant_backend="bitsandbytes_4bit",
+            quant_kwargs={
+                "load_in_4bit": True,
+                "bnb_4bit_quant_type": "nf4",
+                "bnb_4bit_compute_dtype": torch.bfloat16,
+            },
+            components_to_quantize=["transformer", "text_encoder"],
+        )
+        plan["decision"] = "quantize-4bit+cpu-offload"
+        plan["planned_bytes"] = int(weight_bytes / _QUANT_SHRINK)
+        _log_plan(plan)
+        return quant_config, plan
+    except Exception as exc:  # noqa: BLE001 — no bnb/quant API: priced fp16 plan
+        plan["decision"] = (
+            "fp16 (4-bit wanted but quant stack unavailable: "
+            f"{type(exc).__name__})")
+        _log_plan(plan)
+        return None, plan
+
+
+def _release_cuda() -> None:
+    """Return freed-but-cached CUDA blocks to the OS and collect host garbage.
+    torch's caching allocator keeps freed blocks RESERVED (nvidia-smi attributes
+    them to the process) until empty_cache() — so a caught OOM would otherwise
+    leave the whole card reserved as a zombie (item I /
+    worker-vram-leak-unattributed). This is the deterministic unwind."""
+    import gc
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:  # noqa: BLE001 — no torch/cuda: nothing to release
+        pass
+
+
+def _trim_host_ram() -> None:
+    """Post-load: hand torch's CUDA cache and glibc's host arena back to the OS so
+    RSS/VRAM don't stay pinned at the load high-water mark (mirrors the img2img
+    idiom that used to live inline)."""
+    _release_cuda()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:  # noqa: BLE001 — non-glibc/musl: no malloc_trim
+        pass
+
+
+def _load_diffusers_pipeline(auto_cls, model_dir: str, model_key: str,
+                             *, place_fn=None):
+    """The ONE priced diffusers loader, shared by both image runners (stages 2 &
+    4 of the ruling). Prices + elects quant, loads (with a DiffusionPipeline
+    fallback for natively-conditioned edit/flux2 classes ``AutoPipeline`` can't
+    map), then places — CPU-offload when quantized/oversized, else the seam-aware
+    ``place_fn`` (t2i) or a plain ``.to`` (img2img default). Returns
+    ``(pipe, placement_label)``.
+
+    CRITICAL (item I): on ANY failure it removes offload hooks, drops the partial
+    pipeline reference, and releases the CUDA cache BEFORE re-raising — so a
+    load-time OOM returns the process to baseline VRAM instead of zombifying the
+    card until an /ops/restart."""
+    import torch
+    cuda = torch.cuda.is_available()
+    dtype = torch.float16 if cuda else torch.float32
+    quant_config, _plan = _elect_quantization(model_dir, model_key, cuda)
+    load_kwargs: Dict[str, Any] = {"torch_dtype": dtype}
+    if quant_config is not None:
+        load_kwargs["quantization_config"] = quant_config
+
+    pipe = None
+    try:
+        # AutoPipeline maps the classic families (SD/SDXL/flux1); natively
+        # image-conditioned or newer pipeline classes (Flux2KleinPipeline,
+        # QwenImageEditPlusPipeline, …) are absent from its mapping and it raises
+        # "can't find a pipeline linked to <cls>" — fall back to DiffusionPipeline,
+        # which instantiates the concrete class straight from model_index.json.
+        fallback = False
+        try:
+            pipe = auto_cls.from_pretrained(model_dir, **load_kwargs)
+        except ValueError as exc:
+            from diffusers import DiffusionPipeline
+            logger.info(
+                "imagegen: %s has no pipeline mapping for model=%s (%s); "
+                "falling back to the concrete DiffusionPipeline class",
+                getattr(auto_cls, "__name__", auto_cls), model_key, exc,
+            )
+            pipe = DiffusionPipeline.from_pretrained(model_dir, **load_kwargs)
+            fallback = True
+
+        if cuda and (quant_config is not None or fallback):
+            # Quantized / oversized / natively-conditioned edit pipelines:
+            # component CPU-offload spills inactive components to host RAM
+            # (bnb-quantized components are already device-placed) instead of
+            # OOMing at .to("cuda").
+            try:
+                pipe.enable_model_cpu_offload()
+                placement = "model-cpu-offload" + ("+4bit" if quant_config else "")
+            except Exception:  # noqa: BLE001 — offload gap: honest fallback
+                try:
+                    pipe = pipe.to("cuda")
+                    placement = "cuda (offload unavailable)"
+                except Exception:  # noqa: BLE001 — quantized parts already placed
+                    placement = "device-placed (quantized)"
+        elif place_fn is not None:
+            placement = place_fn(pipe, cuda, model_key)   # seam-aware default path
+        else:
+            pipe = pipe.to("cuda" if cuda else "cpu")
+            placement = "cuda" if cuda else "cpu"
+    except BaseException:
+        # Deterministic unwind: strip hooks, drop the partial pipe, empty the
+        # allocator cache. Null the local BEFORE _release_cuda so the tensors are
+        # actually collectable (a live reference would keep the blocks reserved).
+        try:
+            if pipe is not None and hasattr(pipe, "remove_all_hooks"):
+                pipe.remove_all_hooks()
+        except Exception:  # noqa: BLE001 — best-effort teardown
+            pass
+        pipe = None
+        _release_cuda()
+        raise
+
+    _trim_host_ram()
+    return pipe, placement
+
+
 class ImageGenRunner:
     """Runner for diffusers text-to-image pipelines.
 
@@ -196,7 +443,7 @@ class ImageGenRunner:
                 return cached
 
             try:
-                import torch
+                import torch  # noqa: F401 — availability probe
                 from diffusers import AutoPipelineForText2Image
             except ImportError as exc:
                 raise RuntimeError(
@@ -207,16 +454,19 @@ class ImageGenRunner:
             # Free any idle prior pipeline BEFORE loading this one (bounds VRAM).
             _evict_idle_pipelines(self._PIPELINES, self.model_key)
             model_dir = ensure_model(self.model_key)
-            cuda = torch.cuda.is_available()
-            pipe = AutoPipelineForText2Image.from_pretrained(
-                model_dir,
-                torch_dtype=torch.float16 if cuda else torch.float32,
+            # Priced, quant-electing loader shared with Img2ImgRunner: honest
+            # footprint pricing (never a blind fp16 election), 4-bit-on-load when
+            # the fp16 footprint won't fit, and a deterministic VRAM unwind if the
+            # load fails. The seam-aware _place_diffusers_pipeline governs the
+            # non-quantized default so byte-identical placement is preserved when
+            # the model fits.
+            pipe, placement = _load_diffusers_pipeline(
+                AutoPipelineForText2Image, model_dir, self.model_key,
+                place_fn=_place_diffusers_pipeline,
             )
-            placement = _place_diffusers_pipeline(pipe, cuda, self.model_key)
-
             logger.info(
-                "ImageGenRunner: loaded model=%s dir=%s device=%s placement=%s",
-                self.model_key, model_dir, "cuda" if cuda else "cpu", placement,
+                "ImageGenRunner: loaded model=%s dir=%s placement=%s",
+                self.model_key, model_dir, placement,
             )
             self._PIPELINES[self.model_key] = pipe
             return pipe
@@ -245,7 +495,15 @@ class ImageGenRunner:
             call_kwargs["generator"] = torch.Generator(device).manual_seed(req.seed)
 
         with _generate_lock(self.model_key):
-            output = self.pipeline(**call_kwargs)
+            try:
+                output = self.pipeline(**call_kwargs)
+            except BaseException:
+                # A generation OOM (or a load OOM reached via the .pipeline
+                # property) leaves reserved allocator blocks the process still
+                # owns — return them to the OS so failure doesn't zombie the card
+                # until an /ops/restart (item I).
+                _release_cuda()
+                raise
 
         out_dir = os.path.join(UPLOADS_HOME, "generated")
         os.makedirs(out_dir, exist_ok=True)
@@ -346,8 +604,8 @@ class Img2ImgRunner:
                 return cached
 
             try:
-                import torch
-                from diffusers import AutoPipelineForImage2Image, DiffusionPipeline
+                import torch  # noqa: F401 — availability probe
+                from diffusers import AutoPipelineForImage2Image
             except ImportError as exc:
                 raise RuntimeError(
                     "diffusers + torch are required for image-to-image tasks "
@@ -357,120 +615,18 @@ class Img2ImgRunner:
             # Free any idle prior pipeline BEFORE loading this one (bounds VRAM).
             _evict_idle_pipelines(self._PIPELINES, self.model_key)
             model_dir = ensure_model(self.model_key)
-            # GPU guard block — VERBATIM from ImageGenRunner: fp16 on cuda, fp32
-            # on cpu, move the whole pipe to the resolved device.
-            cuda = torch.cuda.is_available()
-            dtype = torch.float16 if cuda else torch.float32
-
-            # ---- fit ladder (cuda only) -------------------------------------
-            # Weights far bigger than free VRAM (Qwen-Image-Edit: ~55GB bf16 vs
-            # a 24GB card) can still serve: quantize ON LOAD to bnb 4-bit
-            # (~4.5x smaller — the 20B transformer lands ~11GB) and let
-            # cpu-offload spill the rest to host RAM. Opt out / force via
-            # HUGPY_IMG2IMG_QUANTIZE = "auto" (default) | "always" | "never".
-            quant_config = None
-            if cuda:
-                mode = (os.environ.get("HUGPY_IMG2IMG_QUANTIZE") or "auto").lower()
-                weight_bytes = 0
-                for root, _dirs, files in os.walk(model_dir):
-                    for fn in files:
-                        if fn.endswith((".safetensors", ".bin")):
-                            try:
-                                weight_bytes += os.path.getsize(os.path.join(root, fn))
-                            except OSError:
-                                pass
-                free_vram = torch.cuda.mem_get_info()[0]
-                need_quant = (mode == "always" or
-                              (mode == "auto" and weight_bytes > free_vram * 0.85))
-                if need_quant and mode != "never":
-                    try:
-                        import bitsandbytes  # noqa: F401 — availability probe
-                        from diffusers import PipelineQuantizationConfig
-                        quant_config = PipelineQuantizationConfig(
-                            quant_backend="bitsandbytes_4bit",
-                            quant_kwargs={
-                                "load_in_4bit": True,
-                                "bnb_4bit_quant_type": "nf4",
-                                "bnb_4bit_compute_dtype": torch.bfloat16,
-                            },
-                            components_to_quantize=["transformer", "text_encoder"],
-                        )
-                        logger.warning(
-                            "Img2ImgRunner: model=%s weights ~%.1fGB vs %.1fGB free "
-                            "VRAM — loading in bnb 4-bit (nf4) to fit",
-                            self.model_key, weight_bytes / 1e9, free_vram / 1e9,
-                        )
-                    except Exception as exc:  # noqa: BLE001 — no bnb/API: plain load
-                        logger.warning(
-                            "Img2ImgRunner: wanted 4-bit load for %s but the "
-                            "quantization stack is unavailable (%s) — plain load "
-                            "may OOM", self.model_key, exc,
-                        )
-                        quant_config = None
-            load_kwargs: Dict[str, Any] = {"torch_dtype": dtype}
-            if quant_config is not None:
-                load_kwargs["quantization_config"] = quant_config
-            # AutoPipelineForImage2Image only maps the classic families (SD /
-            # SDXL / flux1 …); natively image-conditioned EDIT pipelines
-            # (QwenImageEditPlusPipeline, Flux2KleinPipeline, …) are absent from
-            # its mapping and it raises "can't find a pipeline linked to <cls>".
-            # Those classes are img2img by construction, so fall back to
-            # DiffusionPipeline, which instantiates the concrete class straight
-            # from model_index.json.
-            fallback = False
-            try:
-                pipe = AutoPipelineForImage2Image.from_pretrained(
-                    model_dir, **load_kwargs,
-                )
-            except ValueError as exc:
-                logger.info(
-                    "Img2ImgRunner: AutoPipeline has no img2img mapping for "
-                    "model=%s (%s); falling back to the concrete pipeline class",
-                    self.model_key, exc,
-                )
-                pipe = DiffusionPipeline.from_pretrained(model_dir, **load_kwargs)
-                fallback = True
-            if cuda and (fallback or quant_config is not None):
-                # Edit pipelines are typically far larger than the classic SD
-                # families — component-wise CPU offload spills non-active
-                # components to host RAM so a single consumer GPU serves them
-                # instead of OOMing at .to("cuda"). (bnb-quantized components
-                # are already device-placed; offload handles the rest.)
-                try:
-                    pipe.enable_model_cpu_offload()
-                except Exception:
-                    try:
-                        pipe = pipe.to("cuda")
-                    except Exception:
-                        pass  # quantized components may already sit on device
-            else:
-                pipe = pipe.to("cuda" if cuda else "cpu")
-
-            logger.info(
-                "Img2ImgRunner: loaded model=%s dir=%s device=%s class=%s%s",
-                self.model_key, model_dir, "cuda" if cuda else "cpu",
-                type(pipe).__name__, " (cpu-offload)" if cuda and fallback else "",
+            # Shared priced loader: honest footprint pricing, 4-bit-on-load when
+            # the fp16 footprint won't fit (Qwen-Image-Edit ~55GB on a 24GB card),
+            # component CPU-offload for the quantized/oversized case, and a
+            # deterministic VRAM unwind if the load fails. No place_fn — img2img's
+            # historical default is a plain .to(device), not the t2i alloc seam.
+            pipe, placement = _load_diffusers_pipeline(
+                AutoPipelineForImage2Image, model_dir, self.model_key,
             )
-            # A ~55 GB fp16/bf16 load churns a large transient host arena
-            # (staging buffers + the pre-offload copy). Now that the pipe is
-            # placed, drop those references and hand the arena (and torch's CUDA
-            # cache) back to the OS so RSS doesn't stay pinned at the load's
-            # high-water mark. Inline — NOT worker_agent.agent._trim_host_ram —
-            # to avoid cross-module coupling; mirrors this file's evict idiom
-            # (~85-93) plus malloc_trim (glibc/Linux-only, so best-effort).
-            import gc
-            gc.collect()
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except Exception:  # noqa: BLE001 — no torch/cuda: nothing to release
-                pass
-            try:
-                import ctypes
-                ctypes.CDLL("libc.so.6").malloc_trim(0)
-            except Exception:  # noqa: BLE001 — non-glibc/musl: no malloc_trim
-                pass
+            logger.info(
+                "Img2ImgRunner: loaded model=%s dir=%s class=%s placement=%s",
+                self.model_key, model_dir, type(pipe).__name__, placement,
+            )
             self._PIPELINES[self.model_key] = pipe
             return pipe
 
@@ -571,7 +727,13 @@ class Img2ImgRunner:
                                        if k in accepted}
             except (TypeError, ValueError):
                 pass  # unsignaturable callable — send as-is
-            output = pipe(**call_kwargs)
+            try:
+                output = pipe(**call_kwargs)
+            except BaseException:
+                # Unwind the transient allocation a failed/OOM'd generation left
+                # reserved so the card returns to baseline (item I).
+                _release_cuda()
+                raise
 
         out_dir = os.path.join(UPLOADS_HOME, "generated")
         os.makedirs(out_dir, exist_ok=True)

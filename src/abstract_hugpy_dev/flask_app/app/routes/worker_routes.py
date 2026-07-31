@@ -49,15 +49,24 @@ from ..functions.imports.utils.enrollment_tokens import (
     create_enrollment_token, verify_enrollment_token,
     revoke_enrollment_token, list_enrollment_tokens,
 )
-# Per-worker KEEP-WARM STAR (boot_prewarm) — the operator's keep-warm
-# designation (operator RULINGS 2026-07-23): reconcile keeps it warm every beat,
-# so a star evicted under pressure returns next cycle. "nothing warms until
-# starred or static." DISTINCT from media_default (a UI/routing preference that
-# loads nothing) and from 🔒static (which is eviction-protected). The identifier
-# stays ``boot_prewarm`` but the meaning is keep-warm, not boot-once. Persisted
-# server-side (worker_boot_prewarm.json) beside the media stores; surfaced on the
-# worker record and carried to the worker on the heartbeat reply (omit-when-unset,
-# so an older worker just ignores it).
+# Per-worker BOOT-LOAD STAR (boot_prewarm) — the ⭐ lever does exactly TWO
+# things (operator RULINGS 2026-07-23, post-incident, which REVERTED the 0.1.201
+# "reconcile-kept-warm" every-beat re-warm): (1) LOAD ON BOOT, once per worker
+# process lifetime; (2) a PRIORITY tie-break in central's worker ranking for
+# ambiguous/no-warm model calls. It is NOT keep-warm and has NO reconcile
+# re-warm — central's _reconcile_warm_set (below) deliberately EXCLUDES the star,
+# and the worker fires it boot-once (worker_agent._adopt_boot_prewarm).
+# ⚠ Do not restore the "reconcile keeps it warm every beat" behavior: re-warm-
+# after-eviction fights the headroom sweep + active inference (the 2026-07-23
+# zombie-seat incident, and k67 item K's sweep×star oscillation). k67 keeps a
+# FITTING star warm the convergent way — the worker's headroom sweep simply does
+# not evict a star whose footprint fits under the pressure ceiling — so there is
+# nothing to re-warm. Co-fit-gated re-entry is the future safe path (Slice D,
+# DEFERRED). DISTINCT from media_default (a UI/routing preference that loads
+# nothing) and from 🔒static (which IS eviction-protected — the star is a plain
+# evictable resident). Persisted server-side (worker_boot_prewarm.json) beside
+# the media stores; surfaced on the worker record and carried to the worker on
+# the heartbeat reply (omit-when-unset, so an older worker just ignores it).
 # Per-worker WILDCARD flag — the "take all comers" ROUTING opt-in (operator
 # doctrine 2026-07-23): designations are a hard routing scope; an undesignated
 # model routes onto a worker ONLY if that worker opted in here. Routing
@@ -449,6 +458,9 @@ class RegisterRequest(BaseModel):
     # The dev package version this worker currently has installed (for the
     # self-update handshake). None from older agents that don't report it.
     pkg_version: str | None = None
+    # Native llama-server ENGINE build id ("1 (039e20a)") from first contact
+    # (item L, k65). None = no native engine on the box.
+    engine_build: str | None = None
     # Shard pool: "host:port" of this node's llama.cpp rpc-server (role=rpc), and
     # available RAM for the allocator's CPU tier.
     rpc_endpoint: str | None = None
@@ -565,6 +577,10 @@ class HeartbeatRequest(BaseModel):
     url: str | None = None
     port: int | None = None
     pkg_version: str | None = None
+    # Native llama-server ENGINE build id ("1 (039e20a)") beside pkg_version so
+    # engine skew is visible in /llm/workers (item L, k65). None = no native
+    # engine on the box. Additive; extra='ignore' drops it for older central.
+    engine_build: str | None = None
     role: str | None = None
     rpc_endpoint: str | None = None
     free_ram: int | None = None
@@ -880,6 +896,7 @@ def workers_register():
         models=body.models,
         worker_id=body.worker_id,
         pkg_version=body.pkg_version,
+        engine_build=body.engine_build,
         rpc_endpoint=body.rpc_endpoint,
         free_ram=body.free_ram,
         ram_total=body.ram_total,
@@ -1230,6 +1247,7 @@ def workers_heartbeat(worker_id):
         spill=body.spill,
         url=url,
         pkg_version=body.pkg_version,
+        engine_build=body.engine_build,
         role=body.role,
         rpc_endpoint=body.rpc_endpoint,
         free_ram=body.free_ram,
@@ -4784,7 +4802,8 @@ def _attach_alloc_feasibility(row, model_key):
         return
     try:
         from ..functions.imports.utils.workers import (
-            list_workers, feasible_modes_for, derived_default_for)
+            list_workers, feasible_modes_for, derived_default_for,
+            _PLACEMENT_SPILL_KEYS)
         by_worker = {}
         for w in list_workers():
             wid = w.get("id")
@@ -4808,6 +4827,42 @@ def _attach_alloc_feasibility(row, model_key):
                     if m not in union:
                         union.append(m)
             row["alloc_modes_feasible"] = union
+            # k67 item D — ONE derivation, every view. The top-level ``alloc_mode``
+            # is set by _effective_alloc_mode, which for a DERIVED (unpersisted)
+            # row falls to the worker-agnostic max-gpu default. But dispatch
+            # (WorkerStore._placement_spill_for -> derived_default_allocation) and
+            # the console (_model_alloc_modes) both use the per-worker
+            # FEASIBILITY-aware derivation, so the serving row alone disagreed —
+            # it showed "max-gpu (derived)" while alloc_by_worker[ae] derived
+            # "explicit" for the same (model, worker). Reconcile the derived
+            # top-level to the per-worker derived defaults we just computed so the
+            # two views can never contradict, and match what will actually load.
+            #
+            # GUARD: only when NO model-level placement contract exists. A model
+            # whose override carries a legacy placement knob (e.g. n_gpu_layers:-1
+            # with no explicit alloc_mode) has alloc_mode_derived=True yet
+            # derive_alloc_mode already returns the RIGHT mode (gpu-only) from that
+            # knob — reconciling would wrongly clobber it with the blank default.
+            # This mirrors _placement_spill_for's persisted-vs-derived predicate.
+            try:
+                _ov = get_override(model_key) or {}
+                _has_placement = bool(set(_ov) & _PLACEMENT_SPILL_KEYS)
+            except Exception:  # noqa: BLE001
+                _has_placement = True   # be conservative; don't touch the mode
+            if row.get("alloc_mode_derived") and not _has_placement:
+                dds = [e.get("derived_default") for e in by_worker.values()
+                       if e.get("derived_default")]
+                distinct = list(dict.fromkeys(dds))
+                if len(distinct) == 1:
+                    row["alloc_mode"] = distinct[0]
+                elif len(distinct) > 1:
+                    # Genuinely per-worker (a model designated to boxes whose
+                    # feasibility differs): a single top-level string would lie.
+                    # Keep the first as a stable representative but flag it so the
+                    # UI/operator reads alloc_by_worker for the truth rather than
+                    # trusting one number.
+                    row["alloc_mode"] = distinct[0]
+                    row["alloc_mode_varies_by_worker"] = True
     except Exception:  # noqa: BLE001 — a surface miss omits the field, never 500s
         row.pop("alloc_by_worker", None)
         row.pop("alloc_modes_feasible", None)

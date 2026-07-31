@@ -541,6 +541,15 @@ def _public_view_fields(worker: Dict[str, Any]) -> Dict[str, Any]:
         # Size column and starts answering "where will this actually go".
         "planned_split": {mk: planned_split(worker, mk)
                           for mk in (worker.get("models") or [])},
+        # k67 item G — INERT SPILL ROWS. A persisted spill for a BLOCKED model is
+        # a dead contract (the model can't route while blocked, and block never
+        # authored it). Rather than let it linger indistinguishable from a live
+        # spill, LABEL it here so the console renders it inert instead of as a
+        # real placement. {model_key: reason} for every spill row whose model is
+        # currently blocked; absent/empty when nothing is inert.
+        "spill_inert": {mk: "blocked"
+                        for mk in (worker.get("spill_by_model") or {})
+                        if _model_blocked(mk)},
     }
 
 
@@ -771,6 +780,13 @@ _PLACEMENT_SPILL_KEYS = frozenset({
     "alloc_mode", "n_gpu_layers", "leniency_pct", "priority", "priority_device",
     "gpu_mem_gib", "cpu_mem_gib", "gpu_mem_gib_deviation_pct",
     "cpu_mem_gib_deviation_pct", "tensor_split", "threads",
+    # k67: n_cpu_moe is a placement contract (it IS the MoE split). Without it
+    # here a spill persisted as {"n_cpu_moe": 999} ALONE read as "blank" at the
+    # emission seam, so _placement_spill_for re-derived the split and DISCARDED
+    # the operator's value before it ever reached the wire (lever-exhaustion
+    # matrix, 2026-07-31). It is already in _NEW_SPILL_KEYS_LOCAL for the version
+    # gate; recognizing it as placement-affecting closes that drop.
+    "n_cpu_moe",
 })
 
 # Mirror of managers.alloc_modes.NEW_SPILL_KEYS, used only to decide whether a
@@ -2677,6 +2693,7 @@ class WorkerStore:
         models: Optional[List[str]] = None,
         worker_id: Optional[str] = None,
         pkg_version: Optional[str] = None,
+        engine_build: Optional[str] = None,
         rpc_endpoint: Optional[str] = None,
         free_ram: Optional[int] = None,
         ram_total: Optional[int] = None,
@@ -2722,6 +2739,8 @@ class WorkerStore:
                     existing["models"] = sorted(set(models))
                 if pkg_version is not None:
                     existing["pkg_version"] = pkg_version
+                if engine_build is not None:
+                    existing["engine_build"] = engine_build   # item L (k65)
                 if rpc_endpoint is not None:
                     existing["rpc_endpoint"] = rpc_endpoint
                 if free_ram is not None:
@@ -2775,6 +2794,23 @@ class WorkerStore:
             if remembered:
                 restored_models = list(remembered.get("models") or [])
                 restored_spill = dict(remembered.get("spill_by_model") or {})
+                # k67 item G — a BLOCKED model has no live placement contract, so
+                # its remembered spill row is INERT. Resurrecting it on a registry
+                # loss just regrows the exact stale bare rows the operator hand-
+                # cleared 2026-07-31 (Jershone~Echo-Mini kept a lingering bare
+                # n_gpu_layers=-1 this way). Blocking never authored the row and
+                # the model can't route while blocked, so drop it here — the
+                # designation stays recorded, only the dead spill is not revived.
+                _blocked = _blocked_keys()
+                if _blocked:
+                    for _mk in list(restored_spill):
+                        if _mk in _blocked:
+                            restored_spill.pop(_mk, None)
+                            logger.info(
+                                "register: NOT restoring inert spill row for "
+                                "blocked model %s on %s (block leaves the "
+                                "designation, drops the dead contract)",
+                                _mk, name or wid)
                 restored_gpu_known = remembered.get(_GPU_TOTAL_DURABLE_KEY)
                 restored_ram_known = remembered.get(_RAM_TOTAL_DURABLE_KEY)
                 if restored_models:
@@ -2791,6 +2827,7 @@ class WorkerStore:
                 "models": sorted(set(models or []) | set(restored_models)),
                 "spill_by_model": restored_spill,
                 "pkg_version": pkg_version,
+                "engine_build": engine_build,   # item L (k65) — native engine commit
                 "rpc_endpoint": rpc_endpoint,
                 "free_ram": free_ram,
                 "ram_total": ram_total,
@@ -2845,6 +2882,7 @@ class WorkerStore:
         spill: Optional[Dict[str, Any]] = None,
         url: Optional[str] = None,
         pkg_version: Optional[str] = None,
+        engine_build: Optional[str] = None,
         role: Optional[str] = None,
         rpc_endpoint: Optional[str] = None,
         free_ram: Optional[int] = None,
@@ -2945,6 +2983,11 @@ class WorkerStore:
                 worker["spill"] = spill
             if pkg_version is not None:
                 worker["pkg_version"] = pkg_version
+            # ENGINE build id beside pkg_version (item L, k65) — the native
+            # llama-server commit, so /llm/workers shows engine skew like version
+            # skew. Stored verbatim; None on a box with no native engine.
+            if engine_build is not None:
+                worker["engine_build"] = engine_build
             if role is not None:
                 worker["role"] = role
             if rpc_endpoint is not None:
@@ -3499,6 +3542,7 @@ class WorkerStore:
         tier_skipped = 0
         task_skipped = 0
         id_lock_skipped = 0
+        infeasible_skipped = 0
         engine_skipped = 0
         wildcard_engine_skipped = 0
         out = []
@@ -3601,6 +3645,19 @@ class WorkerStore:
             if require_comfy_id_lock and not _comfy_id_lock_capable(w):
                 id_lock_skipped += 1
                 continue
+            # STATIC-FEASIBILITY gate (k67, resolution-stage-pipeline): never
+            # OFFER a worker whose refusal central already knows — a model that
+            # does not fit this box's GPU+RAM combined cannot land here in ANY
+            # mode, so routing it only produces an honest but wasteful refusal
+            # (the computron case: bare-key 51.8 GB GGUF offered to an 8 GiB card,
+            # over and over). AFFIRMATIVE-only: worker_can_hold returns False just
+            # when the numbers are known AND confidently don't fit; None (unsized
+            # model / unmeasured box) never eliminates (degrade-not-guess). A HOME
+            # match is exempt — a box already holding/serving the model is feasible
+            # de facto and must never be route-refused by a static estimate.
+            if not home and worker_can_hold(w, model_key) is False:
+                infeasible_skipped += 1
+                continue
             if not home:
                 # Transient RESPONSE-COPY marker: ``w`` is a _public_view copy
                 # (self.all() rebuilds it from the store on every read), so this
@@ -3663,6 +3720,17 @@ class WorkerStore:
                 "model %s id_lock: %d otherwise-eligible worker(s) skipped — no "
                 "box advertises comfy.id_lock (install ComfyUI_IPAdapter_plus + "
                 "weights per WORKER-SETUP §5b)", model_key, id_lock_skipped)
+        if not out and infeasible_skipped:
+            # The model HAS servers — every one was excluded because the model
+            # does not fit that box's GPU+RAM combined (statically infeasible).
+            # Name it so the operator sees the honest capacity wall instead of a
+            # bare no-worker error, and knows to (re)assign a box that can hold it
+            # or split it differently. k67.
+            import logging as _logging
+            _logging.getLogger(__name__).info(
+                "model %s: %d designated worker(s) skipped — model does not fit "
+                "their GPU+RAM combined (statically infeasible; assign a larger "
+                "box or a smaller quant)", model_key, infeasible_skipped)
         return out
 
     def pick_for_model(self, model_key: str, pool: Optional[str] = None,
@@ -4209,6 +4277,32 @@ def feasible_modes_for(worker_id: str, model_key: str) -> Optional[tuple]:
     except Exception:  # noqa: BLE001 — a derivation must never break a read/relay
         from ......managers.alloc_modes import ALLOC_MODES
         return ALLOC_MODES
+
+
+def worker_can_hold(worker: Dict[str, Any], model_key: str) -> Optional[bool]:
+    """STATIC feasibility of (worker, model): can this box hold the model AT ALL,
+    in ANY mode — i.e. does it fit GPU+RAM combined (the honest ceiling for GGUF
+    partial-offload and transformers cpu/disk offload alike)?
+
+    Returns True (fits somewhere on this box), False (confidently cannot — the
+    refusal is statically knowable), or None (unsizable model / unmeasured box —
+    NO opinion, degrade-not-guess: the caller must NOT eliminate on a None).
+
+    k67: the routing candidate pipeline uses this to stop OFFERING a worker whose
+    refusal central already knows — e.g. a 51.8 GB GGUF to computron's 8 GiB card
+    (which then refused honestly, repeatedly). It is the pure ``worker_fit_verdict``
+    fed from central's authoritative size/totals; ``feasible_modes`` is NOT a
+    substitute here because it rates GGUF max-gpu universally feasible (partial
+    offload) and so never catches an oversized model that overflows RAM too."""
+    try:
+        from ......managers.alloc_modes import worker_fit_verdict
+        return worker_fit_verdict(
+            _model_engine(model_key),
+            _model_size_bytes(model_key),
+            _worker_gpu_total_bytes(worker),
+            _worker_ram_total_bytes(worker))
+    except Exception:  # noqa: BLE001 — a static gate must never manufacture a skip
+        return None
 
 
 def feasibility_context(worker_id: str, model_key: str) -> Dict[str, Any]:

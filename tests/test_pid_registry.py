@@ -135,8 +135,12 @@ def test_reconcile_attribution():
     att = res["attributed"]
     check("reconcile: subprocess model gets its pid's mib",
           att["slot/gguf"] == 5120 * _MIB)
-    check("reconcile: in-process model gets torch-split bytes (not the lump)",
-          att["inproc/vision"] == 2_000_000_000)
+    # MEASURED-TRUTH ruling (E/M 2026-07-31): the in-process model's SIZE is its
+    # PID's measured nvidia-smi mib (3600 MiB — the whole lump, since it is the
+    # sole in-process model on the worker PID), NOT the 2.0 GB torch estimate.
+    # The estimate rides along as the PLANNED figure for the panel to show beside.
+    check("reconcile: in-process model gets MEASURED pid mib (not the estimate)",
+          att["inproc/vision"] == 3600 * _MIB)
     check("reconcile: comfy model gets comfy_bytes",
           att["comfy/sdxl"] == 8000 * _MIB)
 
@@ -157,6 +161,12 @@ def test_reconcile_attribution():
     check("snapshot: slot row carries reconciled vram",
           by_key["slot/gguf"]["vram_bytes"] == 5120 * _MIB)
     check("snapshot: slot row host_mode", by_key["slot/gguf"]["host_mode"] == "subprocess")
+    check("snapshot: in-process row carries MEASURED vram (the lump)",
+          by_key["inproc/vision"]["vram_bytes"] == 3600 * _MIB)
+    check("snapshot: in-process row carries PLANNED estimate beside measured",
+          by_key["inproc/vision"]["vram_bytes_planned"] == 2_000_000_000)
+    check("snapshot: subprocess row has no planned estimate key",
+          "vram_bytes_planned" not in by_key["slot/gguf"])
     check("snapshot: all rows alive under guard",
           all(m["alive"] for m in snap["models"]))
     check("snapshot: unattributed squatter carried through",
@@ -290,6 +300,47 @@ def test_foreign_call_ttl():
           f.get(comfy_pid, {}).get("model_key") is None)
 
 
+# ── E/M byte-exact: rows sum to the nvidia-smi total, multi-in-process split ──
+def test_measured_sum_byte_exact():
+    """Acceptance (E/M 2026-07-31): every attributed/foreign/unattributed row's
+    measured bytes sum BYTE-FOR-BYTE to nvidia-smi's compute-apps total, and a
+    worker PID hosting TWO in-process models splits its measured lump between them
+    (proportional to their torch estimates) rather than counting the lump twice."""
+    fake = FakeProc()
+    worker_pid, slot_pid, foreign_pid = 1000, 2000, 4000
+    fake.table[worker_pid] = {"starttime": 10, "cmdline": "python -m ...agent", "name": "python"}
+    fake.table[slot_pid] = {"starttime": 20, "cmdline": "llama-server", "name": "llama-server"}
+    fake.table[foreign_pid] = {"starttime": 40, "cmdline": "./miner", "name": "xmrig"}
+    r = new_registry(fake)
+    r.record_launch("slot/gguf", slot_pid, "subprocess")
+    r.record_launch("inproc/a", worker_pid, "in_process")
+    r.record_launch("inproc/b", worker_pid, "in_process")
+
+    gpu_procs = {
+        worker_pid: {"name": "python", "mib": 3000},   # lump shared by a + b
+        slot_pid: {"name": "llama-server", "mib": 5120},
+        foreign_pid: {"name": "xmrig", "mib": 12000},
+    }
+    # a estimated 3x b -> a gets 3/4 of the lump, b 1/4 (last peer takes remainder).
+    inprocess_bytes = {"inproc/a": {"vram_bytes": 900, "device": "cuda"},
+                       "inproc/b": {"vram_bytes": 300, "device": "cuda"}}
+    res = r.reconcile(gpu_procs, inprocess_bytes, None)
+    att = res["attributed"]
+    lump = 3000 * _MIB
+    check("split: two in-process shares sum to the measured lump (exact)",
+          att["inproc/a"] + att["inproc/b"] == lump)
+    check("split: proportional to estimate (a=3/4 of lump)",
+          att["inproc/a"] == lump * 900 // 1200)
+    check("split: b takes the remainder", att["inproc/b"] == lump - att["inproc/a"])
+
+    total_smi = sum(m["mib"] for m in gpu_procs.values()) * _MIB
+    attributed_sum = sum(att.values())
+    foreign_sum = sum(int(f.get("vram_bytes") or 0) for f in res["foreign"])
+    unattr_sum = sum(int(u.get("mib") or 0) * _MIB for u in res["unattributed"])
+    check("byte-exact: attributed + foreign + unattributed == nvidia-smi total",
+          attributed_sum + foreign_sum + unattr_sum == total_smi)
+
+
 def main():
     test_record_verify_forget()
     test_recycled_pid_guard()
@@ -300,6 +351,7 @@ def main():
     test_own_pid_cuda_context()
     test_comfy_call_attribution()
     test_foreign_call_ttl()
+    test_measured_sum_byte_exact()
     print("\n%d ok, %d failed" % (ok, fail))
     return 1 if fail else 0
 
