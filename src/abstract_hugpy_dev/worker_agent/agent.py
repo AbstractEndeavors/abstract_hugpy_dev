@@ -6097,13 +6097,22 @@ def _moe_plan_for(model_key: str) -> "dict | None":
                 ncm = _spill.MOE_ALL_LAYERS      # unmeasurable card: slot degrade
             elif not budget:
                 return None                      # no GPU budget -> slot plans no split
-            else:
+            elif (os.environ.get("HUGPY_GPU_MEM_GIB") or "").strip():
+                # A stated per-model VRAM CONTRACT (gpu_mem_gib): the k53
+                # remainder-fill stands — the budget is a demand, not a
+                # momentary reading — same rule as the slot's free_cap path.
                 plan = _spill.moe_dense_first_plan(det, budget)
                 if not plan:
                     return None
                 ncm = int(plan["n_cpu_moe"])
                 split = {"gpu_bytes": int(plan["gpu_bytes"]),
                          "cpu_bytes": int(plan["cpu_bytes"])}
+            else:
+                # k64 (2026-07-31): the auto budget is MOMENTARY free VRAM,
+                # not a stated contract, so it never promotes experts onto the
+                # card — all of them stay CPU-side, exactly what the slot's
+                # _build_cmd now launches (the two must agree byte-for-byte).
+                ncm = _spill.MOE_ALL_LAYERS
         elif ncm <= 0:
             return None                          # explicit "experts on GPU" = no split
         if split is None:

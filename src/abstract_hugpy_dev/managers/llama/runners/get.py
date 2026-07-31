@@ -261,9 +261,15 @@ def _build_runner(model_key: str) -> "LlamaCppBaseRunner":
                     # Explicit per-model budgets (assign spill → env via the
                     # agent's _apply_spill) ride as per-load opts: slot
                     # processes were spawned earlier and never see env changes.
+                    # k64: HUGPY_ALLOC_MODE rides too — the slot plans MoE
+                    # placement per the ACTIVE mode (_moe_gpu_budget /
+                    # _strict_gpu_only) and, being a separate process, never
+                    # sees the agent's per-request env. Without it a
+                    # max-ram/explicit designation silently planned as max-gpu.
                     for env_name, key in (("HUGPY_GPU_MEM_GIB", "gpu_mem_gib"),
                                           ("HUGPY_CPU_MEM_GIB", "cpu_mem_gib"),
                                           ("HUGPY_N_CPU_MOE", "n_cpu_moe"),
+                                          ("HUGPY_ALLOC_MODE", "alloc_mode"),
                                           ("DEFAULT_LLAMA_THREADS", "threads")):
                         v = _os.environ.get(env_name)
                         if v:

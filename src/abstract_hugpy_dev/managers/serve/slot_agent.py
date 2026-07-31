@@ -795,6 +795,26 @@ def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None,
                 elif budget:
                     plan = moe_dense_first_plan(moe, budget)
                     moe_budget_priced = True
+                    # k64 (operator ruling 2026-07-31, declare-need doctrine):
+                    # a budget priced from MOMENTARY free VRAM — max-gpu / the
+                    # blank default / a max-ram overflow, i.e. any load WITHOUT
+                    # a stated per-model contract (gpu_mem_gib) — buys the
+                    # dense backbone and the KV cache, never the experts. The
+                    # remainder-fill that k53 ratified let an empty card
+                    # promote ALL experts (n_cpu_moe=0): coder-next then
+                    # launched whole at 19.6 GiB, rode the 90% ceiling, and
+                    # the idle-pressure sweep evicted it minutes later — every
+                    # call repaid a full load. Expert promotion is an operator
+                    # DEMAND (explicit n_cpu_moe, gpu-only, or an explicit
+                    # gpu_mem_gib contract, which keeps the k53 remainder
+                    # fill below); free VRAM at load instant is not one.
+                    if plan is not None and free_cap is None \
+                            and int(plan["n_cpu_moe"]) != MOE_ALL_LAYERS:
+                        plan = dict(plan, n_cpu_moe=MOE_ALL_LAYERS,
+                                    expert_layers_on_gpu=0,
+                                    cpu_bytes=int(moe.get("expert_bytes") or 0),
+                                    gpu_bytes=int(moe.get("non_expert_bytes")
+                                                  or 0))
                 elif budget is None:
                     # Unmeasurable card: keep the measured default (backbone on
                     # the GPU, ALL experts to CPU — +59% tok/s at 5x less VRAM
@@ -1004,11 +1024,30 @@ def _build_cmd(model_key, n_gpu_layers=None, ctx=None, threads=None, cpus=None,
                 ngl = moe_fallback_ngl
             eff_n_cpu_moe = None
             moe_mode = None
+        # k64: llama-server grew params-fit and CHANGED -ngl's vocabulary in
+        # the same release: ``-1`` now parses as "auto — let --fit (default ON)
+        # plan placement against device memory", and "all layers" is spelled
+        # ``all`` (-2). Every ``-1`` this choke point emits MEANS "all layers
+        # on the card" (the k53 dense-first plan pairs it with --n-cpu-moe;
+        # gpu-only demands it outright), so on a fit-capable binary the old
+        # spelling silently handed placement back to llama.cpp's own autofit —
+        # the exact ae repro: "common_init_result: fitting params to device
+        # memory", whole MoE on the card, the plan discarded. Translate the
+        # spelling AND turn --fit off: placement decided here is deterministic
+        # (same mode + same card state => same argv), and llama.cpp's fit
+        # deliberately fills the card to a ~1 GiB margin — under the worker's
+        # ~10% pressure ceiling, so a fit-planned child is evicted on the next
+        # headroom sweep by construction. An old binary (no --fit in --help)
+        # keeps the historical argv byte-identical.
+        fit_capable = _server_supports_flag(server_bin, "--fit")
+        _ngl_arg = "all" if (fit_capable and int(ngl) == -1) else str(int(ngl))
         argv = [
             server_bin, "-m", path,
             "--host", "127.0.0.1", "--port", str(SLOT_CHILD_PORT),
-            "--n-gpu-layers", str(ngl), "-c", str(ctx), "-t", str(threads),
+            "--n-gpu-layers", _ngl_arg, "-c", str(ctx), "-t", str(threads),
         ]
+        if fit_capable:
+            argv += ["--fit", "off"]
         if eff_n_cpu_moe is not None:
             # Explicit argv beats any inherited LLAMA_ARG_N_CPU_MOE env (the
             # transition-era ae unit hack), so the launched split is
@@ -1346,8 +1385,21 @@ class Slot:
     def load(self, model_key, n_gpu_layers=None, ctx=None, threads=None,
              cpus=None, gpu=None, path=None, gpu_mem_gib=None,
              cpu_mem_gib=None, profile_bin=None, force=False,
-             n_cpu_moe=None) -> dict:
+             n_cpu_moe=None, alloc_mode=None) -> dict:
         with self.lock:
+            # k64: the ACTIVE allocation mode, as a per-load opt. The slot is a
+            # separate process spawned at boot, so the agent's per-request
+            # HUGPY_ALLOC_MODE (worker_agent._apply_spill) never reaches it —
+            # a max-ram/explicit designation was silently planned as max-gpu
+            # here. Project the opt into this process's env (what
+            # spill.alloc_mode_env / _moe_gpu_budget / _strict_gpu_only read),
+            # clear-when-absent so a mode can never leak onto the next model
+            # (the same rule as _SPILL_ENV_CLEAR_WHEN_ABSENT on the agent).
+            # Single-flight under self.lock, so the process-wide env is safe.
+            if alloc_mode not in (None, ""):
+                os.environ["HUGPY_ALLOC_MODE"] = str(alloc_mode)
+            else:
+                os.environ.pop("HUGPY_ALLOC_MODE", None)
             # ``force`` (k14 relaunch): a relaunch re-seats the SAME model with a
             # NEW spec (e.g. a swept-down n_gpu_layers), so it must bypass the
             # already-serving short-circuit and actually respawn the child —
@@ -1661,7 +1713,8 @@ def build_app():
                                      gpu_mem_gib=body.get("gpu_mem_gib"),
                                      cpu_mem_gib=body.get("cpu_mem_gib"),
                                      profile_bin=body.get("profile_bin"),
-                                     n_cpu_moe=body.get("n_cpu_moe")))
+                                     n_cpu_moe=body.get("n_cpu_moe"),
+                                     alloc_mode=body.get("alloc_mode")))
         except Exception as exc:  # noqa: BLE001
             return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
 
