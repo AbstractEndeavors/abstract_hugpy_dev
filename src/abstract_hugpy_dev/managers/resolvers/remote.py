@@ -1092,6 +1092,17 @@ _PERMANENT_LOAD_MARKERS = (
     # healthy (stall/hard-cap)" — a stall, i.e. transient — which is precisely
     # how a permanently-broken model kept earning retries.
     "hard load failure",
+    # ENGINE REJECTED THE REQUEST ITSELF (incident 2026-08-01, k53 live). The
+    # worker's llama-server answered the relayed chat with an HTTP 4xx —
+    # "Client error '400 BAD REQUEST' for url …/v1/chat/completions" — which is
+    # deterministic for THIS request (over-context prompt, malformed payload):
+    # the same bytes get the same 4xx on every attempt, on every worker.
+    # Classified transient, the hold re-posted the identical doomed request
+    # every ~2s indefinitely, wedging the model's relay slot so real callers
+    # queued behind it until the 1800s expiry. A client error is not a stall:
+    # fail fast and hand the caller the refusal. (5xx stays transient — that
+    # really can be a warming/mid-swap engine.)
+    "client error '4", "exceeds the available context", "exceeds context",
 )
 
 
