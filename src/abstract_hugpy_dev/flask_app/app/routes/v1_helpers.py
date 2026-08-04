@@ -70,6 +70,16 @@ def _completion_kwargs(payload: dict) -> dict:
     # at the relay (_relay_payload) — the single enforcement point.
     if isinstance(payload.get("alloc"), dict) and payload["alloc"]:
         kwargs["alloc"] = payload["alloc"]
+    # t74 hard no-think: per-request engine chat keys, forwarded onto the slot
+    # child's llama-server body. chat_template_kwargs reaches the chat TEMPLATE
+    # ({"enable_thinking": false} pre-closes the <think> block — enforced by
+    # rendering, for models that ignore the /no_think soft switch); logit_bias
+    # is the OpenAI param (the <think>-token-ban fallback). Version-gating per
+    # worker happens at the relay (gate_chat_extras_for_worker) — the single
+    # enforcement point, same pattern as alloc above.
+    for k in ("chat_template_kwargs", "logit_bias"):
+        if isinstance(payload.get(k), dict) and payload[k]:
+            kwargs[k] = payload[k]
     return kwargs
 
 

@@ -24,6 +24,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 
 logging.disable(logging.INFO)
 
@@ -178,6 +179,80 @@ def test_run_studio_i2v_cancel_maps_to_job_error():
         shutil.rmtree(spec.out_root, ignore_errors=True)
 
 
+# --------------------------------------------------------------------------- #
+# (iv) DELEGATED cancel is retried until DELIVERED. A cancel POST that raises
+#      used to still set cancel_sent=True, so one transient blip on the worker
+#      link dropped the user's cancel forever and the render ran to its 30-min
+#      budget while the console said "cancelling". The worker link is known to
+#      blip, so the one-shot was a real loss of intent.
+# --------------------------------------------------------------------------- #
+def test_delegated_cancel_retries_until_delivered():
+    from abstract_hugpy_dev.video_intel.runners import studio_i2v as s
+
+    posts = []          # every cancel POST attempt, in order
+    attempts = {"n": 0}
+
+    def fake_post(url, payload, timeout):
+        if url.endswith("/studio/cancel/rid-1"):
+            posts.append(url)
+            attempts["n"] += 1
+            if attempts["n"] < 3:        # first TWO attempts blip
+                raise OSError("connection refused")
+            return 200, {"ok": True}
+        return 200, {"job_id": "rid-1", "accepted": "running"}   # kick-off
+
+    def fake_get(url, timeout):
+        # Settle only AFTER the cancel actually lands, so the loop must retry.
+        # A honored cancel comes back as the worker's ERROR-AS-DATA terminal
+        # (status 'error' + an Err(CANCELLED) result), NOT status 'cancelled' —
+        # the delegation loop's terminals are exactly ('done', 'error'), so any
+        # other string reads as "still running" and polls to the budget.
+        if attempts["n"] >= 3:
+            return 200, {"status": "error",
+                         "result": {"ok": False,
+                                    "error": {"code": "cancelled",
+                                              "message": "cancelled",
+                                              "retryable": False}}}
+        return 200, {"status": "running"}
+
+    # BOUND the delegation. Without this the OLD one-shot behavior doesn't fail the
+    # assertion — it HANGS: the cancel is dropped, the worker never settles, and the
+    # loop polls until the 30-min render budget. A short budget turns that into a
+    # fast, legible failure instead of a wedged test run.
+    orig_env = {k: os.environ.get(k) for k in
+                ("HUGPY_STUDIO_DELEGATE_TIMEOUT_S", "HUGPY_STUDIO_OVERALL_CAP_S",
+                 "HUGPY_STUDIO_POLL_INTERVAL_S")}
+    os.environ["HUGPY_STUDIO_DELEGATE_TIMEOUT_S"] = "3"
+    os.environ["HUGPY_STUDIO_OVERALL_CAP_S"] = "3"
+    os.environ["HUGPY_STUDIO_POLL_INTERVAL_S"] = "0.01"
+
+    orig_post, orig_get, orig_sleep = s._http_post_json, s._http_get_json, time.sleep
+    s._http_post_json, s._http_get_json = fake_post, fake_get
+    time.sleep = lambda _s: None          # don't actually wait out the poll ticks
+    try:
+        spec = make_studio_i2v(width=320, height=180, fps=12, vram_budget_gb=0.5,
+                               seed=0, out_root=tempfile.mkdtemp(prefix="studio-delegcancel-"))
+        outcome = s._delegate_to_worker(
+            "http://worker.invalid", spec, "rid-1",
+            should_cancel=lambda: True, progress_sink=lambda _b: None)
+    finally:
+        s._http_post_json, s._http_get_json = orig_post, orig_get
+        time.sleep = orig_sleep
+        for k, v in orig_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(spec.out_root, ignore_errors=True)
+
+    assert attempts["n"] >= 3, (
+        "a cancel POST that raised must be RETRIED on the next poll tick; "
+        f"only {attempts['n']} attempt(s) were made — the intent was dropped")
+    assert outcome.ok is False, f"a cancelled delegation must be ok=False; got {outcome}"
+    assert outcome.error is not None and outcome.error.code == "cancelled", (
+        f"a delivered cancel must settle as code 'cancelled'; got {outcome.error}")
+
+
 CHECKS = [
     ("produce_clip cancelled after 2nd frame -> Err(cancelled) + NO clip.mp4",
      test_produce_clip_cancel_mid_render_leaves_no_clip),
@@ -185,6 +260,8 @@ CHECKS = [
      test_produce_clip_no_cancel_regression),
     ("run_studio_i2v + is_cancelling=True -> JobResult(ok=False, 'cancelled', not retryable)",
      test_run_studio_i2v_cancel_maps_to_job_error),
+    ("delegated cancel POST that blips is RETRIED until delivered (not dropped)",
+     test_delegated_cancel_retries_until_delivered),
 ]
 
 

@@ -225,8 +225,11 @@ def _patch_dispatch(monkeypatch, fake):
 
 
 def test_execute_prompt_no_think_sends_directive_and_strips(monkeypatch):
-    """The wrapper does BOTH halves and nothing new crosses the wire: the only
-    field it touches is `messages`, which the relay already carries."""
+    """The wrapper does BOTH halves, plus the t74 HARD switch: the directive
+    rides the messages (a field the wire always carried), and
+    chat_template_kwargs {"enable_thinking": False} rides the request for the
+    slot path's template to enforce — version-gated at the relay, so an old
+    worker still sees only the frozen wire."""
     seen = {}
 
     def fake_execute_prompt(*args, **kwargs):
@@ -235,7 +238,8 @@ def test_execute_prompt_no_think_sends_directive_and_strips(monkeypatch):
 
     _patch_dispatch(monkeypatch, fake_execute_prompt)
 
-    from abstract_hugpy_dev.utils.no_think import execute_prompt_no_think
+    from abstract_hugpy_dev.utils.no_think import (
+        NO_THINK_CHAT_TEMPLATE_KWARGS, execute_prompt_no_think)
     out = execute_prompt_no_think(
         model_key="m", task="text-generation",
         messages=[{"role": "user", "content": "draft"}],
@@ -244,12 +248,31 @@ def test_execute_prompt_no_think_sends_directive_and_strips(monkeypatch):
     # half 1: the directive rode the query
     assert NO_THINK_DIRECTIVE in seen["messages"][-1]["content"]
     assert seen["messages"][-1]["content"].startswith("draft")
-    # no new wire field
-    assert set(seen) == {"model_key", "task", "messages"}
+    # the HARD half rides too (t74) — and nothing else new
+    assert seen["chat_template_kwargs"] == NO_THINK_CHAT_TEMPLATE_KWARGS
+    assert set(seen) == {"model_key", "task", "messages", "chat_template_kwargs"}
     # half 2: stripped, reasoning preserved under its own key
     assert out["text"] == "A red car."
     assert out["reasoning"] == "deliberating"
     assert out["thinking_suppressed"] is True
+
+
+def test_execute_prompt_no_think_merges_caller_chat_template_kwargs(monkeypatch):
+    """A caller's own chat_template_kwargs survive; enable_thinking is only
+    defaulted in, never clobbered."""
+    seen = {}
+
+    def fake_execute_prompt(*args, **kwargs):
+        seen.update(kwargs)
+        return {"ok": True, "text": "clean"}
+
+    _patch_dispatch(monkeypatch, fake_execute_prompt)
+    from abstract_hugpy_dev.utils.no_think import execute_prompt_no_think
+    execute_prompt_no_think(prompt="p",
+                            chat_template_kwargs={"custom": 1,
+                                                  "enable_thinking": True})
+    assert seen["chat_template_kwargs"] == {"custom": 1,
+                                            "enable_thinking": True}
 
 
 def test_execute_prompt_no_think_prompt_shaped_call(monkeypatch):

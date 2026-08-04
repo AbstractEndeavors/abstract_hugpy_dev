@@ -1389,6 +1389,10 @@ _STAGE_TAIL = 6
 # The window is deliberately long: a job legitimately HELD for GPU capacity only
 # re-writes its marker when the hold CHANGES, so its movement clock can idle for
 # hours while it is perfectly alive. Env-overridable; default 6h.
+# NOTE (2026-08-04): hiding is not resolving — a hidden row keeps its in-flight
+# status forever. The ORPHAN SWEEP (_reap_orphans, near _runner_loop) is the write
+# side that terminalizes them; it reuses this same window as its claimed/running
+# movement gate, for exactly the held-job reason above.
 def _stale_inflight_seconds() -> float:
     raw = (os.environ.get("HUGPY_MEDIA_BUS_STALE_SECONDS") or "").strip()
     if not raw:
@@ -1515,6 +1519,246 @@ def list_jobs(include_terminal: bool = False, limit: int = 50,
         conn.close()
 
 
+# --------------------------------------------------------------------------- #
+# ORPHAN SWEEP (k63 follow-up) — TERMINALIZE provably-dead in-flight rows.
+#
+# THE INCIDENT (2026-08-04): the 11:53 gunicorn restart dropped the runner threads
+# supervising two in-flight studio_i2v renders. The ROWS kept their in-flight
+# status (nothing writes a terminal on process death — run_claimed's terminal write
+# lives in the thread that just died), so a later user Cancel flipped them to
+# 'cancelling' — a flag only a LIVE runner honors (is_cancelling(), polled between
+# frames). With no runner left to poll it, they sat "canceling" in the console for
+# 134+ minutes. 17 more zombies dated back to 2026-07-03; 19 were hand-terminalized
+# that day. The stale filter below (_stale_inflight_seconds) only HIDES such rows
+# from the listing — deliberately, since list_jobs is read-only by construction
+# (k57). Hiding is not resolving: a hidden row still holds its status, still reads
+# as in-flight per-id, and never reaches a terminal. This sweep is the systemic fix
+# — the WRITE side that the read side is forbidden to do.
+#
+# TWO GATES, deliberately different in kind:
+#   1. PROVABLY DEAD RUNNER (the restart case — immediate, no waiting). Claim tokens
+#      embed the owning PID (`daemon-<pid>-r<i>-<hex>`, `worker-<pid>-<hex>`). Every
+#      runner supervisor is a local thread inside gunicorn ON THIS VM, so a PID that
+#      is not alive here is a supervisor that is CERTAINLY gone. PID reuse can make a
+#      dead runner look alive — that only DELAYS the reap to gate 2, which is the safe
+#      direction. An alive PID is NEVER treated as dead, and a token that does not
+#      parse never uses this gate at all.
+#   2. MOVEMENT FALLBACK (the wedged-but-alive-process case). Same movement clock the
+#      stale filter ages on (_last_movement_ts over stage_log + updated). For
+#      'cancelling' the window is SHORT (30 min): a live runner honors a cancel
+#      between frames, i.e. minutes at worst, so half an hour of silence after a
+#      cancel means nobody is listening. For 'claimed'/'running' it is the LONG stale
+#      window (6h) for the reason documented above it: a job legitimately HELD for GPU
+#      capacity idles its movement clock while perfectly alive.
+#
+# WRITE DISCIPLINE: the UPDATE is a compare-and-swap on the OBSERVED status, and it
+# NULLs claim_token as well as progress_json. The NULL is load-bearing, not tidiness:
+# if the "dead" thread is actually alive-but-wedged and later finishes, its terminal
+# write in run_claimed is gated `AND claim_token=?` — against a NULLed token that
+# UPDATE MISSES, so a late finisher can never overwrite the reap's honest terminal.
+# A CAS that matches 0 rows means the row moved under us (a real runner got there
+# first) and we skip it entirely — no stage-log append, no bridge, no release.
+#
+# Only RUNNER THREADS call this (via _runner_loop). It is deliberately NOT hooked
+# into _ensure_db or any read path: a CLI import or a list-only consumer must never
+# mutate the store — the listing's read-only-by-construction property (k57) stays
+# intact.
+# --------------------------------------------------------------------------- #
+_REAPABLE_STATES = ("claimed", "running", "cancelling")
+
+_last_reap_ts = 0.0
+_reap_lock = threading.Lock()
+
+
+def _cancel_reap_seconds() -> float:
+    """How long a 'cancelling' row may sit with NO movement before the sweep calls
+    the cancel unhonorable and terminalizes it (HUGPY_MEDIA_BUS_CANCEL_REAP_SECONDS,
+    default 1800). Much shorter than the claimed/running window on purpose: a live
+    runner polls is_cancelling between frames, so an honored cancel lands in minutes;
+    silence past that means the supervising thread is gone."""
+    raw = (os.environ.get("HUGPY_MEDIA_BUS_CANCEL_REAP_SECONDS") or "").strip()
+    if not raw:
+        return 1800.0
+    try:
+        v = float(raw)
+        return v if v > 0 else 1800.0
+    except ValueError:
+        return 1800.0
+
+
+def _reap_interval_seconds() -> float:
+    """Minimum seconds between sweeps across the whole pool
+    (HUGPY_MEDIA_BUS_REAP_INTERVAL_SECONDS, default 60). N runner threads hit the
+    hook every tick; only the interval winner actually scans."""
+    raw = (os.environ.get("HUGPY_MEDIA_BUS_REAP_INTERVAL_SECONDS") or "").strip()
+    if not raw:
+        return 60.0
+    try:
+        v = float(raw)
+        return v if v > 0 else 60.0
+    except ValueError:
+        return 60.0
+
+
+def _token_pid(claim_token: Optional[str]) -> Optional[int]:
+    """The owning PID embedded in a claim token, or None when the token is absent or
+    not one of OUR two shapes (`daemon-<pid>-r<i>-<hex>` from the pool,
+    `worker-<pid>-<hex>` from work_once). None means "no liveness evidence" — such a
+    row is only ever reaped by the movement gate, never by the PID gate."""
+    if not claim_token or not isinstance(claim_token, str):
+        return None
+    parts = claim_token.split("-")
+    if len(parts) < 2 or parts[0] not in ("daemon", "worker"):
+        return None
+    try:
+        pid = int(parts[1])
+    except ValueError:
+        return None
+    return pid if pid > 0 else None
+
+
+def _pid_alive(pid: int) -> bool:
+    """Is that PID alive on THIS host? signal 0 is the standard probe: it validates
+    the target without delivering anything. ProcessLookupError is the ONLY answer we
+    read as dead — PermissionError means the process exists under another uid (alive),
+    and any other error is treated as alive too. The bias is absolute and deliberate:
+    a false "alive" merely defers the reap to the movement gate, while a false "dead"
+    would terminalize a RUNNING render out from under its runner."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:  # noqa: BLE001 — unknown probe failure ⇒ assume alive
+        return True
+    return True
+
+
+def _orphan_verdict(status: str, claim_token: Optional[str],
+                    movement_ts: Optional[float], now: float
+                    ) -> Tuple[bool, Optional[str], Optional[str]]:
+    """(is_orphan, gate, why) for one in-flight row. ``gate`` is 'dead_pid' or
+    'no_movement'; ``why`` is the honest human clause that goes into the JobError
+    message, so a reaped row SAYS which evidence condemned it."""
+    pid = _token_pid(claim_token)
+    if pid is not None and not _pid_alive(pid):
+        return True, "dead_pid", (f"the runner process (pid {pid}) that owned this "
+                                  f"job is no longer alive on this host")
+    limit = (_cancel_reap_seconds() if status == "cancelling"
+             else _stale_inflight_seconds())
+    if movement_ts is not None and (now - movement_ts) > limit:
+        return True, "no_movement", (f"no movement for {int(now - movement_ts)}s "
+                                     f"(limit {int(limit)}s)")
+    return False, None, None
+
+
+def _reap_one(conn, job_id: str, name: Optional[str], status: str,
+              gate: str, why: str, stage_log) -> bool:
+    """Terminalize ONE orphan. Mirrors run_claimed's terminal ORDERING: serialize the
+    result, CAS the row (status + result + NULLed claim_token/progress_json), then the
+    three best-effort after-effects (stage log, reservation release, JobStore bridge),
+    each individually guarded so one failing never blocks the others. Returns True iff
+    the CAS actually won the row."""
+    from .result_schema import JobError, JobResult as _JR
+    if status == "cancelling":
+        new_status = "cancelled"
+        code, retryable = "cancelled", False
+        message = (f"cancel could not be honored: {why} — the supervising runner "
+                   "thread was lost (service restart / process loss) before the "
+                   "cooperative cancel was picked up. The orphan sweep terminalized it.")
+    else:
+        new_status = "failed"
+        code, retryable = "runner_lost", True
+        message = (f"the runner was lost without writing a terminal state: {why}. "
+                   "The orphan sweep terminalized it; the job is safe to re-submit.")
+    result = _JR(job_id=job_id, ok=False,
+                 error=JobError(code=code, message=message, retryable=retryable))
+    cur = conn.execute(
+        "UPDATE media_jobs SET status=?, result_json=?, claim_token=NULL, "
+        "progress_json=NULL, updated=? WHERE job_id=? AND status=?",
+        (new_status, serialize_result(result), time.time(), job_id, status),
+    )
+    if cur.rowcount != 1:
+        # The row moved between our SELECT and this write — a real runner got there
+        # first, and ITS terminal is the authoritative one. Leave it completely alone.
+        logger.debug("media_bus reaper: %s moved from %s under the sweep — skipped",
+                     job_id, status)
+        return False
+    logger.info("media_bus reaper: %s (%s) %s -> %s [gate=%s] %s",
+                job_id, name, status, new_status, gate, why)
+    extra = {"code": code, "message": message, "retryable": retryable,
+             "reaped_by": "orphan_sweep", "reap_gate": gate,
+             "prior_status": status}
+    prior_stage = _current_stage(stage_log)
+    if prior_stage:
+        extra["failed_at_stage"] = prior_stage
+    try:
+        _append_stage_log(job_id, new_status, message, terminal_extra=extra)
+    except Exception:  # noqa: BLE001 — timeline is observability, never fatal
+        logger.debug("media_bus reaper: stage-log append failed for %s", job_id,
+                     exc_info=True)
+    try:
+        # The dead runner never ran its own finally, so its GPU claim (if any) is
+        # still held until the lease TTL. Release it now — idempotent by contract.
+        _release_reservation(job_id)
+    except Exception:  # noqa: BLE001
+        logger.debug("media_bus reaper: reservation release failed for %s", job_id,
+                     exc_info=True)
+    try:
+        _bridge("on_terminal", job_id, name or "media", new_status)
+    except Exception:  # noqa: BLE001 — the bridge already swallows; belt + braces
+        logger.debug("media_bus reaper: bridge failed for %s", job_id, exc_info=True)
+    return True
+
+
+def _reap_orphans() -> int:
+    """Scan the in-flight rows and terminalize the provably-dead ones. Returns how
+    many were reaped. See the block comment above for the gates and the CAS rationale.
+    Called ONLY from _runner_loop (through the throttled _maybe_reap_orphans)."""
+    _ensure_db()
+    now = time.time()
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT job_id, name, status, claim_token, updated, stage_log_json "
+            "FROM media_jobs WHERE status IN (?,?,?)", _REAPABLE_STATES,
+        ).fetchall()
+        reaped = 0
+        for job_id, name, status, claim_token, updated, stage_log_json in rows:
+            stage_log = _load_stage_log(stage_log_json)
+            orphan, gate, why = _orphan_verdict(
+                status, claim_token, _last_movement_ts(stage_log, updated), now)
+            if not orphan:
+                continue
+            if _reap_one(conn, job_id, name, status, gate, why, stage_log):
+                reaped += 1
+    finally:
+        conn.close()
+    if reaped:
+        logger.info("media_bus reaper: terminalized %d orphaned in-flight job(s) "
+                    "out of %d scanned", reaped, len(rows))
+    return reaped
+
+
+def _maybe_reap_orphans() -> None:
+    """The THROTTLED hook the runner threads call every pass. At most one sweep per
+    _reap_interval_seconds across the whole pool: the lock only guards the timestamp
+    claim, so a non-winning thread returns INSTANTLY (it never waits on the scan) and
+    the winner does the work outside the lock. Fully swallowed — the sweep is a
+    janitor, and a janitor must never be able to kill a runner thread."""
+    global _last_reap_ts
+    try:
+        now = time.time()
+        with _reap_lock:
+            if now - _last_reap_ts < _reap_interval_seconds():
+                return
+            _last_reap_ts = now
+        _reap_orphans()
+    except Exception:  # noqa: BLE001
+        logger.debug("media_bus reaper: sweep raised (non-fatal)", exc_info=True)
+
+
 def _runner_loop(worker_token: str, idle_sleep_s: float,
                  stop_event: Optional[threading.Event] = None) -> None:
     """One pool thread: reservation-gated claim -> run, forever. Each pass claims
@@ -1523,6 +1767,11 @@ def _runner_loop(worker_token: str, idle_sleep_s: float,
     error — a bad tick just idles. ``stop_event`` (optional) lets a caller stop the
     loop gracefully (used by tests; production runs it forever as a daemon)."""
     while not (stop_event is not None and stop_event.is_set()):
+        # Janitor first, at the TOP of the pass so both the idle and the busy path
+        # reach it (a pool that is saturated with long renders would otherwise never
+        # sweep — and the restart that orphans rows is exactly when work resumes).
+        # Throttled + fully swallowed; see _maybe_reap_orphans.
+        _maybe_reap_orphans()
         try:
             job_id = claim_admissible(worker_token)
         except Exception:  # noqa: BLE001 — never let a runner die on a transient error

@@ -24,7 +24,8 @@ API surface used (all vanilla ComfyUI):
     GET  /history/<prompt_id>                        -> outputs when done
     GET  /view?filename&subfolder&type=output        -> image bytes
     POST /upload/image (multipart)                   -> init image for img2img
-    POST /interrupt                                  -> cancel (future wiring)
+    POST /interrupt (+ /queue delete)                -> cancel before the ONE
+                                                        VRAM-class retry (k71)
 """
 from __future__ import annotations
 
@@ -39,6 +40,7 @@ import uuid
 from typing import Any, Dict
 
 from ..imagegen.schemas import GeneratedImage, ImageGenRequest, ImageGenResult
+from ..imagegen.vram_retry import is_retryable_vram_failure, settle_delay_s
 from ...imports.src.constants.constants import UPLOADS_HOME
 
 logger = logging.getLogger(__name__)
@@ -405,52 +407,98 @@ class ComfyRunner:
             logger.info("ComfyRunner: %s submitted prompt %s (ckpt=%s, %s)",
                         self.model_key, prompt_id, self.checkpoint, mode)
 
-            # Poll history until outputs arrive (generation runs server-side).
-            deadline = time.time() + _TIMEOUT_S
-            outputs = None
-            while time.time() < deadline:
-                h = client.get(_comfy_url() + f"/history/{prompt_id}").json()
-                entry = h.get(prompt_id)
-                if entry:
-                    status = (entry.get("status") or {})
-                    if status.get("status_str") == "error":
-                        msgs = [m for m in (status.get("messages") or [])
-                                if m and m[0] == "execution_error"]
-                        detail = json.dumps(msgs[-1][1] if msgs else status)[:400]
-                        raise RuntimeError(f"ComfyUI execution error: {detail}")
-                    if entry.get("outputs"):
-                        outputs = entry["outputs"]
-                        break
-                time.sleep(_POLL_S)
-            if outputs is None:
-                raise TimeoutError(
-                    f"ComfyUI did not finish prompt {prompt_id} within "
-                    f"{_TIMEOUT_S:.0f}s")
+            try:
+                # Poll history until outputs arrive (generation runs server-side).
+                deadline = time.time() + _TIMEOUT_S
+                outputs = None
+                while time.time() < deadline:
+                    h = client.get(_comfy_url() + f"/history/{prompt_id}").json()
+                    entry = h.get(prompt_id)
+                    if entry:
+                        status = (entry.get("status") or {})
+                        if status.get("status_str") == "error":
+                            msgs = [m for m in (status.get("messages") or [])
+                                    if m and m[0] == "execution_error"]
+                            detail = json.dumps(msgs[-1][1] if msgs else status)[:400]
+                            raise RuntimeError(f"ComfyUI execution error: {detail}")
+                        if entry.get("outputs"):
+                            outputs = entry["outputs"]
+                            break
+                    time.sleep(_POLL_S)
+                if outputs is None:
+                    raise TimeoutError(
+                        f"ComfyUI did not finish prompt {prompt_id} within "
+                        f"{_TIMEOUT_S:.0f}s")
 
-            out_dir = os.path.join(UPLOADS_HOME, "generated")
-            os.makedirs(out_dir, exist_ok=True)
-            images: list[GeneratedImage] = []
-            index = 0
-            for node_out in outputs.values():
-                for im in node_out.get("images", []):
-                    r = client.get(_comfy_url() + "/view", params={
-                        "filename": im["filename"],
-                        "subfolder": im.get("subfolder", ""),
-                        "type": im.get("type", "output")})
-                    r.raise_for_status()
-                    data = r.content
-                    path = os.path.join(out_dir, f"{req.request_id}_{index}.png")
-                    with open(path, "wb") as fh:
-                        fh.write(data)
-                    b64 = (base64.b64encode(data).decode("ascii")
-                           if req.return_b64 else None)
-                    images.append(GeneratedImage(
-                        path=path, b64=b64, width=req.width, height=req.height,
-                        seed=seed))
-                    index += 1
-            if not images:
-                raise RuntimeError("ComfyUI finished but produced no images")
-            return images
+                out_dir = os.path.join(UPLOADS_HOME, "generated")
+                os.makedirs(out_dir, exist_ok=True)
+                images: list[GeneratedImage] = []
+                index = 0
+                for node_out in outputs.values():
+                    for im in node_out.get("images", []):
+                        r = client.get(_comfy_url() + "/view", params={
+                            "filename": im["filename"],
+                            "subfolder": im.get("subfolder", ""),
+                            "type": im.get("type", "output")})
+                        r.raise_for_status()
+                        data = r.content
+                        path = os.path.join(out_dir, f"{req.request_id}_{index}.png")
+                        with open(path, "wb") as fh:
+                            fh.write(data)
+                        b64 = (base64.b64encode(data).decode("ascii")
+                               if req.return_b64 else None)
+                        images.append(GeneratedImage(
+                            path=path, b64=b64, width=req.width, height=req.height,
+                            seed=seed))
+                        index += 1
+                if not images:
+                    raise RuntimeError("ComfyUI finished but produced no images")
+                return images
+            except BaseException as exc:
+                # Tag the failure with the submission it belongs to, so the
+                # one-shot VRAM retry seam (run) can interrupt/clean exactly
+                # this prompt before re-submitting. Best-effort: a tag that
+                # can't stick just means the cancel falls back to a bare
+                # /interrupt.
+                try:
+                    exc.comfy_prompt_id = prompt_id
+                except Exception:  # noqa: BLE001
+                    pass
+                raise
+
+    # -- one-shot VRAM retry (k71) -------------------------------------------
+    def _cancel_prompt(self, prompt_id) -> None:
+        """Best-effort cancel/clean of a submitted comfy prompt before the ONE
+        retry, so the retry cannot duplicate: drop it from the queue if it is
+        still pending (vanilla ``POST /queue {"delete": [id]}``) and interrupt
+        it if it is the one running (``POST /interrupt``). Never raises — the
+        first attempt usually already terminated server-side (that is why we
+        are here at all), and a cancel failure must not block the retry."""
+        try:
+            import httpx
+            with httpx.Client(timeout=5.0) as client:
+                if prompt_id:
+                    try:
+                        client.post(_comfy_url() + "/queue",
+                                    json={"delete": [prompt_id]})
+                    except Exception:  # noqa: BLE001 — best-effort clean
+                        pass
+                client.post(_comfy_url() + "/interrupt")
+        except Exception:  # noqa: BLE001 — best-effort cancel, never blocks
+            pass
+
+    def _settle_for_retry(self, req: ImageGenRequest, prompt_id) -> None:
+        """Between a retryable VRAM-class first failure and the ONE retry:
+        cancel/clean the first submission, re-drive the SAME ensure-comfy-
+        headroom eviction hook every attempt gets (so the pool state the first
+        attempt tripped over is actually re-driven, not just waited out), then
+        give the pool a bounded few seconds to settle. Every step is
+        best-effort — the retry proceeds regardless."""
+        self._cancel_prompt(prompt_id)
+        _ensure_comfy_headroom(self.model_key, getattr(req, "request_id", None))
+        delay = settle_delay_s()
+        if delay > 0:
+            time.sleep(delay)
 
     # -- public API (mirrors Img2ImgRunner) ----------------------------------
     async def run(self, req: ImageGenRequest) -> ImageGenResult:
@@ -460,7 +508,27 @@ class ComfyRunner:
         _job_id = getattr(req, "request_id", None)
         _reg_comfy_call(self.model_key, _job_id)
         try:
-            images = await asyncio.to_thread(self._generate, req)
+            try:
+                images = await asyncio.to_thread(self._generate, req)
+            except Exception as first_exc:
+                # ONE retry, and only for the VRAM/eviction/OOM/allocation
+                # class (stale pre-eviction pool state: the identical second
+                # try succeeds once the eviction settles). Everything else —
+                # workflow validation, missing checkpoint, timeout, no-images —
+                # surfaces exactly as before. A second failure takes the outer
+                # except, i.e. exactly today's error path.
+                if not is_retryable_vram_failure(first_exc):
+                    raise
+                logger.warning(
+                    "ComfyRunner %s: retrying ONCE — first attempt failed with "
+                    "a VRAM/allocation-class error (%s: %s); cancelling the "
+                    "first submission and re-driving comfy headroom eviction "
+                    "before the retry", self.model_key,
+                    type(first_exc).__name__, first_exc)
+                await asyncio.to_thread(
+                    self._settle_for_retry, req,
+                    getattr(first_exc, "comfy_prompt_id", None))
+                images = await asyncio.to_thread(self._generate, req)
             return ImageGenResult(
                 request_id=req.request_id, model_key=req.model_key,
                 ok=True, images=images,

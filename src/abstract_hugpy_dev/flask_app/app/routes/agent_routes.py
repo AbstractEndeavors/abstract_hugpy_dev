@@ -1180,6 +1180,74 @@ def install_download(link_id):
     return _serve_install_py(link_id)
 
 
+# ── fleet-console distribution (console regifted to hugpy 2026-08-04) ───────
+# The desktop fleet-console (.deb) + its paired hugpy_agent wheel, served as
+# plain persistent downloads in the SAME surface as the hugpy-agent installer
+# (the API tab). Unlike the installer these bake NO key, so there is no
+# one-time-link machinery: public GET, like the icons above. Artifacts live
+# under the keeper deploy dir (never in git — the deb is ~73M); drop a newer
+# fleet-console_*.deb / hugpy_agent-*.whl there and /agent/console/info picks
+# it up by version sort, no code change. Each artifact may carry a
+# ``<name>.sha256`` sidecar (written at staging time) surfaced in info.
+_CONSOLE_ARTIFACTS_DIR = os.getenv(
+    "HUGPY_CONSOLE_ARTIFACTS_DIR", "/mnt/llm_storage/_keeper_deploy/console")
+
+
+def _console_artifact(prefix: str, suffix: str) -> "dict | None":
+    """Newest matching artifact in the console dir as an info row, or None.
+    'Newest' = highest natural version sort of the filename (falls back to
+    mtime on a tie) so 1.0.12 beats 1.0.7 the way a human means it."""
+    try:
+        names = [n for n in os.listdir(_CONSOLE_ARTIFACTS_DIR)
+                 if n.startswith(prefix) and n.endswith(suffix)]
+    except OSError:
+        return None
+    if not names:
+        return None
+
+    def _natkey(n: str):
+        import re as _re
+        return ([int(t) if t.isdigit() else t
+                 for t in _re.split(r"(\d+)", n)],
+                os.path.getmtime(os.path.join(_CONSOLE_ARTIFACTS_DIR, n)))
+    name = max(names, key=_natkey)
+    path = os.path.join(_CONSOLE_ARTIFACTS_DIR, name)
+    row = {"filename": name, "size_bytes": os.path.getsize(path),
+           "url": f"/agent/console/{name}"}
+    try:
+        with open(path + ".sha256") as fh:
+            row["sha256"] = fh.read().split()[0]
+    except OSError:
+        pass
+    return row
+
+
+@agent_bp.route("/agent/console/info", methods=["GET"])
+def console_dist_info():
+    """Public: what console artifacts are downloadable right now."""
+    return jsonify({
+        "deb": _console_artifact("fleet-console_", ".deb"),
+        "agent_whl": _console_artifact("hugpy_agent-", ".whl"),
+    })
+
+
+@agent_bp.route("/agent/console/<path:filename>", methods=["GET"])
+def console_dist_download(filename):
+    """Public download of a staged console artifact. Only bare filenames that
+    actually sit in the artifacts dir and carry a distributable extension are
+    servable — no traversal, no sidecar/README leakage."""
+    if "/" in filename or filename != os.path.basename(filename):
+        abort(404)
+    if not (filename.endswith(".deb") or filename.endswith(".whl")):
+        abort(404)
+    path = os.path.join(_CONSOLE_ARTIFACTS_DIR, filename)
+    if not os.path.isfile(path):
+        abort(404)
+    from flask import send_file
+    return send_file(path, as_attachment=True, download_name=filename,
+                     conditional=True)
+
+
 # ── console UI: operator lists nodes + dispatches tasks ────────────────────
 @agent_bp.route("/agent/nodes", methods=["GET"])
 def agent_nodes():

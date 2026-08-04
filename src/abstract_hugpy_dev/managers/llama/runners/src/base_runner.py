@@ -83,8 +83,15 @@ class LlamaCppBaseRunner(ABC):
         max_tokens: int,
         temp: float,
         top_p: float,
+        extras: Optional[dict] = None,
     ) -> AsyncIterator[tuple[str, Optional[str]]]:
-        """Yield (text_chunk, finish_reason_or_None) pairs from the backend."""
+        """Yield (text_chunk, finish_reason_or_None) pairs from the backend.
+
+        ``extras`` (t74, may be None): per-request engine chat keys —
+        ``chat_template_kwargs`` / ``logit_bias`` — for the chat-completion
+        body. The HTTP runner forwards them verbatim to llama-server; the
+        in-process runner honors what llama_cpp can and says what it can't.
+        """
         ...
     @abstractmethod
     def _chat_complete(
@@ -94,6 +101,7 @@ class LlamaCppBaseRunner(ABC):
         temp: float,
         top_p: float,
         stop: Optional[list[str]],
+        extras: Optional[dict] = None,
     ) -> tuple[str, str]:
         """Chat-template path. Return (text, finish_reason)."""
         ...
@@ -120,10 +128,20 @@ class LlamaCppBaseRunner(ABC):
         stop: Optional[list[str]],
         use_chat_template: bool,
         return_full_text: bool,
+        extras: Optional[dict] = None,
     ) -> tuple[str, str]:
         if use_chat_template and isinstance(messages, list):
-            return self._chat_complete(messages, max_tokens, temp, top_p, stop)
+            return self._chat_complete(messages, max_tokens, temp, top_p, stop,
+                                       extras=extras)
 
+        # The raw /completion path renders no chat template, so
+        # chat_template_kwargs cannot apply here — say so rather than silently
+        # dropping a selected suppression (the /no_think directive in the
+        # prompt text still rides).
+        if extras:
+            logger.info("raw-prompt path cannot apply engine chat extras %s "
+                        "for %s — relying on the /no_think directive",
+                        sorted(extras), self.model_key)
         prompt = (
             messages
             if isinstance(messages, str)
@@ -174,6 +192,25 @@ class LlamaCppBaseRunner(ABC):
         else:
             messages.append({"role": "user", "content": list(parts)})
         return messages
+
+    # --- per-request engine chat extras (t74 hard no-think) ------------------
+
+    @staticmethod
+    def _engine_extras(req) -> dict:
+        """The per-request engine chat keys riding this ChatRequest, or {}.
+
+        ``chat_template_kwargs`` (the Qwen3 ``enable_thinking:false`` idiom —
+        suppression enforced by the chat TEMPLATE, for models that ignore the
+        /no_think soft switch) and ``logit_bias`` (the <think>-token-ban
+        fallback). getattr-tolerant so a req built from an older schema simply
+        yields {} — the directive+strip seam (utils/no_think.py) still applies.
+        """
+        extras = {}
+        for k in ("chat_template_kwargs", "logit_bias"):
+            v = getattr(req, k, None)
+            if isinstance(v, dict) and v:
+                extras[k] = v
+        return extras
 
     # --- usage accounting ---------------------------------------------------
     # Subclasses stash the engine-reported usage dict of the CURRENT pass here
@@ -245,6 +282,7 @@ class LlamaCppBaseRunner(ABC):
         temp      = resolve_temperature(req.temperature, req.do_sample)
         top_p     = resolve_top_p(req.top_p)
         messages  = self._attach_image(messages_to_dicts(req.messages), req)
+        extras    = self._engine_extras(req)
         output_chunks = 0
         last_finish: Optional[str] = None
         full_text = ""          # for tokenizer-based usage accounting
@@ -252,7 +290,8 @@ class LlamaCppBaseRunner(ABC):
         self._stream_timings = None
 
         try:
-            async for text, fr in self._iter_stream(messages, max_tokens, temp, top_p):
+            async for text, fr in self._iter_stream(messages, max_tokens, temp,
+                                                    top_p, extras=extras or None):
                 if cancel_event and cancel_event.is_set():
                     self._log_done(req, "cancelled", output_chunks, max_tokens)
                     yield DoneEvent(request_id=req.request_id, input_tokens=0,
@@ -303,6 +342,7 @@ class LlamaCppBaseRunner(ABC):
         temp     = resolve_temperature(req.temperature, req.do_sample)
         top_p    = resolve_top_p(req.top_p)
         convo    = self._attach_image(messages_to_dicts(req.messages), req)
+        extras   = self._engine_extras(req)
         initial_convo = list(convo)   # usage: count the CALLER's prompt, not the continue-nudges
         output_chunks = 0
         last_finish = "stop"
@@ -334,7 +374,8 @@ class LlamaCppBaseRunner(ABC):
                 piece_text = ""
                 chunk_finish: Optional[str] = None
 
-                async for text, fr in self._iter_stream(convo, chunk_tokens, temp, top_p):
+                async for text, fr in self._iter_stream(convo, chunk_tokens, temp,
+                                                        top_p, extras=extras or None):
                     if cancel_event and cancel_event.is_set():
                         self._log_done(req, "cancelled", output_chunks, chunk_tokens)
                         yield DoneEvent(request_id=req.request_id, input_tokens=0,
@@ -395,20 +436,27 @@ class LlamaCppBaseRunner(ABC):
 
     def generate_text(self, messages, *, max_new_tokens=0, temperature=0.0,
                       top_p=1.0, do_sample=False, use_chat_template=True,
-                      return_full_text=False, stop=None, **_) -> str:
+                      return_full_text=False, stop=None,
+                      chat_template_kwargs=None, logit_bias=None, **_) -> str:
         max_tokens = resolve_max_tokens(max_new_tokens)
         temp       = resolve_temperature(temperature, do_sample)
         top_p_val  = resolve_top_p(top_p)
+        extras = {k: v for k, v in (("chat_template_kwargs", chat_template_kwargs),
+                                    ("logit_bias", logit_bias))
+                  if isinstance(v, dict) and v}
         # _blocking_complete returns (text, finish_reason) per the base contract;
         # unpack so a one-shot run() yields a str (not a tuple) into ChatResult.text.
         text, _finish = self._blocking_complete(
-            messages, max_tokens, temp, top_p_val, stop, use_chat_template, return_full_text
+            messages, max_tokens, temp, top_p_val, stop, use_chat_template,
+            return_full_text, extras=extras or None
         )
         return text
 
     def generate_text_unbounded(self, messages, *, chunk_tokens=1024,
                                 max_chunks=None, temperature=0.0, top_p=1.0,
-                                do_sample=False, stop=None, **_) -> str:
+                                do_sample=False, stop=None,
+                                chat_template_kwargs=None, logit_bias=None,
+                                **_) -> str:
         import os as _os
         if max_chunks is None:
             try:
@@ -417,6 +465,9 @@ class LlamaCppBaseRunner(ABC):
                 max_chunks = 256
         temp      = resolve_temperature(temperature, do_sample)
         top_p_val = resolve_top_p(top_p)
+        extras = {k: v for k, v in (("chat_template_kwargs", chat_template_kwargs),
+                                    ("logit_bias", logit_bias))
+                  if isinstance(v, dict) and v}
         accumulated = ""
         convo = list(messages)
         # Anti-repetition guard state (mirrors stream_chat_unbounded).
@@ -427,7 +478,8 @@ class LlamaCppBaseRunner(ABC):
         for chunk_idx in range(max_chunks):
             text, finish = self._blocking_complete(
                 convo, chunk_tokens, temp, top_p_val, stop,
-                use_chat_template=True, return_full_text=False
+                use_chat_template=True, return_full_text=False,
+                extras=extras or None
             )
             accumulated += text
             logger.info("generate_text_unbounded chunk=%s model=%s finish=%s",

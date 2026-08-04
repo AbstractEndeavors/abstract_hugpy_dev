@@ -54,8 +54,14 @@ def _build_chat_request(kwargs: Dict[str, Any], model_key: str) -> ChatRequest:
     # unbounded continue-loop — part of the 2026-07-14 /v1 stall fix.
     # alloc: per-request placement triggers (2026-07-29) — same silent-drop trap
     # as max_chunks above; without forwarding it here the relay never sees it.
+    # chat_template_kwargs / logit_bias: t74 hard no-think — this whitelist IS
+    # the seam that made the template kwarg unreachable (utils/no_think.py's
+    # "zero hits across this package"); forwarding them here is what makes the
+    # llama-server body keys reachable end-to-end, on central AND on the
+    # worker's second builder pass.
     for k in ("max_new_tokens", "temperature", "top_p", "do_sample", "request_id",
-              "unbounded", "max_chunks", "pool", "images", "alloc"):
+              "unbounded", "max_chunks", "pool", "images", "alloc",
+              "chat_template_kwargs", "logit_bias"):
         if k in kwargs:
             out[k] = kwargs[k]
     out.setdefault("request_id", make_request_id())
@@ -64,7 +70,19 @@ def _build_chat_request(kwargs: Dict[str, Any], model_key: str) -> ChatRequest:
     # still force a bounded response with unbounded=False / a max_new_tokens cap.
     if "unbounded" not in out and not kwargs.get("max_new_tokens"):
         out["unbounded"] = True
-    return ChatRequest(**out)
+    req = ChatRequest(**out)
+    # Ctx-fit guard: a session whose history outgrew the model's window drops
+    # its oldest non-system turns here instead of dying on an over-ctx refusal.
+    # This builder is the one funnel every chat pass (console, /v1, and each
+    # continuation pass) goes through, so a growing history is re-fitted per
+    # pass. Fail-open twice over: the guard itself returns the request
+    # untouched on any internal error, and an import failure changes nothing.
+    try:
+        from ...chat_context.chat_context import ctx_fit_chat_request
+        req = ctx_fit_chat_request(req)
+    except Exception:  # noqa: BLE001
+        pass
+    return req
 
 
 def _build_vision_chat_request(kwargs: Dict[str, Any], model_key: str) -> ChatRequest:

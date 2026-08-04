@@ -89,12 +89,21 @@ class LlamaCppChatRunner:
         if has_image:
             messages = runner._attach_image(messages, req)
 
+        # t74 hard no-think: per-request engine chat keys ride the request to
+        # the chat-completion body (the streaming path reads them off req in
+        # base_runner._engine_extras; this one-shot path threads them by kwarg).
+        _extras_kw = {k: v for k, v in
+                      (("chat_template_kwargs", req.chat_template_kwargs),
+                       ("logit_bias", req.logit_bias))
+                      if isinstance(v, dict) and v}
+
         if req.unbounded and not has_image:
             text = await runner.generate_text_async(
                 messages,
                 temperature=req.temperature,
                 top_p=req.top_p,
                 do_sample=req.do_sample,
+                **_extras_kw,
             )
         else:
             # Image turns MUST go through the chat-template/chat-completion path
@@ -108,6 +117,7 @@ class LlamaCppChatRunner:
                 do_sample=req.do_sample,
                 use_chat_template=True,
                 return_full_text=False,
+                **_extras_kw,
             )
 
         # The engine's OWN measured decode rate for this one-shot, when the

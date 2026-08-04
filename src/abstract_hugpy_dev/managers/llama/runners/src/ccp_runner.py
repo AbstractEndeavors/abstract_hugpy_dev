@@ -96,7 +96,7 @@ class LlamaCppRunner(LlamaCppBaseRunner):
         self.served_model = serve_model_name(self.model_key)
         return True
 
-    async def _iter_stream(self, messages, max_tokens, temp, top_p):
+    async def _iter_stream(self, messages, max_tokens, temp, top_p, extras=None):
         # Mild anti-repetition on the streaming path (llama.cpp sampling
         # extension accepted by llama-server's OpenAI-compatible endpoint;
         # harmless if a given build ignores it). Complements the loop-guard in
@@ -105,6 +105,12 @@ class LlamaCppRunner(LlamaCppBaseRunner):
         payload = {"messages": messages, "max_tokens": max_tokens,
                    "temperature": temp, "top_p": top_p, "stream": True,
                    "repeat_penalty": 1.1}
+        if extras:
+            # t74: chat_template_kwargs / logit_bias, verbatim body keys —
+            # llama-server applies chat_template_kwargs at template render
+            # (--jinja builds; e.g. enable_thinking:false pre-closes <think>)
+            # and logit_bias at sampling. Older builds ignore unknown keys.
+            payload.update(extras)
         for attempt in (1, 2):
             try:
                 async with httpx.AsyncClient(timeout=None) as client:
@@ -175,11 +181,13 @@ class LlamaCppRunner(LlamaCppBaseRunner):
                     if self._refresh_endpoint():
                         continue
                 raise
-    def _chat_complete(self, messages, max_tokens, temp, top_p, stop):
+    def _chat_complete(self, messages, max_tokens, temp, top_p, stop, extras=None):
         payload = {"messages": messages, "max_tokens": max_tokens,
                    "temperature": temp, "top_p": top_p, "stream": False}
         if stop:
             payload["stop"] = stop
+        if extras:
+            payload.update(extras)      # t74 body keys — see _iter_stream
         for attempt in (1, 2):
             try:
                 with httpx.Client(timeout=DEFAULT_HTTP_TIMEOUT) as client:
@@ -226,6 +234,7 @@ class LlamaCppRunner(LlamaCppBaseRunner):
         stop: Optional[list[str]],
         use_chat_template: bool,
         return_full_text: bool,
+        extras: Optional[dict] = None,
     ) -> tuple[str, str]:
         timeout = DEFAULT_HTTP_TIMEOUT
 
@@ -240,6 +249,8 @@ class LlamaCppRunner(LlamaCppBaseRunner):
 
             if stop:
                 payload["stop"] = stop
+            if extras:
+                payload.update(extras)  # t74 body keys — see _iter_stream
 
             with httpx.Client(timeout=timeout) as client:
                 response = client.post(
@@ -259,6 +270,13 @@ class LlamaCppRunner(LlamaCppBaseRunner):
             return text, finish
 
         # Raw-prompt fallback: llama-server /completion endpoint
+        if extras:
+            # /completion renders no chat template — the t74 keys cannot apply.
+            # Say so rather than silently dropping a selected suppression; the
+            # /no_think directive in the prompt text still rides.
+            logger.info("raw-prompt path cannot apply engine chat extras %s "
+                        "for %s — relying on the /no_think directive",
+                        sorted(extras), self.model_key)
         prompt = (
             messages
             if isinstance(messages, str)

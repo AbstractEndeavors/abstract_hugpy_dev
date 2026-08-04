@@ -740,9 +740,19 @@ def _delegate_to_worker(base: str, spec, render_id: str, *,
     while True:
         time.sleep(poll_s)
 
-        # Forward a cancel INTENT once (then keep polling until the worker settles).
-        # ``should_cancel`` probes the OWNING bus job (the movie relays the MOVIE job's
-        # cancel to the per-segment worker render; single-clip probes its own job).
+        # Forward a cancel INTENT until it is actually DELIVERED (then keep polling
+        # until the worker settles). ``should_cancel`` probes the OWNING bus job (the
+        # movie relays the MOVIE job's cancel to the per-segment worker render;
+        # single-clip probes its own job).
+        #
+        # ``cancel_sent`` flips ONLY on a successful POST. It used to be set even when
+        # the POST raised, so a single transient blip on the worker link dropped the
+        # user's cancel FOREVER: nothing retried it, and the render then ran to the
+        # 30-min render budget / 2-h overall cap while the console showed
+        # "cancelling". That link is known to blip (five consecutive refused status
+        # polls were observed 2026-08-04), so the one-shot was a real loss of the
+        # cancel. Retries ride the existing poll tick, and a worker that stays
+        # unreachable is still bounded by _MAX_POLL_ERRORS -> worker_lost.
         if not cancel_sent:
             try:
                 cancelling = should_cancel()
@@ -752,9 +762,10 @@ def _delegate_to_worker(base: str, spec, render_id: str, *,
                 try:
                     _http_post_json(cancel_url, {}, timeout=_CANCEL_TIMEOUT_S)
                     logger.info("studio render %s: forwarded cancel to %s", render_id, base)
+                    cancel_sent = True
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning("studio render %s: cancel POST failed: %s", render_id, exc)
-                cancel_sent = True
+                    logger.warning("studio render %s: cancel POST failed (retrying "
+                                   "next poll): %s", render_id, exc)
 
         # Poll status.
         try:

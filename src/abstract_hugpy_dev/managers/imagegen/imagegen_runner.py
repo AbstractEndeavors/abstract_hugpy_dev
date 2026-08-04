@@ -18,10 +18,12 @@ import io
 import logging
 import os
 import threading
+import time
 from typing import Any, Dict
 
 from .imports import *           # ensure_model, UPLOADS_HOME, TokenEvent, DoneEvent, …
 from .schemas import GeneratedImage, ImageGenRequest, ImageGenResult
+from .vram_retry import is_retryable_vram_failure, settle_delay_s
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +42,35 @@ def _generate_lock(model_key: str) -> threading.Lock:
         if lock is None:
             lock = _GEN_LOCKS[model_key] = threading.Lock()
         return lock
+
+
+def _record_battery(req, result, secs: float, axis: str) -> None:
+    """One model-battery row per generation (ok AND failed). Telemetry only —
+    no-raise by contract, so it can never alter the ImageGenResult returned or
+    break the image path. The shared util (``abstract_hugpy_dev.model_battery``)
+    is itself guarded; this is the belt to its braces."""
+    try:
+        from abstract_hugpy_dev import model_battery
+
+        if not model_battery.enabled():
+            return
+        run = model_battery.run_for_session("imagegen")
+        if run is None:
+            return
+        uri = ""
+        if result.ok and result.images:
+            uri = result.images[0].path or ""
+        run.record(
+            model=req.model_key,
+            axis=axis,
+            ok=bool(result.ok),
+            secs=secs,
+            uri=uri,
+            thumb_b64=model_battery.thumb_b64_for(uri),
+            error=None if result.ok else (result.error or "unknown"),
+        )
+    except Exception:
+        logger.debug("model battery record failed (non-fatal)", exc_info=True)
 
 
 def _evict_idle_pipelines(cache: Dict[str, Any], keep: str) -> list[str]:
@@ -333,6 +364,25 @@ def _trim_host_ram() -> None:
         pass
 
 
+def _settle_for_vram_retry(cache: Dict[str, Any], lock: threading.Lock,
+                           keep: str) -> None:
+    """Between a retryable VRAM-class first failure and the ONE retry (k71, the
+    in-process twin of the comfy seam's cancel+headroom step): re-drive the
+    eviction machinery that already exists — evict idle sibling pipelines,
+    return freed-but-reserved CUDA blocks to the OS — then give the allocator a
+    bounded few seconds to settle. Only the settle sleep is new mechanism.
+    Every step is best-effort; the retry proceeds regardless."""
+    try:
+        with lock:
+            _evict_idle_pipelines(cache, keep)
+    except Exception:  # noqa: BLE001 — best-effort eviction re-drive
+        pass
+    _release_cuda()
+    delay = settle_delay_s()
+    if delay > 0:
+        time.sleep(delay)
+
+
 def _load_diffusers_pipeline(auto_cls, model_dir: str, model_key: str,
                              *, place_fn=None):
     """The ONE priced diffusers loader, shared by both image runners (stages 2 &
@@ -527,9 +577,29 @@ class ImageGenRunner:
     # --- public API ---------------------------------------------------------
 
     async def run(self, req: ImageGenRequest) -> ImageGenResult:
+        t0 = time.monotonic()
         try:
-            images = await asyncio.to_thread(self._generate, req)
-            return ImageGenResult(
+            try:
+                images = await asyncio.to_thread(self._generate, req)
+            except Exception as first_exc:
+                # ONE retry, only for the VRAM/eviction/OOM/allocation class
+                # (k71): stale pre-eviction pool state fails the first attempt
+                # and an identical second try succeeds once eviction settles.
+                # Every other class surfaces as before; a second failure takes
+                # the outer except, i.e. exactly today's error path.
+                if not is_retryable_vram_failure(first_exc):
+                    raise
+                logger.warning(
+                    "ImageGenRunner %s: retrying ONCE — first attempt failed "
+                    "with a VRAM/allocation-class error (%s: %s); re-driving "
+                    "idle-pipeline eviction and letting the pool settle before "
+                    "the retry", self.model_key,
+                    type(first_exc).__name__, first_exc)
+                await asyncio.to_thread(
+                    _settle_for_vram_retry, self._PIPELINES, self._LOCK,
+                    self.model_key)
+                images = await asyncio.to_thread(self._generate, req)
+            result = ImageGenResult(
                 request_id=req.request_id,
                 model_key=req.model_key,
                 ok=True,
@@ -542,12 +612,14 @@ class ImageGenRunner:
                 "ImageGenRunner.run failed: model=%s req=%s",
                 self.model_key, req.request_id,
             )
-            return ImageGenResult(
+            result = ImageGenResult(
                 request_id=req.request_id,
                 model_key=req.model_key,
                 ok=False,
                 error=f"{type(exc).__name__}: {exc}",
             )
+        _record_battery(req, result, time.monotonic() - t0, axis="t2i")
+        return result
 
     async def stream(self, req: ImageGenRequest, cancel_event=None):
         """One-shot wrapped as a stream, mirroring VisionRunner."""
@@ -757,9 +829,26 @@ class Img2ImgRunner:
     # --- public API ---------------------------------------------------------
 
     async def run(self, req: ImageGenRequest) -> ImageGenResult:
+        t0 = time.monotonic()
         try:
-            images = await asyncio.to_thread(self._generate, req)
-            return ImageGenResult(
+            try:
+                images = await asyncio.to_thread(self._generate, req)
+            except Exception as first_exc:
+                # ONE retry for the VRAM/allocation class only — see
+                # ImageGenRunner.run (k71). Same seam, img2img cache.
+                if not is_retryable_vram_failure(first_exc):
+                    raise
+                logger.warning(
+                    "Img2ImgRunner %s: retrying ONCE — first attempt failed "
+                    "with a VRAM/allocation-class error (%s: %s); re-driving "
+                    "idle-pipeline eviction and letting the pool settle before "
+                    "the retry", self.model_key,
+                    type(first_exc).__name__, first_exc)
+                await asyncio.to_thread(
+                    _settle_for_vram_retry, self._PIPELINES, self._LOCK,
+                    self.model_key)
+                images = await asyncio.to_thread(self._generate, req)
+            result = ImageGenResult(
                 request_id=req.request_id,
                 model_key=req.model_key,
                 ok=True,
@@ -772,12 +861,14 @@ class Img2ImgRunner:
                 "Img2ImgRunner.run failed: model=%s req=%s",
                 self.model_key, req.request_id,
             )
-            return ImageGenResult(
+            result = ImageGenResult(
                 request_id=req.request_id,
                 model_key=req.model_key,
                 ok=False,
                 error=f"{type(exc).__name__}: {exc}",
             )
+        _record_battery(req, result, time.monotonic() - t0, axis="i2i")
+        return result
 
     async def stream(self, req: ImageGenRequest, cancel_event=None):
         """One-shot wrapped as a stream, mirroring ImageGenRunner."""

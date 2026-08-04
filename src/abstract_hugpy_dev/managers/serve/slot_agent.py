@@ -1479,15 +1479,40 @@ class Slot:
                               _LOAD_BACKOFF_MAX_S)
                 self._load_backoff_until[model_key] = time.time() + backoff
                 kind = getattr(self, "_load_fail_kind", None)
-                if kind == "exit":
-                    # The child DIED rather than hung: the loader rejected the
-                    # model file. Permanent by construction — the same bytes fail
-                    # the same way forever — so the wording carries "hard load
-                    # failure", which central's _PERMANENT_LOAD_MARKERS matches to
-                    # fail the call fast instead of holding and re-requesting it.
+                exit_code = getattr(self, "_load_exit_code", None)
+                if kind == "exit" and isinstance(exit_code, int) and exit_code < 0:
+                    # The child was killed by a SIGNAL (Popen returncode -N):
+                    # -11 SIGSEGV / -9 oom-kill / -6 abort. That is a CRASH —
+                    # in practice exhausted/leaked VRAM or driver state (k70;
+                    # the 2026-08-04 32B case crashed -11 on a 383MB-free card
+                    # while its file chunksum-verified clean) — NOT a verdict
+                    # on the model file. The wording says "child crashed",
+                    # which central classifies fail-fast but STATE-DEPENDENT:
+                    # never cached, so the next request re-attempts once the
+                    # card frees instead of inheriting a corrupt-file verdict.
+                    import signal as _sig
+                    try:
+                        signame = _sig.Signals(-exit_code).name
+                    except ValueError:
+                        signame = f"signal {-exit_code}"
+                    self.last_load_error = (
+                        f"the llama-server child crashed ({signame}, exit "
+                        f"{exit_code}) after "
+                        f"{getattr(self, '_load_fail_after_s', 0.0):.1f}s without "
+                        f"ever serving — likely exhausted VRAM/RAM or driver "
+                        f"state, not a verdict on the model file. See the worker "
+                        f"journal for the loader's own error. "
+                        f"Attempt {n}, backing off {backoff:.0f}s")
+                elif kind == "exit":
+                    # The child EXITED cleanly-but-nonzero rather than hung: the
+                    # loader rejected the model file. Permanent by construction —
+                    # the same bytes fail the same way forever — so the wording
+                    # carries "hard load failure", which central's
+                    # _PERMANENT_LOAD_MARKERS matches to fail the call fast (and
+                    # cache) instead of holding and re-requesting it.
                     self.last_load_error = (
                         f"hard load failure: the llama-server child exited "
-                        f"(code {getattr(self, '_load_exit_code', None)}) after "
+                        f"(code {exit_code}) after "
                         f"{getattr(self, '_load_fail_after_s', 0.0):.1f}s without "
                         f"ever serving — the model file was rejected by the "
                         f"loader, not stalled; retrying cannot fix it. See the "

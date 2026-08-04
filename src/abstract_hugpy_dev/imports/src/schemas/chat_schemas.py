@@ -157,6 +157,34 @@ class ChatRequest(BaseModel):
     # Takes effect at LOAD time: an already-resident model keeps its current
     # placement until evicted/reseated (same rule as designation edits).
     alloc: Optional[dict] = None
+    # t74 HARD NO-THINK: per-request engine chat keys, forwarded verbatim onto
+    # the slot child's llama-server /v1/chat/completions body.
+    #   chat_template_kwargs — reaches the chat TEMPLATE (the Qwen3
+    #     ``{"enable_thinking": false}`` idiom emits a pre-closed <think> block,
+    #     so suppression is enforced by rendering, not by model obedience — the
+    #     fix for models that ignore the /no_think soft switch);
+    #   logit_bias — OpenAI-style token bias (the <think>-token-ban fallback).
+    # ⚠ WIRE LANDMINE, same class as ``alloc``: released workers re-validate
+    # relays with extra="forbid" schemas and builders that don't forward these
+    # keys. They are omitted from model_dump() when None (see the serializer
+    # below), and when SET the relay version-gates them per worker
+    # (alloc_modes.gate_chat_extras_for_worker) — strip + LOUD log for a worker
+    # predating CHAT_EXTRAS_MIN_PKG_VERSION, never a silent no-op.
+    chat_template_kwargs: Optional[dict] = None
+    logit_bias: Optional[dict] = None
+
+    @model_serializer(mode="wrap")
+    def _omit_null_engine_extras(self, handler):
+        # Same discipline as ChatMessage._omit_null_tool_fields: dumping the
+        # t74 keys as None would break EVERY offloaded chat against a released
+        # worker (extra="forbid" on the re-validated wire). Omit unless set so
+        # the relay wire stays byte-identical for all non-no-think traffic.
+        data = handler(self)
+        for key in ("chat_template_kwargs", "logit_bias"):
+            if data.get(key) is None:
+                data.pop(key, None)
+        return data
+
     @field_validator("messages", mode="before")
     @classmethod
     def normalize_messages(cls, value: Any) -> Any:

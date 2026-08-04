@@ -250,14 +250,50 @@ class LlamaCppPythonRunner(LlamaCppBaseRunner):
         )
         return new_prompt, out
 
-    async def _iter_stream(self, messages, max_tokens, temp, top_p):
+    def _llm_extras_kwargs(self, extras) -> dict:
+        """In-process analogue of the t74 llama-server body keys — honor what
+        llama_cpp can, NAME what it can't (a selected suppression must never be
+        a silent no-op).
+
+        ``logit_bias`` passes through when this llama_cpp build's
+        create_chat_completion accepts it. ``chat_template_kwargs`` has no
+        create_chat_completion analogue (the handler renders the template with
+        fixed args), so it is logged-and-skipped — the /no_think directive +
+        caller-side strip (utils/no_think.py) remain the suppression here; the
+        slot path (native llama-server) is where the template kwarg is honored.
+        """
+        if not extras:
+            return {}
+        kw = {}
+        lb = extras.get("logit_bias")
+        if lb:
+            try:
+                import inspect as _inspect
+                accepts = "logit_bias" in _inspect.signature(
+                    self.llm.create_chat_completion).parameters
+            except (TypeError, ValueError):
+                accepts = False
+            if accepts:
+                kw["logit_bias"] = lb
+            else:
+                logger.warning("in-process llama_cpp build ignores logit_bias "
+                               "for %s", self.model_key)
+        if extras.get("chat_template_kwargs"):
+            logger.info("in-process llama_cpp cannot apply chat_template_kwargs "
+                        "%s for %s — relying on the /no_think directive + strip",
+                        extras["chat_template_kwargs"], self.model_key)
+        return kw
+
+    async def _iter_stream(self, messages, max_tokens, temp, top_p, extras=None):
         messages, max_tokens = self._fit_chat(messages, max_tokens)
+        extra_kw = self._llm_extras_kwargs(extras)
 
         def run():
             with self.generate_lock:
                 return self.llm.create_chat_completion(
                     messages=messages, max_tokens=max_tokens,
-                    temperature=temp, top_p=top_p, stream=True, stop=None)
+                    temperature=temp, top_p=top_p, stream=True, stop=None,
+                    **extra_kw)
         stream = await asyncio.to_thread(run)
         for raw in stream:
             try:
@@ -274,12 +310,14 @@ class LlamaCppPythonRunner(LlamaCppBaseRunner):
                 text, fr = "", None
             yield text, fr
             await asyncio.sleep(0)
-    def _chat_complete(self, messages, max_tokens, temp, top_p, stop):
+    def _chat_complete(self, messages, max_tokens, temp, top_p, stop, extras=None):
         messages, max_tokens = self._fit_chat(messages, max_tokens)
+        extra_kw = self._llm_extras_kwargs(extras)
         with self.generate_lock:
             out = self.llm.create_chat_completion(
                 messages=messages, max_tokens=max_tokens,
-                temperature=temp, top_p=top_p, stop=stop, stream=False)
+                temperature=temp, top_p=top_p, stop=stop, stream=False,
+                **extra_kw)
         choice = out["choices"][0]
         logger.info("_chat_complete: model=%s finish=%s usage=%s cap=%s",
                     self.model_key, choice.get("finish_reason"), out.get("usage"), max_tokens)
@@ -303,6 +341,7 @@ class LlamaCppPythonRunner(LlamaCppBaseRunner):
         stop: Optional[list[str]],
         use_chat_template: bool,
         return_full_text: bool,
+        extras: Optional[dict] = None,
     ) -> tuple[str, str]:
         with self.generate_lock:
             if use_chat_template and isinstance(messages, list):
@@ -314,6 +353,7 @@ class LlamaCppPythonRunner(LlamaCppBaseRunner):
                     top_p=top_p,
                     stop=stop,
                     stream=False,
+                    **self._llm_extras_kwargs(extras),
                 )
 
                 choice = out["choices"][0]

@@ -138,6 +138,26 @@ MODE_MIN_PKG_VERSION = "0.1.203"
 NO_EVICT_SPILL_KEY = "no_evict"
 NO_EVICT_MIN_PKG_VERSION = "0.1.226"
 
+# ── t74: HARD NO-THINK — per-request engine chat keys ───────────────────────
+# ``chat_template_kwargs`` (the Qwen3 ``enable_thinking:false`` idiom — the
+# chat template pre-closes ``<think>\n\n</think>`` so generation starts with
+# thinking already shut) and ``logit_bias`` (the <think>-token-ban fallback)
+# now ride ChatRequest and are forwarded verbatim onto the slot child's
+# llama-server /v1/chat/completions body. They exist because /no_think is a
+# SOFT switch some models ignore outright (wazimondo~Qwen3.6-35B-A3B-
+# Uncensored-Wasserstein-GGUF burns its whole budget thinking anyway); the
+# template kwarg is enforced by the TEMPLATE, not by model obedience.
+#
+# These are NOT spill keys (they steer the request body, never placement), so
+# they are gated separately from NEW_SPILL_KEYS — but by the same rule: a
+# worker whose builder predates them silently DROPS the keys (its chat-request
+# whitelist doesn't forward them), and a selected suppression must never be a
+# silent no-op. Central strips them for an old worker and logs the downgrade;
+# the soft directive + caller-side strip (utils/no_think.py) still ride the
+# messages, so the request degrades to today's behavior, never breaks.
+CHAT_EXTRAS_WIRE_KEYS = frozenset({"chat_template_kwargs", "logit_bias"})
+CHAT_EXTRAS_MIN_PKG_VERSION = "0.1.229"
+
 # Modes a non-GGUF (transformers/comfy) model may select. Slice C wired the gap
 # loaders to the spill seam, and this slice (2026-07-24, operator-approved)
 # OPENS the central gate for ``max-ram``: transformers honor it via
@@ -1133,6 +1153,42 @@ def no_evict_downgrade_note(pkg_version: Any, worker_name: str = "") -> str:
             f"{NO_EVICT_MIN_PKG_VERSION}); no_evict STRIPPED — this worker "
             f"would evict residents to make room, so central does not route a "
             f"polite model here (update the worker to honor it)")
+
+
+def worker_honors_chat_extras(pkg_version: Any) -> bool:
+    """True when a worker's reported package version forwards the per-request
+    engine chat keys (>= CHAT_EXTRAS_MIN_PKG_VERSION). Unknown/unparseable ->
+    False (fail SAFE, same rule as worker_honors_mode_keys: never ship a knob
+    we can't prove the worker reads)."""
+    have = _ver_tuple(pkg_version)
+    need = _ver_tuple(CHAT_EXTRAS_MIN_PKG_VERSION)
+    return have is not None and need is not None and have >= need
+
+
+def gate_chat_extras_for_worker(payload: "Optional[dict]", pkg_version: Any,
+                                worker_name: str = "") -> "tuple[dict, Optional[str]]":
+    """t74 version gate at the relay: a chat payload carrying
+    ``chat_template_kwargs``/``logit_bias`` only ships them to a worker that
+    honors them; an older worker gets the keys STRIPPED, with a note the caller
+    logs/surfaces. The stripped request still carries the /no_think directive
+    in its messages (utils/no_think.py appends it caller-side), so hard
+    suppression degrades to the soft switch — never to a rejected request and
+    never to a silent no-op.
+
+    Returns ``(payload_to_emit, downgrade_note)``. A payload with neither key
+    passes through untouched (None note) regardless of version."""
+    p = dict(payload or {})
+    present = sorted(set(p) & CHAT_EXTRAS_WIRE_KEYS)
+    if not present or worker_honors_chat_extras(pkg_version):
+        return p, None
+    for k in present:
+        p.pop(k, None)
+    note = (f"worker {worker_name or '?'} (pkg {pkg_version or 'unknown'}) "
+            f"predates per-request engine chat keys (needs >= "
+            f"{CHAT_EXTRAS_MIN_PKG_VERSION}); {', '.join(present)} STRIPPED — "
+            f"hard no-think degrades to the /no_think directive for this "
+            f"request (update the worker to honor it)")
+    return p, note
 
 
 def gate_spill_for_worker(spill: "Optional[dict]", pkg_version: Any,

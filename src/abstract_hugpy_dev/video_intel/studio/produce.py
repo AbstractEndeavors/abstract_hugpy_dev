@@ -20,6 +20,8 @@ No pathlib anywhere. os.path only (there is none here — pure orchestration).
 from __future__ import annotations
 
 import inspect
+import logging
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Callable
@@ -269,11 +271,13 @@ def produce_clip(
 
     runner = _DISPATCH.get((binding.framework, binding.task))
     if runner is None:
-        return Err(StageError(
+        missing = Err(StageError(
             ErrorCode.RUNNER_MISSING,
             f"no wired runner for ({binding.framework.value}, {binding.task.value})",
             (("model_id", binding.model_id),),
         ))
+        _record_battery_iteration(request, binding, missing, 0.0, out_root)
+        return missing
 
     # Thread the cancel probe only when a caller supplied one, so the runner
     # contract stays backward-compatible with any 3-arg dispatch shim that predates
@@ -289,4 +293,57 @@ def produce_clip(
     # anyway, so an un-stepped runner just renders as before.
     if on_step is not None and _accepts_on_step(runner):
         runner_kwargs["on_step"] = on_step
-    return runner(manifest, out_root, **runner_kwargs)
+    _t0 = time.monotonic()
+    result = runner(manifest, out_root, **runner_kwargs)
+    # PER-ITERATION BATTERY/APTITUDE RECORD (k71): every render pass — Ok or Err,
+    # in-process or on a worker — lands one row in the session's model-battery
+    # run-dir plus an aptitude verdict line in its run.log. Telemetry only: the
+    # helper is no-raise end to end, so it can never alter the Result returned.
+    _record_battery_iteration(request, binding, result, time.monotonic() - _t0, out_root)
+    return result
+
+
+def _record_battery_iteration(request, binding, result, secs, out_root) -> None:
+    """One battery row + one aptitude run.log line per render iteration.
+
+    NO-RAISE BY CONTRACT — this is instrumentation on the render path, and the
+    render path's Result must be identical with or without it. Any failure here
+    (unwritable roots, thumbnail tooling absent, a schema surprise) degrades to a
+    debug log line. The battery util is itself no-raise; this outer guard is the
+    belt to its braces."""
+    try:
+        from ... import model_battery
+
+        if not model_battery.enabled():
+            return
+        run = model_battery.run_for_session(
+            model_battery.session_key_for_out_root(out_root))
+        if run is None:
+            return
+        ok = result.is_ok()
+        uri = result.unwrap().path if ok else ""
+        error = None if ok else str(result.error)
+        run.record(
+            model=binding.model_id,
+            axis=request.capability.value,
+            ok=ok,
+            secs=secs,
+            uri=uri,
+            thumb_b64=model_battery.thumb_b64_for(uri) if ok else "",
+            error=error,
+        )
+        # The aptitude tester, per iteration: the preset verdict for THIS capability
+        # (weights-on-disk + non-stub-runner machinery behind presets.py) recorded
+        # beside the render outcome, so a pass that succeeded against a capability
+        # the table refuses — or failed against one it promises — is visible per row.
+        from .presets import capability_verdict
+
+        v = capability_verdict(request.capability)
+        run.log(
+            f"aptitude: capability={request.capability.value} "
+            f"servable={v.servable} presets={','.join(v.preset_ids) or '-'} "
+            f"model={binding.model_id} render_ok={ok} secs={secs:.2f}"
+        )
+    except Exception:
+        logging.getLogger(__name__).debug(
+            "battery iteration record failed (non-fatal)", exc_info=True)

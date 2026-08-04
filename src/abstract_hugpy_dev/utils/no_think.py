@@ -57,10 +57,24 @@ would drag the llama serve/runner stack into callers that never touch it.
 The directive itself is the Qwen3 chat-template idiom: those templates carry
 ``{%- if enable_thinking is defined and enable_thinking is false %}`` which emits
 a PRE-CLOSED ``<think>\\n\\n</think>`` so generation starts after thinking is
-already shut. We cannot reach that kwarg — ``chat_template_kwargs`` has zero hits
-across this package, so plumbing one would be a knob nothing reads. ``/no_think``
-rides the EXISTING message path and does the same job. VERIFIED on the same model
-+ draft: a clean 4-sentence prompt, no ``<think>`` at all.
+already shut. ``/no_think`` rides the EXISTING message path and does the same job
+for models that honor it. VERIFIED on flux2-klein + draft: a clean 4-sentence
+prompt, no ``<think>`` at all.
+
+THE HARD SWITCH (t74). Some models ignore the soft directive outright
+(wazimondo~Qwen3.6-35B-A3B-Uncensored-Wasserstein-GGUF burns its whole budget
+thinking anyway), so the template kwarg became REACHABLE: ``ChatRequest`` now
+carries optional ``chat_template_kwargs`` (and ``logit_bias``, the
+<think>-token-ban fallback), the chat builder forwards them, and the slot path
+puts them verbatim on the llama-server /v1/chat/completions body — where
+``{"enable_thinking": false}`` is enforced by the TEMPLATE, not by model
+obedience. :func:`execute_prompt_no_think` sets it by default. The wire stays
+safe by VERSION GATE, not by wishful thinking: the keys are omitted from
+``model_dump()`` when unset (byte-identical wire for everyone else), and the
+relay strips them — LOUDLY, never as a silent no-op — for a worker whose
+pkg_version predates ``alloc_modes.CHAT_EXTRAS_MIN_PKG_VERSION``. A stripped or
+in-process request degrades to exactly this module's directive+strip seam, which
+is why BOTH halves here remain load-bearing and nothing below this line changed.
 """
 
 from __future__ import annotations
@@ -70,6 +84,7 @@ from typing import Any
 
 __all__ = [
     "NO_THINK_DIRECTIVE",
+    "NO_THINK_CHAT_TEMPLATE_KWARGS",
     "THINK_BLOCK_RE",
     "strip_think",
     "with_no_think",
@@ -80,6 +95,13 @@ __all__ = [
 ]
 
 NO_THINK_DIRECTIVE = "/no_think"
+
+#: The HARD half of the stipulation (t74): rendered by the chat template itself
+#: (Qwen3-family ``enable_thinking``), so it works on models that ignore the
+#: soft directive. Rides ChatRequest.chat_template_kwargs to the slot child's
+#: llama-server body; version-gated at the relay, ignored where a template has
+#: no such variable — always IN ADDITION to the directive, never instead.
+NO_THINK_CHAT_TEMPLATE_KWARGS = {"enable_thinking": False}
 
 #: Matches a think block, closed OR unclosed (``\Z`` alternative) — see the
 #: module docstring on why the unclosed case is not an edge case here.
@@ -322,6 +344,19 @@ def execute_prompt_no_think(*args: Any, **kwargs: Any) -> dict:
             if isinstance(kwargs.get(key), str):
                 kwargs[key] = with_no_think(kwargs[key])
                 break
+
+    # THE HARD SWITCH (t74), alongside — never instead of — the directive: the
+    # chat builder forwards chat_template_kwargs onto ChatRequest, and the slot
+    # path puts it on the llama-server body, where enable_thinking=false is
+    # enforced by the template itself. Per-key merge so a caller's own
+    # chat_template_kwargs survive; non-chat builders simply ignore the kwarg,
+    # old workers get it stripped (loudly) at the relay, and the in-process
+    # runner names it as inapplicable — every degrade lands back on the
+    # directive+strip seam below.
+    ctk = dict(kwargs.get("chat_template_kwargs") or {})
+    for k, v in NO_THINK_CHAT_TEMPLATE_KWARGS.items():
+        ctk.setdefault(k, v)
+    kwargs["chat_template_kwargs"] = ctk
 
     from ..managers.dispatch import execute_prompt
 

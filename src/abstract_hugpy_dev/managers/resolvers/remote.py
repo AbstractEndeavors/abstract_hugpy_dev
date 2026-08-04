@@ -1092,6 +1092,11 @@ _PERMANENT_LOAD_MARKERS = (
     # healthy (stall/hard-cap)" — a stall, i.e. transient — which is precisely
     # how a permanently-broken model kept earning retries.
     "hard load failure",
+    # SLOT CHILD KILLED BY A SIGNAL (k70 fix, 2026-08-04): slot_agent now words
+    # a signal-death (-11 segv / -9 oom-kill / -6 abort) as "child crashed" —
+    # fail-fast here (a crash mid-load storm-retried is still a storm), but
+    # STATE-DEPENDENT below: VRAM/driver state clears, so never cached.
+    "child crashed",
     # ENGINE REJECTED THE REQUEST ITSELF (incident 2026-08-01, k53 live). The
     # worker's llama-server answered the relayed chat with an HTTP 4xx —
     # "Client error '400 BAD REQUEST' for url …/v1/chat/completions" — which is
@@ -1142,6 +1147,21 @@ _STATE_DEPENDENT_LOAD_MARKERS = (
     "local serving disabled", "hugpy_no_local_serving",
     # operator BLOCK — unblocking must take effect immediately, never after a TTL
     "blocked from the serving pool",
+    # AMBIGUOUS LOADER NULL-RETURN (k70, 2026-08-04). llama-cpp's bindings raise
+    # the SAME generic "Failed to load model from file: <path>" for a
+    # structurally-bad file AND for a load killed by exhausted/leaked VRAM or
+    # driver state (llama-server exit -11) — the k70 incident, re-hit live on
+    # Qwen2.5-Coder-32B whose hot copy chunksum-verified CLEAN. Caching the
+    # generic string as deterministic-until-repaired turns a crash victim into
+    # a "corrupt file" for the whole TTL. So the generic wordings stay
+    # fail-fast (they are still in _PERMANENT_LOAD_MARKERS — no hold storm)
+    # but are never CACHED; only messages carrying structural evidence
+    # (check_tensor_dims / wrong shape / unknown architecture / size mismatch /
+    # hard load failure ...) keep answering later requests from the cache.
+    "failed to load model from file", "error loading model",
+    # ...and the slot path's honest wording for the same k70 class: a child
+    # killed by a signal is a crash of state, not a property of the file.
+    "child crashed",
 )
 
 
@@ -1576,7 +1596,8 @@ def _inline_reference_images(payload: dict) -> bool:
 
 
 def _worker_payload(task: str, req, model_key: str, worker_id: Optional[str],
-                    spill_override: Optional[dict] = None) -> Optional[dict]:
+                    spill_override: Optional[dict] = None,
+                    worker: Optional[dict] = None) -> Optional[dict]:
     """JSON body for a worker /infer[/stream] call, built from a built req.
 
     A worker re-runs execute_prompt(**body), and req.model_dump() already uses
@@ -1584,9 +1605,24 @@ def _worker_payload(task: str, req, model_key: str, worker_id: Optional[str],
     resolved task + _force_local (loop guard) and the spill override, then inline
     a local file the worker can't reach. ``spill_override`` (a shard plan's
     rpc_servers/tensor_split) wins over the per-assignment spill when present.
+    ``worker`` (the full registry row, when the caller has it) supplies the
+    pkg_version the t74 chat-extras gate reads; absent -> fail-safe strip.
     Returns None to signal "can't offload this turn, run local".
     """
     payload: Dict[str, Any] = {"_force_local": True, **req.model_dump()}
+    # t74 hard no-think: chat_template_kwargs / logit_bias only dump when SET
+    # (ChatRequest omits them when None), and only ship to a worker whose
+    # builder forwards them — an older worker would silently DROP the keys,
+    # and a selected suppression must never be a silent no-op. Stripped, the
+    # request still carries the /no_think directive in its messages, so it
+    # degrades to the soft switch. No worker row (older call shape) reads as
+    # version-unknown -> strip (fail SAFE, same rule as the spill gate).
+    from ..alloc_modes import gate_chat_extras_for_worker
+    payload, _extras_note = gate_chat_extras_for_worker(
+        payload, (worker or {}).get("pkg_version"),
+        (worker or {}).get("name") or worker_id or "")
+    if _extras_note:
+        logger.warning("chat-extras downgrade for %s: %s", model_key, _extras_note)
     # Per-REQUEST alloc triggers (operator ask 2026-07-29). ALWAYS pop the key —
     # even when unset it dumps as alloc=None, and released workers run
     # extra="forbid": an unknown key on the wire rejects ALL relayed chat (the
@@ -1853,6 +1889,17 @@ def make_peer_runner(peer, framework: str, task: str):
             # Same wire scrub as _relay_payload: a peer on a released build
             # forbids unknown keys, and alloc dumps even when None.
             payload.pop("alloc", None)
+            # t74 chat extras: a peer is a static placement.json entry with no
+            # advertised pkg_version, so the version gate has nothing to read —
+            # strip fail-safe (the /no_think directive still rides the
+            # messages) and say so, never a silent no-op.
+            _t74_stripped = [k for k in ("chat_template_kwargs", "logit_bias")
+                             if payload.pop(k, None) is not None]
+            if _t74_stripped:
+                logger.info("peer relay to %s: %s stripped (peer pkg_version "
+                            "unknown; hard no-think degrades to the /no_think "
+                            "directive)", peer.base_url,
+                            ", ".join(_t74_stripped))
             url = peer.base_url.rstrip("/") + "/api/llm/execute"
             # A peer is another central, not a worker, but the call shape is
             # identical (long relay over the LAN) so it takes the same short
@@ -2123,7 +2170,8 @@ def make_delegating_runner(framework: str, task: str):
                                                            task=task)
                     worker, spill_override = slot.worker, slot.spill
                     payload = _worker_payload(task, req, self.model_key, worker.get("id"),
-                                              spill_override=spill_override)
+                                              spill_override=spill_override,
+                                              worker=worker)
                     if payload is None:
                         slot.release()
                         break  # unbuildable (oversized inline) → local, as before
@@ -2268,7 +2316,8 @@ def make_delegating_runner(framework: str, task: str):
             # return" sites replaced by a classified raise.
             async def _relay_attempt(worker, spill_override):
                 payload = _worker_payload(task, req, self.model_key, worker.get("id"),
-                                          spill_override=spill_override)
+                                          spill_override=spill_override,
+                                          worker=worker)
                 if payload is None:
                     raise _RelayUnbuildable()
                 wname = worker.get("name") or worker.get("id") or "worker"
