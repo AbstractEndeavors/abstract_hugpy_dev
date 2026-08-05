@@ -190,6 +190,45 @@ def revoke_api_key(key_id: str) -> bool:
     return True
 
 
+def prune_api_keys(*, expired: bool = True,
+                   older_than_days: Optional[float] = None,
+                   unused_only: bool = False) -> list[dict[str, Any]]:
+    """Bulk-revoke 'dated' keys and return what was pruned (id/name/prefix/why).
+
+    A key is pruned when it matches ANY enabled criterion:
+      * ``expired``          its ``expires_at`` has passed (default on).
+      * ``older_than_days``  minted more than N days ago (None => off).
+    ``unused_only`` narrows an ``older_than_days`` sweep to keys that have NEVER
+    been used (``last_used`` is None) — so a stale-but-active integration is
+    never swept out from under a caller by age alone. It does NOT gate the
+    ``expired`` criterion: an expired key already refuses calls, so pruning it
+    is safe regardless of prior use.
+
+    Already-revoked rows are skipped (idempotent — pruning twice is a no-op).
+    """
+    now = time.time()
+    cutoff = (now - older_than_days * 86400) if older_than_days is not None else None
+    pruned: list[dict[str, Any]] = []
+    with _LOCK:
+        data = _load()
+        for rec in data["keys"].values():
+            if rec.get("revoked"):
+                continue
+            reason = None
+            if expired and _is_expired(rec, now):
+                reason = "expired"
+            elif cutoff is not None and (rec.get("created_at") or 0) < cutoff:
+                if not (unused_only and rec.get("last_used")):
+                    reason = f"older than {older_than_days:g}d"
+            if reason:
+                rec["revoked"] = True
+                pruned.append({"id": rec.get("id"), "name": rec.get("name"),
+                               "prefix": rec.get("prefix"), "reason": reason})
+        if pruned:
+            _save(data)
+    return pruned
+
+
 def verify_api_key(token: Optional[str],
                    required_scope: Optional[str] = None) -> bool:
     """Validate a presented key on its own merits (hash + revocation, and —

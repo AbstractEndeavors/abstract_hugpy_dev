@@ -548,6 +548,26 @@ def keys_revoke(key_id):
     return jsonify({"ok": True})
 
 
+@v1_bp.route("/keys/prune", methods=["POST"])
+def keys_prune():
+    """Bulk-revoke 'dated' keys. Body (all optional):
+      {"expired": true,            # revoke keys whose expires_at has passed (default)
+       "older_than_days": 90,      # also revoke keys minted > N days ago
+       "unused_only": true}        # ...but among the age sweep, only never-used ones
+    Returns {ok, pruned: [{id,name,prefix,reason}], count}."""
+    body = request.get_json(silent=True) or {}
+    older = body.get("older_than_days")
+    try:
+        older = float(older) if older not in (None, "") else None
+    except (TypeError, ValueError):
+        return jsonify({"error": "'older_than_days' must be a number"}), 400
+    pruned = prune_api_keys(
+        expired=bool(body.get("expired", True)),
+        older_than_days=older,
+        unused_only=bool(body.get("unused_only", False)))
+    return jsonify({"ok": True, "pruned": pruned, "count": len(pruned)})
+
+
 @v1_bp.route("/keys/require", methods=["PUT"])
 def keys_require():
     body = request.get_json(silent=True) or {}
